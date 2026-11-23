@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="turbotap — Headless iPhone CLI at 4x WDA speed over Wi-Fi">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0B0F19"/>
+      <stop offset="55%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#090D16"/>
+    </linearGradient>
+    <radialGradient id="glowCyan" cx="0.22" cy="0.50" r="0.34">
+      <stop offset="0%" stop-color="#22D3EE" stop-opacity="0.28"/>
+      <stop offset="55%" stop-color="#0EA5E9" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#0B0F19" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowAmber" cx="0.26" cy="0.44" r="0.22">
+      <stop offset="0%" stop-color="#F59E0B" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#0B0F19" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tapGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#22D3EE"/>
+    </linearGradient>
+    <linearGradient id="boltGrad" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="55%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </linearGradient>
+    <linearGradient id="phoneScreen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#94A3B8" fill-opacity="0.10"/>
+    </pattern>
+    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Card background -->
+  <rect x="2" y="2" width="1196" height="356" rx="24" fill="url(#bg)" stroke="#1E293B" stroke-width="2"/>
+  <rect x="2" y="2" width="1196" height="356" rx="24" fill="url(#dots)"/>
+  <rect x="2" y="2" width="1196" height="356" rx="24" fill="url(#glowCyan)"/>
+  <rect x="2" y="2" width="1196" height="356" rx="24" fill="url(#glowAmber)"/>
+
+  <!-- Left emblem: geometric iPhone + tap ripples + lightning bolt -->
+  <g transform="translate(155, 62)">
+    <!-- Outer tap ripples -->
+    <circle cx="72" cy="118" r="106" fill="none" stroke="#22D3EE" stroke-opacity="0.16" stroke-width="2" stroke-dasharray="6 8"/>
+    <circle cx="72" cy="118" r="82" fill="none" stroke="#38BDF8" stroke-opacity="0.28" stroke-width="2"/>
+
+    <!-- Phone chassis -->
+    <rect x="16" y="8" width="112" height="220" rx="24" fill="url(#phoneScreen)" stroke="#CBD5E1" stroke-width="3.5"/>
+    <!-- Dynamic Island -->
+    <rect x="52" y="22" width="40" height="9" rx="4.5" fill="#020617"/>
+    <!-- Home indicator -->
+    <rect x="50" y="214" width="44" height="4" rx="2" fill="#475569"/>
+
+    <!-- Inner tap ripple on screen -->
+    <circle cx="72" cy="120" r="36" fill="#22D3EE" fill-opacity="0.12" stroke="#22D3EE" stroke-opacity="0.55" stroke-width="2"/>
+    <circle cx="72" cy="120" r="20" fill="#22D3EE" fill-opacity="0.20"/>
+
+    <!-- Lightning bolt striking the tap point -->
+    <path d="M84 68 L52 122 L73 122 L61 168 L98 110 L76 110 Z"
+          fill="url(#boltGrad)" filter="url(#softGlow)"/>
+  </g>
+
+  <!-- Wordmark & tagline -->
+  <g transform="translate(360, 0)">
+    <text x="0" y="170" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+          font-size="92" font-weight="800" letter-spacing="-3" fill="#F8FAFC">turbo<tspan fill="url(#tapGrad)">tap</tspan></text>
+
+    <text x="4" y="216" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+          font-size="18.5" font-weight="600" letter-spacing="2.4" fill="#94A3B8">HEADLESS IPHONE CLI  •  4× WDA SPEED OVER WI-FI</text>
+
+    <!-- Minimal terminal command pill -->
+    <rect x="2" y="244" width="560" height="46" rx="11" fill="#020617" fill-opacity="0.72" stroke="#1E293B" stroke-width="1.5"/>
+    <text x="20" y="273" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+          font-size="16" fill="#38BDF8">$ <tspan fill="#E2E8F0">turbotap flow open:Spotify tap:"Liked Songs" read</tspan></text>
+  </g>
+</svg>
