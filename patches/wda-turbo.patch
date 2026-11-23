@@ -1,0 +1,229 @@
+diff --git a/WebDriverAgentLib/Commands/FBElementCommands.m b/WebDriverAgentLib/Commands/FBElementCommands.m
+index 97afb7b..d289081 100644
+--- a/WebDriverAgentLib/Commands/FBElementCommands.m
++++ b/WebDriverAgentLib/Commands/FBElementCommands.m
+@@ -40,6 +40,9 @@
+ #import "XCUIElement.h"
+ #import "XCUIElementQuery.h"
+ #import "FBXCodeCompatibility.h"
++#import "FBXCTestDaemonsProxy.h"
++#import "XCSynthesizedEventRecord.h"
++#import "XCPointerEventPath.h"
+ 
+ @interface FBElementCommands ()
+ @end
+@@ -115,6 +118,10 @@ + (NSArray *)routes
+ 
+     [[FBRoute POST:@"/wda/element/:uuid/tap"] respondWithTarget:self action:@selector(handleTap:)],
+     [[FBRoute POST:@"/wda/tap"] respondWithTarget:self action:@selector(handleTap:)],
++    [[FBRoute POST:@"/wda/fastTap"] respondWithTarget:self action:@selector(handleFastTap:)],
++    [[FBRoute POST:@"/wda/fastTap"].withoutSession respondWithTarget:self action:@selector(handleFastTap:)],
++    [[FBRoute POST:@"/wda/fastDrag"] respondWithTarget:self action:@selector(handleFastDrag:)],
++    [[FBRoute POST:@"/wda/fastDrag"].withoutSession respondWithTarget:self action:@selector(handleFastDrag:)],
+ 
+     [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
+ #endif
+@@ -509,6 +516,62 @@ + (NSArray *)routes
+   return FBResponseWithOK();
+ }
+ 
++// wda-turbo: tap screen coordinates (points) with one synthesized touch event.
++// Skips XCUICoordinate's app-quiescence/idle waits that make /wda/tap ~740 ms.
++// Body: {"x": 215, "y": 600, "duration": 0.05 (s, optional)}
+++ (id<FBResponsePayload>)handleFastTap:(FBRouteRequest *)request
++{
++  if (nil == request.arguments[@"x"] || nil == request.arguments[@"y"]) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'x' and 'y' are required" traceback:nil]);
++  }
++  CGPoint point = CGPointMake((CGFloat)[request.arguments[@"x"] doubleValue],
++                              (CGFloat)[request.arguments[@"y"] doubleValue]);
++  double duration = nil == request.arguments[@"duration"] ? 0.05 : [request.arguments[@"duration"] doubleValue];
++  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast tap"
++                                                               interfaceOrientation:UIInterfaceOrientationPortrait];
++  XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:point offset:0];
++  [path liftUpAtOffset:duration];
++  [record addPointerEventPath:path];
++  NSError *error;
++  if (![FBXCTestDaemonsProxy synthesizeEventWithRecord:record error:&error]) {
++    return FBResponseWithUnknownError(error);
++  }
++  return FBResponseWithOK();
++}
++
++// wda-turbo: one synthesized drag/swipe in points.
++// Body: {"fromX","fromY","toX","toY","duration": move seconds (default 0.12),
++//        "hold": seconds before moving (default 0), "release": seconds at the end before lifting
++//        (default 0.02; ~0.15 stops scroll momentum for a precise scroll)}
+++ (id<FBResponsePayload>)handleFastDrag:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  if (nil == a[@"fromX"] || nil == a[@"fromY"] || nil == a[@"toX"] || nil == a[@"toY"]) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'fromX', 'fromY', 'toX' and 'toY' are required" traceback:nil]);
++  }
++  CGPoint from = CGPointMake((CGFloat)[a[@"fromX"] doubleValue], (CGFloat)[a[@"fromY"] doubleValue]);
++  CGPoint to = CGPointMake((CGFloat)[a[@"toX"] doubleValue], (CGFloat)[a[@"toY"] doubleValue]);
++  double duration = nil == a[@"duration"] ? 0.12 : [a[@"duration"] doubleValue];
++  double hold = nil == a[@"hold"] ? 0.0 : [a[@"hold"] doubleValue];
++  double release = nil == a[@"release"] ? 0.02 : [a[@"release"] doubleValue];
++  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast drag"
++                                                               interfaceOrientation:UIInterfaceOrientationPortrait];
++  XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:from offset:0];
++  [path moveToPoint:to atOffset:hold + duration];
++  if (release > 0.03) {
++    // A hold with no move samples still flings: UIKit keeps the last velocity.
++    // Crawl 1 pt during the hold so the release velocity is ~0 (no momentum).
++    [path moveToPoint:CGPointMake(to.x, to.y + 1) atOffset:hold + duration + release - 0.01];
++  }
++  [path liftUpAtOffset:hold + duration + release];
++  [record addPointerEventPath:path];
++  NSError *error;
++  if (![FBXCTestDaemonsProxy synthesizeEventWithRecord:record error:&error]) {
++    return FBResponseWithUnknownError(error);
++  }
++  return FBResponseWithOK();
++}
++
+ + (id<FBResponsePayload>)handlePinch:(FBRouteRequest *)request
+ {
+   XCUIElement *element = [self targetFromRequest:request];
+diff --git a/WebDriverAgentLib/Commands/FBScreenshotCommands.m b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
+index 9586a19..17bef12 100644
+--- a/WebDriverAgentLib/Commands/FBScreenshotCommands.m
++++ b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
+@@ -9,6 +9,11 @@
+ #import "FBScreenshotCommands.h"
+ 
+ #import "XCUIDevice+FBHelpers.h"
++#import "FBScreenshot.h"
++#import "FBImageProcessor.h"
++#import "FBCommandStatus.h"
++#import "FBRouteRequest.h"
++@import UniformTypeIdentifiers;
+ 
+ @implementation FBScreenshotCommands
+ 
+@@ -20,6 +25,8 @@ + (NSArray *)routes
+   @[
+     [[FBRoute GET:@"/screenshot"].withoutSession.standalone respondWithTarget:self action:@selector(handleGetScreenshot:)],
+     [[FBRoute GET:@"/screenshot"].standalone respondWithTarget:self action:@selector(handleGetScreenshot:)],
++    [[FBRoute POST:@"/wda/fastScreenshot"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastScreenshot:)],
++    [[FBRoute POST:@"/wda/fastScreenshot"].standalone respondWithTarget:self action:@selector(handleFastScreenshot:)],
+   ];
+ }
+ 
+@@ -37,4 +44,39 @@ + (NSArray *)routes
+   return FBResponseWithObject(screenshot);
+ }
+ 
++// wda-turbo: {"x0":0,"y0":460,"x1":430,"y1":700,"quality":0.8,"scale":1.0} (points) -> base64 JPEG
++// of that band only; scale < 1 downscales on the phone before sending.
+++ (id<FBResponsePayload>)handleFastScreenshot:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  CGRect rect = CGRectNull;
++  if (nil != a[@"y0"] || nil != a[@"y1"] || nil != a[@"x0"] || nil != a[@"x1"]) {
++    CGSize size = UIScreen.mainScreen.bounds.size;
++    CGFloat x0 = nil == a[@"x0"] ? 0 : [a[@"x0"] doubleValue];
++    CGFloat y0 = nil == a[@"y0"] ? 0 : [a[@"y0"] doubleValue];
++    CGFloat x1 = nil == a[@"x1"] ? size.width : [a[@"x1"] doubleValue];
++    CGFloat y1 = nil == a[@"y1"] ? size.height : [a[@"y1"] doubleValue];
++    rect = CGRectMake(x0, y0, x1 - x0, y1 - y0);
++  }
++  CGFloat quality = nil == a[@"quality"] ? 0.8 : [a[@"quality"] doubleValue];
++  UTType *uti = [@"png" isEqualToString:a[@"format"]] ? UTTypePNG : UTTypeJPEG;
++  NSError *error;
++  NSData *data = [FBScreenshot takeWithRect:rect compressionQuality:quality uti:uti error:&error];
++  if (nil == data) {
++    return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:error.description traceback:nil]);
++  }
++  CGFloat scale = nil == a[@"scale"] ? 1.0 : [a[@"scale"] doubleValue];
++  if (scale > 0 && scale < 1.0) {
++    NSData *scaled = [[[FBImageProcessor alloc] init] scaledImageWithData:data
++                                                                      uti:uti
++                                                            scalingFactor:scale
++                                                       compressionQuality:quality
++                                                                    error:&error];
++    if (nil != scaled) {
++      data = scaled;
++    }
++  }
++  return FBResponseWithObject([data base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0]);
++}
++
+ @end
+diff --git a/WebDriverAgentLib/Utilities/FBScreenshot.h b/WebDriverAgentLib/Utilities/FBScreenshot.h
+index 3604ba2..3beb05e 100644
+--- a/WebDriverAgentLib/Utilities/FBScreenshot.h
++++ b/WebDriverAgentLib/Utilities/FBScreenshot.h
+@@ -39,6 +39,15 @@ NS_ASSUME_NONNULL_BEGIN
+                                                   timeout:(NSTimeInterval)timeout
+                                                     error:(NSError **)error;
+ 
++/**
++ wda-turbo: screenshot of a rect (points) of the current display, cropped by testmanagerd.
++ Pass CGRectNull for the full screen.
++ */
+++ (nullable NSData *)takeWithRect:(CGRect)rect
++               compressionQuality:(CGFloat)compressionQuality
++                              uti:(UTType *)uti
++                            error:(NSError **)error;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+diff --git a/WebDriverAgentLib/Utilities/FBScreenshot.m b/WebDriverAgentLib/Utilities/FBScreenshot.m
+index ee37fa3..7ced618 100644
+--- a/WebDriverAgentLib/Utilities/FBScreenshot.m
++++ b/WebDriverAgentLib/Utilities/FBScreenshot.m
+@@ -93,18 +93,50 @@ + (NSData *)takeWithScreenID:(long long)screenID
+                                                         error:error];
+ }
+ 
+++ (NSData *)takeWithRect:(CGRect)rect
++      compressionQuality:(CGFloat)compressionQuality
++                     uti:(UTType *)uti
++                   error:(NSError **)error
++{
++  XCUIScreen *screen = [FBScreen currentScreenWithError:error];
++  if (nil == screen) {
++    return nil;
++  }
++  return [self.class takeWithScreenID:screen.displayID
++                                 rect:rect
++                   compressionQuality:compressionQuality
++                                  uti:uti
++                              timeout:SCREENSHOT_TIMEOUT
++                                error:error];
++}
++
+ + (NSData *)takeInOriginalResolutionWithScreenID:(long long)screenID
+                               compressionQuality:(CGFloat)compressionQuality
+                                              uti:(UTType *)uti
+                                          timeout:(NSTimeInterval)timeout
+                                            error:(NSError **)error
++{
++  return [self.class takeWithScreenID:screenID
++                                 rect:CGRectNull
++                   compressionQuality:compressionQuality
++                                  uti:uti
++                              timeout:timeout
++                                error:error];
++}
++
+++ (NSData *)takeWithScreenID:(long long)screenID
++                        rect:(CGRect)rect
++          compressionQuality:(CGFloat)compressionQuality
++                         uti:(UTType *)uti
++                     timeout:(NSTimeInterval)timeout
++                       error:(NSError **)error
+ {
+   id<XCTMessagingChannel_RunnerToDaemon> proxy = [FBXCTestDaemonsProxy testRunnerProxy];
+   __block NSData *screenshotData = nil;
+   __block NSError *innerError = nil;
+   dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+   id screnshotRequest = [self.class screenshotRequestWithScreenID:screenID
+-                                                             rect:CGRectNull
++                                                             rect:rect
+                                                               uti:uti
+                                                compressionQuality:compressionQuality
+                                                             error:error];
