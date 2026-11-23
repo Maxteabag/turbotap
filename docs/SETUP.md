@@ -41,7 +41,7 @@ To find your **Apple Developer Team ID**:
 
 ## Step 3: Build and launch patched WebDriverAgent (`wda-turbo`)
 
-`turbotap deploy` runs the bundled [`deploy_wda_mac.sh`](../src/turbotap/wda/deploy_wda_mac.sh) over SSH on the Mac. It clones `appium/WebDriverAgent` (16.14.0), applies [`wda-turbo.patch`](../src/turbotap/wda/wda-turbo.patch) (adding `/wda/fastTap`, `/wda/fastScreenshot`, and `/wda/fastDrag`), builds, and starts `WebDriverAgentRunner` on port `8100`.
+`turbotap deploy` runs the bundled [`deploy_wda_mac.sh`](../scripts/deploy_wda_mac.sh) over SSH on the Mac. It clones `appium/WebDriverAgent` (16.14.0), applies [`wda-turbo.patch`](../patches/wda-turbo.patch) (adding `/wda/fastTap`, `/wda/fastScreenshot`, and `/wda/fastDrag`), builds, and starts `WebDriverAgentRunner` on port `8100`.
 
 ### Option A: Using `~/.config/turbotap/config.json` (recommended)
 
@@ -101,12 +101,14 @@ curl -fsS http://192.168.1.50:8100/status
 
 ## Step 4: Install `turbotap` and Tesseract
 
-Install `turbotap`:
+Install `turbotap` and its agent skills:
 
 ```bash
 uv tool install git+https://github.com/Maxteabag/turbotap.git
-# or: pip install git+https://github.com/Maxteabag/turbotap.git
+turbotap install-skill
 ```
+
+`install-skill` copies the `turbotap` and `turbotap-retro` skills into `~/.agents/skills` and `~/.claude/skills` (whichever exist, else `~/.agents/skills`). Use `--claude`, `--codex`, `--agents` or `--dir DIR` to pick folders. After an upgrade (`uv tool install --force git+https://github.com/Maxteabag/turbotap.git`), the next `turbotap` run refreshes those copies by itself.
 
 Install `libtesseract` for 180–250 ms in-process parallel OCR:
 

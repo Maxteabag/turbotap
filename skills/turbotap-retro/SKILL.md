@@ -42,7 +42,7 @@ turbotap preflight                               # when a phone is reachable
 git diff | grep -nE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-F]{8}-[0-9A-F]{16}|@[a-z0-9-]+\.[a-z]{2,}' || echo clean
 ```
 
-Review every hit. Placeholder values such as `192.168.1.50` or `000081XX-...` are fine, and real ones are not. Then commit only the files you changed, with a conventional message (`perf(tap): ...`, `fix(flow): ...`), and push. If you installed `turbotap` from Git, reinstall it so the fix is live:
+Review every hit. Placeholder values such as `192.168.1.50` or `000081XX-...` are fine, and real ones are not. Then commit only the files you changed, with a conventional message (`perf(tap): ...`, `fix(flow): ...`), and push. If you installed `turbotap` from Git, reinstall it so the fix is live (installed skills refresh themselves on the next run):
 
 ```bash
 uv tool install --force git+https://github.com/Maxteabag/turbotap.git

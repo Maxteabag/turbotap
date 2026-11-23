@@ -63,8 +63,9 @@ turbotap flow open:Messenger search:Alice wait:"Alice Smith"
 
 ## 6. Setup & Reference
 
+- Install or upgrade: `uv tool install --force git+https://github.com/Maxteabag/turbotap.git` then `turbotap install-skill` (once; installed skill copies refresh themselves after upgrades)
 - CLI & configuration: see [README.md](../../README.md)
 - Full Mac + Xcode + iPhone Developer Mode setup & troubleshooting: see [docs/SETUP.md](../../docs/SETUP.md)
-- Fast WDA routes (`/wda/fastTap`, `/wda/fastScreenshot`, `/wda/fastDrag`): see [wda-turbo.patch](../../src/turbotap/wda/wda-turbo.patch); deploy or restart WDA with `turbotap deploy [--no-build]`
+- Fast WDA routes (`/wda/fastTap`, `/wda/fastScreenshot`, `/wda/fastDrag`): see [wda-turbo.patch](../../patches/wda-turbo.patch); deploy or restart WDA with `turbotap deploy [--no-build]`
 - Why each speed trick works (OCR, zero-momentum drag, cheap `/source`, iOS quirks): see [docs/HOW_IT_WORKS.md](../../docs/HOW_IT_WORKS.md)
 - After a non-trivial task, run [`turbotap-retro`](../turbotap-retro/SKILL.md): fix what slowed you down once, in `turbotap` itself, with generic primitives only.

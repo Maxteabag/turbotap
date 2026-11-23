@@ -15,7 +15,7 @@
 #                     keychain unlocked over SSH (default ~/.local/share/iphone-use/signing)
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-PATCH="${WDA_PATCH:-$HERE/wda-turbo.patch}"
+PATCH="${WDA_PATCH:-$HERE/../patches/wda-turbo.patch}"
 CFG="${WDA_CONFIG:-}"
 if [[ -z "$CFG" ]]; then
   if [[ -f "$HOME/.config/turbotap/config.json" ]]; then

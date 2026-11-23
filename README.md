@@ -33,14 +33,14 @@ Run `turbotap flow --help` to see all available verbs.
 
 ## Setup
 
-Install `turbotap` straight from GitHub:
+Install the CLI and the agent skills:
 
 ```bash
 uv tool install git+https://github.com/Maxteabag/turbotap.git
-# or: pip install git+https://github.com/Maxteabag/turbotap.git
+turbotap install-skill
 ```
 
-To hack on it, clone the repo and run `uv tool install --editable .` instead.
+That's it: the package carries the skills, the WebDriverAgent patch and the deploy script, so you don't need a clone. `install-skill` puts the skills in `~/.agents/skills` and `~/.claude/skills` (whichever exist; add `--codex` or `--dir DIR` for other agents), prints where they went, and refreshes them by itself after you upgrade with `uv tool install --force git+https://github.com/Maxteabag/turbotap.git`. `npx skills add Maxteabag/turbotap` installs just the skills too. `pip install git+https://github.com/Maxteabag/turbotap.git` works in place of uv, and `uv tool install --editable .` in a clone is for hacking on it.
 
 Install Tesseract (used for local screen reading):
 
@@ -87,7 +87,7 @@ Full walkthrough and troubleshooting (finding your Team ID, trusting the dev cer
 
 ## Benchmarks
 
-Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full-res screenshots over HTTP, and runs visibility checks on hidden UI nodes. [`wda-turbo.patch`](src/turbotap/wda/wda-turbo.patch) skips most of that overhead, and `turbotap` keeps one HTTP connection open while running OCR locally in parallel with caching on unchanged regions.
+Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full-res screenshots over HTTP, and runs visibility checks on hidden UI nodes. [`wda-turbo.patch`](patches/wda-turbo.patch) skips most of that overhead, and `turbotap` keeps one HTTP connection open while running OCR locally in parallel with caching on unchanged regions.
 
 | Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
@@ -114,7 +114,7 @@ Formatted iOS text fields (phone numbers, OTPs, IDs) tend to drop characters whe
 
 ## Using with AI agents
 
-There is a skill file at [skills/turbotap/SKILL.md](skills/turbotap/SKILL.md). Drop it into your Claude Code, Codex, or OpenClaw skills folder so the agent batches steps into `turbotap flow` calls and knows how to handle the input quirks above.
+`turbotap install-skill` (or `npx skills add Maxteabag/turbotap`) installs [skills/turbotap/SKILL.md](skills/turbotap/SKILL.md) for Claude Code, Codex, OpenClaw and other agents that read skill folders. It teaches the agent to batch steps into `turbotap flow` calls and to handle the input quirks above.
 
 [skills/turbotap-retro/SKILL.md](skills/turbotap-retro/SKILL.md) is an optional companion: after each non-trivial task the agent reviews what slowed it down and fixes it once in `turbotap` itself, using generic primitives only.
 

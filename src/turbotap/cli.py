@@ -25,6 +25,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -46,8 +47,16 @@ def _default_config_path():
 
 
 CONFIG_PATH = _default_config_path()
-# deploy_wda_mac.sh + wda-turbo.patch, shipped as package data.
-WDA_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wda")
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def asset_dir(name):
+    """skills/, patches/ or scripts/: inside the installed package, or at the
+    repo root when turbotap runs from a source checkout."""
+    for d in (os.path.join(_PKG_DIR, name), os.path.join(_PKG_DIR, "..", "..", name)):
+        if os.path.isdir(d):
+            return os.path.normpath(d)
+    raise RuntimeError(f"turbotap's {name}/ folder is missing; reinstall turbotap")
 
 
 def load_config():
@@ -136,6 +145,7 @@ class WDAClient:
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 st = self.req("GET", "/status", timeout=6)
         if st.get("error"):
+            print("WDA not responding; restarting WebDriverAgentRunner on the Mac host...", file=sys.stderr)
             self.start_wda_on_mac()
             st = self.req("GET", "/status", timeout=8)
             if st.get("error"):
@@ -158,15 +168,14 @@ class WDAClient:
     def start_wda_on_mac(self, build=False):
         """(Re)start the wda-turbo patched runner on the Mac host; build=True also
         clones, patches and builds it first. The script and patch ship inside the
-        package (turbotap/wda/), so this works from any install."""
-        if not build:
-            print("WDA not responding; restarting WebDriverAgentRunner on the Mac host...", file=sys.stderr)
+        package (turbotap/scripts, turbotap/patches), so no clone is needed."""
         env = {**os.environ, "WDA_URL": self.base_url}
         if self.udid:
             env["WDA_UDID"] = self.udid
         if self.device_key:
             env["WDA_DEVICE"] = self.device_key
-        cmd = ["bash", os.path.join(WDA_ASSETS, "deploy_wda_mac.sh")] + ([] if build else ["--no-build"])
+        env.setdefault("WDA_PATCH", os.path.join(asset_dir("patches"), "wda-turbo.patch"))
+        cmd = ["bash", os.path.join(asset_dir("scripts"), "deploy_wda_mac.sh")] + ([] if build else ["--no-build"])
         subprocess.run(cmd, check=True, env=env)
 
     # None = not probed yet; True when the wda-turbo patch is running. WDA_TURBO=0
@@ -1328,6 +1337,126 @@ def walk_accessible(node, out, depth=0):
         walk_accessible(ch, out, depth + 1 if shown else depth)
 
 
+# ---------------------------------------------------------------------------
+# Agent skills shipped in the package: install once, re-synced after upgrades
+# ---------------------------------------------------------------------------
+SKILL_ROOTS = {"agents": "~/.agents/skills", "claude": "~/.claude/skills", "codex": "~/.codex/skills"}
+SKILL_STATE = os.path.join(os.path.expanduser(os.environ.get("XDG_STATE_HOME") or "~/.local/state"),
+                           "turbotap", "skills.json")
+
+
+def bundled_skills():
+    root = asset_dir("skills")
+    return {n: os.path.join(root, n) for n in sorted(os.listdir(root))
+            if os.path.isfile(os.path.join(root, n, "SKILL.md"))}
+
+
+def _skills_stamp(skills):
+    h = hashlib.blake2b(digest_size=12)
+    for name, src in skills.items():
+        for dp, dns, fns in os.walk(src):
+            dns[:] = sorted(d for d in dns if d != "__pycache__")
+            for fn in sorted(fns):
+                if fn.endswith(".pyc"):
+                    continue
+                fp = os.path.join(dp, fn)
+                h.update(os.path.relpath(fp, os.path.dirname(src)).encode() + b"\0")
+                with open(fp, "rb") as f:
+                    h.update(f.read())
+    return h.hexdigest()
+
+
+def _skill_name(d):
+    try:
+        with open(os.path.join(d, "SKILL.md")) as f:
+            m = re.search(r"^name:\s*['\"]?([\w.-]+)", f.read(4096), re.M)
+            return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def install_skills(root, skills, force=False):
+    """Copy each bundled skill to root/<name>. A symlink there is replaced (it
+    points at some other copy); a real folder only if it is the same skill."""
+    os.makedirs(root, exist_ok=True)
+    done = []
+    for name, src in skills.items():
+        dest = os.path.join(root, name)
+        if not os.path.islink(dest) and os.path.exists(dest) and not force and _skill_name(dest) != name:
+            raise RuntimeError(f"{dest} exists and is not the {name} skill; pass --force to replace it")
+        tmp = dest + ".turbotap-new"
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.copytree(src, tmp, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        if os.path.islink(dest) or os.path.isfile(dest):
+            os.unlink(dest)
+        elif os.path.isdir(dest):
+            shutil.rmtree(dest)
+        os.replace(tmp, dest)
+        done.append(dest)
+    return done
+
+
+def _load_skill_state():
+    try:
+        with open(SKILL_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_skill_state(st):
+    os.makedirs(os.path.dirname(SKILL_STATE), exist_ok=True)
+    with open(SKILL_STATE, "w") as f:
+        json.dump(st, f, indent=1)
+
+
+def sync_skills_if_stale():
+    """After `uv tool install --force` (or pip -U) brings new skill text, refresh
+    every folder `turbotap install-skill` wrote to. Costs one small file read."""
+    st = _load_skill_state()
+    if not st.get("targets"):
+        return
+    try:
+        skills = bundled_skills()
+        stamp = _skills_stamp(skills)
+    except (OSError, RuntimeError):
+        return
+    if st.get("stamp") == stamp:
+        return
+    for root in st["targets"]:
+        try:
+            install_skills(root, skills)
+            print(f"turbotap: updated agent skills in {root}", file=sys.stderr)
+        except (OSError, RuntimeError) as e:
+            print(f"turbotap: could not update skills in {root}: {e}", file=sys.stderr)
+    st["stamp"] = stamp
+    _save_skill_state(st)
+
+
+def cmd_install_skill(args):
+    roots = [SKILL_ROOTS[k] for k in ("agents", "claude", "codex") if getattr(args, k)] + (args.dir or [])
+    if not roots:
+        roots = [r for r in (SKILL_ROOTS["agents"], SKILL_ROOTS["claude"])
+                 if os.path.isdir(os.path.expanduser(r))] or [SKILL_ROOTS["agents"]]
+    skills = bundled_skills()
+    st = _load_skill_state()
+    targets, real_seen = list(st.get("targets") or []), {}
+    for r in roots:
+        root = os.path.abspath(os.path.expanduser(r))
+        real = os.path.realpath(root)
+        if real in real_seen:
+            print(f"{root} is the same folder as {real_seen[real]}; already installed there")
+            continue
+        real_seen[real] = root
+        for dest in install_skills(root, skills, force=args.force):
+            print(f"installed {os.path.basename(dest)} -> {dest}")
+        if root not in targets:
+            targets.append(root)
+    st.update(targets=targets, stamp=_skills_stamp(skills))
+    _save_skill_state(st)
+    print("These copies update themselves the next time turbotap runs after an upgrade.")
+
+
 def cmd_deploy(client, args):
     """Clone/patch/build (unless --no-build) and start WDA on the Mac host."""
     client.start_wda_on_mac(build=not args.no_build)
@@ -1389,6 +1518,17 @@ def cmd_otp_type(client, args):
 
 
 def main():
+    try:
+        _main()
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"turbotap: {os.path.basename(str(e.cmd[1] if len(e.cmd) > 1 else e.cmd[0]))} failed (exit {e.returncode})")
+    except (RuntimeError, OSError) as e:
+        sys.exit(f"turbotap: {e}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def _main():
     p = argparse.ArgumentParser(description="Fast generic WebDriverAgent (WDA) controller for physical iOS devices")
     p.add_argument("--url", default=None, help="WDA base URL (or set WDA_URL / ~/.config/turbotap/config.json)")
     p.add_argument("--device", default=None, help="device key from ~/.config/turbotap/config.json (or WDA_DEVICE)")
@@ -1396,6 +1536,14 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("preflight")
     sub.add_parser("unlock")
+    sp_skill = sub.add_parser("install-skill", help="install the turbotap agent skills (Claude Code, Codex, ...)",
+                              description="Copy the turbotap and turbotap-retro skills into agent skill folders. "
+                              "Default: ~/.agents/skills and ~/.claude/skills where they exist, else ~/.agents/skills.")
+    sp_skill.add_argument("--agents", action="store_true", help="~/.agents/skills")
+    sp_skill.add_argument("--claude", action="store_true", help="~/.claude/skills")
+    sp_skill.add_argument("--codex", action="store_true", help="~/.codex/skills")
+    sp_skill.add_argument("--dir", action="append", metavar="DIR", help="any skills folder (repeatable)")
+    sp_skill.add_argument("--force", action="store_true", help="replace a different folder with the same name")
     sp_deploy = sub.add_parser("deploy", help="build + start the wda-turbo patched WebDriverAgent on the Mac host")
     sp_deploy.add_argument("--no-build", action="store_true", help="only restart the existing build")
     sp_ocr = sub.add_parser("ocr")
@@ -1422,6 +1570,9 @@ def main():
     sp_otp.add_argument("--timeout", type=float, default=20.0)
     sp_otp.add_argument("--mac-host", default=MAC_HOST)
     args = p.parse_args()
+    if args.cmd == "install-skill":
+        return cmd_install_skill(args)
+    sync_skills_if_stale()
     url, udid, dev_key = resolve_device_settings(args.url, args.device, args.udid)
     client = WDAClient(url, udid=udid, device_key=dev_key)
     dispatch = {
