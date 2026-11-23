@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo-banner.svg" alt="turbotap — Headless iPhone CLI at 4x WDA speed over Wi-Fi" width="100%" />
+  <img src="assets/turbotap-banner.png" alt="turbotap — Headless iPhone CLI at 4x WDA speed over Wi-Fi" width="100%" />
 </p>
 
 # turbotap — Drive a physical iPhone over Wi-Fi at 4× WDA speed
