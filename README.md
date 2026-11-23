@@ -2,7 +2,7 @@
   <img src="assets/banner.svg" alt="turbotap — Headless iPhone CLI at 4x WDA speed over Wi-Fi" width="100%" />
 </p>
 
-# turbotap ⚡ — Drive a physical iPhone over Wi-Fi at 4× WDA speed
+# turbotap — Drive a physical iPhone over Wi-Fi at 4× WDA speed
 
 [![License](https://img.shields.io/github/license/Maxteabag/turbotap?style=flat-square)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)](pyproject.toml)

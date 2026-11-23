@@ -1,83 +1,123 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="turbotap — Headless iPhone CLI at 4x WDA speed over Wi-Fi">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="1200" height="340" role="img" aria-label="turbotap — Headless iPhone automation over Wi-Fi">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0B0F19"/>
-      <stop offset="55%" stop-color="#0F172A"/>
-      <stop offset="100%" stop-color="#090D16"/>
+    <!-- Deep obsidian card gradient -->
+    <linearGradient id="cardBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0B0D12"/>
+      <stop offset="50%" stop-color="#10141D"/>
+      <stop offset="100%" stop-color="#090B10"/>
     </linearGradient>
-    <radialGradient id="glowCyan" cx="0.22" cy="0.50" r="0.34">
-      <stop offset="0%" stop-color="#22D3EE" stop-opacity="0.28"/>
-      <stop offset="55%" stop-color="#0EA5E9" stop-opacity="0.08"/>
-      <stop offset="100%" stop-color="#0B0F19" stop-opacity="0"/>
+
+    <!-- Subtle top-lit ambient studio glow -->
+    <radialGradient id="studioGlow" cx="0.24" cy="0.48" r="0.38">
+      <stop offset="0%" stop-color="#60A5FA" stop-opacity="0.18"/>
+      <stop offset="55%" stop-color="#38BDF8" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#0B0D12" stop-opacity="0"/>
     </radialGradient>
-    <radialGradient id="glowAmber" cx="0.26" cy="0.44" r="0.22">
-      <stop offset="0%" stop-color="#F59E0B" stop-opacity="0.22"/>
-      <stop offset="100%" stop-color="#0B0F19" stop-opacity="0"/>
+
+    <!-- Card hairline border with top specular catchlight -->
+    <linearGradient id="cardBorder" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="40%" stop-color="#94A3B8" stop-opacity="0.09"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.04"/>
+    </linearGradient>
+
+    <!-- Sculptural macOS squircle icon fill & rim -->
+    <linearGradient id="iconFill" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0%" stop-color="#1E2534"/>
+      <stop offset="50%" stop-color="#131823"/>
+      <stop offset="100%" stop-color="#0B0E15"/>
+    </linearGradient>
+    <linearGradient id="iconRim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.42"/>
+      <stop offset="35%" stop-color="#93C5FD" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#1E293B" stop-opacity="0.35"/>
+    </linearGradient>
+
+    <!-- Luminous silver-to-ice-blue glyph gradients -->
+    <linearGradient id="arcGrad1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#E2E8F0" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#60A5FA" stop-opacity="0.85"/>
+    </linearGradient>
+    <linearGradient id="arcGrad2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#93C5FD" stop-opacity="0.72"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.42"/>
+    </linearGradient>
+    <linearGradient id="arcGrad3" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#60A5FA" stop-opacity="0.36"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.14"/>
+    </linearGradient>
+    <radialGradient id="coreDot" cx="0.35" cy="0.32" r="0.68">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="55%" stop-color="#BAE6FD"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
     </radialGradient>
-    <linearGradient id="tapGrad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#38BDF8"/>
-      <stop offset="100%" stop-color="#22D3EE"/>
+
+    <!-- Subtle metallic wordmark fill -->
+    <linearGradient id="wordmarkGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#CBD5E1"/>
     </linearGradient>
-    <linearGradient id="boltGrad" x1="0" y1="0" x2="0.6" y2="1">
-      <stop offset="0%" stop-color="#FDE047"/>
-      <stop offset="55%" stop-color="#F59E0B"/>
-      <stop offset="100%" stop-color="#F97316"/>
-    </linearGradient>
-    <linearGradient id="phoneScreen" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#1E293B"/>
-      <stop offset="100%" stop-color="#0F172A"/>
-    </linearGradient>
-    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
-      <circle cx="2" cy="2" r="1" fill="#94A3B8" fill-opacity="0.10"/>
+
+    <!-- Ultra-subtle fine grid -->
+    <pattern id="fineGrid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#FFFFFF" stroke-opacity="0.025" stroke-width="1"/>
     </pattern>
-    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="4" result="blur"/>
+
+    <!-- Soft drop shadow for the squircle -->
+    <filter id="iconShadow" x="-25%" y="-25%" width="150%" height="160%">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#000000" flood-opacity="0.65"/>
+    </filter>
+    <!-- Crisp glow for the touch core -->
+    <filter id="coreGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="5" result="b"/>
       <feMerge>
-        <feMergeNode in="blur"/>
+        <feMergeNode in="b"/>
         <feMergeNode in="SourceGraphic"/>
       </feMerge>
     </filter>
   </defs>
 
-  <!-- Card background -->
-  <rect x="2" y="2" width="1196" height="356" rx="24" fill="url(#bg)" stroke="#1E293B" stroke-width="2"/>
-  <rect x="2" y="2" width="1196" height="356" rx="24" fill="url(#dots)"/>
-  <rect x="2" y="2" width="1196" height="356" rx="24" fill="url(#glowCyan)"/>
-  <rect x="2" y="2" width="1196" height="356" rx="24" fill="url(#glowAmber)"/>
+  <!-- Card shell -->
+  <rect x="1.5" y="1.5" width="1197" height="337" rx="22" fill="url(#cardBg)" stroke="url(#cardBorder)" stroke-width="1.5"/>
+  <rect x="2" y="2" width="1196" height="336" rx="22" fill="url(#fineGrid)"/>
+  <rect x="2" y="2" width="1196" height="336" rx="22" fill="url(#studioGlow)"/>
 
-  <!-- Left emblem: geometric iPhone + tap ripples + lightning bolt -->
-  <g transform="translate(155, 62)">
-    <!-- Outer tap ripples -->
-    <circle cx="72" cy="118" r="106" fill="none" stroke="#22D3EE" stroke-opacity="0.16" stroke-width="2" stroke-dasharray="6 8"/>
-    <circle cx="72" cy="118" r="82" fill="none" stroke="#38BDF8" stroke-opacity="0.28" stroke-width="2"/>
+  <!-- Left sculptural squircle brand mark -->
+  <g transform="translate(152, 86)" filter="url(#iconShadow)">
+    <rect x="0" y="0" width="168" height="168" rx="38" fill="url(#iconFill)" stroke="url(#iconRim)" stroke-width="1.75"/>
+    <!-- Subtle inner top highlight arc -->
+    <rect x="2" y="2" width="164" height="164" rx="36.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.05" stroke-width="1"/>
 
-    <!-- Phone chassis -->
-    <rect x="16" y="8" width="112" height="220" rx="24" fill="url(#phoneScreen)" stroke="#CBD5E1" stroke-width="3.5"/>
-    <!-- Dynamic Island -->
-    <rect x="52" y="22" width="40" height="9" rx="4.5" fill="#020617"/>
-    <!-- Home indicator -->
-    <rect x="50" y="214" width="44" height="4" rx="2" fill="#475569"/>
-
-    <!-- Inner tap ripple on screen -->
-    <circle cx="72" cy="120" r="36" fill="#22D3EE" fill-opacity="0.12" stroke="#22D3EE" stroke-opacity="0.55" stroke-width="2"/>
-    <circle cx="72" cy="120" r="20" fill="#22D3EE" fill-opacity="0.20"/>
-
-    <!-- Lightning bolt striking the tap point -->
-    <path d="M84 68 L52 122 L73 122 L61 168 L98 110 L76 110 Z"
-          fill="url(#boltGrad)" filter="url(#softGlow)"/>
+    <!-- Kinetic touch-ripple + speed-wave emblem (no lightning bolt, no clipart) -->
+    <!-- Outer trailing motion arc -->
+    <path d="M 46 38 A 66 66 0 0 1 46 130" fill="none" stroke="url(#arcGrad3)" stroke-width="7.5" stroke-linecap="round"/>
+    <!-- Mid kinetic ripple arc -->
+    <path d="M 68 48 A 50 50 0 0 1 68 120" fill="none" stroke="url(#arcGrad2)" stroke-width="8.5" stroke-linecap="round"/>
+    <!-- Inner primary touch arc -->
+    <path d="M 90 59 A 34 34 0 0 1 90 109" fill="none" stroke="url(#arcGrad1)" stroke-width="9.5" stroke-linecap="round"/>
+    <!-- Tactile touch-point core -->
+    <circle cx="116" cy="84" r="14" fill="url(#coreDot)" filter="url(#coreGlow)"/>
+    <circle cx="116" cy="84" r="24" fill="none" stroke="#7DD3FC" stroke-opacity="0.28" stroke-width="1.5"/>
   </g>
 
-  <!-- Wordmark & tagline -->
-  <g transform="translate(360, 0)">
-    <text x="0" y="170" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
-          font-size="92" font-weight="800" letter-spacing="-3" fill="#F8FAFC">turbo<tspan fill="url(#tapGrad)">tap</tspan></text>
+  <!-- Typography block -->
+  <g transform="translate(366, 0)">
+    <text x="0" y="168" font-family="Inter, -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="86" font-weight="700" letter-spacing="-3.2" fill="url(#wordmarkGrad)">turbotap</text>
 
-    <text x="4" y="216" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
-          font-size="18.5" font-weight="600" letter-spacing="2.4" fill="#94A3B8">HEADLESS IPHONE CLI  •  4× WDA SPEED OVER WI-FI</text>
+    <text x="3" y="210" font-family="Inter, -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="21" font-weight="400" letter-spacing="0.2" fill="#94A3B8">Headless iPhone automation over Wi-Fi</text>
 
-    <!-- Minimal terminal command pill -->
-    <rect x="2" y="244" width="560" height="46" rx="11" fill="#020617" fill-opacity="0.72" stroke="#1E293B" stroke-width="1.5"/>
-    <text x="20" y="273" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
-          font-size="16" fill="#38BDF8">$ <tspan fill="#E2E8F0">turbotap flow open:Spotify tap:"Liked Songs" read</tspan></text>
+    <!-- Subtle hairline spec pills -->
+    <g transform="translate(2, 234)" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13.5" font-weight="500">
+      <rect x="0" y="0" width="136" height="32" rx="8" fill="#FFFFFF" fill-opacity="0.04" stroke="#FFFFFF" stroke-opacity="0.10"/>
+      <text x="68" y="20.5" text-anchor="middle" fill="#CBD5E1">4× WDA speed</text>
+
+      <rect x="148" y="0" width="144" height="32" rx="8" fill="#FFFFFF" fill-opacity="0.04" stroke="#FFFFFF" stroke-opacity="0.10"/>
+      <text x="220" y="20.5" text-anchor="middle" fill="#CBD5E1">Parallel OCR</text>
+
+      <rect x="304" y="0" width="188" height="32" rx="8" fill="#FFFFFF" fill-opacity="0.04" stroke="#FFFFFF" stroke-opacity="0.10"/>
+      <text x="398" y="20.5" text-anchor="middle" fill="#CBD5E1">Linux · macOS → iOS</text>
+    </g>
   </g>
 </svg>
