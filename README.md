@@ -1,6 +1,8 @@
 <p align="center">
-  <img src="assets/turbotap-banner.png" alt="turbotap" width="100%" />
+  <img src="assets/logo.png" alt="turbotap" width="140" />
 </p>
+
+<h1 align="center">turbotap</h1>
 
 CLI for driving a real iPhone over Wi-Fi from your terminal or an AI agent (Claude Code, Codex, etc.).
 
