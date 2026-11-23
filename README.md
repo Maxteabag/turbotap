@@ -1,24 +1,14 @@
 <p align="center">
-  <img src="assets/turbotap-banner.png" alt="turbotap — Control your real iPhone from the terminal or an AI agent over Wi-Fi" width="100%" />
+  <img src="assets/turbotap-banner.png" alt="turbotap" width="100%" />
 </p>
 
-<p align="center">
-  <strong>Let your terminal or AI agent (Claude Code, Codex, etc.) control your real iPhone over Wi-Fi.</strong><br />
-  No screen mirroring, no Bluetooth keyboard hacks, and 4× faster than standard iOS automation.
-</p>
+CLI for driving a real iPhone over Wi-Fi from your terminal or an AI agent (Claude Code, Codex, etc.).
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Maxteabag/turbotap?style=flat-square" alt="License" /></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square" alt="Python 3.10+" /></a>
-  <a href="docs/SETUP.md"><img src="https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux-111827?style=flat-square" alt="macOS and Linux" /></a>
-  <a href="docs/SETUP.md"><img src="https://img.shields.io/badge/controls-iOS%2017%2B-0EA5E9?style=flat-square" alt="iOS 17+" /></a>
-</p>
+I put this together because controlling an iPhone one screenshot at a time through an LLM is painfully slow. Grabbing a frame, waiting on the model to pick coordinates, and waiting another second per tap on stock WebDriverAgent turns a 5-tap task into a minute of waiting. `turbotap` takes a whole sequence of steps in one command, runs them locally against a patched WebDriverAgent on the phone, and returns JSON with the text and buttons on screen.
 
----
+A multi-step flow usually finishes in 3.8-6.5s end to end, compared to 14.4-15.7s on stock WDA.
 
-## What it does
-
-Give your agent (or a script) a single command to unlock your iPhone, open any app, tap buttons, type into forms, and read what's on screen:
+## Examples
 
 ```bash
 # Open Settings -> General -> About and read the iOS version (~6.5s)
@@ -31,21 +21,17 @@ turbotap flow open:Spotify tap:"Your Library" tap:"Liked Songs@y>150" wait:songs
 turbotap flow open:Weather read
 ```
 
-Instead of taking a screenshot, asking an LLM where to click, and waiting 20 seconds for *every single tap*, `turbotap` runs the whole multi-step flow locally on your machine in **3–6 seconds** and returns clean JSON with the text and buttons on screen.
+Run `turbotap flow --help` to see all available verbs.
 
----
+## Requirements
 
-## What you need
+- An iPhone running iOS 17+ on your local Wi-Fi
+- A Mac with Xcode (Apple requires it to sign and install WebDriverAgent on the phone. Once it's running, you can run `turbotap` from that Mac or from a Linux machine on the same network.)
+- Python 3.10+ and Tesseract if you want local OCR
 
-- **An iPhone** (iOS 17+) on your Wi-Fi network
-- **A Mac with Xcode** — required by Apple to sign and install the helper app (WebDriverAgent) onto your iPhone
-- **macOS or Linux** to run `turbotap` (can be the same Mac, or a Linux machine on the same Wi-Fi)
+## Setup
 
----
-
-## Quick setup (4 steps)
-
-### 1. Clone and install `turbotap`
+Clone the repo and install `turbotap`:
 
 ```bash
 git clone https://github.com/Maxteabag/turbotap.git
@@ -53,18 +39,22 @@ cd turbotap
 uv tool install .   # or: pip install -e .
 ```
 
-Install Tesseract (used for fast local screen reading):
-- **macOS:** `brew install tesseract`
-- **Ubuntu / Debian:** `sudo apt install libtesseract5 tesseract-ocr-eng`
-- **Arch Linux:** `sudo pacman -S tesseract tesseract-data-eng`
+Install Tesseract (used for local screen reading):
 
-### 2. Turn on Developer Mode on your iPhone
+```bash
+# macOS
+brew install tesseract
 
-- **Settings → Privacy & Security → Developer Mode → ON**
-- **Settings → Developer → Enable UI Automation → ON**
-- Note your iPhone's Wi-Fi IP (**Settings → Wi-Fi → (i)**) and UDID (run `xcrun devicectl list devices` on your Mac).
+# Ubuntu / Debian
+sudo apt install libtesseract5 tesseract-ocr-eng
 
-### 3. Add your iPhone to `~/.config/turbotap/config.json`
+# Arch Linux
+sudo pacman -S tesseract tesseract-data-eng
+```
+
+On the iPhone, turn on Developer Mode (`Settings -> Privacy & Security -> Developer Mode`) and UI Automation (`Settings -> Developer -> Enable UI Automation`). Note the phone's Wi-Fi IP under `Settings -> Wi-Fi -> (i)` and its UDID from your Mac with `xcrun devicectl list devices`.
+
+Create `~/.config/turbotap/config.json`:
 
 ```json
 {
@@ -82,47 +72,43 @@ Install Tesseract (used for fast local screen reading):
 }
 ```
 
-### 4. Start the iPhone helper and test it
+Deploy and start the patched WebDriverAgent on the iPhone, then make sure it responds:
 
 ```bash
-bash scripts/deploy_wda_mac.sh   # installs & starts patched WebDriverAgent on your iPhone
-turbotap preflight               # checks connection, lock state, and screen size
-turbotap unlock                  # unlocks the iPhone with your passcode
+bash scripts/deploy_wda_mac.sh
+turbotap preflight
+turbotap unlock
 ```
 
-For full walkthrough & troubleshooting (including multiple iPhones and SSH keychain tips), see **[docs/SETUP.md](docs/SETUP.md)**.
+Full walkthrough and troubleshooting (finding your Team ID, trusting the dev cert on first launch, multiple phones, SSH keychain tips) are in [docs/SETUP.md](docs/SETUP.md).
 
----
+## Benchmarks
 
-## Why it's 4× faster than standard iOS automation
+Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full-res screenshots over HTTP, and runs visibility checks on hidden UI nodes. `patches/wda-turbo.patch` skips most of that overhead, and `turbotap` keeps one HTTP connection open while running OCR locally in parallel with caching on unchanged regions.
 
-Standard iOS automation (Appium / stock WebDriverAgent) is built for slow CI test suites, not live agents. `turbotap` includes a small patch (`patches/wda-turbo.patch`) and a fast local runner:
-
-| Step | Standard WDA | `turbotap` | Why |
+| Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
-| Tap a button | 740–1,200 ms | **~320 ms** | Skips waiting for background animations to stop |
-| Grab screen | 123–244 ms | **41–62 ms** | Crops and shrinks the image on the iPhone before sending |
-| Read screen text | ~1,470 ms | **180–250 ms** | Parallel local OCR with caching for unchanged parts |
-| Scroll a list | ~2,000 ms | **150–370 ms** | Stops cleanly at the end of the drag (no fling momentum) |
-| List UI buttons | ~2,600 ms | **300–700 ms** | Skips slow visibility checks on hidden elements |
-| Full multi-step flow | 14.4–15.7 s | **3.8–6.5 s** | One persistent connection, zero round-trips per tap |
+| Tap | 740-1200ms | ~320ms | Skips waiting for background animations |
+| Grab frame | 123-244ms | 41-62ms | Crops and shrinks the image on the phone first |
+| Read screen (OCR) | ~1470ms | 180-250ms | Parallel local Tesseract + region caching |
+| Scroll | ~2000ms | 150-370ms | Clean drag stop with no fling momentum |
+| UI tree | ~2600ms | 300-700ms | Skips visibility checks on hidden elements |
+| Multi-step flow | 14.4-15.7s | 3.8-6.5s | Single process, persistent connection |
 
-*(Works with unpatched WebDriverAgent too — `turbotap` automatically falls back if the patch isn't installed.)*
+If you don't want to patch WDA, `turbotap` still works against stock WDA and falls back to the standard endpoints automatically.
 
----
+## Safety and quirks
 
-## Built-in safety & handy commands
+By default, `turbotap` blocks taps on buttons matching `Send`, `Pay`, `Buy`, `Delete`, `Cancel booking`, or `Start call` (`--deny`). Pass `--no-deny` when you actually want it to press one of those.
 
-- **Safety guard (`--deny`):** Refuses to tap risky buttons (`Send`, `Pay`, `Buy`, `Delete`, `Cancel booking`, `Start call`) by default unless you pass `--no-deny`.
-- **Target the right row:** `tap:"Alice@below:Chats"` skips stories/carousels at the top of the screen.
-- **Type reliably into tricky fields:** `cleartype:TEXT` clears before typing and checks the result; `typedigits:env:CODE` types 1 digit at a time so phone/OTP/ID fields never drop digits.
-- **Unlock banking / MDM PIN pads:** `pintap:env:APP_PIN` taps secure PIN keyboards even when iOS blacks them out in screenshots.
-- **Use with AI agents:** Drop [`skills/turbotap/SKILL.md`](skills/turbotap/SKILL.md) into your Claude Code / Codex / OpenClaw skills folder so your agent knows how to use `turbotap` automatically.
+You can narrow down tap targets relative to other text on screen. `tap:"Alice@below:Chats"`, for example, skips stories or carousels above the list.
 
-Run `turbotap flow --help` to see every command.
+Formatted iOS text fields (phone numbers, OTPs, IDs) tend to drop characters when pasted all at once. `cleartype:TEXT` clears the field first and checks what landed in it, and `typedigits:env:CODE` types one digit at a time. For banking or MDM PIN pads that iOS blacks out in screenshots, `pintap:env:APP_PIN` taps the keypad directly.
 
----
+## Using with AI agents
+
+There is a skill file at [skills/turbotap/SKILL.md](skills/turbotap/SKILL.md). Drop it into your Claude Code, Codex, or OpenClaw skills folder so the agent batches steps into `turbotap flow` calls and knows how to handle the input quirks above.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
