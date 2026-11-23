@@ -81,17 +81,18 @@ Linux / macOS (Agent or Terminal)
 
 ## Install & Setup
 
-### 1. Install the CLI (+ Tesseract for fast local OCR)
+### 1. Clone, install the CLI, and install Tesseract
 
 ```bash
-uv tool install git+https://github.com/Maxteabag/turbotap.git
-# or: pip install git+https://github.com/Maxteabag/turbotap.git
+git clone https://github.com/Maxteabag/turbotap.git
+cd turbotap
+uv tool install .   # or: pip install -e .
 ```
 
 Install `libtesseract` for 180–250 ms in-process OCR:
-- **Arch Linux:** `sudo pacman -S tesseract tesseract-data-eng`
-- **Ubuntu / Debian:** `sudo apt install libtesseract5 tesseract-ocr-eng`
 - **macOS:** `brew install tesseract`
+- **Ubuntu / Debian:** `sudo apt install libtesseract5 tesseract-ocr-eng`
+- **Arch Linux:** `sudo pacman -S tesseract tesseract-data-eng`
 
 ### 2. Enable Developer Mode & UI Automation on your iPhone
 

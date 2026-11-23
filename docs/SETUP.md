@@ -110,9 +110,9 @@ uv tool install git+https://github.com/Maxteabag/turbotap.git
 
 Install `libtesseract` for 180–250 ms in-process parallel OCR:
 
-- **Arch Linux:** `sudo pacman -S tesseract tesseract-data-eng`
-- **Ubuntu / Debian:** `sudo apt install libtesseract5 tesseract-ocr-eng`
 - **macOS:** `brew install tesseract`
+- **Ubuntu / Debian:** `sudo apt install libtesseract5 tesseract-ocr-eng`
+- **Arch Linux:** `sudo pacman -S tesseract tesseract-data-eng`
 
 ---
 
