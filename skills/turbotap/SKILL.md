@@ -1,30 +1,66 @@
 ---
 name: turbotap
-description: "Drive a physical iPhone headlessly over Wi-Fi with turbotap (WebDriverAgent + wda-turbo): fast multi-step UI flows in one process, parallel in-process libtesseract OCR, lightweight accessibility-tree controls with coordinates, screen-size-agnostic passcode unlock, and verified form/PIN/digit input."
+description: "Drive a physical iPhone headlessly over Wi-Fi with turbotap (patched WebDriverAgent + local parallel OCR): bundle multi-step UI flows in one process, read screens with fused OCR + lightweight accessibility controls, unlock passcodes, handle FLAG_SECURE PIN pads, formatted WebView inputs, and deep React Native trees."
 ---
 
 # Driving a Physical iPhone with `turbotap`
 
-Use `turbotap` to automate any app on a physical iOS device over Wi-Fi without AirPlay screen mirroring or manual taps.
+Use `turbotap` to operate any app on a real iPhone over Wi-Fi without AirPlay screen mirroring, Bluetooth HID, or burning 20 seconds of LLM round-trip on every tap.
 
-## Rules for fast, reliable agent runs
+## 1. Core Speed Rules (Read Before Running Anything)
 
-1. **Bundle multi-step flows in one `turbotap flow` call.** Never execute one tap per LLM turn (each turn costs 15–25 s of inference; a local `flow` step takes 200–350 ms).
-2. **Use `typedigits:` for formatted numeric fields** (phone numbers, OTPs, IDs) — never send bursts via `element/value`.
-3. **Use `pintap:env:VAR` for `FLAG_SECURE` PIN keyboards** where screenshots are blacked out and `/wda/keys` is ignored.
-4. **Never retry an external `Send`/`Pay`/`Submit` based on OCR alone.** Dark-mode or colored outgoing bubbles are often missed by grayscale OCR — verify with `shot:/tmp/check.png` or `ui` first.
-5. **Pass `--no-deny` only when the user explicitly requested a guarded action** (`send`, `pay`, `delete`, `cancel`, etc.).
+1. **Always bundle steps into ONE `turbotap flow` command.** Never do `open:APP` in one tool call and `tap:...` in the next — each extra LLM turn wastes 15–25 seconds while a local `flow` step takes 200–350 ms.
+2. **Drop `home` before `open:APP`.** `open:APP` brings any app straight to the foreground from anywhere; adding `home` wastes ~500 ms.
+3. **Use `open:APP` vs `launch:APP` deliberately:**
+   - `open:APP` resumes the app where it was (~100 ms).
+   - `launch:APP` terminates and cold-starts the app — use it when an app needs to fetch a fresh state or incoming push notification (for example, auth/banking apps that don't surface a pending approval prompt while warm in memory).
+4. **Skip tapping a tab that is already selected.** `tap:` waits to see the screen react and retries once if nothing changed (~1.2 s wasted).
+5. **After `open:` on React Native or heavy apps, poll with `wait:TEXT` (OCR), not `tapel:` (DOM).** Immediately after app activation, WDA element queries can stall ~8 s while the accessibility tree builds, whereas `wait:TEXT` reads frames in ~180–250 ms.
 
-## Common commands
+## 2. Reading Screens (`read` vs `read:ocr` vs `readel:` vs `ui`)
+
+- **`read`** (default when exploring): waits for OCR lines to settle, then returns **both** `lines` (OCR text with `(x, y)`) **and** `ui` (on-screen interactive controls: `Button`, `Tab`, `Cell`, `SearchField`, `TextField`, `SecureTextField`, `Switch`, `Slider`, `Image`, with centers and `value` on switches/sliders). Off-screen recycled list cells are pruned and invisible Unicode bidi/space characters are stripped automatically.
+- **`read:ocr`** (fastest, ~180–250 ms, ~90 ms cached): OCR only, skips `/source`. Use when you already know the screen layout and just need text.
+- **`read:Y0-Y1`**: OCR a vertical band only (points).
+- **`readel:TEXT`**: polls the lightweight accessibility tree for labels containing `TEXT`. Use this whenever OCR misreads stylized fonts, white text on photos, or split digits (e.g. 2FA authenticator codes where OCR splits `123 456` or misreads `OpenAI` as `OpenAl`, while the `Cell` label is exact and includes the countdown timer).
+- **`ui`**: dumps all on-screen labelled controls with `(x, y)` (~300–700 ms because `turbotap` requests `/source?format=json&excluded_attributes=visible,accessible,enabled,index` and filters visibility client-side).
+
+## 3. Targeting & Navigation Patterns
 
 ```bash
-turbotap preflight
-turbotap unlock
+# Multi-step examples (one process, 2-6 s total)
 turbotap flow open:Spotify tap:"Your Library" tap:"Liked Songs@y>150" wait:songs read:ocr tap:Back
+turbotap flow open:Messenger wait:"Ask Meta" tap:"Alice@y>300" read tap:Back
+turbotap flow open:Instagram tapel:"Direct messages" tap:"Bob@below:Messages" read
+turbotap flow open:Authenticator readel:OpenAI
 turbotap flow open:Weather read
-turbotap ocr
-turbotap tree
-turbotap screenshot /tmp/screen.png
+turbotap flow open:Messenger search:Alice wait:"Alice Smith"
 ```
 
-See [README.md](../../README.md) and [docs/SETUP.md](../../docs/SETUP.md) for installation, `config.json`, and all `flow` verbs.
+- **Region filters (`@below:HEADER`, `@above:HEADER`, `@y>N`, `@y<N`):** Use these whenever a label appears twice on screen (e.g. a chat contact in the top stories carousel *and* in the thread list below: `tap:"Alice@below:Chats"` or `tap:"Alice@y>300"`).
+- **Icon-only buttons (no visible text):** `tap:TEXT` automatically falls back to an exact accessibility label when the first OCR frame doesn't contain `TEXT` (e.g. `tap:Close`, `tap:"Direct messages"`). Use `tapel:LABEL` to target the accessibility label directly without waiting for OCR.
+- **Back navigation:** `tap:Back` checks for a lone `<` chevron in the nav bar (`x < 70, 55 < y < 130`, avoiding the status-bar `< PreviousApp` link) before touching `/source`. `back` performs an iOS edge-swipe and verifies the screen changed, falling back to tapping the Back control if the page springs back.
+- **Zero-momentum scrolling (`scroll:down|up`, `scrollto:TEXT`):** With `wda-turbo.patch`, `/wda/fastDrag` crawls 1 pt before releasing so UIKit sees ~0 velocity and stops in ~150–370 ms instead of flinging for ~2 s.
+- **Search bars (`search:QUERY`):** Finds the `SearchField` (or Search tab/button + field), waits 350 ms for keyboard focus so leading characters aren't dropped, types via `/wda/keys`, and settles without pressing Return.
+
+## 4. Forms, Auth, PIN Pads & Tricky iOS Edge Cases
+
+- **Formatted numeric inputs (`typedigits:VALUE` or `typedigits:env:VAR`):** Never send phone numbers, OTPs, card numbers, or national IDs in one `element/value` burst — WebView JS auto-formatters frequently drop a digit. `typedigits:` clears the field, types 1 digit every `0.08 s` via `/wda/keys`, reads back the field value, strips formatting, and asserts an exact digit-by-digit match (retrying once on mismatch).
+- **WebView text fields (`cleartype:TEXT` + `dismisskb`):** iOS WebViews often append to existing field contents instead of replacing them, and the iOS keyboard accessory bar adds duplicate `Next`/`Previous` buttons that collide with form buttons. Use `cleartype:TEXT` (clears, types via `/wda/keys`, verifies read-back on non-secure fields) followed by `dismisskb` (taps `Done`/`Ferdig`) before clicking the form's submit button.
+- **`FLAG_SECURE` PIN keyboards (`pintap:DIGITS|env:VAR|cmd:CMD`):** Banking and MDM apps blank their PIN keyboard in screenshots and ignore `/wda/keys`. Dismiss any Face ID prompt first (`alert:accept` or `tap:Cancel`), then run `pintap:env:APP_PIN` — it reads `XCUIElementTypeKey` rectangles directly from `/source` and taps each digit via `/wda/fastTap`.
+- **iOS system alerts & Face ID fallbacks (`alert:accept|dismiss`):** Use `alert:accept` to accept "Open in App" or dismiss "Face Not Recognized — Try Again" sheets so the app falls back to PIN entry.
+- **Lock-screen unlock (`unlock`):** Uses screen-size-agnostic `XCUIElementTypeKey` clicks (works across any iPhone screen size) with the passcode from `WDA_PASSCODE` or `passcode_cmd` in `~/.config/turbotap/config.json`.
+- **Idle Wi-Fi wake:** If the iPhone has been sleeping, `turbotap` automatically sends one ICMP ping on first `/status` timeout to wake iOS Wi-Fi before trying to restart WDA.
+- **SMS OTPs (`otp-type`):** `turbotap otp-type --pattern '%code%' --after-rowid <N>` polls macOS `~/Library/Messages/chat.db` (read-only) over SSH for a newly arrived 6-digit SMS code and types it paced into the active field.
+
+## 5. Safety & Anti-Double-Send Rules
+
+- **Built-in `--deny` guard:** Taps matching destructive or external labels (`send`, `pay`, `buy`, `subscribe`, `delete`, `unsend`, `remove`, `cancel booking`, `start audio/video call`, `record voice`, `accept/decline/maybe`) are refused by default. Only pass `--no-deny` when the user explicitly authorized that action.
+- **NEVER retry an external `Send`, `Pay`, or `Submit` based on OCR alone.** Dark-mode or colored outgoing message bubbles (white text on purple/grey/blue backgrounds) are frequently missed by grayscale Tesseract OCR even though the send succeeded. Always capture `shot:/tmp/verify.png` and inspect the image (or check `ui` / accessibility tree) before ever retrying.
+- **Never print secrets** (passcodes, PINs, passwords, OTPs, national IDs) in logs, chat, or shell arguments — pass them through `env:VAR` or `cmd:...`.
+
+## 6. Setup & Reference
+
+- CLI & configuration: see [README.md](../../README.md)
+- Full Mac + Xcode + iPhone Developer Mode setup & troubleshooting: see [docs/SETUP.md](../../docs/SETUP.md)
+- Fast WDA routes (`/wda/fastTap`, `/wda/fastScreenshot`, `/wda/fastDrag`): see [patches/wda-turbo.patch](../../patches/wda-turbo.patch)
