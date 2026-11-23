@@ -33,13 +33,14 @@ Run `turbotap flow --help` to see all available verbs.
 
 ## Setup
 
-Clone the repo and install `turbotap`:
+Install `turbotap` straight from GitHub:
 
 ```bash
-git clone https://github.com/Maxteabag/turbotap.git
-cd turbotap
-uv tool install .   # or: pip install -e .
+uv tool install git+https://github.com/Maxteabag/turbotap.git
+# or: pip install git+https://github.com/Maxteabag/turbotap.git
 ```
+
+To hack on it, clone the repo and run `uv tool install --editable .` instead.
 
 Install Tesseract (used for local screen reading):
 
@@ -74,10 +75,10 @@ Create `~/.config/turbotap/config.json`:
 }
 ```
 
-Deploy and start the patched WebDriverAgent on the iPhone, then make sure it responds:
+Deploy and start the patched WebDriverAgent on the iPhone (over SSH to the Mac in `mac_host`), then make sure it responds:
 
 ```bash
-bash scripts/deploy_wda_mac.sh
+turbotap deploy              # clone, patch, build and start WDA; --no-build just restarts it
 turbotap preflight
 turbotap unlock
 ```
@@ -86,7 +87,7 @@ Full walkthrough and troubleshooting (finding your Team ID, trusting the dev cer
 
 ## Benchmarks
 
-Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full-res screenshots over HTTP, and runs visibility checks on hidden UI nodes. `patches/wda-turbo.patch` skips most of that overhead, and `turbotap` keeps one HTTP connection open while running OCR locally in parallel with caching on unchanged regions.
+Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full-res screenshots over HTTP, and runs visibility checks on hidden UI nodes. [`wda-turbo.patch`](src/turbotap/wda/wda-turbo.patch) skips most of that overhead, and `turbotap` keeps one HTTP connection open while running OCR locally in parallel with caching on unchanged regions.
 
 | Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
@@ -97,11 +98,15 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 | UI tree | ~2600ms | 300-700ms | Skips visibility checks on hidden elements |
 | Multi-step flow | 14.4-15.7s | 3.8-6.5s | Single process, persistent connection |
 
+[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) explains each trick behind these numbers: in-process strip-parallel OCR, the zero-momentum drag, the cheap UI tree, and a few iOS quirks.
+
 If you don't want to patch WDA, `turbotap` still works against stock WDA and falls back to the standard endpoints automatically.
 
 ## Safety and quirks
 
 By default, `turbotap` blocks taps on buttons matching `Send`, `Pay`, `Buy`, `Delete`, `Cancel booking`, or `Start call` (`--deny`). Pass `--no-deny` when you actually want it to press one of those.
+
+`tap:TEXT` prefers a button labelled exactly `TEXT` over a longer line that only contains it (`tap:"Sign In"` won't hit `Sign in with another account`). Tapping a switch row's label flips the switch itself, and `Next`/`Previous` pick the form's button over the keyboard toolbar's copy. When a step fails, the JSON lists the visible text and the tappable controls with their exact labels.
 
 You can narrow down tap targets relative to other text on screen. `tap:"Alice@below:Chats"`, for example, skips stories or carousels above the list.
 
@@ -110,6 +115,8 @@ Formatted iOS text fields (phone numbers, OTPs, IDs) tend to drop characters whe
 ## Using with AI agents
 
 There is a skill file at [skills/turbotap/SKILL.md](skills/turbotap/SKILL.md). Drop it into your Claude Code, Codex, or OpenClaw skills folder so the agent batches steps into `turbotap flow` calls and knows how to handle the input quirks above.
+
+[skills/turbotap-retro/SKILL.md](skills/turbotap-retro/SKILL.md) is an optional companion: after each non-trivial task the agent reviews what slowed it down and fixes it once in `turbotap` itself, using generic primitives only.
 
 ## License
 

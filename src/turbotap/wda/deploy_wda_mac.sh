@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # Build and (re)start the wda-turbo patched WebDriverAgent on a remote Mac host.
-#   deploy_wda_mac.sh            # clone/update, patch, build, restart runner, wait for /status
-#   deploy_wda_mac.sh --no-build # only restart the runner from the existing build
+#   turbotap deploy             # clone/update, patch, build, restart runner, wait for WDA
+#   turbotap deploy --no-build  # only restart the runner from the existing build
+# (turbotap runs this script; it also runs it directly: bash deploy_wda_mac.sh [--no-build])
 #
-# Configuration via env vars or ~/.config/iphone-wda/config.json:
+# Configuration via env vars or ~/.config/turbotap/config.json:
 #   WDA_URL       e.g. http://192.168.1.50:8100
 #   WDA_UDID      target iOS device UDID (or IPHONE_UDID)
 #   WDA_MAC_HOST  SSH alias of the Mac running xcodebuild (default: mac)
 #   WDA_TEAM      Apple Developer Team ID
 #   WDA_BUNDLE    WebDriverAgentRunner bundle identifier
-#   WDA_DEVICE    optional device key in ~/.config/iphone-wda/config.json
+#   WDA_DEVICE    optional device key in ~/.config/turbotap/config.json
+#   WDA_KEYCHAIN_DIR  dir on the Mac with wda.keychain-db + kcpass, a dedicated signing
+#                     keychain unlocked over SSH (default ~/.local/share/iphone-use/signing)
 set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH="$HERE/../patches/wda-turbo.patch"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PATCH="${WDA_PATCH:-$HERE/wda-turbo.patch}"
 CFG="${WDA_CONFIG:-}"
 if [[ -z "$CFG" ]]; then
   if [[ -f "$HOME/.config/turbotap/config.json" ]]; then
@@ -55,22 +58,24 @@ BUILD=1
 
 for req in UDID WDA_URL TEAM BUNDLE; do
   if [[ -z "${!req}" ]]; then
-    echo "Missing $req. Set WDA_$req or configure ~/.config/iphone-wda/config.json" >&2
+    echo "Missing $req. Set it in the environment or configure ~/.config/turbotap/config.json" >&2
     exit 2
   fi
 done
 
 scp -q "$PATCH" "$MAC:/var/tmp/wda-turbo.patch"
-ssh "$MAC" BUILD="$BUILD" UDID="$UDID" TEAM="$TEAM" BUNDLE="$BUNDLE" REF="$UPSTREAM_REF" SRC="$SRC" DD="$DD" bash -s <<'REMOTE'
+ssh "$MAC" BUILD="$BUILD" UDID="$UDID" TEAM="$TEAM" BUNDLE="$BUNDLE" REF="$UPSTREAM_REF" SRC="$SRC" DD="$DD" \
+  KCDIR="${WDA_KEYCHAIN_DIR:-}" XB="${WDA_XCODEBUILD:-}" bash -s <<'REMOTE'
 set -euo pipefail
-XB=/Applications/Xcode-26.6.app/Contents/Developer/usr/bin/xcodebuild
+[[ -n "$XB" && -x "$XB" ]] || XB=/Applications/Xcode-26.6.app/Contents/Developer/usr/bin/xcodebuild
 [[ -x "$XB" ]] || XB=xcodebuild
-KC="$HOME/.local/share/iphone-use/signing/wda.keychain-db"
+KCDIR="${KCDIR:-$HOME/.local/share/iphone-use/signing}"
+KC="$KCDIR/wda.keychain-db"
 SIGN=(-allowProvisioningUpdates DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic
       CODE_SIGN_IDENTITY="Apple Development" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE")
-if [[ -f "$KC" && -f "$HOME/.local/share/iphone-use/signing/kcpass" ]]; then
+if [[ -f "$KC" && -f "$KCDIR/kcpass" ]]; then
   # Over ssh the keychain is locked and codesign fails with errSecInternalComponent.
-  security unlock-keychain -p "$(cat "$HOME/.local/share/iphone-use/signing/kcpass")" "$KC"
+  security unlock-keychain -p "$(cat "$KCDIR/kcpass")" "$KC"
   security set-keychain-settings -t 3600 "$KC"
   SIGN+=(OTHER_CODE_SIGN_FLAGS="--keychain $KC")
 fi

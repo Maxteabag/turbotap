@@ -41,7 +41,7 @@ To find your **Apple Developer Team ID**:
 
 ## Step 3: Build and launch patched WebDriverAgent (`wda-turbo`)
 
-`scripts/deploy_wda_mac.sh` clones `appium/WebDriverAgent` (16.14.0), applies `patches/wda-turbo.patch` (adding `/wda/fastTap`, `/wda/fastScreenshot`, and `/wda/fastDrag`), builds, and starts `WebDriverAgentRunner` on port `8100`.
+`turbotap deploy` runs the bundled [`deploy_wda_mac.sh`](../src/turbotap/wda/deploy_wda_mac.sh) over SSH on the Mac. It clones `appium/WebDriverAgent` (16.14.0), applies [`wda-turbo.patch`](../src/turbotap/wda/wda-turbo.patch) (adding `/wda/fastTap`, `/wda/fastScreenshot`, and `/wda/fastDrag`), builds, and starts `WebDriverAgentRunner` on port `8100`.
 
 ### Option A: Using `~/.config/turbotap/config.json` (recommended)
 
@@ -66,10 +66,10 @@ Create `~/.config/turbotap/config.json` (`chmod 600`):
 }
 ```
 
-Then deploy:
+Then deploy (install `turbotap` first, see Step 4):
 
 ```bash
-bash scripts/deploy_wda_mac.sh
+turbotap deploy
 ```
 
 > **Note:** On the very first launch on a new iPhone, iOS may ask you to approve the Face ID / Passcode prompt authorizing UI testing, and you may need to trust your developer certificate under **Settings → General → VPN & Device Management**.
@@ -82,13 +82,13 @@ WDA_UDID=000081XX-XXXXXXXXXXXXXXXX \
 WDA_URL=http://192.168.1.50:8100 \
 WDA_TEAM=YOUR_TEAM_ID \
 WDA_BUNDLE=com.yourname.wda \
-bash scripts/deploy_wda_mac.sh
+turbotap --url http://192.168.1.50:8100 deploy
 ```
 
 To restart later without rebuilding:
 
 ```bash
-bash scripts/deploy_wda_mac.sh --no-build
+turbotap deploy --no-build
 ```
 
 Verify WDA is reachable from your Linux/macOS host:
@@ -144,7 +144,7 @@ App display-name caches (`~/.cache/turbotap/apps-<udid>.json`) are isolated per 
 ## Troubleshooting
 
 - **`WDA unreachable` after the iPhone sat idle:** `turbotap` automatically sends one ICMP ping to wake iOS Wi-Fi before retrying `/status`. If it still fails, check that the iPhone is on the same Wi-Fi subnet and restart the runner with `deploy_wda_mac.sh --no-build`.
-- **Codesign fails over SSH (`errSecInternalComponent`):** macOS locks the login keychain in non-interactive SSH sessions. Unlock your signing keychain over SSH before running `xcodebuild` (or use a dedicated signing keychain as supported in `deploy_wda_mac.sh`).
+- **Codesign fails over SSH (`errSecInternalComponent`):** macOS locks the login keychain in non-interactive SSH sessions. Unlock your signing keychain over SSH before running `xcodebuild` (or use a dedicated signing keychain: put `wda.keychain-db` and its password file `kcpass` in `~/.local/share/iphone-use/signing/` on the Mac, or point `WDA_KEYCHAIN_DIR` at another folder, and the deploy script unlocks it before every build).
 - **Formatted numeric fields drop digits (e.g., phone numbers, OTPs, national IDs):** Use `typedigits:VALUE` (or `typedigits:env:VAR`), which paces `/wda/keys` at `0.08 s` per digit and verifies exact digit-by-digit read-back.
 - **Secure PIN keyboards are black in screenshots (`FLAG_SECURE`):** Use `pintap:env:APP_PIN` (or `pintap:cmd:...`), which reads `XCUIElementTypeKey` rects from `/source` and taps them via `/wda/fastTap`.
 - **Works without the `wda-turbo` patch too:** If you run stock `appium/WebDriverAgent`, `turbotap` auto-detects 404 on `/wda/fast*` routes and falls back cleanly to standard WDA endpoints.

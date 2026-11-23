@@ -37,6 +37,8 @@ turbotap flow open:Weather read
 turbotap flow open:Messenger search:Alice wait:"Alice Smith"
 ```
 
+- **Exact labels win:** `tap:TEXT` taps a Button/Link labelled exactly `TEXT` when OCR only finds it inside a longer line (`tap:"Sign In"` never hits `Sign in with another account`). Tapping a switch row's label that doesn't react taps the toggle itself (it checks the toggle didn't already flip first). `tap:Next`/`Previous`/`Neste`/`Forrige` pick the topmost match, i.e. the form button over the keyboard toolbar's copy.
+- **Failed steps show exact labels:** a failing `flow` returns `visible` (OCR lines) **and** `ui` (top 30 tappable controls with exact labels and `(x, y)`). Retry with those labels; don't spend a turn on `tree`.
 - **Region filters (`@below:HEADER`, `@above:HEADER`, `@y>N`, `@y<N`):** Use these whenever a label appears twice on screen (e.g. a chat contact in the top stories carousel *and* in the thread list below: `tap:"Alice@below:Chats"` or `tap:"Alice@y>300"`).
 - **Icon-only buttons (no visible text):** `tap:TEXT` automatically falls back to an exact accessibility label when the first OCR frame doesn't contain `TEXT` (e.g. `tap:Close`, `tap:"Direct messages"`). Use `tapel:LABEL` to target the accessibility label directly without waiting for OCR.
 - **Back navigation:** `tap:Back` checks for a lone `<` chevron in the nav bar (`x < 70, 55 < y < 130`, avoiding the status-bar `< PreviousApp` link) before touching `/source`. `back` performs an iOS edge-swipe and verifies the screen changed, falling back to tapping the Back control if the page springs back.
@@ -63,4 +65,6 @@ turbotap flow open:Messenger search:Alice wait:"Alice Smith"
 
 - CLI & configuration: see [README.md](../../README.md)
 - Full Mac + Xcode + iPhone Developer Mode setup & troubleshooting: see [docs/SETUP.md](../../docs/SETUP.md)
-- Fast WDA routes (`/wda/fastTap`, `/wda/fastScreenshot`, `/wda/fastDrag`): see [patches/wda-turbo.patch](../../patches/wda-turbo.patch)
+- Fast WDA routes (`/wda/fastTap`, `/wda/fastScreenshot`, `/wda/fastDrag`): see [wda-turbo.patch](../../src/turbotap/wda/wda-turbo.patch); deploy or restart WDA with `turbotap deploy [--no-build]`
+- Why each speed trick works (OCR, zero-momentum drag, cheap `/source`, iOS quirks): see [docs/HOW_IT_WORKS.md](../../docs/HOW_IT_WORKS.md)
+- After a non-trivial task, run [`turbotap-retro`](../turbotap-retro/SKILL.md): fix what slowed you down once, in `turbotap` itself, with generic primitives only.

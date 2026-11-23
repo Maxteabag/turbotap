@@ -8,7 +8,8 @@ verified form/PIN input, and optional SMS OTP reading.
 
 Configuration: pass --url / --device / --udid, env vars (WDA_URL, WDA_DEVICE,
 WDA_UDID, WDA_MAC_HOST, WDA_PASSCODE_CMD, WDA_PASSCODE), or create
-~/.config/iphone-wda/config.json.
+~/.config/turbotap/config.json (the legacy ~/.config/iphone-wda/config.json is
+still read when the new file does not exist).
 """
 import argparse
 import atexit
@@ -45,6 +46,8 @@ def _default_config_path():
 
 
 CONFIG_PATH = _default_config_path()
+# deploy_wda_mac.sh + wda-turbo.patch, shipped as package data.
+WDA_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wda")
 
 
 def load_config():
@@ -152,16 +155,19 @@ class WDAClient:
             })
         return self.sid
 
-    def start_wda_on_mac(self):
-        """Restart the (wda-turbo patched) runner on mac from its existing build."""
-        print("WDA not responding; restarting WebDriverAgentRunner on mac...", file=sys.stderr)
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploy_wda_mac.sh")
+    def start_wda_on_mac(self, build=False):
+        """(Re)start the wda-turbo patched runner on the Mac host; build=True also
+        clones, patches and builds it first. The script and patch ship inside the
+        package (turbotap/wda/), so this works from any install."""
+        if not build:
+            print("WDA not responding; restarting WebDriverAgentRunner on the Mac host...", file=sys.stderr)
         env = {**os.environ, "WDA_URL": self.base_url}
         if self.udid:
             env["WDA_UDID"] = self.udid
         if self.device_key:
             env["WDA_DEVICE"] = self.device_key
-        subprocess.run(["bash", script, "--no-build"], check=True, env=env)
+        cmd = ["bash", os.path.join(WDA_ASSETS, "deploy_wda_mac.sh")] + ([] if build else ["--no-build"])
+        subprocess.run(cmd, check=True, env=env)
 
     # None = not probed yet; True when the wda-turbo patch is running. WDA_TURBO=0
     # forces the stock endpoints (benchmark baseline).
@@ -338,10 +344,11 @@ def _norm(s):
 
 
 class Match:
-    __slots__ = ("x", "y", "text", "line")
+    """rank: 0 exact line, 1 line starts/ends with it, 2 substring, 3 fuzzy."""
+    __slots__ = ("x", "y", "text", "line", "rank")
 
-    def __init__(self, x, y, text, line):
-        self.x, self.y, self.text, self.line = x, y, text, line
+    def __init__(self, x, y, text, line, rank=0):
+        self.x, self.y, self.text, self.line, self.rank = x, y, text, line, rank
 
 
 def find_text(lines, label, fuzzy=0.84, where=None):
@@ -388,7 +395,7 @@ def find_text(lines, label, fuzzy=0.84, where=None):
         ws = ln.words[span[0]:span[1]]
         x = int((min(w[1] for w in ws) + max(w[3] for w in ws)) / 2)
         y = int((min(w[2] for w in ws) + max(w[4] for w in ws)) / 2)
-        cand = (rank, y, Match(x, y, ln.text, ln))
+        cand = (rank, y, Match(x, y, ln.text, ln, rank))
         if best is None or cand[:2] < best[:2]:
             best = cand
     return best[2] if best else None
@@ -404,6 +411,31 @@ def _region(lines, where):
     if not hdr:
         return None
     return [l for l in lines if (l.y0 > hdr.line.y1 - 1 if kind == "below" else l.y1 < hdr.line.y0 + 1)]
+
+
+def _controls_in_region(controls, lines, where):
+    """Controls allowed by a split_where() condition (same rules as _region)."""
+    if not where:
+        return controls
+    kind, _, val = where.partition(":")
+    if kind.startswith("y"):
+        lim = int(kind[2:] if len(kind) > 2 else val)
+        return [c for c in controls if (c["y"] > lim if kind[1] == ">" else c["y"] < lim)]
+    hdr = find_text(lines, val, fuzzy=0)
+    if not hdr:
+        return []
+    return [c for c in controls if (c["y"] > hdr.line.y1 if kind == "below" else c["y"] < hdr.line.y0)]
+
+
+def _box_diff(a, b, x, y, scale, dx=30, dy=18):
+    """Mean grey difference of two frames in a small box around (x, y) points."""
+    if a is None or b is None or a.size != b.size:
+        return 255.0
+    box = (max(0, int((x - dx) * scale)), max(0, int((y - dy) * scale)),
+           min(a.size[0], int((x + dx) * scale)), min(a.size[1], int((y + dy) * scale)))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return 255.0
+    return ImageStat.Stat(ImageChops.difference(a.crop(box), b.crop(box))).mean[0]
 
 
 def _thumb_diff(a, b):
@@ -653,6 +685,11 @@ def ui_controls(client, screen=(430, 932), text=False):
             t = "Text"
         if (t in CONTROL_TYPES or t in ("Value", "Text")) and lab and rc.get("width") and rc.get("height"):
             x, y = int(rc["x"] + rc["width"] / 2), int(rc["y"] + rc["height"] / 2)
+            if t == "Switch":
+                # A Switch's rect often spans its whole row (label + toggle), and
+                # tapping the row's middle does nothing: x is the toggle itself,
+                # at the right end (the centre of a bare 51 pt UISwitch).
+                x = int(rc["x"] + rc["width"] - min(rc["width"] / 2, 32))
             key = (lab, x // 4, y // 4)
             if 0 <= x <= screen[0] and 0 <= y <= screen[1] and key not in seen \
                     and not (t == "Image" and " " not in lab and re.search(r"[._-]", lab)):
@@ -669,6 +706,23 @@ def ui_controls(client, screen=(430, 932), text=False):
 
     walk(r.get("value") or {})
     return out
+
+
+# Controls a tap:TEXT may land on instead of the OCR text, best type first.
+TAP_TYPES = ("Button", "Link", "Switch", "Tab", "SegmentedControl", "Cell")
+# Shown with 'visible' when a flow step fails, so the next try uses exact labels.
+INTERACTIVE_TYPES = {"Button", "Tab", "Cell", "Link", "Switch", "Slider", "SegmentedControl",
+                     "SearchField", "TextField", "SecureTextField", "TextView"}
+# The iOS keyboard toolbar repeats these above the keys; a form's own button wins.
+KB_TOOLBAR_LABELS = {"next", "previous", "neste", "forrige"}
+
+
+def exact_control(controls, label, types=TAP_TYPES):
+    """The control whose label equals label (case-insensitive), preferring
+    Button/Link over Switch/Tab/Cell, then the topmost."""
+    want = _clean_text(label).casefold()
+    hits = [c for c in controls if c["type"] in types and c["label"].casefold() == want]
+    return min(hits, key=lambda c: (types.index(c["type"]), c["y"], c["x"])) if hits else None
 
 
 def find_control(controls, label, types=None):
@@ -708,7 +762,10 @@ FLOW_HELP = """steps (one argument each, run in order):
   gone:TEXT             poll until TEXT is no longer on screen
   tap:TEXT              wait until TEXT is on screen at the same spot twice, tap its
                         centre, and re-tap once if the screen did not react; text
-                        OCR cannot see falls back to the control with that label
+                        OCR cannot see falls back to the control with that label.
+                        A Button labelled exactly TEXT beats a longer OCR line that
+                        only contains it; a switch row's label taps the toggle;
+                        Next/Previous prefer the form button over the keyboard bar
   TEXT@below:HEADER     (tap/wait/scrollto) only match under HEADER, e.g.
   TEXT@above:T TEXT@y>N   tap:Alice@below:Chats skips the stories carousel
   search:QUERY          tap the app's search field/Search button, type QUERY, settle
@@ -809,37 +866,79 @@ class Flow:
                 self.tap_point(chev.x, chev.y, "back")
                 self.settle(timeout=1.5)
                 return Match(chev.x, chev.y, "<", chev)
+        if base.casefold() in KB_TOOLBAR_LABELS:
+            m = self.tap_form_button(base, where)
+            if m:
+                return m
         if not where and not find_text(self.lines(), base):
             # Not in the first OCR frame: an exact accessibility label (icon-only
             # Back/Close/Search/tab) is tapped at once instead of after the 2.2 s
             # OCR wait (Messenger Back: 2,979 -> ~800 ms).
-            c = next((c for c in self.controls() if c["label"].casefold() == base.casefold()), None)
+            c = exact_control(self.controls(), base, TAP_TYPES + (
+                "Image", "SearchField", "TextField", "SecureTextField", "TextView", "Slider", "Value"))
             if c:
-                self.tap_point(c["x"], c["y"], c["label"])
-                return Match(c["x"], c["y"], f"[{c['type']}:{c['label']}]", None)
+                return self.tap_control(c)
         try:
             m = self.wait(label, timeout=min(2.2, self.timeout), stable=True)
         except FlowError:
             # Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct messages)
             # have no visible text for OCR: one /source lookup with coordinates, then
             # the slower element-predicate poll.
-            base, where = split_where(label)
             c = None if where else find_control(self.controls(), base)
             if c:
-                self.tap_point(c["x"], c["y"], c["label"])
-                return Match(c["x"], c["y"], f"[{c['type']}:{c['label']}]", None)
+                return self.tap_control(c)
             x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
             return Match(x, y, f"[el:{label}]", None)
+        if m.rank:
+            # OCR only found TEXT inside a longer line ('Sign in with another account'
+            # for tap:"Sign In", often because the real button's white-on-colour text
+            # did not OCR): a control labelled exactly TEXT wins over the substring.
+            c = exact_control(_controls_in_region(self.controls(), self.r.read(img=self.r.last), where), base)
+            if c:
+                return self.tap_control(c)
         before = self.r.last
         self.tap_point(m.x, m.y, m.text)
         if not self.changed_since(before):
+            # Tapping a switch row's label does nothing: tap the toggle itself, unless
+            # the toggle changed already (too small a change to count as a reaction).
+            sw = self.switch_near(base, m)
+            if sw:
+                if _box_diff(before, self.r.grab(), sw["x"], sw["y"], self.r.scale) < 4:
+                    return self.tap_control(sw)
+                return m
             # Nothing moved: the tap was probably eaten by an animation. Retry once
             # if the target is still there.
-            base, where = split_where(label)
             m2 = find_text(self.lines(), base, where=where)
             if m2:
                 self.tap_point(m2.x, m2.y, m2.text)
         return m
+
+    def tap_control(self, c):
+        self.tap_point(c["x"], c["y"], c["label"])
+        return Match(c["x"], c["y"], f"[{c['type']}:{c['label']}]", None)
+
+    def switch_near(self, label, m):
+        """The Switch on the matched text's row whose label contains label."""
+        want = _clean_text(label).casefold()
+        hits = [c for c in self.controls() if c["type"] == "Switch" and abs(c["y"] - m.y) <= 30
+                and (want in c["label"].casefold() or c["label"].casefold() in _norm(m.text))]
+        return min(hits, key=lambda c: abs(c["y"] - m.y)) if hits else None
+
+    def tap_form_button(self, label, where=None):
+        """Next/Previous also sit on the keyboard toolbar: tap the topmost exact
+        match from OCR or the tree, i.e. the form's own button when both show."""
+        lines = self.lines()
+        want = _norm(label)
+        region = (_region(lines, where) or []) if where else lines
+        cands = [(l.y, l.x, l.text) for l in region if _norm(l.text) == want]
+        cands += [(c["y"], c["x"], c["label"]) for c in _controls_in_region(self.controls(), lines, where)
+                  if c["type"] in ("Button", "Link") and c["label"].casefold() == label.casefold()]
+        if not cands:
+            return None
+        y, x, text = min(cands)
+        self.tap_point(x, y, text)
+        self.settle(timeout=1.5)
+        return Match(x, y, text, None)
 
     def tap_el(self, label, timeout=None):
         q = json.dumps(label)
@@ -1157,8 +1256,13 @@ class Flow:
                 res = self.step(spec)
             except FlowError as e:
                 visible = [l.text for l in (self.r.read() if self.r else [])][:40]
+                try:  # exact tappable labels too, so the retry needs no separate tree call
+                    ui = sorted((c for c in self.controls() if c["type"] in INTERACTIVE_TYPES),
+                                key=lambda c: (c["y"], c["x"]))[:30]
+                except Exception:
+                    ui = []
                 return {"ok": False, "failed_step": spec, "error": str(e), "steps": done,
-                        "visible": visible, "total_ms": round((time.perf_counter() - t0) * 1000)}
+                        "visible": visible, "ui": ui, "total_ms": round((time.perf_counter() - t0) * 1000)}
             item = {"step": spec, "ms": round((time.perf_counter() - s0) * 1000)}
             if res is not None:
                 item["result"] = res
@@ -1199,6 +1303,34 @@ def cmd_flow(client, args):
     print(json.dumps(res, ensure_ascii=False))
     if not res["ok"]:
         sys.exit(1)
+
+
+def walk_accessible(node, out, depth=0):
+    """Indented 'Type 'label' (x, y)' lines for a /wda/accessibleSource tree."""
+    if isinstance(node, list):
+        for n in node:
+            walk_accessible(n, out, depth)
+        return
+    if not isinstance(node, dict):
+        return
+    t = node.get("type") or ""
+    lab = _clean_text(str(node.get("label") or node.get("name") or ""))
+    rc = node.get("rect") or {}
+    shown = bool(lab) or t not in ("", "Other", "Application", "Window")
+    if shown:
+        pos = ""
+        if rc.get("width") and rc.get("height"):
+            pos = f" ({int(rc['x'] + rc['width'] / 2)}, {int(rc['y'] + rc['height'] / 2)})"
+        val = node.get("value")
+        extra = f" = {_clean_text(str(val))!r}" if val not in (None, "") and str(val) != lab else ""
+        out.append(f"{'  ' * depth}{t} {lab!r}{extra}{pos}")
+    for ch in node.get("children") or []:
+        walk_accessible(ch, out, depth + 1 if shown else depth)
+
+
+def cmd_deploy(client, args):
+    """Clone/patch/build (unless --no-build) and start WDA on the Mac host."""
+    client.start_wda_on_mac(build=not args.no_build)
 
 
 def cmd_tree(client, _args):
@@ -1258,12 +1390,14 @@ def cmd_otp_type(client, args):
 
 def main():
     p = argparse.ArgumentParser(description="Fast generic WebDriverAgent (WDA) controller for physical iOS devices")
-    p.add_argument("--url", default=None, help="WDA base URL (or set WDA_URL / ~/.config/iphone-wda/config.json)")
-    p.add_argument("--device", default=None, help="device key from ~/.config/iphone-wda/config.json (or WDA_DEVICE)")
+    p.add_argument("--url", default=None, help="WDA base URL (or set WDA_URL / ~/.config/turbotap/config.json)")
+    p.add_argument("--device", default=None, help="device key from ~/.config/turbotap/config.json (or WDA_DEVICE)")
     p.add_argument("--udid", default=None, help="device UDID (or WDA_UDID / config.json)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("preflight")
     sub.add_parser("unlock")
+    sp_deploy = sub.add_parser("deploy", help="build + start the wda-turbo patched WebDriverAgent on the Mac host")
+    sp_deploy.add_argument("--no-build", action="store_true", help="only restart the existing build")
     sp_ocr = sub.add_parser("ocr")
     sp_ocr.add_argument("--scale", type=float, default=1.5, help="OCR px per point")
     sp_ocr.add_argument("--y0", type=int, default=0, help="crop band top (pt)")
@@ -1293,6 +1427,7 @@ def main():
     dispatch = {
         "preflight": cmd_preflight,
         "unlock": cmd_unlock,
+        "deploy": cmd_deploy,
         "ocr": cmd_ocr,
         "tap-ocr": cmd_tap_ocr,
         "tree": cmd_tree,
