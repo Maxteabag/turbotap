@@ -3716,29 +3716,36 @@ class Flow:
                 self.guard(0, 0, alias, action="slider")
 
         matched_label = sel_lab or sel_name or target_label
-        en_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/enabled")
-        en_verified = False
-        if isinstance(en_resp, dict) and not en_resp.get("error"):
-            en_val = en_resp.get("value")
-            if _is_wda_disabled_value(en_val):
-                desc = repr(matched_label) if matched_label else "Slider"
-                raise FlowError(f"{desc} is disabled")
-            if isinstance(en_val, bool) or (isinstance(en_val, (int, float)) and en_val == 1) \
-                    or str(en_val).strip().casefold() in ("1", "true", "yes"):
-                en_verified = True
-        if not en_verified:
-            # Fallback check via UI tree when /enabled errored or returned an unreadable value.
-            try:
-                ctl_sl = [x for x in self.controls() if x["type"] == "Slider"]
-            except FlowError:
-                ctl_sl = []
-            aliases_cf = {a.casefold() for a in (sel_lab, sel_name, target_label or "") if a}
-            cand_sl = [x for x in ctl_sl if x["label"].casefold() in aliases_cf] if aliases_cf else (ctl_sl if len(ctl_sl) == 1 else [])
-            if not cand_sl:
-                raise FlowError("cannot verify slider enabled state")
-            if any(x.get("enabled") is False for x in cand_sl):
-                desc = repr(matched_label) if matched_label else "Slider"
-                raise FlowError(f"{desc} is disabled")
+
+        def _parse_wda_bool(val):
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)) and val in (0, 1):
+                return bool(val)
+            if isinstance(val, str):
+                s = val.strip().casefold()
+                if s in ("1", "true", "yes"):
+                    return True
+                if s in ("0", "false", "no"):
+                    return False
+            return None
+
+        en_state = None
+        for en_path in (
+            f"/session/{self.c.sid}/element/{eid}/enabled",
+            f"/session/{self.c.sid}/element/{eid}/attribute/enabled",
+        ):
+            en_resp = self.c.req("GET", en_path)
+            if isinstance(en_resp, dict) and not en_resp.get("error"):
+                parsed_en = _parse_wda_bool(en_resp.get("value"))
+                if parsed_en is not None:
+                    en_state = parsed_en
+                    break
+        if en_state is False:
+            desc = repr(matched_label) if matched_label else "Slider"
+            raise FlowError(f"{desc} is disabled")
+        if en_state is not True:
+            raise FlowError("cannot verify slider enabled state")
         self._mark_action()
         _check_wda_ok(
             self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/value", {"value": [f"{frac:.2f}"]}),

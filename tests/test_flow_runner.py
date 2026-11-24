@@ -1758,22 +1758,55 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             finally:
                 flow_aerr.close()
 
-            # /enabled lookup error with no verified Slider in controls() refuses with ZERO value POSTs.
-            c_enerr = MockWDAClient(
+            # Failed /enabled and /attribute/enabled on the selected element MUST refuse with
+            # ZERO value POSTs even when fastUI has a matching older tree (no enabled field)
+            # or a different same-labelled enabled slider.
+            for tree_items in (
+                [{"type": "Slider", "label": "Brightness", "x": 200, "y": 400}],
+                [{"type": "Slider", "label": "Brightness", "x": 200, "y": 400, "enabled": True}],
+            ):
+                c_enerr = MockWDAClient(
+                    elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "s1"}]},
+                    element_labels={"s1": "Brightness"},
+                    element_names={"s1": "Brightness"},
+                    fast_ui=_fast_ui(tree_items),
+                    custom_handler=lambda m, p, d: {"error": 500, "body": "enabled err"}
+                    if p.endswith("/enabled") or p.endswith("/attribute/enabled")
+                    else None,
+                )
+                flow_enerr = cli.Flow(c_enerr, reader=FakeReader(frames=[(img, [])]))
+                try:
+                    with self.assertRaises(cli.FlowError) as ctx_ee:
+                        flow_enerr.step("slider:Brightness=50%")
+                    self.assertIn("enabled state", str(ctx_ee.exception))
+                    self.assertEqual([p for _, p, _ in c_enerr.calls if p.endswith("/value")], [])
+                finally:
+                    flow_enerr.close()
+
+            # When /enabled fails but /attribute/enabled on the SAME element returns true/false,
+            # respect that verified same-element state.
+            c_attr_en = MockWDAClient(
                 elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "s1"}]},
                 element_labels={"s1": "Brightness"},
                 element_names={"s1": "Brightness"},
-                fast_ui=_fast_ui([]),
-                custom_handler=lambda m, p, d: {"error": 500, "body": "enabled err"} if p.endswith("/enabled") else None,
+                element_enabled={"s1": True},
+                custom_handler=lambda m, p, d: {"error": 500, "body": "enabled err"}
+                if p.endswith("/enabled") and not p.endswith("/attribute/enabled")
+                else None,
             )
-            flow_enerr = cli.Flow(c_enerr, reader=FakeReader(frames=[(img, [])]))
+            flow_attr_en = cli.Flow(c_attr_en, reader=FakeReader(frames=[(img, [])]))
             try:
-                with self.assertRaises(cli.FlowError) as ctx_ee:
-                    flow_enerr.step("slider:50%")
-                self.assertIn("enabled state", str(ctx_ee.exception))
-                self.assertEqual([p for _, p, _ in c_enerr.calls if p.endswith("/value")], [])
+                self.assertEqual(flow_attr_en.step("slider:Brightness=50%"), "Brightness=50%")
+                self.assertEqual(c_attr_en.element_values["s1"], "0.50")
+
+                c_attr_en.element_enabled["s1"] = False
+                calls_before = len(c_attr_en.calls)
+                with self.assertRaises(cli.FlowError) as ctx_ad:
+                    flow_attr_en.step("slider:Brightness=60%")
+                self.assertIn("disabled", str(ctx_ad.exception))
+                self.assertEqual([p for _, p, _ in c_attr_en.calls[calls_before:] if p.endswith("/value")], [])
             finally:
-                flow_enerr.close()
+                flow_attr_en.close()
 
             self.assertIn("slider:", cli.FLOW_HELP)
         finally:

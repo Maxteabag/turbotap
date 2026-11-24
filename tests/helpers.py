@@ -334,6 +334,9 @@ class MockWDAClient(cli.WDAClient):
                 return {"value": self.element_rects.get(eid, {})}
             if sub == "enabled":
                 return {"value": self.element_enabled.get(eid, True)}
+            if sub == "attribute/enabled":
+                v = self.element_enabled.get(eid, True)
+                return {"value": "true" if v else "false"} if isinstance(v, bool) else {"value": v}
             if sub == "attribute/label":
                 return {"value": self.element_labels.get(eid)}
             if sub == "attribute/name":
