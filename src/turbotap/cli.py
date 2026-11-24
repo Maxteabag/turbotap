@@ -1676,7 +1676,12 @@ class Flow:
                     if c:
                         break
             if c:
-                return self.tap_control(c)
+                before = self.r.last
+                just_opened = bool(self._pending_bundle_ts and (time.monotonic() - self._pending_bundle_ts) < 1.5)
+                m_ctl = self.tap_control(c)
+                if just_opened and before is not None and not self.changed_since(before, x=c["x"], y=c["y"]):
+                    m_ctl = self.tap_control(c)
+                return m_ctl
         try:
             m = self.wait(label, timeout=min(2.2, self.timeout), stable=True, initial=m0)
         except FlowError:
