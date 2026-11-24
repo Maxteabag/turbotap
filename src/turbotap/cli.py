@@ -1505,15 +1505,19 @@ class Flow:
                 self.r.set_last(cur_img)
             else:
                 self.r.last = cur_img
-        if _thumb_diff(cache_img, cur_img) >= _CTL_CACHE_MAX_DIFF:
+        if (_thumb_diff(cache_img, cur_img) >= 5.0
+                or _box_diff(cache_img, cur_img, c["x"], c["y"], self.r.scale, dx=35, dy=25) >= 8.0):
             self._invalidate_ctl_cache()
             return None
         self._last_tap_small_delta = True
         before = cur_img
         m = self.tap_control(c)
         if self.changed_since(before, x=c["x"], y=c["y"]):
-            if self.r.last is not None and _thumb_diff(cache_img, self.r.last) >= _CTL_CACHE_MAX_DIFF:
-                self._invalidate_ctl_cache()
+            if self.r.last is not None:
+                if _thumb_diff(cache_img, self.r.last) >= 5.0:
+                    self._invalidate_ctl_cache()
+                else:
+                    self._ctl_cache = (ctl, cache_bundle, time.monotonic(), self.r.last)
             return m
         # Safety net: cached tap produced no UI reaction -> drop cache and fall through.
         self._invalidate_ctl_cache()
