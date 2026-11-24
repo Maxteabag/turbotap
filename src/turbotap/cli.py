@@ -709,6 +709,7 @@ def find_text(lines, label, fuzzy=0.84, where=None):
     for ln in lines:
         t = _norm(ln.text)
         words = [_norm(w[0]) for w in ln.words]
+        icon_stripped = False
         if rx:
             hit = rx.search(ln.text)
             rank = 0 if hit and hit.group(0) == ln.text else 2
@@ -716,18 +717,31 @@ def find_text(lines, label, fuzzy=0.84, where=None):
             need = _norm(hit.group(0)) if hit else ""
         else:
             ok = want in t
-            rank = 0 if t == want else (1 if t.startswith(want) or t.endswith(want) else 2)
+            if t == want:
+                rank = 0
+            else:
+                m_icon = re.match(r"^[^\w\s]\s+(.+)$", t) if want else None
+                if m_icon and m_icon.group(1) == want:
+                    rank = 0
+                    icon_stripped = True
+                elif t.startswith(want) or t.endswith(want):
+                    rank = 1
+                else:
+                    rank = 2
             need = want
         span = None
         if ok:
-            n = len(words)
-            for size in range(1, n + 1):
-                for i in range(n - size + 1):
-                    if need in " ".join(words[i:i + size]):
-                        span = (i, i + size)
+            if icon_stripped and len(ln.words) >= 2 and not re.search(r"\w", ln.words[0][0]):
+                span = (1, len(ln.words))
+            else:
+                n = len(words)
+                for size in range(1, n + 1):
+                    for i in range(n - size + 1):
+                        if need in " ".join(words[i:i + size]):
+                            span = (i, i + size)
+                            break
+                    if span:
                         break
-                if span:
-                    break
         elif fuzzy and not rx and not any(ch.isdigit() for ch in want):
             import difflib
             k = max(1, len(want.split()))
@@ -743,10 +757,10 @@ def find_text(lines, label, fuzzy=0.84, where=None):
         # Deprioritize iOS status-bar lines (clock, battery, '< PrevApp' at y < 54)
         # unless the caller explicitly filtered by region (@y<..., @above:...).
         in_status = (not where) and (y < 54)
-        cand = (in_status, rank, y, Match(x, y, ln.text, ln, rank))
-        if best is None or cand[:3] < best[:3]:
+        cand = (in_status, rank, icon_stripped, y, Match(x, y, ln.text, ln, rank))
+        if best is None or cand[:4] < best[:4]:
             best = cand
-    return best[3] if best else None
+    return best[4] if best else None
 
 
 def _region(lines, where):
@@ -1693,6 +1707,7 @@ class Flow:
         self._side = None
         self._ui_pool = None
         self._last_action_ts = 0.0
+        self._last_action_is_typing = False
         self._wait_settled_ts = 0.0
         self._last_reaction_diff = 0.0
         self._ctl_cache = None  # (controls, bundle, ts, img)
@@ -1742,8 +1757,9 @@ class Flow:
         else:
             self._ctl_cache = None
 
-    def _mark_action(self, keep_ctl_cache=False):
+    def _mark_action(self, keep_ctl_cache=False, typing=False):
         self._last_action_ts = time.monotonic()
+        self._last_action_is_typing = bool(typing)
         self._last_reaction_diff = 0.0
         if hasattr(self.r, "invalidate_last"):
             self.r.invalidate_last()
@@ -1848,7 +1864,12 @@ class Flow:
             prev_img = self.r.last if m is not None else None
             prev_lines = lines if m is not None else None
             now = time.time()
-            if not m and (frames >= 2 or now - start >= 0.4) and (last_ui == 0.0 or now - last_ui >= 0.8):
+            recent_open = bool(
+                self._pending_bundle_ts
+                and (time.monotonic() - self._pending_bundle_ts) < 2.0
+            )
+            ui_interval = 0.35 if (recent_open and (now - start) < 1.2) else 0.8
+            if not m and (frames >= 2 or now - start >= min(0.4, ui_interval)) and (last_ui == 0.0 or now - last_ui >= ui_interval):
                 ctl = _controls_in_region(self.controls(text=True), lines, where)
                 last_ui = time.time()
                 cm = find_control_match(ctl, label, types=WAIT_UI_TYPES, allow_disabled=allow_disabled)
@@ -1938,6 +1959,7 @@ class Flow:
                 else:
                     self.r.last = cur
                 self._last_action_ts = 0.0
+                self._last_action_is_typing = False
                 return True
             prev = cur
         if prev is not None and prev is not start:
@@ -2098,7 +2120,9 @@ class Flow:
             if m0 is None:
                 first_lines = self.lines()
                 m0 = find_text(first_lines, base, where=where)
-        if m0 is None and self._last_action_ts and (time.monotonic() - self._last_action_ts) < 0.7:
+        if (m0 is None and self._last_action_ts
+                and not self._last_action_is_typing
+                and (time.monotonic() - self._last_action_ts) < 0.7):
             # Right after open:/launch: once _wait_active_app() confirmed the app and Frame 1
             # already rendered page content below the status bar (e.g. Safari before tapping
             # accessibility-only TextField:Adresse), go straight to controls() instead of
@@ -2709,7 +2733,13 @@ class Flow:
         animated backgrounds like Weather), plus labelled controls with
         coordinates. Reuses one persistent side connection/worker so /source
         overlaps with OCR, checks active-app freshness, reuses fresh wait:
-        frames without redundant OCR, and never discards a fresh completed tree."""
+        frames without redundant OCR, confirms static screens via cheap
+        pixel-still grabs, and never discards a fresh completed tree."""
+        pending_bundle = (
+            self._pending_bundle
+            if self._pending_bundle and (time.monotonic() - self._pending_bundle_ts) <= 2.5
+            else None
+        )
         app_confirmed = self._wait_active_app()
         side, pool = self._get_ui_worker() if ui else (None, None)
         pt = self.r.pt_size()
@@ -2722,11 +2752,20 @@ class Flow:
         # or wait: already confirmed destination text; stale/splash trees are still
         # caught by bundleId/app_name and _text_overlap(fut_texts, texts) < 0.5 below.
         may_be_transitioning = (not app_confirmed) and (not settled_by_wait) and (t0 - self._last_action_ts) < 1.5
+        wb = None
+        wb_ms = 0
+        if app_confirmed and self.bundle:
+            wb, wb_ms = self.bundle, 600
+        elif pending_bundle:
+            wb, wb_ms = pending_bundle, 1500
+        elif self._switched_from_app_name and self.bundle and (t0 - self._switched_at) <= 3.0:
+            wb, wb_ms = self.bundle, 600
         fut = None
         fut_texts = None
         if side and not may_be_transitioning:
-            fut = pool.submit(_fetch_ui_controls_meta, side, pt, True)
+            fut = pool.submit(_fetch_ui_controls_meta, side, pt, True, wb, wb_ms)
         prev_texts, prev_img = None, None
+        prev_has_content = False
         populated_frames = 0
         lines, texts = [], []
         already_stable = False
@@ -2739,6 +2778,7 @@ class Flow:
                     and any(l.y >= status_y for l in cached_lines)):
                 prev_img = self.r.last
                 prev_texts = [l.text for l in cached_lines]
+                prev_has_content = True
                 lines, texts = cached_lines, prev_texts
                 populated_frames = 1
                 if fut is not None:
@@ -2762,6 +2802,23 @@ class Flow:
                 lines = self.r.read(img=cur_img)
                 if hasattr(self.r, "set_last"):
                     self.r.set_last(cur_img, lines=lines)
+                else:
+                    self.r.last = cur_img
+            elif prev_img is not None and prev_has_content:
+                # Confirm stability with one cheap raw grab (~34 ms) before paying
+                # for a second full OCR pass (300-600 ms) on static screens.
+                cur_img = self.r.grab()
+                if cur_img is not prev_img and _thumb_diff(prev_img, cur_img) < 0.8:
+                    if hasattr(self.r, "set_last"):
+                        self.r.set_last(cur_img, lines=lines)
+                    else:
+                        self.r.last = cur_img
+                    break
+                lines = self.r.read(img=cur_img)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(cur_img, lines=lines)
+                else:
+                    self.r.last = cur_img
             else:
                 lines = self.lines()
                 cur_img = self.r.last
@@ -2770,7 +2827,7 @@ class Flow:
             if has_content:
                 populated_frames += 1
             if fut is not None and fut_texts is None:
-                fut_texts = texts
+                fut_texts = texts if has_content else []
             elapsed = time.monotonic() - t0
             stable = False
             if prev_texts is not None:
@@ -2787,12 +2844,12 @@ class Flow:
                     stable = True
             if stable or time.monotonic() >= end:
                 break
-            prev_texts, prev_img = texts, cur_img
+            prev_texts, prev_img, prev_has_content = texts, cur_img, has_content
             if side and has_content and (
                 fut is None or (fut.done() and fut_texts is not None and _text_overlap(fut_texts, texts) < 0.5)
             ):
                 fut_texts = texts
-                fut = pool.submit(_fetch_ui_controls_meta, side, pt, True)
+                fut = pool.submit(_fetch_ui_controls_meta, side, pt, True, wb, wb_ms)
         if side:
             fut_fresh = (
                 fut is not None
@@ -2800,7 +2857,7 @@ class Flow:
                 and (_text_overlap(fut_texts, texts) >= 0.5 or (not fut_texts and not texts))
             )
             if not fut_fresh:
-                fut = pool.submit(_fetch_ui_controls_meta, side, pt, True)
+                fut = pool.submit(_fetch_ui_controls_meta, side, pt, True, wb, wb_ms)
         if fut:
             ui_res, app_name, bundle_id = fut.result()
             if self._is_stale_ui(app_name, bundle_id):
@@ -2982,7 +3039,7 @@ class Flow:
                 if rem > 0:
                     time.sleep(rem)
             self._last_tap_type = None
-            self._mark_action()
+            self._mark_action(typing=True)
             self.c.fast_keys(arg)
         elif verb == "key":
             kname = arg.strip().lower()
@@ -2995,12 +3052,12 @@ class Flow:
                 if rem > 0:
                     time.sleep(rem)
             self._last_tap_type = None
-            self._mark_action()
+            self._mark_action(typing=True)
             self.c.fast_keys(ch)
             return kname
         elif verb == "cleartype":
             arg = _secret_arg(verb, arg)
-            self._mark_action()
+            self._mark_action(typing=True)
             els = []
             secure = False
             for cls, is_sec in (
@@ -3044,7 +3101,7 @@ class Flow:
             return "no-kb"
         elif verb == "typedigits":
             # Paced 0.08 s/digit /wda/keys input with exact digit-by-digit read-back verification.
-            self._mark_action()
+            self._mark_action(typing=True)
             if arg.startswith("env:"):
                 raw = os.environ.get(arg[4:], "").strip()
                 if not raw:
