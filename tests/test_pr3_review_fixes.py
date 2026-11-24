@@ -543,11 +543,14 @@ class PR3ReviewFixesTests(unittest.TestCase):
         self.assertEqual(attempts[0], 1)
         self.assertTrue(r_out.get("deadline_exceeded") or r_out.get("error"))
 
-    # Re-review 9: app switch resolving via controls() must discard pre-confirmation OCR frames
+    # Re-review 9: first open: in a fresh flow followed by tapif: must confirm target
+    # UI tree before trusting OCR coordinates, never tapping outgoing OCR frames, and
+    # still tapping when the fresh post-confirmation target frame matches.
     def test_tapif_app_switch_resolving_discards_pre_confirmation_outgoing_ocr_frame(self):
         old_img = solid_img(210, size=(430, 932))
         new_img = solid_img(230, size=(430, 932))
         old_lines = [make_line("Continue", 70, 190, 110, 210)]
+        target_lines = [make_line("Continue", 220, 520, 300, 545)]
         ui_calls = [0]
 
         def switching_ui(qs):
@@ -560,31 +563,89 @@ class PR3ReviewFixesTests(unittest.TestCase):
                     "ui": [{"type": "Button", "label": "Continue", "x": 90, "y": 200}],
                 }
             return {
-                "bundleId": "com.apple.target",
+                "bundleId": "com.example.target",
                 "appName": "TargetApp",
                 "screen": [430, 932],
                 "ui": [{"type": "Button", "label": "Settings", "x": 200, "y": 400}],
             }
 
-        c = MockWDAClient(active_app="com.apple.target", fast_ui=switching_ui)
-        # Seed reader.last with the outgoing app's cached frame (containing Continue at 90,200),
-        # while the fresh post-confirmation frame has no Continue.
-        r = FakeReader(frames=[(new_img, []), (new_img, [])])
-        r.set_last(old_img, lines=old_lines)
+        # Case A: public Flow.step("open:com.example.target") with NO prior UI query.
+        # activeAppInfo already reports target, first UI tree still reports outgoing app,
+        # retry returns target tree with no Continue. Model a real screen whose pixels
+        # still show outgoing "Continue" at (90, 200) until the app switch resolves
+        # (ui_calls < 2), and show the target app with no "Continue" once ui_calls >= 2.
+        class SwitchAwareReader(FakeReader):
+            def __init__(self, target_frame):
+                super().__init__(frames=[target_frame])
+                self._target_frame = target_frame
+                self.read_ui_counts = []
+
+            def read(self, y0=0, y1=None, img=None, sauvola=False, timeout=None, deadline=None):
+                self.read_ui_counts.append(ui_calls[0])
+                frame = (old_img, old_lines) if ui_calls[0] < 2 else self._target_frame
+                self.set_last(frame[0], lines=frame[1])
+                return list(frame[1])
+
+        c = MockWDAClient(active_app="com.example.target", fast_ui=switching_ui)
+        r = SwitchAwareReader((new_img, []))
         flow = cli.Flow(c, reader=r)
         try:
-            flow.bundle = "com.apple.target"
-            flow._pending_bundle = None
-            flow._pending_bundle_ts = time.monotonic()
-            flow._switched_from_app_name = "OldApp"
-            flow._switched_at = time.monotonic()
             with mock.patch.object(cli, "_STALE_UI_BACKOFF", (0.01,)):
+                flow.step("open:com.example.target")
                 res = flow.tap_if("Continue", timeout=0.5)
             self.assertEqual(res, "skipped")
-            post_calls = [(m, p) for m, p, _ in c.calls if m == "POST"]
-            self.assertEqual(post_calls, [])
+            self.assertGreaterEqual(ui_calls[0], 2)
+            # Every OCR read happened AFTER the target UI tree was confirmed.
+            self.assertTrue(all(cnt >= 2 for cnt in r.read_ui_counts))
+            tap_posts = [p for m, p, _ in c.calls if m == "POST" and ("Tap" in p or p.endswith("/tap"))]
+            self.assertEqual(tap_posts, [])
         finally:
             flow.close()
+
+        # Case A2: mid-loop retry path — even if an outgoing OCR frame was already
+        # captured first, a subsequent controls() retry resolving a stale mismatch
+        # discards the earlier frame and reads a fresh post-confirmation frame.
+        ui_calls[0] = 0
+        c_mid = MockWDAClient(active_app="com.example.target", fast_ui=switching_ui)
+        r_mid = FakeReader(frames=[(old_img, old_lines), (new_img, []), (new_img, [])])
+        flow_mid = cli.Flow(c_mid, reader=r_mid)
+        try:
+            flow_mid.bundle = "com.example.target"
+            flow_mid._pending_bundle = None
+            flow_mid._pending_bundle_ts = 0.0
+            flow_mid._switched_from_app_name = None
+            flow_mid._switched_at = 0.0
+            # Simulate a late stale-app mismatch detected inside controls() after frame 1.
+            orig_controls = flow_mid.controls
+
+            def controls_resolving_stale(**kw):
+                flow_mid._pending_bundle_ts = time.monotonic()
+                return orig_controls(**kw)
+
+            flow_mid.controls = controls_resolving_stale
+            with mock.patch.object(cli, "_STALE_UI_BACKOFF", (0.01,)):
+                res_mid = flow_mid.tap_if("Continue", timeout=0.5)
+            self.assertEqual(res_mid, "skipped")
+            tap_posts = [p for m, p, _ in c_mid.calls if m == "POST" and ("Tap" in p or p.endswith("/tap"))]
+            self.assertEqual(tap_posts, [])
+        finally:
+            flow_mid.close()
+
+        # Case B: when a fresh target-app frame DOES contain Continue after the switch
+        # resolves, tap_if taps the fresh target coordinates (260, 532), never (90, 200).
+        ui_calls[0] = 0
+        c2 = MockWDAClient(active_app="com.example.target", fast_ui=switching_ui)
+        r2 = SwitchAwareReader((new_img, target_lines))
+        flow2 = cli.Flow(c2, reader=r2)
+        try:
+            with mock.patch.object(cli, "_STALE_UI_BACKOFF", (0.01,)):
+                flow2.step("open:com.example.target")
+                res2 = flow2.tap_if("Continue", timeout=0.5)
+            self.assertEqual(res2, "Continue")
+            self.assertEqual(len(c2.tapped_points), 1)
+            self.assertEqual(c2.tapped_points[0][:2], (260, 532))
+        finally:
+            flow2.close()
 
 
 if __name__ == "__main__":

@@ -2565,7 +2565,17 @@ class Flow:
 
     def _tap_if_impl(self, label, timeout=1.0):
         eff_timeout = min(timeout, self.timeout)
-        deadline = time.monotonic() + eff_timeout
+        now0 = time.monotonic()
+        deadline = now0 + eff_timeout
+        # Snapshot whether a recent open:/launch: switch still needs UI-tree
+        # verification BEFORE _wait_active_app() can clear _pending_bundle, so
+        # even the very first open: in a flow (with no prior app name) confirms
+        # the target UI tree before trusting any OCR or Sauvola coordinates.
+        needs_ui_confirm = bool(
+            self._pending_bundle
+            or (self._pending_bundle_ts and (now0 - self._pending_bundle_ts) <= 3.0)
+            or (self._switched_from_app_name and self._switched_at and (now0 - self._switched_at) <= 3.0)
+        )
         rem = deadline - time.monotonic()
         if rem > 0:
             self._wait_active_app(max_wait=min(1.5, rem), deadline=deadline)
@@ -2581,10 +2591,7 @@ class Flow:
         prev_texts = None
         prev_img = None
         frames = 0
-        confirmed_fresh_app = not bool(
-            self._pending_bundle
-            or (self._switched_from_app_name and self._switched_at and (time.monotonic() - self._switched_at) <= 3.0)
-        )
+        confirmed_fresh_app = not needs_ui_confirm
         while True:
             t_frame = time.monotonic()
             rem = deadline - t_frame
@@ -2663,6 +2670,13 @@ class Flow:
                         last_ctl = ctl_for_check
                         last_ui_check = time.monotonic()
                         last_ui_img = cur_img
+                        if getattr(self, "_last_ui_retried_stale", False):
+                            # The lookup just resolved a stale-app mismatch: discard
+                            # the pre-confirmation OCR frame and capture a fresh one.
+                            if hasattr(self.r, "invalidate_last"):
+                                self.r.invalidate_last()
+                            last_ui_img = None
+                            continue
                     except _StaleAppError:
                         confirmed_fresh_app = False
                         stale_app = True
@@ -2696,6 +2710,28 @@ class Flow:
                     raw_ctl = []
                 if time.monotonic() >= deadline:
                     return "skipped"
+                if getattr(self, "_last_ui_retried_stale", False) and not stale_app:
+                    # Resolved a mismatch mid-loop: allow verified target-app controls
+                    # directly, but discard cur_img so Sauvola never runs on an older frame.
+                    last_ctl = raw_ctl
+                    last_ui_img = None
+                    if hasattr(self.r, "invalidate_last"):
+                        self.r.invalidate_last()
+                    ctl = _controls_in_region(raw_ctl, [], where) if not where or not (where.startswith("below:") or where.startswith("above:")) else []
+                    if base.startswith("re:"):
+                        cm = find_control_match(ctl, base, types=set(ext_types), allow_disabled=False)
+                        if cm:
+                            if time.monotonic() >= deadline:
+                                return "skipped"
+                            self.tap_point(cm.x, cm.y, cm.text, deadline=deadline)
+                            return cm.text
+                    else:
+                        c = exact_control(ctl, base, ext_types)
+                        if c:
+                            if time.monotonic() >= deadline:
+                                return "skipped"
+                            return self.tap_control(c, deadline=deadline).text
+                    continue
                 if not stale_app and confirmed_fresh_app:
                     last_ctl = raw_ctl
                     ctl = _controls_in_region(raw_ctl, lines, where)
@@ -3189,11 +3225,13 @@ class Flow:
             )
         if ctl is None:
             raise FlowError("UI tree timed out")
+        self._last_ui_retried_stale = False
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
             # /source or /wda/fastUI occasionally lags behind activeAppInfo right after open:;
             # use short adaptive backoff until iOS publishes the new app's tree.
             # Keep controls and provenance together: never overwrite (app_name, bundle_id)
             # when a retry fails and returns None, or the final stale check would be bypassed.
+            self._last_ui_retried_stale = True
             screen_pt = _get_screen_pt()
             for delay in _STALE_UI_BACKOFF:
                 if deadline is not None:
