@@ -407,7 +407,13 @@ class FindTextMatchingTests(unittest.TestCase):
         self.assertEqual(m_icon_apne.rank, 0)
         self.assertEqual(m_icon_apne.x, 100)  # centered on 'Apne' [60..140], skipping '[5]'
 
-        # 5. Regex ('re:') queries remain strict and untouched by accent folding.
+        # 5. All-combining-mark queries that fold to empty must NEVER match unrelated text.
+        self.assertIsNone(cli.find_text([make_line("Settings", 20, 120, 140, 140)], "\u0301"))
+        self.assertIsNone(cli.find_text(["Settings"], "\u0301"))
+        self.assertIsNone(cli.find_text([make_line("Settings", 20, 120, 140, 140)], "\u0301\u0308"))
+        self.assertIsNone(cli.find_text([make_line("Settings", 20, 120, 140, 140)], "   "))
+
+        # 6. Regex ('re:') queries remain strict and untouched by accent folding.
         self.assertIsNone(cli.find_text([make_line("Pa", 20, 120, 80, 140)], r"re:^På$"))
         m_rx_exact = cli.find_text([make_line("På", 20, 120, 80, 140)], r"re:^På$")
         self.assertIsNotNone(m_rx_exact)

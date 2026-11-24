@@ -93,19 +93,26 @@ class ReadFullTests(unittest.TestCase):
     def test_springboard_system_alert_awareness_in_controls_and_read_full(self):
         img = solid_img(240, size=(430, 932))
         lines = [make_line("Allow Paste from Safari?", 40, 380, 390, 405)]
-        alert_buttons = [
+        mixed_sb_controls = [
+            {"type": "Button", "label": "Settings", "x": 85, "y": 210},
             {"type": "Button", "label": "Don't Allow", "x": 135, "y": 510},
             {"type": "Button", "label": "Allow Paste", "x": 295, "y": 510},
         ]
-        sb_alert_ui = _fast_ui(alert_buttons, app_name="SpringBoard", bundle_id="com.apple.springboard")
+        sb_alert_ui = _fast_ui(mixed_sb_controls, app_name="SpringBoard", bundle_id="com.apple.springboard")
 
-        # 1. Active SpringBoard system alert over a launched app in controls() and read_full():
-        # surfaces alert controls immediately with 0 _STALE_UI_BACKOFF retries, does NOT cache
-        # under self.bundle, preserves _pending_bundle, and attaches "alert" to step("read").
+        # 1. Mixed SpringBoard tree with an active system alert over a pending target app:
+        # - Generic action/control paths (controls() default allow_alert=False, tapif:Settings)
+        #   NEVER treat the SpringBoard alert as target-app confirmation and dispatch ZERO taps
+        #   to unrelated background SpringBoard controls.
+        # - Read-only alert inspection (read / ui / controls(allow_alert=True)) exits without
+        #   _STALE_UI_BACKOFF retries, exposes ONLY provable alert buttons via /wda/alert/buttons
+        #   (dropping unrelated "Settings"), does NOT cache under self.bundle, preserves
+        #   _pending_bundle, and attaches "alert".
         c_alert = MockWDAClient(
             active_app="com.apple.springboard",
             fast_ui=sb_alert_ui,
             alert_text="Allow Paste from Safari?",
+            alert_buttons=["Don't Allow", "Allow Paste"],
         )
         r_alert = FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0)
         flow_alert = cli.Flow(c_alert, reader=r_alert, timeout=1.0)
@@ -114,17 +121,37 @@ class ReadFullTests(unittest.TestCase):
             self.assertEqual(flow_alert.bundle, "com.example.target")
             self.assertEqual(flow_alert._pending_bundle, "com.example.target")
 
+            # Generic controls() rejects SpringBoard alert immediately (0 backoff sleeps)
+            # so action verbs never mistake an alert for target-app confirmation.
             sleeps = []
             with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
-                got_ctl = flow_alert.controls()
-            self.assertEqual([x["label"] for x in got_ctl], ["Don't Allow", "Allow Paste"])
+                with self.assertRaises(cli._StaleAppError):
+                    flow_alert.controls()
             self.assertEqual(sleeps, [], "Active SpringBoard alert must not burn _STALE_UI_BACKOFF retries")
             self.assertIsNone(flow_alert._ctl_cache)
             self.assertEqual(flow_alert._pending_bundle, "com.example.target")
             self.assertEqual(flow_alert._last_alert_text, "Allow Paste from Safari?")
 
-            # step("read") (via read_full) surfaces alert buttons without retries, keeps _pending_bundle,
-            # does not cache under self.bundle, and attaches "alert" to the read entry.
+            # tapif:Settings must NOT tap the unrelated background SpringBoard control.
+            res_tapif = flow_alert.tap_if("Settings", timeout=0.15)
+            self.assertEqual(res_tapif, "skipped")
+            self.assertEqual(c_alert.tapped_points, [])
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+
+            # Explicit read-only inspection (step("ui") / controls(allow_alert=True))
+            # exposes ONLY the alert buttons from /wda/alert/buttons, never "Settings".
+            sleeps.clear()
+            with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                n_ui = flow_alert.step("ui")
+            self.assertEqual(n_ui, 2)
+            self.assertEqual(sleeps, [])
+            self.assertEqual([x["label"] for x in flow_alert.reads[-1]["ui"]], ["Don't Allow", "Allow Paste"])
+            self.assertEqual(flow_alert.reads[-1]["alert"], "Allow Paste from Safari?")
+            self.assertIsNone(flow_alert._ctl_cache)
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+
+            # step("read") (via read_full) surfaces ONLY alert buttons without retries,
+            # keeps _pending_bundle, does not cache, and attaches "alert".
             c_alert.calls.clear()
             with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
                 n_lines = flow_alert.step("read")
@@ -138,6 +165,53 @@ class ReadFullTests(unittest.TestCase):
             self.assertEqual(len(fast_ui_calls), 1)
         finally:
             flow_alert.close()
+
+        # 1b. Flat fastUI without /wda/alert/buttons exposes [] (never leaks background controls);
+        # /source Alert subtree exposes ONLY Alert descendants (never outside sibling Settings).
+        c_no_btns = MockWDAClient(
+            active_app="com.apple.springboard",
+            fast_ui=sb_alert_ui,
+            alert_text="Allow Paste from Safari?",
+            alert_buttons=None,
+        )
+        flow_no_btns = cli.Flow(c_no_btns, reader=FakeReader(frames=[(img, lines)], pt=(430, 932), scale=1.0), timeout=1.0)
+        try:
+            flow_no_btns.step("open:com.example.target")
+            self.assertEqual(flow_no_btns.controls(allow_alert=True), [])
+        finally:
+            flow_no_btns.close()
+
+        source_alert_tree = {
+            "type": "Application",
+            "name": "SpringBoard",
+            "children": [
+                {"type": "Button", "label": "Settings", "rect": {"x": 50, "y": 180, "width": 70, "height": 70}},
+                {
+                    "type": "Alert",
+                    "label": "Restore App?",
+                    "rect": {"x": 60, "y": 360, "width": 310, "height": 180},
+                    "children": [
+                        {"type": "Button", "label": "Cancel", "rect": {"x": 80, "y": 490, "width": 120, "height": 44}},
+                        {"type": "Button", "label": "Restore", "rect": {"x": 220, "y": 490, "width": 120, "height": 44}},
+                    ],
+                },
+            ],
+        }
+        c_src_alert = MockWDAClient(
+            active_app="com.apple.springboard",
+            fast_ui={"error": 404},
+            source_tree=source_alert_tree,
+            alert_text="Restore App?",
+            alert_buttons=None,
+        )
+        flow_src_alert = cli.Flow(c_src_alert, reader=FakeReader(frames=[(img, lines)], pt=(430, 932), scale=1.0), timeout=1.0)
+        try:
+            flow_src_alert.step("open:com.example.target")
+            ctl_src = flow_src_alert.controls(allow_alert=True)
+            self.assertEqual([x["label"] for x in ctl_src], ["Cancel", "Restore"])
+            self.assertTrue(all("inAlert" not in x for x in ctl_src))
+        finally:
+            flow_src_alert.close()
 
         # 2. CRITICAL SAFETY INVARIANT: Ordinary outgoing SpringBoard Home Screen
         # (bundleId="com.apple.springboard" + alert_text=None/empty/404) right after
@@ -2277,6 +2351,14 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             self.assertEqual(flow.step("alert:text"), "no-alert")
             self.assertEqual(len(flow.reads), reads_len)
 
+            # HTTP 500 or unknown 404 on /alert/text must raise FlowError, NOT report "no-alert".
+            c.alert_text = {"error": 500, "body": "internal server error"}
+            with self.assertRaises(cli.FlowError):
+                flow.step("alert:text")
+            c.alert_text = {"error": 404, "body": "unknown command"}
+            with self.assertRaises(cli.FlowError):
+                flow.step("alert:text")
+
             with mock.patch("turbotap.cli.time.sleep"):
                 self.assertEqual(flow.step("alert:accept"), "accept")
                 self.assertEqual(flow.step("alert:dismiss"), "dismiss")
@@ -2295,6 +2377,29 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             self.assertNotIn("alert", cli._IMAGE_STEP_VERBS)
         finally:
             flow.close()
+
+        # 6. assertnot:TEXT must FAIL (never report "absent") when both UI endpoints fail (HTTP 500),
+        # while still succeeding on older WDA (404 /wda/fastUI -> 200 /source fallback) and genuine empty trees.
+        c_err = MockWDAClient(
+            fast_ui={"error": 500, "body": "boom"},
+            source_tree={"error": 500, "body": "boom"},
+        )
+        flow_err = cli.Flow(c_err, reader=FakeReader(frames=[(img, [])], pt=(430, 932), scale=1.0), timeout=0.5)
+        try:
+            with self.assertRaises(cli.FlowError):
+                flow_err.step("assertnot:Pending Approval")
+        finally:
+            flow_err.close()
+
+        c_old = MockWDAClient(
+            fast_ui={"error": 404},
+            source_tree={"type": "Application", "name": "Demo", "children": []},
+        )
+        flow_old = cli.Flow(c_old, reader=FakeReader(frames=[(img, [])], pt=(430, 932), scale=1.0), timeout=0.5)
+        try:
+            self.assertEqual(flow_old.step("assertnot:Pending Approval"), "absent")
+        finally:
+            flow_old.close()
 
 
 class LazyImportAndWarmupTests(unittest.TestCase):

@@ -1001,9 +1001,11 @@ def find_text(lines, label, fuzzy=0.84, where=None):
             return None
     want = _norm(label)
     rx = re.compile(label[3:], re.I) if label.startswith("re:") else None
+    if not rx and not want:
+        return None
     short_alpha = (not rx) and bool(want) and len(want) <= 3 and want.isalpha()
     wb_rx = re.compile(rf"(?<!\w){re.escape(want)}(?!\w)") if short_alpha else None
-    want_f = _fold_accents(want) if not rx else ""
+    want_f = _norm(_fold_accents(want)) if not rx else ""
     short_alpha_f = (not rx) and bool(want_f) and (short_alpha or (len(want_f) <= 3 and want_f.isalpha()))
     wb_rx_f = re.compile(rf"(?<!\w){re.escape(want_f)}(?!\w)") if short_alpha_f else None
     best = None
@@ -1032,7 +1034,7 @@ def find_text(lines, label, fuzzy=0.84, where=None):
             res = _match_line_tokens(ln, t, words, want, wb_rx)
             t_f = _fold_accents(t)
             words_f = None
-            if (res is None or res[0] > 0) and (t_f != t or want_f != want):
+            if want_f and t_f and (res is None or res[0] > 0) and (t_f != t or want_f != want):
                 words_f = [_fold_accents(w) for w in words]
                 res_f = _match_line_tokens(ln, t_f, words_f, want_f, wb_rx_f)
                 if res_f is not None and (res is None or (res_f[0], True, res_f[1]) < (res[0], False, res[1])):
@@ -1049,7 +1051,7 @@ def find_text(lines, label, fuzzy=0.84, where=None):
                     if difflib.SequenceMatcher(None, " ".join(words[i:i + k]), want).ratio() >= fuzzy:
                         span, rank, folded = (i, min(len(words), i + k)), 3, False
                         break
-                if span is None and (t_f != t or want_f != want):
+                if span is None and want_f and t_f and (t_f != t or want_f != want):
                     if words_f is None:
                         words_f = [_fold_accents(w) for w in words]
                     k_f = max(1, len(want_f.split()))
@@ -1712,7 +1714,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
     if isinstance(root, dict) and root.get("type") == "Application":
         app_name = _clean_text(str(root.get("name") or root.get("label") or ""))
 
-    def walk(n, in_keyboard=False):
+    def walk(n, in_keyboard=False, in_alert=False):
         if not isinstance(n, dict):
             return
         t = n.get("type", "")
@@ -1722,6 +1724,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
             if x0 >= screen[0] or x0 + rc["width"] <= 0 or y0 >= screen[1] or y0 + rc["height"] <= 0:
                 return  # off-screen recycled table cells can carry stale on-screen child rects
         kb = in_keyboard or t == "Keyboard"
+        al = in_alert or t == "Alert"
         raw_label = n.get("label") or ""
         raw_name = n.get("name") or ""
         label_from_id = (not bool(raw_label)) and bool(raw_name)
@@ -1759,6 +1762,8 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
                         item["value"] = cval
                 if _is_explicitly_disabled(n):
                     item["enabled"] = False
+                if al:
+                    item["inAlert"] = True
                 if key not in seen:
                     seen[key] = len(out)
                     out.append(item)
@@ -1770,7 +1775,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
                       and not (out[seen[key]].get("enabled") is not False and item.get("enabled") is False)):
                     out[seen[key]] = item
         for ch in n.get("children") or []:
-            walk(ch, kb)
+            walk(ch, kb, al)
 
     walk(root or {})
 
@@ -1843,6 +1848,8 @@ def _parse_fast_ui(data, screen=(430, 932)):
             item["inKeyboard"] = True
         if raw.get("inKeyboardAccessory"):
             item["inKeyboardAccessory"] = True
+        if raw.get("inAlert"):
+            item["inAlert"] = True
         key = (lab, x // 4, y // 4)
         if key not in seen:
             seen[key] = len(out)
@@ -1904,9 +1911,9 @@ def _fetch_ui_controls_full(client, screen=(430, 932), text=False,
     if rem <= 0:
         return None, "", ""
     r = client._req_with_deadline("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=max(0.05, rem), deadline=deadline) if hasattr(client, "_req_with_deadline") else client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=max(0.05, rem))
-    if isinstance(r, dict) and r.get("error") and timeout is not None and timeout < 30:
+    if not isinstance(r, dict) or r.get("error") or not isinstance(r.get("value"), dict):
         return None, "", ""
-    ctl, app_name = _parse_ui_controls(r.get("value") or {}, screen=screen, text=text)
+    ctl, app_name = _parse_ui_controls(r["value"], screen=screen, text=text)
     return ctl, app_name, ""
 
 
@@ -1927,7 +1934,21 @@ def ui_controls(client, screen=(430, 932), text=False):
     more than the pixels (Google Authenticator: 'OpenAI: ..., 123 456, 27
     seconds before code expires'). One request, ~300-600 ms."""
     ctl, _ = _fetch_ui_controls(client, screen=screen, text=text)
+    return _strip_alert_meta(ctl or [])
+
+
+def _strip_alert_meta(ctl):
+    if not ctl:
+        return ctl
+    if any("inAlert" in c for c in ctl):
+        return [{k: v for k, v in c.items() if k != "inAlert"} for c in ctl]
     return ctl
+
+
+def _is_springboard_ui(app_name, bundle_id):
+    return bundle_id == "com.apple.springboard" or (
+        not bundle_id and (app_name or "").strip().casefold() == "springboard"
+    )
 
 
 # Controls a tap:TEXT may land on instead of the OCR text, best type first.
@@ -3994,15 +4015,15 @@ class Flow:
             return True
         return False
 
-    def _active_alert_text(self, client=None, deadline=None):
-        """Return cleaned non-empty alert text if WDA confirms an active system alert
-        via GET /session/{sid}/alert/text, else None."""
+    def _query_alert_text(self, client=None, deadline=None):
+        """Query WDA GET /session/{sid}/alert/text and preserve three states:
+        ('present', cleaned_text), ('absent', None), or ('error', detail)."""
         c = client if client is not None else self.c
         path = f"/session/{c.sid}/alert/text"
         if deadline is not None:
             rem = deadline - time.monotonic()
             if rem <= 0:
-                return None
+                return "error", "deadline exceeded"
             eff_to = max(0.05, min(4.0, rem))
             if hasattr(c, "_req_with_deadline"):
                 r = c._req_with_deadline("GET", path, timeout=eff_to, deadline=deadline)
@@ -4010,11 +4031,77 @@ class Flow:
                 r = c.req("GET", path, timeout=eff_to)
         else:
             r = c.req("GET", path, timeout=4)
-        if isinstance(r, dict) and not r.get("error") and isinstance(r.get("value"), str) and r["value"].strip():
-            return _clean_text(r["value"]) or None
-        return None
+        if not isinstance(r, dict):
+            return "error", "invalid response"
+        if not r.get("error"):
+            val = r.get("value")
+            if isinstance(val, str):
+                cleaned = _clean_text(val)
+                return ("present", cleaned) if cleaned else ("absent", None)
+            if val is None:
+                return "absent", None
+            return "error", f"unexpected alert value: {val!r}"
+        err = r.get("error")
+        parts = [str(r.get("body") or "")]
+        val = r.get("value")
+        if isinstance(val, dict):
+            parts.append(str(val.get("error") or ""))
+            parts.append(str(val.get("message") or ""))
+        blob = " ".join(parts).casefold()
+        no_alert_markers = (
+            "no such alert",
+            "nosuchalert",
+            "no alert",
+            "modal dialog",
+            "unable to find an alert",
+        )
+        if err == 404 and any(m in blob for m in no_alert_markers):
+            return "absent", None
+        return "error", f"alert query failed ({err})"
 
-    def controls(self, text=False, timeout=None, deadline=None, fast_only=False):
+    def _active_alert_text(self, client=None, deadline=None):
+        """Return cleaned non-empty alert text only when WDA confirms an active alert."""
+        status, txt = self._query_alert_text(client=client, deadline=deadline)
+        return txt if status == "present" else None
+
+    def _active_alert_buttons(self, client=None, deadline=None):
+        """Return cleaned set of active alert button labels from WDA's alert API."""
+        c = client if client is not None else self.c
+        path = f"/session/{c.sid}/wda/alert/buttons"
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return set()
+            eff_to = max(0.05, min(4.0, rem))
+            if hasattr(c, "_req_with_deadline"):
+                r = c._req_with_deadline("GET", path, timeout=eff_to, deadline=deadline)
+            else:
+                r = c.req("GET", path, timeout=eff_to)
+        else:
+            r = c.req("GET", path, timeout=4)
+        if isinstance(r, dict) and not r.get("error") and isinstance(r.get("value"), list):
+            return {_clean_text(s) for s in r["value"] if isinstance(s, str) and _clean_text(s)}
+        return set()
+
+    def _extract_alert_controls(self, ctl, client=None, deadline=None):
+        """Filter SpringBoard controls strictly to provable alert provenance:
+        either descendants of an XCUIElementTypeAlert subtree (inAlert=True) or
+        Button controls whose exact label is returned by /wda/alert/buttons.
+        Never exposes unrelated SpringBoard background controls."""
+        if not ctl:
+            return []
+        in_alert = [c for c in ctl if c.get("inAlert")]
+        if in_alert:
+            return _strip_alert_meta(in_alert)
+        alert_btns = self._active_alert_buttons(client=client, deadline=deadline)
+        if alert_btns:
+            return _strip_alert_meta([
+                c for c in ctl
+                if c.get("type") == "Button" and _clean_text(c.get("label") or "") in alert_btns
+            ])
+        return []
+
+    def controls(self, text=False, timeout=None, deadline=None, fast_only=False, allow_alert=False):
         if fast_only and (
             getattr(self.c, "turbo", None) is False
             or getattr(self.c, "_fast_ui", None) is False
@@ -4105,11 +4192,13 @@ class Flow:
         if ctl is None:
             if fast_only:
                 return None
-            raise FlowError("UI tree timed out")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise FlowError("UI tree timed out")
+            raise FlowError("UI tree unavailable")
         self._last_ui_retried_stale = False
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
             if (
-                bundle_id == "com.apple.springboard"
+                _is_springboard_ui(app_name, bundle_id)
                 and expected_bundle
                 and expected_bundle != "com.apple.springboard"
             ):
@@ -4119,7 +4208,12 @@ class Flow:
                     self._invalidate_ctl_cache()
                     if had_pending:
                         self._pending_bundle = had_pending
-                    return ctl
+                    if allow_alert:
+                        return self._extract_alert_controls(ctl, deadline=deadline)
+                    raise _StaleAppError(
+                        f"System alert active on SpringBoard ({alert_txt!r}) "
+                        f"instead of expected {expected_bundle!r}"
+                    )
             # /source or /wda/fastUI occasionally lags behind activeAppInfo right after open:;
             # use short adaptive backoff until iOS publishes the new app's tree.
             # Keep controls and provenance together: never overwrite (app_name, bundle_id)
@@ -4159,7 +4253,7 @@ class Flow:
                 if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                     break
                 if (
-                    bundle_id == "com.apple.springboard"
+                    _is_springboard_ui(app_name, bundle_id)
                     and expected_bundle
                     and expected_bundle != "com.apple.springboard"
                 ):
@@ -4169,9 +4263,14 @@ class Flow:
                         self._invalidate_ctl_cache()
                         if had_pending:
                             self._pending_bundle = had_pending
-                        return ctl
+                        if allow_alert:
+                            return self._extract_alert_controls(ctl, deadline=deadline)
+                        raise _StaleAppError(
+                            f"System alert active on SpringBoard ({alert_txt!r}) "
+                            f"instead of expected {expected_bundle!r}"
+                        )
         elif (
-            bundle_id == "com.apple.springboard"
+            _is_springboard_ui(app_name, bundle_id)
             and expected_bundle != "com.apple.springboard"
         ):
             alert_txt = self._active_alert_text(deadline=deadline)
@@ -4180,7 +4279,12 @@ class Flow:
                 self._invalidate_ctl_cache()
                 if had_pending:
                     self._pending_bundle = had_pending
-                return ctl
+                if allow_alert:
+                    return self._extract_alert_controls(ctl, deadline=deadline)
+                raise _StaleAppError(
+                    f"System alert active on SpringBoard ({alert_txt!r}) "
+                    f"instead of expected {expected_bundle!r}"
+                )
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
             # Never return or cache mismatched outgoing-app coordinates under the target bundle.
             self._invalidate_ctl_cache()
@@ -4197,6 +4301,7 @@ class Flow:
             self._last_app_bundle = bundle_id or expected_bundle
             if app_name != self._switched_from_app_name:
                 self._switched_from_app_name = None
+        ctl = _strip_alert_meta(ctl)
         self._store_ctl_cache(ctl)
         return ctl
 
@@ -4344,7 +4449,7 @@ class Flow:
             sb_alert_txt = None
             if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                 if (
-                    bundle_id == "com.apple.springboard"
+                    _is_springboard_ui(app_name, bundle_id)
                     and expected_bundle
                     and expected_bundle != "com.apple.springboard"
                 ):
@@ -4363,7 +4468,7 @@ class Flow:
                         if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                             break
                         if (
-                            bundle_id == "com.apple.springboard"
+                            _is_springboard_ui(app_name, bundle_id)
                             and expected_bundle
                             and expected_bundle != "com.apple.springboard"
                         ):
@@ -4371,7 +4476,7 @@ class Flow:
                             if sb_alert_txt:
                                 break
             elif (
-                bundle_id == "com.apple.springboard"
+                _is_springboard_ui(app_name, bundle_id)
                 and expected_bundle != "com.apple.springboard"
             ):
                 sb_alert_txt = self._active_alert_text(client=side)
@@ -4380,6 +4485,7 @@ class Flow:
                 self._invalidate_ctl_cache()
                 if had_pending_bundle:
                     self._pending_bundle = had_pending_bundle
+                ui_res = self._extract_alert_controls(ui_res or [], client=side)
             elif self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                 # Never return or cache mismatched outgoing-app UI coordinates.
                 self._invalidate_ctl_cache()
@@ -4394,7 +4500,9 @@ class Flow:
                     self._last_app_bundle = bundle_id or expected_bundle
                     if app_name != self._switched_from_app_name:
                         self._switched_from_app_name = None
-                self._store_ctl_cache(ui_res, img=self.r.last)
+                ui_res = _strip_alert_meta(ui_res)
+                if ui_res is not None:
+                    self._store_ctl_cache(ui_res, img=self.r.last)
         else:
             ui_res = None
         if ui_res:
@@ -4961,11 +5069,13 @@ class Flow:
         elif verb == "alert":
             action = arg.strip().lower() or "accept"
             if action == "text":
-                txt = self._active_alert_text()
-                if txt:
+                status, txt = self._query_alert_text()
+                if status == "present":
                     self.reads.append({"alert": txt})
                     return txt
-                return "no-alert"
+                if status == "absent":
+                    return "no-alert"
+                raise FlowError(f"alert:text failed: {txt}")
             if action not in ("accept", "dismiss"):
                 raise FlowError("alert step must be alert:accept, alert:dismiss, or alert:text")
             self._mark_action()
@@ -5013,8 +5123,12 @@ class Flow:
             self.reads.append(entry)
             return len(lines)
         elif verb == "ui":
-            ui = self.controls()
-            self.reads.append({"ui": ui})
+            self._last_alert_text = None
+            ui = self.controls(allow_alert=True)
+            entry = {"ui": ui}
+            if self._last_alert_text:
+                entry["alert"] = self._last_alert_text
+            self.reads.append(entry)
             return len(ui)
         elif verb == "readel":
             end = time.time() + self.timeout
