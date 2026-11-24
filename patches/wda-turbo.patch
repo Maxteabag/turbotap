@@ -162,10 +162,10 @@ index 6dee73b..fbf238c 100644
  {
    NSNumber *resource = request.arguments[@"resource"];
 diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m b/WebDriverAgentLib/Commands/FBDebugCommands.m
-index 42ea74b..f622e2e 100644
+index 42ea74b..9eb5996 100644
 --- a/WebDriverAgentLib/Commands/FBDebugCommands.m
 +++ b/WebDriverAgentLib/Commands/FBDebugCommands.m
-@@ -8,13 +8,179 @@
+@@ -8,13 +8,193 @@
  
  #import "FBDebugCommands.h"
  
@@ -213,9 +213,11 @@ index 42ea74b..f622e2e 100644
 +                            NSInteger sh,
 +                            BOOL includeText,
 +                            BOOL inKeyboard,
++                            CGRect toolbarRect,
 +                            BOOL *hasKeyboardOut,
 +                            CGRect *kbRectOut,
-+                            NSMutableArray<NSDictionary<NSString *, id> *> *out)
++                            NSMutableArray<NSDictionary<NSString *, id> *> *toolbarItemsOut,
++                            NSMutableArray<NSMutableDictionary<NSString *, id> *> *out)
 +{
 +  if (nil == snapshot) {
 +    return;
@@ -232,6 +234,10 @@ index 42ea74b..f622e2e 100644
 +    if (NULL != kbRectOut) {
 +      *kbRectOut = frame;
 +    }
++  }
++  CGRect nextToolbarRect = toolbarRect;
++  if (type == XCUIElementTypeToolbar && finiteFrame && frame.size.width > 0.0 && frame.size.height > 0.0) {
++    nextToolbarRect = frame;
 +  }
 +  if (type == XCUIElementTypeCell && finiteFrame && frame.size.width > 0.0 && frame.size.height > 0.0) {
 +    if (frame.origin.x >= screenW || frame.origin.x + frame.size.width <= 0.0
@@ -330,6 +336,14 @@ index 42ea74b..f622e2e 100644
 +      }
 +      if (kb) {
 +        item[@"inKeyboard"] = @YES;
++      } else if (nil != toolbarItemsOut && nextToolbarRect.size.width > 0.0 && nextToolbarRect.size.height > 0.0) {
++        [toolbarItemsOut addObject:@{
++          @"item": item,
++          @"x": @((double)nextToolbarRect.origin.x),
++          @"y": @((double)nextToolbarRect.origin.y),
++          @"w": @((double)nextToolbarRect.size.width),
++          @"h": @((double)nextToolbarRect.size.height),
++        }];
 +      }
 +      [out addObject:item];
 +    }
@@ -337,7 +351,7 @@ index 42ea74b..f622e2e 100644
 +  NSArray *children = snapshot.children;
 +  for (id<FBXCElementSnapshot> child in children) {
 +    @autoreleasepool {
-+      FBFastUICollect(child, screenW, screenH, sw, sh, includeText, kb, hasKeyboardOut, kbRectOut, out);
++      FBFastUICollect(child, screenW, screenH, sw, sh, includeText, kb, nextToolbarRect, hasKeyboardOut, kbRectOut, toolbarItemsOut, out);
 +    }
 +  }
 +}
@@ -345,7 +359,7 @@ index 42ea74b..f622e2e 100644
  @implementation FBDebugCommands
  
  #pragma mark - <FBCommandHandler>
-@@ -27,6 +193,8 @@
+@@ -27,6 +207,8 @@
      [[FBRoute GET:@"/source"].withoutSession respondWithTarget:self action:@selector(handleGetSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"] respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"].withoutSession respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
@@ -354,7 +368,7 @@ index 42ea74b..f622e2e 100644
    ];
  }
  
-@@ -78,4 +246,95 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
+@@ -78,4 +260,113 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
    return FBResponseWithObject(application.fb_accessibilityTree ?: @{});
  }
  
@@ -410,10 +424,28 @@ index 42ea74b..f622e2e 100644
 +  BOOL includeText = (nil != textParam
 +                      && ([textParam isEqualToString:@"1"]
 +                          || [textParam caseInsensitiveCompare:@"true"] == NSOrderedSame));
-+  NSMutableArray<NSDictionary<NSString *, id> *> *items = [NSMutableArray array];
++  NSMutableArray<NSMutableDictionary<NSString *, id> *> *items = [NSMutableArray array];
++  NSMutableArray<NSDictionary<NSString *, id> *> *toolbarItems = [NSMutableArray array];
 +  BOOL hasKeyboard = NO;
 +  CGRect kbRect = CGRectZero;
-+  FBFastUICollect(snapshot, screenW, screenH, sw, sh, includeText, NO, &hasKeyboard, &kbRect, items);
++  FBFastUICollect(snapshot, screenW, screenH, sw, sh, includeText, NO, CGRectZero, &hasKeyboard, &kbRect, toolbarItems, items);
++  if (hasKeyboard && kbRect.size.width > 0.0 && kbRect.size.height > 0.0) {
++    double kbX0 = (double)kbRect.origin.x;
++    double kbX1 = kbX0 + (double)kbRect.size.width;
++    double kbY = (double)kbRect.origin.y;
++    for (NSDictionary<NSString *, id> *entry in toolbarItems) {
++      double tx = [(NSNumber *)entry[@"x"] doubleValue];
++      double ty = [(NSNumber *)entry[@"y"] doubleValue];
++      double tw = [(NSNumber *)entry[@"w"] doubleValue];
++      double th = [(NSNumber *)entry[@"h"] doubleValue];
++      double tBottom = ty + th;
++      if (ty >= kbY - 72.0 && tBottom >= kbY - 16.0 && tBottom <= kbY + 16.0
++          && tx >= kbX0 - 8.0 && (tx + tw) <= kbX1 + 8.0) {
++        NSMutableDictionary<NSString *, id> *it = entry[@"item"];
++        it[@"inKeyboardAccessory"] = @YES;
++      }
++    }
++  }
 +  NSString *appName = snapshot.label.length > 0
 +    ? snapshot.label
 +    : (snapshot.identifier.length > 0 ? snapshot.identifier : @"");

@@ -281,8 +281,15 @@ class MockWDAClient(cli.WDAClient):
             return {"value": None}
 
         if clean_path.endswith("/elements") and method == "POST":
-            key = (data.get("using"), data.get("value"))
-            val = self.elements_map.get(key)
+            m_sub = re.match(r"^/session/[^/]+/element/([^/]+)/elements$", clean_path)
+            val = None
+            if m_sub:
+                val = self.elements_map.get((m_sub.group(1), data.get("using"), data.get("value")))
+                if val is None:
+                    val = self.elements_map.get((m_sub.group(1), data.get("value")))
+            if val is None:
+                key = (data.get("using"), data.get("value"))
+                val = self.elements_map.get(key)
             if val is None:
                 val = self.elements_map.get(data.get("value"), [])
             return {"value": list(val)}

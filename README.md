@@ -109,7 +109,7 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 | Double-tap / pinch-zoom | ~900ms+ | **~280ms / ~430ms** | `/wda/fastDoubleTap` and `/wda/fastPinch` (single-record `CFRunLoopStop`) |
 | Cold app launch (`launch:APP`) | ~2,200ms | **~110-390ms** | `/wda/fastLaunch` (async XPC terminate + `LSApplicationWorkspace`, ~16x faster) |
 | Unlock passcode (`unlock`) | ~11,660ms | **~4,730ms** | `/wda/fastUI` keypad poll + `/wda/fastTapBatch` (-59.4%) |
-| Multi-tap keypad (`tapbatch:`) | ~2,600ms | **~613ms** | `/wda/fastTapBatch` (auto-chunked `<=4` paths/record for iOS multi-touch cap) |
+| Multi-tap keypad (`tapbatch:fixed:`) | ~2,600ms | **~613ms** | `/wda/fastTapBatch` (auto-chunked `<=4` paths/record for iOS multi-touch cap) |
 | Grab frame | 123-244ms | ~34ms | On-device ImageIO thumbnail + raw binary JPEG |
 | Read screen (OCR) | ~1470ms | 100-180ms | Parallel LSTM OCR + dark-strip pre-invert + caching (~50ms cached) |
 | Scroll | ~2000ms | 150-350ms | Clean drag stop with no fling momentum (`dur=0.08, rel=0.08`) |

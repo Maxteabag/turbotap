@@ -55,7 +55,7 @@ class PackagingAndAssetsTests(unittest.TestCase):
             self.assertIn(route, text, f"Missing route {route} in wda-turbo.patch")
 
         # WDA v5 safety invariants: tri-state fast termination + fastUI keyboard metadata.
-        for sym in ("FBTermTimedOut", "hasKeyboard", "keyboardRect", "inKeyboard"):
+        for sym in ("FBTermTimedOut", "hasKeyboard", "keyboardRect", "inKeyboard", "inKeyboardAccessory"):
             self.assertIn(sym, text, f"Missing symbol {sym} in wda-turbo.patch")
 
         # Inspect only added non-comment ObjC code lines for strict Xcode -Weverything hygiene.
