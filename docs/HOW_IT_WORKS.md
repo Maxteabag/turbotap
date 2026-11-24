@@ -85,17 +85,19 @@ A plain synthesized swipe flings: UIKit keeps the last finger velocity and coast
 
 ## Measured results
 
-| Operation | Stock WDA | turbotap v0.2 | turbotap (WDA v3) |
+| Operation | Stock WDA | turbotap v0.2 | turbotap (WDA v4) |
 |---|---:|---:|---:|
 | CLI import / `--help` | ~150-170 ms | ~150-170 ms | **~55-57 ms** (-67.5% lazy imports) |
 | Session startup (`ensure_session`) | ~88 ms | ~88 ms | **~14 ms** (cached) |
 | First screen size (`pt_size`) | ~172 ms | ~172 ms | **~0 ms** (cached) |
 | Tap (`/wda/fastTap`) | 740-1,200 ms | ~323 ms | **~260 ms** (min 243 ms) |
-| Type 27 chars (`/wda/fastKeys`) | ~725 ms | ~725 ms | **~337 ms** (-53.5%, 100% exact; 289 ms @ 400/s) |
+| Double-tap / pinch-zoom | ~900 ms+ | ~900 ms+ | **~279 ms / ~431 ms** (`/wda/fastDoubleTap`, `/wda/fastPinch`) |
+| 6-key keypad batch | ~2,600 ms | ~2,600 ms | **~607 ms** (`/wda/fastTapBatch`, chunked `<=4` paths/record) |
+| Type 27 chars (`/wda/fastKeys`) | ~725 ms | ~725 ms | **~350 ms** (opt-in `TURBOTAP_TYPING_FREQ=240`; default keeps legacy WDA pace) |
 | Grab frame (`/wda/fastScreenshot`) | 123-244 ms | ~49 ms | **~34 ms** (min 24-30 ms, raw JPEG) |
-| Read screen (OCR) | ~1,470 ms | 180-250 ms | **~100-180 ms** (~50 ms cached; -36% dark mode) |
+| Read screen (`read` / OCR) | ~1,470 ms | 180-250 ms | **~100-180 ms** OCR (`~565-800 ms` full `read` via pixel-still check) |
 | Scroll until settled | ~2,000 ms | 150-370 ms | **150-350 ms** (`dur=0.08, rel=0.08`) |
 | UI tree (`/wda/fastUI`) | ~2,600 ms | ~453 ms | **~158-198 ms** (single-RTT `waitBundle`; 297 ms v1 fallback) |
-| Multi-step flow | 14.4-15.7 s | 5.2-15.9 s | **1.0-6.0 s** (-10.7% vs v0.4, -36.7% vs v0.2) |
+| Multi-step flow | 14.4-15.7 s | 5.2-15.9 s | **0.6-5.1 s** |
 
 `WDA_TURBO=0` forces the stock endpoints and `WDA_OCR=binary` forces a fork of the `tesseract` binary per call. Use them to reproduce the baseline on your own phone.
