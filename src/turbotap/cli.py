@@ -856,6 +856,8 @@ _INVERT_LUT = bytes(255 - i for i in range(256))
 def _tesseract_tsv_raw(raw, w, h, api):
     lib = _tess_lib()
     ctypes_mod = _TESS["ctypes"]
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
     lib.TessBaseAPISetImage(api, raw, w, h, 1, w)
     ptr = lib.TessBaseAPIGetTsvText(api, 0)
     try:
@@ -930,6 +932,8 @@ def find_text(lines, label, fuzzy=0.84, where=None):
             return None
     want = _norm(label)
     rx = re.compile(label[3:], re.I) if label.startswith("re:") else None
+    short_alpha = (not rx) and bool(want) and len(want) <= 3 and want.isalpha()
+    wb_rx = re.compile(rf"(?<!\w){re.escape(want)}(?!\w)") if short_alpha else None
     best = None
     for ln in lines:
         t = _norm(ln.text)
@@ -941,33 +945,44 @@ def find_text(lines, label, fuzzy=0.84, where=None):
             ok = bool(hit)
             need = _norm(hit.group(0)) if hit else ""
         else:
-            ok = want in t
+            ok = bool(wb_rx.search(t)) if wb_rx is not None else (want in t)
             if t == want:
                 rank = 0
             else:
-                m_icon = re.match(r"^[^\w\s]\s+(.+)$", t) if want else None
-                if m_icon and m_icon.group(1) == want:
+                # Strip a leading 1-3 char non-alphabetic icon glyph (e.g. '©', '@', '[5]', '2]')
+                # when the rest of the line equals want; keep numbered items ('1 Foo') as rank 1.
+                m_icon = re.match(r"^(\S{1,3})\s+(.+)$", t) if want else None
+                if (m_icon and m_icon.group(2) == want
+                        and re.search(r"[^\w]", m_icon.group(1))
+                        and not any(ch.isalpha() for ch in m_icon.group(1))):
                     rank = 0
                     icon_stripped = True
-                elif t.startswith(want) or t.endswith(want):
+                elif ok and (t.startswith(want) or t.endswith(want)):
                     rank = 1
                 else:
                     rank = 2
             need = want
         span = None
         if ok:
-            if icon_stripped and len(ln.words) >= 2 and not re.search(r"\w", ln.words[0][0]):
+            if (icon_stripped and len(ln.words) >= 2
+                    and re.search(r"[^\w]", ln.words[0][0])
+                    and not any(ch.isalpha() for ch in ln.words[0][0])):
                 span = (1, len(ln.words))
             else:
                 n = len(words)
                 for size in range(1, n + 1):
                     for i in range(n - size + 1):
-                        if need in " ".join(words[i:i + size]):
+                        chunk = " ".join(words[i:i + size])
+                        if wb_rx is not None:
+                            if wb_rx.search(chunk):
+                                span = (i, i + size)
+                                break
+                        elif need in chunk:
                             span = (i, i + size)
                             break
                     if span:
                         break
-        elif fuzzy and not rx and not any(ch.isdigit() for ch in want):
+        elif fuzzy and not rx and not short_alpha and not any(ch.isdigit() for ch in want):
             import difflib
             k = max(1, len(want.split()))
             for i in range(max(1, len(words) - k + 1)):
@@ -1033,9 +1048,10 @@ def _thumb_diff(a, b):
     """Mean absolute grey difference of two frames (0-255) on a tiny thumbnail."""
     if a is None or b is None or a.size != b.size:
         return 255.0
-    _, ImageChops, ImageStat = _pil()
+    Image, ImageChops, ImageStat = _pil()
     size = (max(1, a.size[0] // 8), max(1, a.size[1] // 8))
-    d = ImageChops.difference(a.resize(size), b.resize(size))
+    box_resample = getattr(Image, "Resampling", Image).BOX
+    d = ImageChops.difference(a.resize(size, box_resample), b.resize(size, box_resample))
     return ImageStat.Stat(d).mean[0]
 
 
@@ -1333,22 +1349,28 @@ class ScreenReader:
     def _cuts(self, img, data=None):
         """Strip boundaries at the most uniform row near each 1/n of the height."""
         w, h = img.size
+        if h < 180 or self.n <= 1:
+            return [0, h]
+        n = min(self.n, max(1, h // 90))
+        if n <= 1:
+            return [0, h]
         data = data if data is not None else img.tobytes()
-        n = self.n
+        step = 4 if w >= 240 else 2
         cuts = [0]
         for i in range(1, n):
             t = h * i // n
-            lo, hi = max(cuts[-1] + 24, t - h // (2 * n)), min(h - 24, t + h // (2 * n))
+            half = min(48, h // (2 * n))
+            lo, hi = max(cuts[-1] + 24, t - half), min(h - 24, t + half)
             if lo >= hi:
                 continue
-            # Search outward from target row t with stride-2 sampling and early exit on
+            # Search outward from target row t with strided sampling and early exit on
             # blank/uniform rows (range <= 2), avoiding scanning every pixel of every row.
             best_y, best_score = t, (256, 0)
             max_off = max(t - lo, hi - 1 - t)
             for off in range(max_off + 1):
                 for y in ((t,) if off == 0 else (t - off, t + off)):
                     if lo <= y < hi:
-                        row = data[y * w:(y + 1) * w:2]
+                        row = data[y * w:(y + 1) * w:step]
                         rng = max(row) - min(row)
                         sc = (rng, off)
                         if sc < best_score:
@@ -1365,21 +1387,38 @@ class ScreenReader:
         return self._ocr_raw(strip.tobytes(), strip.size[0], strip.size[1], sauvola=sauvola)
 
     def _ocr_raw(self, raw, w, h, sauvola=False):
-        sample = raw[::19]
-        if sample:
+        sample = raw[::19].tobytes() if isinstance(raw, memoryview) else raw[::19]
+        n_samp = len(sample)
+        if n_samp:
             # Skip only genuinely uniform flat strips; preserve low-contrast text
             # (e.g. ~12 grayscale levels) for both Otsu and Sauvola binarization.
             min_contrast = 1 if sauvola else 4
-            if max(sample) - min(sample) < min_contrast:
-                return []  # uniform blank strip
-            if (sum(sample) / len(sample)) < 120:
+            if n_samp >= 256:
+                Image, _, _ = _pil()
+                hist = Image.frombuffer("L", (n_samp, 1), sample, "raw", "L", 0, 1).histogram()
+                lo = 0
+                while not hist[lo]:
+                    lo += 1
+                hi = 255
+                while not hist[hi]:
+                    hi -= 1
+                if hi - lo < min_contrast:
+                    return []  # uniform blank strip
+                mean = sum(i * c for i, c in enumerate(hist) if c) / n_samp
+            else:
+                if max(sample) - min(sample) < min_contrast:
+                    return []  # uniform blank strip
+                mean = sum(sample) / n_samp
+            if mean < 120:
                 # Pre-invert dark-mode strips so LSTM succeeds on pass 1 instead of
                 # retrying via tessedit_do_invert (kept enabled for mixed-polarity UI).
-                raw = raw.translate(_INVERT_LUT)
+                raw_bytes = raw.tobytes() if isinstance(raw, memoryview) else raw
+                raw = raw_bytes.translate(_INVERT_LUT)
         lib = _tess_lib()
         if lib is None:
             Image, _, _ = _pil()
-            tsv = tesseract_tsv(Image.frombytes("L", (w, h), raw), self.psm, sauvola=sauvola)
+            raw_bytes = raw.tobytes() if isinstance(raw, memoryview) else raw
+            tsv = tesseract_tsv(Image.frombytes("L", (w, h), raw_bytes), self.psm, sauvola=sauvola)
         else:
             self._ensure_ocr()
             api = self.apis.get()
@@ -1395,10 +1434,14 @@ class ScreenReader:
                 self.apis.put(api)
         lines = {}
         for row in tsv.splitlines():
+            if not row.startswith("5\t"):
+                continue
             p = row.split("\t")
-            if len(p) == 12 and p[0] == "5" and p[11].strip() and float(p[10]) > 30:
-                x0, y0, ww, hh = int(p[6]), int(p[7]), int(p[8]), int(p[9])
-                lines.setdefault((p[2], p[3], p[4]), []).append((p[11].strip(), x0, y0, x0 + ww, y0 + hh))
+            if len(p) == 12:
+                txt = p[11].strip()
+                if txt and float(p[10]) > 30:
+                    x0, y0, ww, hh = int(p[6]), int(p[7]), int(p[8]), int(p[9])
+                    lines.setdefault((p[2], p[3], p[4]), []).append((txt, x0, y0, x0 + ww, y0 + hh))
         return list(lines.values())
 
     def read(self, y0=0, y1=None, img=None, sauvola=False, timeout=None, deadline=None, **_ignored):
@@ -1422,18 +1465,21 @@ class ScreenReader:
                 img = self.grab(y0, y1, timeout=timeout)
             else:
                 img = self.grab(y0, y1)
-        w, _ = img.size
+        w, h = img.size
         data = img.tobytes()
         mv = memoryview(data)
         cuts = self._cuts(img, data=data)
         jobs = []
         for a, b in zip(cuts, cuts[1:]):
-            digest = hashlib.blake2b(mv[a * w:b * w], digest_size=16).digest()
+            digest = hashlib.sha256(mv[a * w:b * w]).digest()
             k = (b"S" + digest) if sauvola else digest
             jobs.append((a, b, k))
         if len(self.cache) > 512:
             self.cache.clear()  # before `todo`, or strips counted as cached vanish (KeyError)
-        todo = [(k, data[a * w:b * w], b - a) for a, b, k in jobs if k not in self.cache]
+        todo = [
+            (k, data if (a == 0 and b == h) else data[a * w:b * w], b - a)
+            for a, b, k in jobs if k not in self.cache
+        ]
         if todo:
             uniq = {}
             for k, raw, sh in todo:
@@ -1929,6 +1975,8 @@ FLOW_HELP = """steps (one argument each, run in order):
                         open:com.apple.Preferences); names come from a per-device
                         devicectl cache (~1 ms; refreshed once on an unknown name)
   launch:APP            terminate + activate (fresh start)
+  url:URL               open a URL or deep-link directly via WDA /url (https://, maps://,
+                        mailto:, tel:, sms:)
   wait:TEXT             poll until TEXT is on screen (OCR-first, falls back to
                         UI controls + Sauvola OCR for colored/icon labels; 're:REGEX' for regex)
   waitany:A|B|C         poll until ANY '|'-separated target appears (OCR-first, then
@@ -1949,7 +1997,10 @@ FLOW_HELP = """steps (one argument each, run in order):
                         UI controls and --deny between every tap so layout changes never tap
                         stale coordinates; tapbatch:fixed:A,B,C opts into single-snapshot
                         /wda/fastTapBatch dispatch for known stationary keypads (e.g. Calculator)
-  TEXT@below:HEADER     (tap/tapif/tapbatch/longpress/doubletap/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
+  toggle:LABEL[=on|off] idempotently set or flip an iOS Switch control (supports @region;
+                        =on|off|1|0|true|false skips tap when already in desired state and
+                        verifies state after tapping; respects --deny)
+  TEXT@below:HEADER     (tap/tapif/tapbatch/toggle/longpress/doubletap/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
   TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
   longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
                         @region, OCR + UI fallback, respects --deny)
@@ -1970,12 +2021,14 @@ FLOW_HELP = """steps (one argument each, run in order):
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
+  slider:[LABEL=]PCT    set an XCUIElementTypeSlider to 0%-100% or 0.0-1.0 (first slider or
+                        matched by label/name; rejects disabled sliders; respects --deny)
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
   alert:accept|dismiss  accept or dismiss an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
-  scrollto:TEXT         scroll down (max 8x) until TEXT is visible
+  scrollto:TEXT         scroll down (max 8x) until TEXT is visible (scrollto:up:TEXT scrolls up)
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
   swipe:left|right:TEXT horizontal row swipe on TEXT's row (damped 80%->30% / 20%->70% to reveal
                         row actions without triggering full-width destructive delete)
@@ -1985,7 +2038,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   settle                wait until two frames in a row are identical
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
-taps, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed."""
+taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed."""
 
 
 _TYPING_FREQ = None  # None = keep legacy WDA default pace; override via TURBOTAP_TYPING_FREQ (e.g. 240)
@@ -2027,6 +2080,42 @@ def _typing_freq():
         except ValueError:
             pass
     return _TYPING_FREQ
+
+
+_TOGGLE_STATES = {
+    "on": True,
+    "1": True,
+    "true": True,
+    "off": False,
+    "0": False,
+    "false": False,
+}
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://|^(?:mailto|tel|sms):.+$", re.I)
+
+
+def _parse_switch_state(val):
+    """Parse an iOS Switch accessibility value into True/False/None."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    s = _clean_text(str(val)).casefold()
+    if s in ("1", "true", "on", "yes"):
+        return True
+    if s in ("0", "false", "off", "no"):
+        return False
+    return None
+
+
+def _is_wda_disabled_value(val):
+    """True only when a WDA /element/{eid}/enabled value explicitly reports False/0."""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return not val
+    if isinstance(val, (int, float)):
+        return val == 0
+    return str(val).strip().casefold() in ("0", "false", "no")
 
 
 def _check_wda_ok(res, action, redact=False):
@@ -2242,14 +2331,72 @@ class Flow:
         frames = 0
         last_ui = 0.0
         last_sauvola_id = None
+        settled_lines = None
+
+        # Reuse very recent already-OCR'd lines when no action has happened since
+        # the screen settled (e.g. wait:TEXT right after read or another wait).
+        if (initial is None
+                and self._wait_settled_ts >= self._last_action_ts
+                and getattr(self.r, "last_lines", None) is not None):
+            cached_lines = self._fresh_lines()
+            if cached_lines is not None:
+                m0 = find_text(cached_lines, label, where=where)
+                if m0 is not None:
+                    if not stable:
+                        self._wait_settled_ts = time.monotonic()
+                        return m0
+                    prev = m0
+                    prev_img = self.r.last
+                    prev_lines = cached_lines
+
+        # Right after a tap that triggered a full-screen slide/push
+        # (_last_reaction_diff >= 2.0), drain the animation with cheap ~34 ms raw
+        # grabs before spending ~250 ms OCRing a blurry mid-transition frame.
+        if (initial is None
+                and prev is None
+                and self._last_action_ts
+                and (time.monotonic() - self._last_action_ts) < 0.7
+                and self._wait_settled_ts < self._last_action_ts
+                and self._last_reaction_diff >= 2.0
+                and getattr(self.r, "last_lines", None) is None
+                and self.r.last is not None):
+            rem_wait = max(0.0, end - time.time())
+            settled_prev, settled_img = self._settle_transition(max_wait=min(0.28, rem_wait), still=1.2)
+            if settled_img is not None:
+                settled_lines = self.r.read(img=settled_img)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(settled_img, lines=settled_lines)
+                m0 = find_text(settled_lines, label, where=where)
+                if m0 is not None:
+                    if (not stable or (
+                        settled_prev is not None
+                        and settled_prev is not settled_img
+                        and (_content_pixel_still(settled_prev, settled_img)
+                             or _thumb_diff(settled_prev, settled_img) < 0.8)
+                        and _box_diff(settled_prev, settled_img, m0.x, m0.y, self.r.scale) < 2.0
+                    )):
+                        self._wait_settled_ts = time.monotonic()
+                        return m0
+                    prev = m0
+                    prev_img = settled_img
+                    prev_lines = settled_lines
+                    frames = 1
+                    settled_lines = None
+
         while True:
-            if stable and prev is not None and prev.line is not None and prev_img is not None:
+            if settled_lines is not None:
+                lines = settled_lines
+                settled_lines = None
+                frames += 1
+                m = None
+            elif stable and prev is not None and prev.line is not None and prev_img is not None:
                 # Confirm stability with one cheap raw screenshot (~34 ms): if the entire
                 # screen and the target box are pixel-still between two distinct grabs,
                 # skip a redundant second full OCR pass (200-700 ms).
                 cur_img = self.r.grab()
                 if (cur_img is not prev_img
-                        and _thumb_diff(prev_img, cur_img) < 0.8
+                        and (_content_pixel_still(prev_img, cur_img)
+                             or _thumb_diff(prev_img, cur_img) < 0.8)
                         and _box_diff(prev_img, cur_img, prev.x, prev.y, self.r.scale) < 2.0):
                     if hasattr(self.r, "set_last"):
                         self.r.set_last(cur_img, lines=prev_lines)
@@ -2260,10 +2407,12 @@ class Flow:
                 lines = self.r.read(img=cur_img)
                 if hasattr(self.r, "set_last"):
                     self.r.set_last(cur_img, lines=lines)
+                frames += 1
+                m = find_text(lines, label, where=where)
             else:
                 lines = self.lines()
-            frames += 1
-            m = find_text(lines, label, where=where)
+                frames += 1
+                m = find_text(lines, label, where=where)
             if m and (not stable or (prev and abs(m.x - prev.x) <= 3 and abs(m.y - prev.y) <= 3)):
                 self._wait_settled_ts = time.monotonic()
                 return m
@@ -2310,14 +2459,49 @@ class Flow:
         frames = 0
         last_ui = 0.0
         last_sauvola_id = None
+        settled_lines = None
+
+        if (self._wait_settled_ts >= self._last_action_ts
+                and getattr(self.r, "last_lines", None) is not None):
+            cached_lines = self._fresh_lines()
+            if cached_lines is not None:
+                for label, where in cands:
+                    m = find_text(cached_lines, label, where=where)
+                    if m:
+                        self._wait_settled_ts = time.monotonic()
+                        return m
+
+        if (self._last_action_ts
+                and (time.monotonic() - self._last_action_ts) < 0.7
+                and self._wait_settled_ts < self._last_action_ts
+                and self._last_reaction_diff >= 2.0
+                and getattr(self.r, "last_lines", None) is None
+                and self.r.last is not None):
+            rem_wait = max(0.0, end - time.time())
+            _, settled_img = self._settle_transition(max_wait=min(0.28, rem_wait), still=1.2)
+            if settled_img is not None:
+                settled_lines = self.r.read(img=settled_img)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(settled_img, lines=settled_lines)
+                for label, where in cands:
+                    m = find_text(settled_lines, label, where=where)
+                    if m:
+                        self._wait_settled_ts = time.monotonic()
+                        return m
+
         while True:
-            lines = self.lines()
-            frames += 1
-            for label, where in cands:
-                m = find_text(lines, label, where=where)
-                if m:
-                    self._wait_settled_ts = time.monotonic()
-                    return m
+            if settled_lines is not None:
+                lines = settled_lines
+                settled_lines = None
+                frames += 1
+            else:
+                lines = self.lines()
+                frames += 1
+                for label, where in cands:
+                    m = find_text(lines, label, where=where)
+                    if m:
+                        self._wait_settled_ts = time.monotonic()
+                        return m
             now = time.time()
             if (frames >= 2 or now - start >= 0.4) and (last_ui == 0.0 or now - last_ui >= 0.8):
                 raw_ctl = self.controls(text=True)
@@ -2346,11 +2530,47 @@ class Flow:
         self._wait_active_app()
         label, where = split_where(label)
         end = time.time() + (timeout or self.timeout)
-        while True:
-            if not find_text(self.lines(), label, where=where):
+        prev_img = None
+        m = None
+        if (self._wait_settled_ts >= self._last_action_ts
+                and getattr(self.r, "last_lines", None) is not None):
+            cached_lines = self._fresh_lines()
+            if cached_lines is not None:
+                m = find_text(cached_lines, label, where=where)
+                if m is not None:
+                    prev_img = self.r.last
+        if prev_img is None:
+            lines = self.lines()
+            m = find_text(lines, label, where=where)
+            if not m:
+                self._wait_settled_ts = time.monotonic()
                 return True
-            if time.time() >= end:
-                break
+            prev_img = self.r.last
+        match_in_status = bool(
+            m is not None and prev_img is not None
+            and (m.y * self.r.scale) < int(prev_img.size[1] * 0.06)
+        )
+        while time.time() < end:
+            cur_img = self.r.grab()
+            if prev_img is not None and not match_in_status and _content_pixel_still(prev_img, cur_img):
+                if cur_img is not prev_img:
+                    if hasattr(self.r, "set_last"):
+                        self.r.set_last(cur_img, lines=getattr(self.r, "last_lines", None))
+                    else:
+                        self.r.last = cur_img
+                continue
+            lines = self.r.read(img=cur_img)
+            if hasattr(self.r, "set_last"):
+                self.r.set_last(cur_img, lines=lines)
+            m = find_text(lines, label, where=where)
+            if not m:
+                self._wait_settled_ts = time.monotonic()
+                return True
+            prev_img = cur_img
+            match_in_status = bool(
+                prev_img is not None
+                and (m.y * self.r.scale) < int(prev_img.size[1] * 0.06)
+            )
         raise FlowError(f"{label!r} still on screen")
 
     def settle(self, timeout=2.0, start=None, still=0.6):
@@ -2402,7 +2622,7 @@ class Flow:
         cur = self.r.grab()
         if cur is prev:
             return None, cur
-        if _thumb_diff(prev, cur) < still or _content_pixel_still(prev, cur):
+        if _content_pixel_still(prev, cur) or _thumb_diff(prev, cur) < still:
             if hasattr(self.r, "set_last"):
                 self.r.set_last(cur)
             else:
@@ -2413,7 +2633,7 @@ class Flow:
         prev = cur
         while time.monotonic() < end:
             cur = self.r.grab()
-            if cur is not prev and (_thumb_diff(prev, cur) < still or _content_pixel_still(prev, cur)):
+            if cur is not prev and (_content_pixel_still(prev, cur) or _thumb_diff(prev, cur) < still):
                 if hasattr(self.r, "set_last"):
                     self.r.set_last(cur)
                 else:
@@ -3300,6 +3520,240 @@ class Flow:
             raise FlowError(f"picker wheel {idx} failed to set {val!r}: {r.get('body') or r.get('error')}")
         return f"wheel[{idx}]={val}"
 
+    def open_url(self, url):
+        """Open a URL or deep-link directly via WDA POST /session/{sid}/url."""
+        raw = (url or "").strip()
+        if not raw or any(ch.isspace() for ch in raw) or not _URL_SCHEME_RE.match(raw):
+            raise FlowError(
+                f"invalid URL {url!r}; must include a scheme without whitespace (e.g. https://..., maps://..., mailto:..., tel:..., sms:...)"
+            )
+        self._mark_action()
+        _check_wda_ok(self.c.req("POST", f"/session/{self.c.sid}/url", {"url": raw}), "url")
+        # Target app may stay the same (e.g. Safari -> new URL) or switch via universal
+        # link/deep-link; clear expected bundle and outgoing-app guard so subsequent
+        # same-app reads are never misclassified as stale.
+        self._switched_from_app_name = None
+        self._switched_at = 0.0
+        self.bundle = None
+        self._pending_bundle = None
+        self._pending_bundle_ts = 0.0
+        return raw
+
+    def toggle(self, spec):
+        """Idempotently set or flip an iOS Switch control: LABEL or LABEL=on|off|1|0|true|false
+        (supports @region). Skips tapping when already in the desired state, enforces --deny and
+        disabled-control rejection, never replays an acknowledged tap, and verifies state once
+        when a desired state was requested."""
+        raw = (spec or "").strip()
+        if not raw:
+            raise FlowError("toggle requires LABEL or LABEL=on|off (e.g. toggle:Wi-Fi=on)")
+        desired = None
+        target = raw
+        left, sep, right = raw.rpartition("=")
+        if sep and right.strip().lower() in _TOGGLE_STATES:
+            desired = _TOGGLE_STATES[right.strip().lower()]
+            target = left.strip()
+        base, where = split_where(target)
+        if desired is None and "=" in base:
+            left2, sep2, right2 = base.rpartition("=")
+            if sep2 and right2.strip().lower() in _TOGGLE_STATES:
+                desired = _TOGGLE_STATES[right2.strip().lower()]
+                base = left2.strip()
+        base = base.strip()
+        if not base:
+            raise FlowError(f"toggle requires a switch label in {spec!r}")
+        self._wait_active_app()
+        ctl = self.controls()
+        needs_lines = bool(where and not where.startswith("y"))
+        lines = (self._fresh_lines() or self.lines()) if needs_lines else []
+        scoped = _controls_in_region(ctl, lines, where) if where else ctl
+        clean_base = _clean_text(base)
+        # Resolve exact matches BEFORE evaluating enabled state so a disabled exact
+        # match ('Sync') is never silently displaced by an enabled substring ('Sync Photos').
+        exact_any = exact_control(scoped, clean_base, ("Switch",), allow_disabled=True)
+        if exact_any is not None:
+            c = exact_control(scoped, clean_base, ("Switch",), allow_disabled=False)
+            if not c:
+                raise FlowError(f"{base!r} is disabled")
+        else:
+            c = find_control(scoped, clean_base, types={"Switch"}, allow_disabled=False)
+            if not c:
+                if find_control(scoped, clean_base, types={"Switch"}, allow_disabled=True):
+                    raise FlowError(f"{base!r} is disabled")
+                raise FlowError(f"no switch labelled {base!r}")
+        current = _parse_switch_state(c.get("value"))
+        if desired is not None:
+            if current is None:
+                raise FlowError(
+                    f"switch {c['label']!r} has unreadable initial state; cannot verify toggle to {'on' if desired else 'off'}"
+                )
+            if current == desired:
+                return "already on" if desired else "already off"
+        self.guard(c["x"], c["y"], c["label"], action="toggle")
+        before = self.r.last if self.r.last is not None else self.r.grab()
+        try:
+            self.tap_control(c)
+        except Exception:
+            self._invalidate_ctl_cache()
+            raise
+        self.changed_since(before, x=c["x"], y=c["y"])
+        self._invalidate_ctl_cache()
+        if desired is not None:
+            ctl_after = self.controls()
+            self._invalidate_ctl_cache()
+            scoped_after = _controls_in_region(ctl_after, lines, where) if where else ctl_after
+            want_lab = c["label"].casefold()
+            same_sw = [
+                x for x in scoped_after
+                if x["type"] == "Switch"
+                and x["label"].casefold() == want_lab
+                and abs(x["x"] - c["x"]) <= 24
+                and abs(x["y"] - c["y"]) <= 36
+            ]
+            if not same_sw:
+                raise FlowError(
+                    f"switch {c['label']!r} disappeared or moved after toggle; cannot verify {'on' if desired else 'off'}"
+                )
+            c_after = min(same_sw, key=lambda x: (abs(x["y"] - c["y"]), abs(x["x"] - c["x"])))
+            after_state = _parse_switch_state(c_after.get("value"))
+            if after_state is None:
+                raise FlowError(
+                    f"switch {c['label']!r} state unreadable after toggle; cannot verify {'on' if desired else 'off'}"
+                )
+            if after_state != desired:
+                raise FlowError(
+                    f"switch {c['label']!r} remained {'on' if after_state else 'off'} after toggle"
+                )
+            return "on" if desired else "off"
+        return "toggled"
+
+    def set_slider(self, spec):
+        """Set an XCUIElementTypeSlider to a normalized fraction [0.0, 1.0]:
+        slider:50%, slider:0.5, slider:Brightness=70%, slider:Lysstyrke=0.4."""
+        raw = (spec or "").strip()
+        if not raw:
+            raise FlowError("slider requires PCT or LABEL=PCT (e.g. slider:50% or slider:Brightness=70%)")
+        if "=" in raw:
+            label_part, _, val_part = raw.rpartition("=")
+            target_label = label_part.strip()
+            val_str = val_part.strip()
+            if not target_label:
+                raise FlowError(f"slider label cannot be empty in {spec!r}")
+        else:
+            target_label = None
+            val_str = raw
+        has_pct = val_str.endswith("%")
+        num_str = val_str[:-1].strip() if has_pct else val_str
+        try:
+            num = float(num_str)
+        except ValueError:
+            raise FlowError(f"invalid slider value {spec!r}; expected 0%-100% or 0.0-1.0")
+        if not (num == num and num != float("inf") and num != float("-inf")):
+            raise FlowError(f"slider value must be finite, got {spec!r}")
+        if has_pct:
+            if num < 0.0 or num > 100.0:
+                raise FlowError(f"slider percentage must be in 0%-100%, got {spec!r}")
+            frac = num / 100.0
+        else:
+            if num < 0.0 or num > 100.0:
+                raise FlowError(f"slider value must be in 0.0-1.0 or 0-100, got {spec!r}")
+            frac = num / 100.0 if num > 1.0 else num
+        if target_label:
+            self.guard(0, 0, target_label, action="slider")
+        self._wait_active_app()
+        els_resp = self.c.req("POST", f"/session/{self.c.sid}/elements",
+                              {"using": "class name", "value": "XCUIElementTypeSlider"})
+        _check_wda_ok(els_resp, "slider")
+        els = els_resp.get("value") or []
+        if not els:
+            raise FlowError("no Slider on screen")
+
+        def _read_slider_aliases(cand_eid):
+            lab_r = self.c.req("GET", f"/session/{self.c.sid}/element/{cand_eid}/attribute/label")
+            name_r = self.c.req("GET", f"/session/{self.c.sid}/element/{cand_eid}/attribute/name")
+            lab_err = not isinstance(lab_r, dict) or bool(lab_r.get("error"))
+            name_err = not isinstance(name_r, dict) or bool(name_r.get("error"))
+            lab_v = None if lab_err else lab_r.get("value")
+            name_v = None if name_err else name_r.get("value")
+            lab_s = _clean_text(str(lab_v)) if lab_v else ""
+            name_s = _clean_text(str(name_v)) if name_v else ""
+            return lab_s, name_s, (lab_err or name_err)
+
+        eid = None
+        sel_lab = ""
+        sel_name = ""
+        sel_attr_err = False
+        if target_label is not None:
+            want = _clean_text(target_label).casefold()
+            sub_hit = None
+            for el_obj in els:
+                if not isinstance(el_obj, dict) or not el_obj:
+                    continue
+                cand_eid = el_obj.get("ELEMENT") or next(iter(el_obj.values()))
+                lab, name, attr_err = _read_slider_aliases(cand_eid)
+                if (lab and lab.casefold() == want) or (name and name.casefold() == want):
+                    eid, sel_lab, sel_name, sel_attr_err = cand_eid, lab, name, attr_err
+                    break
+                if sub_hit is None and ((lab and want in lab.casefold()) or (name and want in name.casefold())):
+                    sub_hit = (cand_eid, lab, name, attr_err)
+            if eid is None and sub_hit is not None:
+                eid, sel_lab, sel_name, sel_attr_err = sub_hit
+            if eid is None:
+                raise FlowError(f"no Slider labelled {target_label!r}")
+        else:
+            first = next((e for e in els if isinstance(e, dict) and e), None)
+            if not first:
+                raise FlowError("no Slider on screen")
+            eid = first.get("ELEMENT") or next(iter(first.values()))
+            sel_lab, sel_name, sel_attr_err = _read_slider_aliases(eid)
+
+        # Enforce --deny across BOTH label and name aliases; if deny is active and
+        # either attribute lookup failed, refuse rather than treating error as empty.
+        if self.deny is not None and sel_attr_err:
+            raise FlowError("cannot verify slider label/name against --deny")
+        for alias in (sel_lab, sel_name):
+            if alias:
+                self.guard(0, 0, alias, action="slider")
+
+        matched_label = sel_lab or sel_name or target_label
+
+        def _parse_wda_bool(val):
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)) and val in (0, 1):
+                return bool(val)
+            if isinstance(val, str):
+                s = val.strip().casefold()
+                if s in ("1", "true", "yes"):
+                    return True
+                if s in ("0", "false", "no"):
+                    return False
+            return None
+
+        en_state = None
+        for en_path in (
+            f"/session/{self.c.sid}/element/{eid}/enabled",
+            f"/session/{self.c.sid}/element/{eid}/attribute/enabled",
+        ):
+            en_resp = self.c.req("GET", en_path)
+            if isinstance(en_resp, dict) and not en_resp.get("error"):
+                parsed_en = _parse_wda_bool(en_resp.get("value"))
+                if parsed_en is not None:
+                    en_state = parsed_en
+                    break
+        if en_state is False:
+            desc = repr(matched_label) if matched_label else "Slider"
+            raise FlowError(f"{desc} is disabled")
+        if en_state is not True:
+            raise FlowError("cannot verify slider enabled state")
+        self._mark_action()
+        _check_wda_ok(
+            self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/value", {"value": [f"{frac:.2f}"]}),
+            "slider",
+        )
+        pct_str = f"{int(round(frac * 100))}%"
+        return f"{target_label}={pct_str}" if target_label else pct_str
+
     def clipboard(self, content_type="plaintext"):
         """Read iOS pasteboard text via /wda/getPasteboard and record it in reads."""
         try:
@@ -3326,8 +3780,15 @@ class Flow:
         # takes the normal 2 grabs whenever the screen actually scrolled.
         self.settle(timeout=2.5, start=before)
 
-    def scroll_to(self, label, where=None, max_swipes=8):
+    def scroll_to(self, label, where=None, max_swipes=8, direction="down"):
         """Read, swipe, read... without waiting for momentum to end."""
+        direction = (direction or "down").strip().lower()
+        if direction not in ("down", "up"):
+            raise FlowError(f"scrollto:{direction}? use down|up")
+        if not label:
+            raise FlowError("scrollto requires target text (e.g. scrollto:TEXT or scrollto:up:TEXT)")
+        self._wait_active_app()
+        _, sh = self.r.pt_size()
         seen = None
         for i in range(max_swipes + 1):
             if i:
@@ -3335,14 +3796,29 @@ class Flow:
             else:
                 lines = self._fresh_lines() or self.lines()
             m = find_text(lines, label, where=where)
-            if m:
-                return m
             texts = [l.text for l in lines]
-            if texts == seen:
+            at_end = (texts == seen)
+            # If scrolling down reveals the target clipped under the iOS bottom home
+            # indicator / tab bar (y > sh - 55), scroll one more step into the tappable
+            # middle of the viewport (unless already at the end of the list or scoped).
+            if m and not (direction == "down" and not where and m.y > sh - 55 and i < max_swipes and not at_end):
+                just_launched = (
+                    i == 0
+                    and bool(self._pending_bundle_ts)
+                    and (time.monotonic() - self._pending_bundle_ts) < 1.5
+                )
+                if not just_launched:
+                    if self.r.last is not None and hasattr(self.r, "set_last"):
+                        self.r.set_last(self.r.last, lines=lines)
+                    self._wait_settled_ts = time.monotonic()
+                return m
+            if at_end:
+                if m:
+                    return m
                 break  # nothing moved: end of the list
             seen = texts
-            self.scroll("down")
-        raise FlowError(f"{label!r} not found while scrolling")
+            self.scroll(direction)
+        raise FlowError(f"{label!r} not found while scrolling {direction}")
 
     def _snapshot_ui_expectation(self, now=None):
         """Snapshot the expected bundle and outgoing app name at the START of a UI
@@ -3566,6 +4042,7 @@ class Flow:
         populated_frames = 0
         lines, texts = [], []
         already_stable = False
+        stable = False
         pending_img = None
         if settled_by_wait:
             last_ts = getattr(self.r, "last_ts", 0.0)
@@ -3612,6 +4089,7 @@ class Flow:
                         self.r.set_last(cur_img, lines=lines)
                     else:
                         self.r.last = cur_img
+                    stable = True
                     break
                 lines = self.r.read(img=cur_img)
                 if hasattr(self.r, "set_last"):
@@ -3711,6 +4189,8 @@ class Flow:
                         continue
                 filtered_ui.append(c)
             ui_res = filtered_ui
+        if already_stable or stable:
+            self._wait_settled_ts = time.monotonic()
         return lines, ui_res
 
     def search(self, query):
@@ -4062,6 +4542,8 @@ class Flow:
                 else:
                     self._switched_from_app_name = None
             return arg
+        elif verb == "url":
+            return self.open_url(arg)
         elif verb in ("wait", "expect"):
             return self.wait(arg).text
         elif verb == "waitany":
@@ -4074,6 +4556,8 @@ class Flow:
             return self.tap_if(arg)
         elif verb == "tapbatch":
             return self.tap_batch(arg)
+        elif verb == "toggle":
+            return self.toggle(arg)
         elif verb == "tapel":
             return self.tap_el(arg)
         elif verb == "tapxy":
@@ -4253,11 +4737,20 @@ class Flow:
         elif verb == "scroll":
             self.scroll(arg or "down")
         elif verb == "scrollto":
-            return self.scroll_to(*split_where(arg)).text
+            direction = "down"
+            target = arg
+            pfx, sep, rest = arg.partition(":")
+            if sep and pfx.strip().lower() in ("up", "down"):
+                direction = pfx.strip().lower()
+                target = rest
+            label, where = split_where(target)
+            return self.scroll_to(label, where=where, direction=direction).text
         elif verb == "swipe":
             return self.swipe_gesture(arg)
         elif verb == "picker":
             return self.set_picker(arg)
+        elif verb == "slider":
+            return self.set_slider(arg)
         elif verb in ("clipboard", "copy"):
             return self.clipboard(content_type=arg.strip().lower() or "plaintext")
         elif verb == "setclip":

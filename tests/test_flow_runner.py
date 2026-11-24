@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest
@@ -107,6 +108,188 @@ class TapTextAndCacheTests(unittest.TestCase):
             self.assertEqual(r.grab_calls, 2)
         finally:
             flow.close()
+
+    def test_wait_drains_active_slide_transition_before_ocr(self):
+        f0 = solid_img(100, size=(430, 932))
+        f_mid = solid_img(160, size=(430, 932))
+        f_done1 = solid_img(230, size=(430, 932))
+        f_done2 = solid_img(230, size=(430, 932))
+        lines = [make_line("iOS-versjon", 40, 200, 180, 220)]
+
+        # 1. wait(stable=False) drains blurry mid-slide frame with grab() and returns on 1 OCR pass.
+        r = FakeReader(frames=[(f_mid, []), (f_done1, lines), (f_done2, lines)], pt=(430, 932), scale=1.0)
+        r.last = f0
+        r.last_lines = None
+        flow = cli.Flow(MockWDAClient(), reader=r, timeout=1.0)
+        flow._last_action_ts = time.monotonic()
+        flow._last_reaction_diff = 12.0
+        try:
+            m = flow.wait("iOS-versjon")
+            self.assertEqual(m.text, "iOS-versjon")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 3)
+            self.assertGreaterEqual(flow._wait_settled_ts, flow._last_action_ts)
+        finally:
+            flow.close()
+
+        # 2. wait(stable=True) also returns immediately in 1 OCR pass when settled_prev and settled_img are still.
+        r2 = FakeReader(frames=[(f_mid, []), (f_done1, lines), (f_done2, lines)], pt=(430, 932), scale=1.0)
+        r2.last = f0
+        r2.last_lines = None
+        flow2 = cli.Flow(MockWDAClient(), reader=r2, timeout=1.0)
+        flow2._last_action_ts = time.monotonic()
+        flow2._last_reaction_diff = 12.0
+        try:
+            m2 = flow2.wait("iOS-versjon", stable=True)
+            self.assertEqual(m2.text, "iOS-versjon")
+            self.assertEqual(r2.read_calls, 1)
+            self.assertEqual(r2.grab_calls, 3)
+        finally:
+            flow2.close()
+
+        # 3. When target is absent on the settled OCR frame, wait() cleanly falls back to UI controls.
+        c_ui = MockWDAClient(fast_ui=_fast_ui([{"type": "Button", "label": "IconOnly", "x": 380, "y": 90}]))
+        r3 = FakeReader(frames=[(f_mid, []), (f_done1, []), (f_done2, []), (solid_img(230, size=(430, 932)), [])],
+                        pt=(430, 932), scale=1.0)
+        r3.last = f0
+        r3.last_lines = None
+        flow3 = cli.Flow(c_ui, reader=r3, timeout=1.0)
+        flow3._last_action_ts = time.monotonic()
+        flow3._last_reaction_diff = 12.0
+        try:
+            m3 = flow3.wait("IconOnly")
+            self.assertEqual(m3.text, "IconOnly")
+            self.assertEqual((m3.x, m3.y), (380, 90))
+        finally:
+            flow3.close()
+
+    def test_wait_reuses_fresh_lines_only_when_settled_after_last_action(self):
+        img1 = solid_img(240, size=(430, 932))
+        img2 = solid_img(240, size=(430, 932))
+        img_new = solid_img(180, size=(430, 932))
+        lines1 = [make_line("General", 40, 150, 140, 170), make_line("About", 40, 220, 120, 240)]
+        lines_new = [make_line("About", 40, 300, 120, 320)]
+
+        r = FakeReader(frames=[(img1, lines1), (img2, lines1), (img_new, lines_new)], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(MockWDAClient(), reader=r, timeout=1.0)
+        try:
+            m1 = flow.wait("General")
+            self.assertEqual(m1.text, "General")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 1)
+
+            # Immediate wait("About") reuses fresh settled lines with 0 grabs and 0 OCR calls.
+            m2 = flow.wait("About")
+            self.assertEqual(m2.text, "About")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 1)
+
+            # wait("About", stable=True) reuses fresh settled lines as prev and confirms with 1 grab, 0 OCR.
+            m3 = flow.wait("About", stable=True)
+            self.assertEqual(m3.text, "About")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 2)
+
+            # After a new action (_last_action_ts > _wait_settled_ts), NEVER reuse pre-action lines.
+            flow._last_action_ts = time.monotonic() + 1.0
+            m4 = flow.wait("About")
+            self.assertEqual(m4.y, 310)
+            self.assertEqual(r.read_calls, 2)
+        finally:
+            flow.close()
+
+    def test_waitany_drains_transition_and_reuses_fresh_lines(self):
+        f0 = solid_img(100, size=(430, 932))
+        f_mid = solid_img(160, size=(430, 932))
+        f_done1 = solid_img(230, size=(430, 932))
+        f_done2 = solid_img(230, size=(430, 932))
+        lines = [make_line("Alarmer", 40, 180, 140, 200), make_line("Start", 40, 300, 110, 320)]
+
+        r = FakeReader(frames=[(f_mid, []), (f_done1, lines), (f_done2, lines)], pt=(430, 932), scale=1.0)
+        r.last = f0
+        r.last_lines = None
+        flow = cli.Flow(MockWDAClient(), reader=r, timeout=1.0)
+        flow._last_action_ts = time.monotonic()
+        flow._last_reaction_diff = 10.0
+        try:
+            m1 = flow.wait_any("Alarmer|Missing")
+            self.assertEqual(m1.text, "Alarmer")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 3)
+
+            # Follow-up wait_any on the same settled frame reuses fresh lines with 0 extra OCR.
+            m2 = flow.wait_any("Missing|Start")
+            self.assertEqual(m2.text, "Start")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 3)
+        finally:
+            flow.close()
+
+    def test_gone_skips_ocr_while_pixel_still_and_detects_change_immediately(self):
+        f_busy1 = box_img(bg=240, boxes=[((100, 300, 300, 360), 40)], size=(430, 932))
+        f_busy2 = box_img(bg=240, boxes=[((100, 300, 300, 360), 40)], size=(430, 932))
+        f_busy3 = box_img(bg=240, boxes=[((100, 300, 300, 360), 40)], size=(430, 932))
+        f_busy4 = box_img(bg=240, boxes=[((100, 300, 300, 360), 40)], size=(430, 932))
+        f_done = solid_img(240, size=(430, 932))
+        busy_lines = [make_line("Loading...", 120, 320, 260, 340)]
+
+        # 1. Still frames skip redundant OCR; pixel change triggers 1 confirming OCR pass.
+        r = FakeReader(frames=[
+            (f_busy1, busy_lines),
+            (f_busy2, busy_lines),
+            (f_busy3, busy_lines),
+            (f_busy4, busy_lines),
+            (f_done, []),
+        ], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(MockWDAClient(), reader=r, timeout=1.0)
+        try:
+            self.assertTrue(flow.gone("Loading...", timeout=1.0))
+            self.assertEqual(r.read_calls, 2)
+            self.assertEqual(r.grab_calls, 5)
+        finally:
+            flow.close()
+
+        # 2. gone() right after wait() reuses wait()'s settled frame on Frame 0 (only 1 OCR total).
+        r2 = FakeReader(frames=[
+            (f_busy1, busy_lines),
+            (f_busy2, busy_lines),
+            (f_busy3, busy_lines),
+            (f_done, []),
+        ], pt=(430, 932), scale=1.0)
+        flow2 = cli.Flow(MockWDAClient(), reader=r2, timeout=1.0)
+        try:
+            self.assertEqual(flow2.wait("Loading...").text, "Loading...")
+            self.assertEqual(r2.read_calls, 1)
+            self.assertTrue(flow2.gone("Loading...", timeout=1.0))
+            self.assertEqual(r2.read_calls, 2)  # 1 in wait + 1 in gone when pixels changed
+            self.assertEqual(r2.grab_calls, 4)
+        finally:
+            flow2.close()
+
+        # 3. Still screen until timeout raises FlowError with only 1 OCR call (Frame 0).
+        r3 = FakeReader(frames=[(f_busy1, busy_lines), (f_busy2, busy_lines)], pt=(430, 932), scale=1.0)
+        flow3 = cli.Flow(MockWDAClient(), reader=r3, timeout=0.05)
+        try:
+            with self.assertRaises(cli.FlowError):
+                flow3.gone("Loading...", timeout=0.05)
+            self.assertEqual(r3.read_calls, 1)
+        finally:
+            flow3.close()
+
+        # 4. Status-bar target (@y<54) does not get masked by _content_pixel_still ignoring top 6%.
+        f_sb1 = box_img(bg=240, boxes=[((40, 10, 100, 30), 20)], size=(430, 932))
+        f_sb2 = solid_img(240, size=(430, 932))
+        self.assertTrue(cli._content_pixel_still(f_sb1, f_sb2))
+        r4 = FakeReader(frames=[
+            (f_sb1, [make_line("VPN", 40, 10, 100, 30)]),
+            (f_sb2, []),
+        ], pt=(430, 932), scale=1.0)
+        flow4 = cli.Flow(MockWDAClient(), reader=r4, timeout=0.5)
+        try:
+            self.assertTrue(flow4.gone("VPN@y<54", timeout=0.5))
+            self.assertEqual(r4.read_calls, 2)
+        finally:
+            flow4.close()
 
     def test_tap_text_drains_transition_before_ocr(self):
         # Simulate an active iOS slide transition right after a prior tap with large reaction diff.
@@ -1117,6 +1300,698 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
         finally:
             flow.close()
 
+    def test_url_opens_valid_schemes_updates_switch_state_and_rejects_invalid_or_error(self):
+        img = solid_img(220, size=(430, 932))
+        c = MockWDAClient()
+        r = FakeReader(frames=[(img, [])])
+        flow = cli.Flow(c, reader=r)
+        try:
+            flow.bundle = "com.apple.Preferences"
+            flow._pending_bundle = "com.apple.Preferences"
+            flow._pending_bundle_ts = time.monotonic()
+            flow._last_app_name = "Settings"
+            flow._store_ctl_cache([{"type": "Button", "label": "General", "x": 100, "y": 200}], img=img)
+            self.assertIsNotNone(flow._ctl_cache)
+
+            res = flow.step("url:  https://example.com/path?a=1  ")
+            self.assertEqual(res, "https://example.com/path?a=1")
+            self.assertEqual(
+                c.calls[-1],
+                ("POST", "/session/test-session-1/url", {"url": "https://example.com/path?a=1"}),
+            )
+            self.assertEqual(c.opened_urls[-1], "https://example.com/path?a=1")
+            self.assertIsNone(flow._ctl_cache)
+            self.assertIsNone(flow.bundle)
+            self.assertIsNone(flow._pending_bundle)
+            self.assertEqual(flow._pending_bundle_ts, 0.0)
+            self.assertIsNone(flow._switched_from_app_name)
+            self.assertEqual(flow._switched_at, 0.0)
+
+            # Opening a new URL while already in Safari must NOT mark Safari as stale!
+            c_saf = MockWDAClient(fast_ui=_fast_ui([{"type": "TextField", "label": "Adresse", "x": 200, "y": 800}], app_name="Safari", bundle_id="com.apple.mobilesafari"))
+            flow_saf = cli.Flow(c_saf, reader=FakeReader(frames=[(img, [])]))
+            try:
+                flow_saf._last_app_name = "Safari"
+                flow_saf._last_app_bundle = "com.apple.mobilesafari"
+                flow_saf.step("url:https://example.com")
+                ctl = flow_saf.controls()
+                self.assertEqual([x["label"] for x in ctl], ["Adresse"])
+            finally:
+                flow_saf.close()
+
+            # Deep-link and mailto:/tel:/sms: schemes all succeed; missing _last_app_name stays None.
+            flow._last_app_name = None
+            for u in (
+                "maps://?q=Oslo",
+                "calshow://",
+                "custom+app-1://open/item",
+                "mailto:user@example.com",
+                "MAILTO:User@Example.com",
+                "tel:+15551234567",
+                "sms:+15551234567",
+            ):
+                self.assertEqual(flow.step(f"url:{u}"), u)
+                self.assertEqual(c.opened_urls[-1], u)
+                self.assertIsNone(flow._switched_from_app_name)
+
+            # Invalid / scheme-less URLs are rejected with zero WDA calls.
+            calls_before = len(c.calls)
+            for bad in (
+                "url:",
+                "url:   ",
+                "url:example.com",
+                "url:www.example.com/page",
+                "url:/local/path",
+                "url://missing-scheme",
+                "url:123://bad-scheme",
+                "url:mailto:",
+                "url:tel:",
+                "url:example.com:8080",
+            ):
+                with self.assertRaises(cli.FlowError):
+                    flow.step(bad)
+            self.assertEqual(len(c.calls), calls_before)
+
+            # FLOW_HELP documents url: and _IMAGE_STEP_VERBS excludes url so OCR stays lazy.
+            self.assertIn("url:", cli.FLOW_HELP)
+            self.assertNotIn("url", cli._IMAGE_STEP_VERBS)
+        finally:
+            flow.close()
+
+        # WDA HTTP 500 propagates FlowError, invalidates cache, and preserves flow.bundle.
+        c_err = MockWDAClient(
+            custom_handler=lambda m, p, d: {"error": 500, "body": "cannot open url"} if p.endswith("/url") else None
+        )
+        flow_err = cli.Flow(c_err, reader=FakeReader(frames=[(img, [])]))
+        flow_err.bundle = "com.example.prev"
+        flow_err._pending_bundle = "com.example.prev"
+        flow_err._store_ctl_cache([{"type": "Button", "label": "Btn", "x": 100, "y": 200}], img=img)
+        try:
+            with self.assertRaises(cli.FlowError) as ctx:
+                flow_err.step("url:https://example.com")
+            self.assertIn("url failed", str(ctx.exception))
+            self.assertIsNone(flow_err._ctl_cache)
+            self.assertEqual(flow_err.bundle, "com.example.prev")
+            self.assertEqual(flow_err._pending_bundle, "com.example.prev")
+        finally:
+            flow_err.close()
+
+    def test_toggle_idempotent_states_region_verification_and_guards(self):
+        img_before = solid_img(240, size=(430, 932))
+        img_after = solid_img(120, size=(430, 932))
+        lines = [
+            make_line("Connectivity", 20, 140, 160, 165),
+            make_line("Privacy", 20, 520, 120, 545),
+        ]
+        base_ui = [
+            {"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 210, "value": "1"},
+            {"type": "Switch", "label": "Wi-Fi Assist", "x": 380, "y": 270, "value": "0"},
+            {"type": "Switch", "label": "Bluetooth", "x": 380, "y": 330, "value": "0"},
+            {"type": "Switch", "label": "A=B", "x": 380, "y": 400, "value": "0"},
+            {"type": "Switch", "label": "Location", "x": 380, "y": 220, "value": "0"},
+            {"type": "Switch", "label": "Location", "x": 380, "y": 580, "value": "1"},
+            {"type": "Switch", "label": "Locked Switch", "x": 380, "y": 640, "value": "0", "enabled": False},
+            {"type": "Switch", "label": "Delete Old Backups", "x": 380, "y": 700, "value": "0"},
+            {"type": "Button", "label": "Dark Mode", "x": 200, "y": 760},
+        ]
+        c = MockWDAClient(fast_ui=_fast_ui(base_ui))
+        r = FakeReader(frames=[(img_before, lines), (img_after, lines)], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(c, reader=r, timeout=0.5)
+        try:
+            # 1. Idempotent zero-tap skip when already in desired state (all accepted spellings).
+            for spec in ("toggle:Wi-Fi=on", "toggle:Wi-Fi=1", "toggle:Wi-Fi=true", "toggle:Wi-Fi=ON"):
+                self.assertEqual(flow.step(spec), "already on")
+            for spec in ("toggle:Bluetooth=off", "toggle:Bluetooth=0", "toggle:Bluetooth=false", "toggle:Bluetooth=OFF"):
+                self.assertEqual(flow.step(spec), "already off")
+            self.assertEqual(c.tapped_points, [])
+            self.assertEqual(r.read_calls, 0)
+
+            # 2. Exact match wins over substring ("Wi-Fi" vs "Wi-Fi Assist"); substring works too.
+            self.assertEqual(flow.step("toggle:Assist=off"), "already off")
+            self.assertEqual(c.tapped_points, [])
+
+            # 3. Desired flip taps ONCE, invalidates cache, and verifies via 2nd controls() call.
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 210, "value": "0"}]),
+                _fast_ui([{"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 210, "value": "1"}]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            self.assertEqual(flow.step("toggle:Wi-Fi=on"), "on")
+            self.assertEqual([(x, y) for x, y, _ in c.tapped_points], [(380, 210)])
+            self.assertIsNone(flow._ctl_cache)
+
+            # 4. Turning off verifies 'off' as well.
+            c.tapped_points.clear()
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 210, "value": "1"}]),
+                _fast_ui([{"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 210, "value": "0"}]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            self.assertEqual(flow.step("toggle:Wi-Fi=off"), "off")
+            self.assertEqual([(x, y) for x, y, _ in c.tapped_points], [(380, 210)])
+            self.assertIsNone(flow._ctl_cache)
+
+            # 5. Switch that refuses to flip raises FlowError and NEVER replays the tap.
+            c.tapped_points.clear()
+            c.fast_ui = _fast_ui([{"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 210, "value": "0"}])
+            r.set_frames([(img_before, lines), (img_before, lines)])
+            with mock.patch.object(flow, "changed_since", return_value=False):
+                with self.assertRaises(cli.FlowError) as ctx_stuck:
+                    flow.step("toggle:Wi-Fi=on")
+            self.assertIn("remained off", str(ctx_stuck.exception))
+            self.assertEqual(len(c.tapped_points), 1)
+            self.assertIsNone(flow._ctl_cache)
+
+            # 6. Unconditional toggle (no =on|off) and labels containing '='.
+            c.tapped_points.clear()
+            c.calls.clear()
+            c.fast_ui = _fast_ui(base_ui)
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            self.assertEqual(flow.step("toggle:A=B"), "toggled")
+            self.assertEqual([(x, y) for x, y, _ in c.tapped_points], [(380, 400)])
+            self.assertEqual(len([p for _, p, _ in c.calls if p.startswith("/wda/fastUI")]), 1)
+
+            c.tapped_points.clear()
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "A=B", "x": 380, "y": 400, "value": "0"}]),
+                _fast_ui([{"type": "Switch", "label": "A=B", "x": 380, "y": 400, "value": "1"}]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            self.assertEqual(flow.step("toggle:A=B=on"), "on")
+            self.assertEqual([(x, y) for x, y, _ in c.tapped_points], [(380, 400)])
+
+            # 7. @region filtering: @y> needs 0 OCR; @below/@above grabs OCR; both orderings work.
+            c.tapped_points.clear()
+            c.fast_ui = _fast_ui(base_ui)
+            r.read_calls = 0
+            self.assertEqual(flow.step("toggle:Location@y>500=on"), "already on")
+            self.assertEqual(flow.step("toggle:Location=off@y<300"), "already off")
+            self.assertEqual(r.read_calls, 0)
+            self.assertEqual(c.tapped_points, [])
+
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            r.read_calls = 0
+            self.assertEqual(flow.step("toggle:Location@below:Privacy=on"), "already on")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(c.tapped_points, [])
+
+            # 8. Disabled switch, non-switch label, missing switch, empty spec, and --deny.
+            with self.assertRaises(cli.FlowError) as ctx_dis:
+                flow.step("toggle:Locked Switch=on")
+            self.assertIn("disabled", str(ctx_dis.exception))
+
+            with self.assertRaises(cli.FlowError) as ctx_nosw:
+                flow.step("toggle:Dark Mode=on")
+            self.assertIn("no switch", str(ctx_nosw.exception))
+
+            with self.assertRaises(cli.FlowError) as ctx_deny:
+                flow.step("toggle:Delete Old Backups=on")
+            self.assertIn("--deny", str(ctx_deny.exception))
+
+            for bad in ("toggle:", "toggle:   ", "toggle:=on"):
+                with self.assertRaises(cli.FlowError):
+                    flow.step(bad)
+            self.assertEqual(c.tapped_points, [])
+
+            # 9. WDA 500 on tap propagates FlowError and clears _ctl_cache.
+            c_err = MockWDAClient(
+                fast_ui=_fast_ui([{"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 210, "value": "0"}]),
+                custom_handler=lambda m, p, d: {"error": 500, "body": "tap failed"} if p == "/wda/fastTap" else None,
+            )
+            flow_err = cli.Flow(c_err, reader=FakeReader(frames=[(img_before, lines)]), timeout=0.5)
+            try:
+                with self.assertRaises(cli.FlowError):
+                    flow_err.step("toggle:Wi-Fi=on")
+                self.assertIsNone(flow_err._ctl_cache)
+            finally:
+                flow_err.close()
+
+            # 10. PR #5 review hardening:
+            # (a) Disabled exact match ('Sync') MUST NOT fall through to enabled substring ('Sync Photos').
+            c.tapped_points.clear()
+            c.fast_ui = _fast_ui([
+                {"type": "Switch", "label": "Sync", "x": 380, "y": 210, "value": "0", "enabled": False},
+                {"type": "Switch", "label": "Sync Photos", "x": 380, "y": 280, "value": "0", "enabled": True},
+            ])
+            with self.assertRaises(cli.FlowError) as ctx_ex_dis:
+                flow.step("toggle:Sync=on")
+            self.assertIn("disabled", str(ctx_ex_dis.exception))
+            self.assertEqual(c.tapped_points, [])
+
+            # (b) Explicit requested state with unreadable initial value refuses with ZERO taps;
+            # disappearing switch or unreadable post-tap state raises FlowError (never reports 'toggled'/'on').
+            c.tapped_points.clear()
+            c.fast_ui = _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210}])
+            with self.assertRaises(cli.FlowError) as ctx_unr:
+                flow.step("toggle:Sync=on")
+            self.assertIn("unreadable initial state", str(ctx_unr.exception))
+            self.assertEqual(c.tapped_points, [])
+
+            c.tapped_points.clear()
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210, "value": "0"}]),
+                _fast_ui([]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            with self.assertRaises(cli.FlowError) as ctx_gone:
+                flow.step("toggle:Sync=on")
+            self.assertIn("disappeared", str(ctx_gone.exception))
+
+            c.tapped_points.clear()
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210, "value": "0"}]),
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210}]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            with self.assertRaises(cli.FlowError) as ctx_unr2:
+                flow.step("toggle:Sync=on")
+            self.assertIn("state unreadable", str(ctx_unr2.exception))
+
+            # (c) Replacement switch with same label at another Y coordinate MUST NOT verify as 'on'.
+            c.tapped_points.clear()
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210, "value": "0"}]),
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 540, "value": "1"}]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            with self.assertRaises(cli.FlowError) as ctx_moved:
+                flow.step("toggle:Sync=on")
+            self.assertIn("disappeared or moved", str(ctx_moved.exception))
+
+            self.assertIn("toggle:", cli.FLOW_HELP)
+        finally:
+            flow.close()
+
+    def test_slider_parsing_matching_guards_disabled_and_errors(self):
+        img = solid_img(220, size=(430, 932))
+        c = MockWDAClient(
+            elements_map={
+                "XCUIElementTypeSlider": [
+                    {"ELEMENT": "s1"},
+                    {"ELEMENT": "s2"},
+                    {"ELEMENT": "s3"},
+                    {"ELEMENT": "s4"},
+                    {"ELEMENT": "s5"},
+                ],
+            },
+            element_labels={
+                "s1": "Screen Brightness",
+                "s2": "Brightness",
+                "s3": "",
+                "s4": "Lysstyrke",
+                "s5": "Delete Threshold",
+            },
+            element_names={
+                "s1": "Screen Brightness",
+                "s2": "Brightness",
+                "s3": "VolumeSlider",
+                "s4": "Lysstyrke",
+                "s5": "Delete Threshold",
+            },
+            element_enabled={"s1": True, "s2": True, "s3": True, "s4": False, "s5": True},
+        )
+        r = FakeReader(frames=[(img, [])])
+        flow = cli.Flow(c, reader=r, timeout=0.5)
+        try:
+            # 1. Unlabelled slider selects first slider and normalizes %, 0-1, and >1-100.
+            flow._store_ctl_cache([{"type": "Button", "label": "Ok", "x": 50, "y": 50}], img=img)
+            self.assertEqual(flow.step("slider:50%"), "50%")
+            self.assertEqual(c.element_values["s1"], "0.50")
+            self.assertIsNone(flow._ctl_cache)
+
+            self.assertEqual(flow.step("slider:0.4"), "40%")
+            self.assertEqual(c.element_values["s1"], "0.40")
+            self.assertEqual(flow.step("slider:1%"), "1%")
+            self.assertEqual(c.element_values["s1"], "0.01")
+            self.assertEqual(flow.step("slider:0%"), "0%")
+            self.assertEqual(c.element_values["s1"], "0.00")
+            self.assertEqual(flow.step("slider:100%"), "100%")
+            self.assertEqual(c.element_values["s1"], "1.00")
+            self.assertEqual(flow.step("slider:0"), "0%")
+            self.assertEqual(c.element_values["s1"], "0.00")
+            self.assertEqual(flow.step("slider:1.0"), "100%")
+            self.assertEqual(c.element_values["s1"], "1.00")
+            self.assertEqual(flow.step("slider:75"), "75%")
+            self.assertEqual(c.element_values["s1"], "0.75")
+
+            # 2. Labelled slider: exact casefold match beats earlier substring match.
+            self.assertEqual(flow.step("slider:brightness=70%"), "brightness=70%")
+            self.assertEqual(c.element_values["s2"], "0.70")
+
+            # 3. Exact match via element name when label is empty.
+            self.assertEqual(flow.step("slider:VolumeSlider=25%"), "VolumeSlider=25%")
+            self.assertEqual(c.element_values["s3"], "0.25")
+
+            # 4. Substring fallback match when no exact match exists.
+            self.assertEqual(flow.step("slider:Screen=0.35"), "Screen=35%")
+            self.assertEqual(c.element_values["s1"], "0.35")
+
+            # 5. Disabled slider rejected with ZERO value POSTs (both labelled and unlabelled).
+            calls_before = len(c.calls)
+            with self.assertRaises(cli.FlowError) as ctx_dis:
+                flow.step("slider:Lysstyrke=0.4")
+            self.assertIn("disabled", str(ctx_dis.exception))
+            self.assertEqual([p for _, p, _ in c.calls[calls_before:] if p.endswith("/value")], [])
+
+            c.element_enabled["s1"] = False
+            calls_before = len(c.calls)
+            with self.assertRaises(cli.FlowError) as ctx_dis_first:
+                flow.step("slider:50%")
+            self.assertIn("disabled", str(ctx_dis_first.exception))
+            self.assertEqual([p for _, p, _ in c.calls[calls_before:] if p.endswith("/value")], [])
+            c.element_enabled["s1"] = True
+
+            # 6. --deny blocks both direct label and resolved substring label before value POST.
+            calls_before = len(c.calls)
+            with self.assertRaises(cli.FlowError) as ctx_deny1:
+                flow.step("slider:Delete Threshold=50%")
+            self.assertIn("--deny", str(ctx_deny1.exception))
+            self.assertEqual(len(c.calls), calls_before)
+
+            calls_before = len(c.calls)
+            with self.assertRaises(cli.FlowError) as ctx_deny2:
+                flow.step("slider:Threshold=50%")
+            self.assertIn("--deny", str(ctx_deny2.exception))
+            self.assertEqual([p for _, p, _ in c.calls[calls_before:] if p.endswith("/value")], [])
+
+            # 7. Missing labelled slider and no sliders on screen.
+            with self.assertRaises(cli.FlowError) as ctx_miss:
+                flow.step("slider:Nonexistent=50%")
+            self.assertIn("no Slider labelled", str(ctx_miss.exception))
+
+            c_empty = MockWDAClient(elements_map={"XCUIElementTypeSlider": []})
+            flow_empty = cli.Flow(c_empty, reader=FakeReader(frames=[(img, [])]))
+            try:
+                with self.assertRaises(cli.FlowError) as ctx_none:
+                    flow_empty.step("slider:50%")
+                self.assertIn("no Slider on screen", str(ctx_none.exception))
+            finally:
+                flow_empty.close()
+
+            # 8. Invalid values / out-of-range / NaN / inf rejected upfront with ZERO WDA calls.
+            calls_before = len(c.calls)
+            for bad in (
+                "slider:",
+                "slider:   ",
+                "slider:=50%",
+                "slider:-1%",
+                "slider:-0.1",
+                "slider:101%",
+                "slider:101",
+                "slider:nan",
+                "slider:NaN%",
+                "slider:inf",
+                "slider:-inf",
+                "slider:abc",
+                "slider:%",
+            ):
+                with self.assertRaises(cli.FlowError):
+                    flow.step(bad)
+            self.assertEqual(len(c.calls), calls_before)
+
+            # 9. WDA HTTP 500 on value POST propagates FlowError.
+            c_err = MockWDAClient(
+                elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "s1"}]},
+                custom_handler=lambda m, p, d: {"error": 500, "body": "slider error"} if p.endswith("/value") else None,
+            )
+            flow_err = cli.Flow(c_err, reader=FakeReader(frames=[(img, [])]))
+            try:
+                with self.assertRaises(cli.FlowError) as ctx_err:
+                    flow_err.step("slider:50%")
+                self.assertIn("slider failed", str(ctx_err.exception))
+            finally:
+                flow_err.close()
+
+            # 10. PR #5 review hardening: --deny checks BOTH label and name aliases regardless
+            # of named vs unnamed matching, and attribute/enabled errors refuse with ZERO value POSTs.
+            c_alias = MockWDAClient(
+                elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "sa1"}, {"ELEMENT": "sa2"}]},
+                element_labels={"sa1": "Display", "sa2": "Delete Threshold"},
+                element_names={"sa1": "Delete Threshold", "sa2": "SafeID"},
+                element_enabled={"sa1": True, "sa2": True},
+            )
+            flow_alias = cli.Flow(c_alias, reader=FakeReader(frames=[(img, [])]))
+            try:
+                # Named match via name='SafeID' must still block on label='Delete Threshold'.
+                with self.assertRaises(cli.FlowError) as ctx_a1:
+                    flow_alias.step("slider:SafeID=50%")
+                self.assertIn("--deny", str(ctx_a1.exception))
+                # Unnamed slider:50% hits sa1 (label='Display', name='Delete Threshold') -> blocked!
+                with self.assertRaises(cli.FlowError) as ctx_a2:
+                    flow_alias.step("slider:50%")
+                self.assertIn("--deny", str(ctx_a2.exception))
+                self.assertEqual([p for _, p, _ in c_alias.calls if p.endswith("/value")], [])
+            finally:
+                flow_alias.close()
+
+            # Label/name lookup error while --deny is active refuses with ZERO value POSTs.
+            c_aerr = MockWDAClient(
+                elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "s1"}]},
+                custom_handler=lambda m, p, d: {"error": 500, "body": "attr err"} if "/attribute/name" in p else None,
+            )
+            flow_aerr = cli.Flow(c_aerr, reader=FakeReader(frames=[(img, [])]))
+            try:
+                with self.assertRaises(cli.FlowError) as ctx_ae:
+                    flow_aerr.step("slider:50%")
+                self.assertIn("--deny", str(ctx_ae.exception))
+                self.assertEqual([p for _, p, _ in c_aerr.calls if p.endswith("/value")], [])
+            finally:
+                flow_aerr.close()
+
+            # Failed /enabled and /attribute/enabled on the selected element MUST refuse with
+            # ZERO value POSTs even when fastUI has a matching older tree (no enabled field)
+            # or a different same-labelled enabled slider.
+            for tree_items in (
+                [{"type": "Slider", "label": "Brightness", "x": 200, "y": 400}],
+                [{"type": "Slider", "label": "Brightness", "x": 200, "y": 400, "enabled": True}],
+            ):
+                c_enerr = MockWDAClient(
+                    elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "s1"}]},
+                    element_labels={"s1": "Brightness"},
+                    element_names={"s1": "Brightness"},
+                    fast_ui=_fast_ui(tree_items),
+                    custom_handler=lambda m, p, d: {"error": 500, "body": "enabled err"}
+                    if p.endswith("/enabled") or p.endswith("/attribute/enabled")
+                    else None,
+                )
+                flow_enerr = cli.Flow(c_enerr, reader=FakeReader(frames=[(img, [])]))
+                try:
+                    with self.assertRaises(cli.FlowError) as ctx_ee:
+                        flow_enerr.step("slider:Brightness=50%")
+                    self.assertIn("enabled state", str(ctx_ee.exception))
+                    self.assertEqual([p for _, p, _ in c_enerr.calls if p.endswith("/value")], [])
+                finally:
+                    flow_enerr.close()
+
+            # When /enabled fails but /attribute/enabled on the SAME element returns true/false,
+            # respect that verified same-element state.
+            c_attr_en = MockWDAClient(
+                elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "s1"}]},
+                element_labels={"s1": "Brightness"},
+                element_names={"s1": "Brightness"},
+                element_enabled={"s1": True},
+                custom_handler=lambda m, p, d: {"error": 500, "body": "enabled err"}
+                if p.endswith("/enabled") and not p.endswith("/attribute/enabled")
+                else None,
+            )
+            flow_attr_en = cli.Flow(c_attr_en, reader=FakeReader(frames=[(img, [])]))
+            try:
+                self.assertEqual(flow_attr_en.step("slider:Brightness=50%"), "Brightness=50%")
+                self.assertEqual(c_attr_en.element_values["s1"], "0.50")
+
+                c_attr_en.element_enabled["s1"] = False
+                calls_before = len(c_attr_en.calls)
+                with self.assertRaises(cli.FlowError) as ctx_ad:
+                    flow_attr_en.step("slider:Brightness=60%")
+                self.assertIn("disabled", str(ctx_ad.exception))
+                self.assertEqual([p for _, p, _ in c_attr_en.calls[calls_before:] if p.endswith("/value")], [])
+            finally:
+                flow_attr_en.close()
+
+            self.assertIn("slider:", cli.FLOW_HELP)
+        finally:
+            flow.close()
+
+    def test_scrollto_then_tap_reuses_settled_lines_without_redundant_ocr(self):
+        img1 = solid_img(240, size=(430, 932))
+        img2 = solid_img(180, size=(430, 932))
+        img2_confirm1 = solid_img(180, size=(430, 932))
+        img2_confirm2 = solid_img(180, size=(430, 932))
+        img_after_tap = solid_img(60, size=(430, 932))
+
+        l1 = [make_line("Wi-Fi", 30, 200, 100, 224)]
+        l2 = [make_line("Generelt", 30, 400, 130, 424)]
+
+        class AgingReadReader(FakeReader):
+            def read(self, y0=0, y1=None, img=None, sauvola=False):
+                # Simulate real ScreenReader.read(img=self.r.last): OCR takes ~250ms and
+                # does not update last_ts when fresh_grab=False, leaving last_ts stale.
+                res = super().read(y0=y0, y1=y1, img=img, sauvola=sauvola)
+                if img is not None and not sauvola:
+                    self.last_ts = time.monotonic() - 0.30
+                return res
+
+        c = MockWDAClient(fast_ui=_fast_ui([{"type": "Cell", "label": "Generelt", "x": 80, "y": 412}]))
+        # Frame sequence:
+        # 0: initial scrollto read (img1, l1)
+        # 1: settle grab 1 after scroll down (img2, l2)
+        # 2: settle grab 2 confirming still (img2_confirm1, l2) -> r.last = img2_confirm1
+        # 3: wait(stable=True) confirm grab inside tap:Generelt (img2_confirm2, l2)
+        # 4: changed_since() grab after tap (img_after_tap, [])
+        r = AgingReadReader(
+            frames=[
+                (img1, l1),
+                (img2, l2),
+                (img2_confirm1, l2),
+                (img2_confirm2, l2),
+                (img_after_tap, []),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow = cli.Flow(c, reader=r, timeout=1.0)
+        try:
+            res_scroll = flow.step("scrollto:Generelt")
+            self.assertEqual(res_scroll, "Generelt")
+            self.assertEqual(len(c.drags), 1)
+            self.assertGreater(c.drags[0]["fromY"], c.drags[0]["toY"])
+            # scroll_to refreshed last_ts and _wait_settled_ts on the settled frame.
+            self.assertLess(time.monotonic() - r.last_ts, 0.15)
+            self.assertGreater(flow._wait_settled_ts, 0.0)
+            reads_after_scroll = r.read_calls
+            grabs_after_scroll = r.grab_calls
+
+            res_tap = flow.step("tap:Generelt")
+            self.assertEqual(res_tap, "Generelt")
+            # Zero redundant full OCR passes during tap:Generelt!
+            self.assertEqual(r.read_calls, reads_after_scroll)
+            # Only 1 cheap confirm grab + 1 post-tap changed_since grab, and 0 /wda/fastUI calls.
+            self.assertEqual(r.grab_calls - grabs_after_scroll, 2)
+            self.assertEqual([p for _, p, _ in c.calls if p.startswith("/wda/fastUI")], [])
+            self.assertEqual(c.tapped_points[-1][:2], (80, 412))
+        finally:
+            flow.close()
+
+    def test_scrollto_bidirectional_up_down_region_regex_and_stop_at_top(self):
+        img_bot = solid_img(240, size=(430, 932))
+        img_mid1 = solid_img(210, size=(430, 932))
+        img_mid2 = solid_img(210, size=(430, 932))
+        img_top1 = solid_img(180, size=(430, 932))
+        img_top2 = solid_img(180, size=(430, 932))
+
+        l_bot = [make_line("General", 30, 60, 120, 80), make_line("Bottom Item", 30, 600, 160, 624)]
+        l_mid = [make_line("General", 30, 60, 120, 80), make_line("Item 42", 30, 320, 120, 344)]
+        l_top = [make_line("General", 30, 260, 120, 284), make_line("Top Header", 30, 140, 160, 164)]
+
+        # 1. scrollto:up:General@y>100 scrolls UP (fromY < toY), skips y=70 header, finds y=272.
+        c = MockWDAClient()
+        r = FakeReader(
+            frames=[
+                (img_bot, l_bot),
+                (img_mid1, l_mid),
+                (img_mid2, l_mid),
+                (img_top1, l_top),
+                (img_top2, l_top),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow = cli.Flow(c, reader=r, timeout=1.0)
+        try:
+            self.assertEqual(flow.step("scrollto:up:General@y>100"), "General")
+            self.assertEqual(len(c.drags), 2)
+            for d in c.drags:
+                self.assertLess(d["fromY"], d["toY"], "scrollto:up must swipe upward (fromY < toY)")
+        finally:
+            flow.close()
+
+        # 2. scrollto:up:re:Item\s+\d+ supports regex while scrolling up.
+        c_re = MockWDAClient()
+        r_re = FakeReader(
+            frames=[
+                (img_bot, l_bot),
+                (img_mid1, l_mid),
+                (img_mid2, l_mid),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_re = cli.Flow(c_re, reader=r_re, timeout=1.0)
+        try:
+            self.assertEqual(flow_re.step(r"scrollto:up:re:Item\s+\d+"), "Item 42")
+            self.assertEqual(len(c_re.drags), 1)
+            self.assertLess(c_re.drags[0]["fromY"], c_re.drags[0]["toY"])
+        finally:
+            flow_re.close()
+
+        # 3. scrollto:down:TEXT explicitly scrolls down (fromY > toY).
+        c_dn = MockWDAClient()
+        r_dn = FakeReader(
+            frames=[
+                (img_top1, l_top),
+                (img_bot, l_bot),
+                (img_bot.copy(), l_bot),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_dn = cli.Flow(c_dn, reader=r_dn, timeout=1.0)
+        try:
+            self.assertEqual(flow_dn.step("scrollto:down:Bottom Item"), "Bottom Item")
+            self.assertEqual(len(c_dn.drags), 1)
+            self.assertGreater(c_dn.drags[0]["fromY"], c_dn.drags[0]["toY"])
+        finally:
+            flow_dn.close()
+
+        # 4. scrollto:up:Missing stops cleanly at top of list when content stops changing.
+        c_stop = MockWDAClient()
+        r_stop = FakeReader(
+            frames=[
+                (img_top1, l_top),
+                (img_top2, l_top),
+                (img_top2.copy(), l_top),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_stop = cli.Flow(c_stop, reader=r_stop, timeout=1.0)
+        try:
+            with self.assertRaises(cli.FlowError) as ctx:
+                flow_stop.step("scrollto:up:MissingTop")
+            self.assertIn("MissingTop", str(ctx.exception))
+            # Stopped after 1 swipe saw identical lines (not max_swipes=8).
+            self.assertEqual(len(c_stop.drags), 1)
+            self.assertLess(c_stop.drags[0]["fromY"], c_stop.drags[0]["toY"])
+
+            # Empty targets rejected cleanly.
+            for bad in ("scrollto:", "scrollto:up:", "scrollto:down:"):
+                with self.assertRaises(cli.FlowError):
+                    flow_stop.step(bad)
+            self.assertIn("scrollto:up:TEXT", cli.FLOW_HELP)
+        finally:
+            flow_stop.close()
+
+        # When scrollto (down) sees the target clipped in the bottom home-indicator strip
+        # (y > sh - 55), it scrolls once more to bring it cleanly into the tappable viewport.
+        edge_img1 = solid_img(240, size=(430, 932))
+        edge_img2 = solid_img(200, size=(430, 932))
+        c_edge = MockWDAClient()
+        r_edge = FakeReader(
+            frames=[
+                (edge_img1, [make_line("Generelt", 40, 895, 160, 915)]),  # y=905 > 932-55=877
+                (edge_img2, [make_line("Generelt", 40, 500, 160, 520)]),  # y=510 cleanly tappable
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_edge = cli.Flow(c_edge, reader=r_edge, timeout=1.0)
+        try:
+            with mock.patch.object(flow_edge, "scroll", side_effect=lambda d="down": r_edge.set_last(edge_img2)):
+                m_edge = flow_edge.scroll_to("Generelt")
+            self.assertEqual(m_edge.y, 510)
+        finally:
+            flow_edge.close()
+
 
 class LazyImportAndWarmupTests(unittest.TestCase):
     def test_import_and_help_do_not_load_pil_or_http_client(self):
@@ -1166,6 +2041,34 @@ class LazyImportAndWarmupTests(unittest.TestCase):
         warm_ocr, sr = created[0]
         self.assertFalse(warm_ocr)
         self.assertIsNone(sr.pool)
+
+    def test_url_only_flow_skips_ocr_warmup(self):
+        c = MockWDAClient()
+        args = types.SimpleNamespace(
+            steps=["url:https://example.com"],
+            scale=1.5,
+            timeout=2.0,
+            deny=cli.DENY_DEFAULT,
+            no_deny=False,
+            quiet=True,
+        )
+        created = []
+        orig_sr = cli.ScreenReader
+
+        def spy_sr(*a, **kw):
+            sr = orig_sr(*a, **kw)
+            created.append((kw.get("warm_ocr", True), sr))
+            return sr
+
+        with mock.patch("turbotap.cli.ScreenReader", side_effect=spy_sr), \
+             mock.patch("builtins.print"):
+            cli.cmd_flow(c, args)
+
+        self.assertEqual(len(created), 1)
+        warm_ocr, sr = created[0]
+        self.assertFalse(warm_ocr)
+        self.assertIsNone(sr.pool)
+        self.assertEqual(c.opened_urls, ["https://example.com"])
 
 
 if __name__ == "__main__":

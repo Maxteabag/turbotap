@@ -38,9 +38,73 @@ class StripSlicingAndOcrTests(unittest.TestCase):
         img = solid_img(240, size=(80, 40))
         reader = cli.ScreenReader(MockWDAClient(), workers=4, warm_ocr=False)
         cuts = reader._cuts(img)
-        self.assertEqual(cuts[0], 0)
-        self.assertEqual(cuts[-1], 40)
+        self.assertEqual(cuts, [0, 40])
         self.assertTrue(all(a < b for a, b in zip(cuts, cuts[1:])))
+
+        # Short band (< 180 px tall) uses 1 strip to skip ThreadPoolExecutor overhead
+        # and avoid slicing text lines into tiny slivers.
+        band = solid_img(240, size=(603, 150))
+        reader6 = cli.ScreenReader(MockWDAClient(), workers=6, warm_ocr=False)
+        self.assertEqual(reader6._cuts(band), [0, 150])
+
+        # Full-height wide image still splits cleanly into `workers` strips.
+        full = solid_img(240, size=(603, 1311))
+        full_cuts = reader6._cuts(full)
+        self.assertEqual(len(full_cuts), 7)
+        self.assertEqual(full_cuts[0], 0)
+        self.assertEqual(full_cuts[-1], 1311)
+        self.assertTrue(all(a < b for a, b in zip(full_cuts, full_cuts[1:])))
+
+    def test_ocr_raw_large_strip_histogram_contrast_dark_blank_and_memoryview(self):
+        reader = cli.ScreenReader(MockWDAClient(), workers=2, warm_ocr=False)
+        w, h = 603, 218  # n_samp = (603*218)//19 ~= 6918 >= 256 -> C-level histogram path
+
+        seen = []
+
+        def fake_tsv(img, psm=11, api=None, sauvola=False):
+            data = img.tobytes()
+            seen.append((sauvola, sum(data) / len(data)))
+            return _tsv_for_word("OK")
+
+        # 1. Uniform blank large strip -> skipped for both Otsu and Sauvola.
+        blank_large = solid_img(210, size=(w, h)).tobytes()
+        # 2. Very-low-contrast 2-level strip -> skipped for Otsu (min_contrast=4), OCR'd for Sauvola (min_contrast=1).
+        low2_img = box_img(bg=200, boxes=[((50, 50, 350, 150), 198)], size=(w, h))
+        # 3. Low-contrast 12-level strip -> OCR'd for BOTH Otsu and Sauvola.
+        low12_img = box_img(bg=200, boxes=[((50, 50, 350, 150), 188)], size=(w, h))
+        # 4. Dark-mode large strip (bg=20, fg=240) -> pre-inverted (mean > 180).
+        dark_large = box_img(bg=20, boxes=[((50, 50, 350, 150), 240)], size=(w, h))
+        # 5. Light mixed-polarity large strip (bg=235, dark pill=20) -> NOT inverted (mean > 180).
+        light_mixed = box_img(bg=235, boxes=[((50, 50, 200, 120), 20)], size=(w, h))
+
+        with mock.patch("turbotap.cli._tess_lib", return_value=None), \
+             mock.patch("turbotap.cli.tesseract_tsv", side_effect=fake_tsv):
+            self.assertEqual(reader._ocr_raw(blank_large, w, h, sauvola=False), [])
+            self.assertEqual(reader._ocr_raw(blank_large, w, h, sauvola=True), [])
+            self.assertEqual(seen, [])
+
+            self.assertEqual(reader._ocr_raw(low2_img.tobytes(), w, h, sauvola=False), [])
+            self.assertEqual(len(seen), 0)
+            res_low2_s = reader._ocr_raw(low2_img.tobytes(), w, h, sauvola=True)
+            self.assertEqual(res_low2_s[0][0][0], "OK")
+            self.assertEqual(len(seen), 1)
+
+            seen.clear()
+            res_low12_o = reader._ocr_raw(low12_img.tobytes(), w, h, sauvola=False)
+            res_low12_s = reader._ocr_raw(low12_img.tobytes(), w, h, sauvola=True)
+            self.assertEqual(res_low12_o[0][0][0], "OK")
+            self.assertEqual(res_low12_s[0][0][0], "OK")
+            self.assertEqual([s[0] for s in seen], [False, True])
+
+            seen.clear()
+            reader._ocr_raw(dark_large.tobytes(), w, h, sauvola=False)
+            reader._ocr_raw(light_mixed.tobytes(), w, h, sauvola=False)
+            # memoryview input also works for both dark and light strips.
+            reader._ocr_raw(memoryview(dark_large.tobytes()), w, h, sauvola=False)
+            reader._ocr_raw(memoryview(light_mixed.tobytes()), w, h, sauvola=False)
+            self.assertEqual(len(seen), 4)
+            for _, mean in seen:
+                self.assertGreater(mean, 180)
 
     def test_blank_strip_skips_ocr_backend(self):
         reader = cli.ScreenReader(MockWDAClient(), workers=2, warm_ocr=False)
@@ -206,6 +270,47 @@ class FindTextMatchingTests(unittest.TestCase):
         m_top = cli.find_text(lines, "Settings", where="y<54")
         self.assertIsNotNone(m_top)
         self.assertEqual(m_top.y, 20)
+
+    def test_short_alpha_word_boundary_and_multichar_icon_prefix(self):
+        # Short alphabetic labels (<= 3 chars like 'Om', 'OK', 'On') must NOT match
+        # mid-word inside unrelated words like '@ Zoom' or 'Home'.
+        false_pos = [
+            make_line("@ Zoom", 20, 120, 120, 140),
+            make_line("Home Screen", 20, 180, 160, 200),
+            make_line("Kommentarer", 20, 240, 180, 260),
+        ]
+        self.assertIsNone(cli.find_text(false_pos, "Om"))
+
+        # Short alphabetic queries must NOT fall through to fuzzy matches on 4-letter
+        # words sharing a 3-letter prefix ('You' must NOT match 'Your').
+        self.assertIsNone(cli.find_text([make_line("Your", 20, 120, 80, 140)], "You"))
+        m_you = cli.find_text([make_line("You", 20, 120, 80, 140)], "You")
+        self.assertIsNotNone(m_you)
+        self.assertEqual(m_you.rank, 0)
+
+        # Word-boundary matches (exact, icon-prefixed, or standalone word) still match cleanly.
+        m_exact = cli.find_text([make_line("Om", 20, 150, 60, 170)], "Om")
+        self.assertIsNotNone(m_exact)
+        self.assertEqual(m_exact.rank, 0)
+
+        m_phrase = cli.find_text([make_line("Zoom Om enheten", 20, 150, 260, 170)], "Om")
+        self.assertIsNotNone(m_phrase)
+        # Span centers on 'Om' (middle word), not 'Zoom' (first word).
+        self.assertGreater(m_phrase.x, 90)
+
+        # Multi-char non-alpha row icon prefixes ('[5] Generelt', '2] Generelt', '© Generelt')
+        # strip to rank 0 centered on the label, while numbered items ('1 Generelt') stay rank 1.
+        for txt in ("[5] Generelt", "2] Generelt", "© Generelt"):
+            ln = cli.Line([(txt.split()[0], 20, 200, 42, 220), ("Generelt", 50, 200, 150, 220)])
+            m = cli.find_text([ln], "Generelt")
+            self.assertIsNotNone(m)
+            self.assertEqual(m.rank, 0, f"expected rank 0 for {txt!r}")
+            self.assertEqual(m.x, 100)  # centered on 'Generelt' [50..150], skipping icon
+
+        num_ln = cli.Line([("1", 20, 200, 32, 220), ("Generelt", 50, 200, 150, 220)])
+        m_num = cli.find_text([num_ln], "Generelt")
+        self.assertIsNotNone(m_num)
+        self.assertEqual(m_num.rank, 1)
 
 
 class FrameReactedTests(unittest.TestCase):

@@ -114,6 +114,8 @@ class MockWDAClient(cli.WDAClient):
         element_rects=None,
         element_values=None,
         element_labels=None,
+        element_names=None,
+        element_enabled=None,
         screenshot_b64=None,
         on_action=None,
         custom_handler=None,
@@ -146,6 +148,8 @@ class MockWDAClient(cli.WDAClient):
         self.element_rects = dict(element_rects or {})
         self.element_values = dict(element_values or {})
         self.element_labels = dict(element_labels or {})
+        self.element_names = dict(element_names or {})
+        self.element_enabled = dict(element_enabled or {})
         self.focused_eid = next(iter(self.element_values), None)
         self.screenshot_b64 = screenshot_b64
         self.on_action = on_action
@@ -154,6 +158,7 @@ class MockWDAClient(cli.WDAClient):
         self.tapped_points = []
         self.batch_taps = []
         self.drags = []
+        self.opened_urls = []
 
     def _fire_action(self, kind, payload):
         if self.on_action is not None:
@@ -279,6 +284,10 @@ class MockWDAClient(cli.WDAClient):
         if clean_path.endswith("/wda/pressButton"):
             self._fire_action("button", data)
             return {"value": None}
+        if clean_path.endswith("/url") and method == "POST":
+            self.opened_urls.append((data or {}).get("url"))
+            self._fire_action("url", data)
+            return {"value": None}
 
         if clean_path.endswith("/elements") and method == "POST":
             m_sub = re.match(r"^/session/[^/]+/element/([^/]+)/elements$", clean_path)
@@ -323,8 +332,15 @@ class MockWDAClient(cli.WDAClient):
                 return {"value": None}
             if sub == "rect":
                 return {"value": self.element_rects.get(eid, {})}
+            if sub == "enabled":
+                return {"value": self.element_enabled.get(eid, True)}
+            if sub == "attribute/enabled":
+                v = self.element_enabled.get(eid, True)
+                return {"value": "true" if v else "false"} if isinstance(v, bool) else {"value": v}
             if sub == "attribute/label":
-                return {"value": self.element_labels.get(eid, "")}
+                return {"value": self.element_labels.get(eid)}
+            if sub == "attribute/name":
+                return {"value": self.element_names.get(eid)}
             if sub == "attribute/value":
                 v = self.element_values.get(eid, "")
                 if callable(v):
