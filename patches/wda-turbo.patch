@@ -1,8 +1,171 @@
+diff --git a/WebDriverAgentLib/Commands/FBCustomCommands.m b/WebDriverAgentLib/Commands/FBCustomCommands.m
+index 6dee73b..fbf238c 100644
+--- a/WebDriverAgentLib/Commands/FBCustomCommands.m
++++ b/WebDriverAgentLib/Commands/FBCustomCommands.m
+@@ -35,6 +35,67 @@
+ #import "XCUIElement+FBIsVisible.h"
+ #import "XCUIElementQuery.h"
+ #import "FBUnattachedAppLauncher.h"
++#import <CoreFoundation/CoreFoundation.h>
++#import <stdatomic.h>
++#import "FBXCTestDaemonsProxy.h"
++#import "XCTMessagingChannel_RunnerToDaemon-Protocol.h"
++
++typedef NS_ENUM(NSInteger, FBTerminateFastResult) {
++  FBTermSucceeded = 0,
++  FBTermUnavailable = 1,
++  FBTermTimedOut = 2,
++};
++
++// wda-turbo: terminate an application via direct async testmanagerd XPC and wake
++// the current CFRunLoop immediately upon completion, with a bounded timeout so it
++// can never hang. Distinguishes timeout (termination still in flight) from
++// unavailable/rejected XPC so callers never race an unresolved termination.
++static FBTerminateFastResult FBTerminateAppFast(NSString *bundleId, NSTimeInterval timeoutSec)
++{
++  id<XCTMessagingChannel_RunnerToDaemon> daemonProxy = [FBXCTestDaemonsProxy testRunnerProxy];
++  if (![(NSObject *)daemonProxy respondsToSelector:@selector(_XCT_terminateApplicationWithBundleID:completion:)]) {
++    return FBTermUnavailable;
++  }
++  __block NSError *xpcError = nil;
++  __block atomic_bool done = false;
++  __block atomic_bool timedOut = false;
++  __block atomic_bool invoked = false;
++  CFRunLoopRef rl = CFRunLoopGetCurrent();
++  CFRetain(rl);
++  @try {
++    [daemonProxy _XCT_terminateApplicationWithBundleID:bundleId
++                                            completion:^(NSError *invokeError) {
++      if (atomic_exchange_explicit(&invoked, true, memory_order_acq_rel)) {
++        return;
++      }
++      if (nil != invokeError) {
++        xpcError = invokeError;
++      }
++      atomic_store_explicit(&done, true, memory_order_release);
++      if (!atomic_load_explicit(&timedOut, memory_order_acquire)) {
++        CFRunLoopStop(rl);
++        CFRunLoopWakeUp(rl);
++      }
++      CFRelease(rl);
++    }];
++  } @catch (NSException *exception) {
++    (void)exception;
++    if (!atomic_exchange_explicit(&invoked, true, memory_order_acq_rel)) {
++      CFRelease(rl);
++    }
++    return FBTermUnavailable;
++  }
++  NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + timeoutSec;
++  while (!atomic_load_explicit(&done, memory_order_acquire)) {
++    NSTimeInterval remaining = deadline - NSProcessInfo.processInfo.systemUptime;
++    if (remaining <= 0.0) {
++      atomic_store_explicit(&timedOut, true, memory_order_release);
++      return FBTermTimedOut;
++    }
++    CFRunLoopRunInMode(kCFRunLoopDefaultMode, MIN(0.02, remaining), (Boolean)true);
++  }
++  return (nil == xpcError) ? FBTermSucceeded : FBTermUnavailable;
++}
+ 
+ @implementation FBCustomCommands
+ 
+@@ -75,6 +136,8 @@
+     [[FBRoute POST:@"/wda/expectNotification"] respondWithTarget:self action:@selector(handleExpectNotification:)],
+     [[FBRoute POST:@"/wda/siri/activate"] respondWithTarget:self action:@selector(handleActivateSiri:)],
+     [[FBRoute POST:@"/wda/apps/launchUnattached"].withoutSession respondWithTarget:self action:@selector(handleLaunchUnattachedApp:)],
++    [[FBRoute POST:@"/wda/fastLaunch"] respondWithTarget:self action:@selector(handleFastLaunch:)],
++    [[FBRoute POST:@"/wda/fastLaunch"].withoutSession respondWithTarget:self action:@selector(handleFastLaunch:)],
+     [[FBRoute GET:@"/wda/device/hingeAngle"] respondWithTarget:self action:@selector(handleGetSimulatedHingeAngle:)],
+     [[FBRoute GET:@"/wda/device/hingeAngle"].withoutSession respondWithTarget:self action:@selector(handleGetSimulatedHingeAngle:)],
+     [[FBRoute POST:@"/wda/device/hingeAngle"] respondWithTarget:self action:@selector(handleSetSimulatedHingeAngle:)],
+@@ -386,6 +449,81 @@
+   return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"LSApplicationWorkspace failed to launch app" traceback:nil]);
+ }
+ 
++// wda-turbo: fast app launch / cold-launch in one round-trip.
++// Skips termination when NotRunning, uses direct async testmanagerd XPC termination
++// (falling back to [app terminate]), briefly polls until NotRunning, then launches via
++// LSApplicationWorkspace (falling back to [app activate]).
++// Body: {"bundleId": "com.apple.Preferences", "terminate": true|false}
+++ (id<FBResponsePayload>)handleFastLaunch:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  id rawBundleId = a[@"bundleId"];
++  if (![rawBundleId isKindOfClass:NSString.class] || ((NSString *)rawBundleId).length == 0U) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'bundleId' must be a non-empty string"
++                                                                       traceback:nil]);
++  }
++  NSString *bundleId = (NSString *)rawBundleId;
++  id rawTerminate = a[@"terminate"];
++  BOOL shouldTerminate = (nil != rawTerminate && [rawTerminate respondsToSelector:@selector(boolValue)])
++    ? [rawTerminate boolValue]
++    : NO;
++
++  XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:bundleId];
++  BOOL didTerminate = NO;
++  if (shouldTerminate
++      && ![bundleId isEqualToString:@"com.apple.springboard"]
++      && app.state > XCUIApplicationStateNotRunning) {
++    FBTerminateFastResult termResult = FBTerminateAppFast(bundleId, 2.0);
++    if (termResult == FBTermTimedOut) {
++      NSString *msg = [NSString stringWithFormat:@"Timed out waiting for '%@' termination", bundleId];
++      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:msg traceback:nil]);
++    }
++    if (termResult == FBTermSucceeded) {
++      didTerminate = YES;
++    } else if (app.state > XCUIApplicationStateNotRunning) {
++      @try {
++        [app terminate];
++        didTerminate = YES;
++      } @catch (NSException *exception) {
++        return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:exception.reason ?: @"Failed to terminate application"
++                                                                   traceback:nil]);
++      }
++    } else {
++      didTerminate = YES;
++    }
++    NSTimeInterval pollDeadline = NSProcessInfo.processInfo.systemUptime + 0.8;
++    while (app.state > XCUIApplicationStateNotRunning
++           && NSProcessInfo.processInfo.systemUptime < pollDeadline) {
++      CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, (Boolean)true);
++    }
++    if (app.state > XCUIApplicationStateNotRunning) {
++      NSString *msg = [NSString stringWithFormat:@"Application '%@' did not reach NotRunning after termination", bundleId];
++      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:msg traceback:nil]);
++    }
++  }
++
++  BOOL launched = [FBUnattachedAppLauncher launchAppWithBundleId:bundleId];
++  if (!launched) {
++    @try {
++      [app activate];
++    } @catch (NSException *exception) {
++      NSString *msg = exception.reason ?: [NSString stringWithFormat:@"Failed to launch '%@'", bundleId];
++      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:msg traceback:nil]);
++    }
++    launched = (app.state > XCUIApplicationStateNotRunning);
++    if (!launched) {
++      NSString *msg = [NSString stringWithFormat:@"Failed to launch application '%@'", bundleId];
++      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:msg traceback:nil]);
++    }
++  }
++
++  return FBResponseWithObject(@{
++    @"bundleId": bundleId,
++    @"terminated": @(didTerminate),
++    @"launched": @(launched),
++  });
++}
++
+ + (id <FBResponsePayload>)handleResetAppAuth:(FBRouteRequest *)request
+ {
+   NSNumber *resource = request.arguments[@"resource"];
 diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m b/WebDriverAgentLib/Commands/FBDebugCommands.m
-index 42ea74b..829efed 100644
+index 42ea74b..9eb5996 100644
 --- a/WebDriverAgentLib/Commands/FBDebugCommands.m
 +++ b/WebDriverAgentLib/Commands/FBDebugCommands.m
-@@ -8,13 +8,165 @@
+@@ -8,13 +8,193 @@
  
  #import "FBDebugCommands.h"
  
@@ -50,7 +213,11 @@ index 42ea74b..829efed 100644
 +                            NSInteger sh,
 +                            BOOL includeText,
 +                            BOOL inKeyboard,
-+                            NSMutableArray<NSDictionary<NSString *, id> *> *out)
++                            CGRect toolbarRect,
++                            BOOL *hasKeyboardOut,
++                            CGRect *kbRectOut,
++                            NSMutableArray<NSDictionary<NSString *, id> *> *toolbarItemsOut,
++                            NSMutableArray<NSMutableDictionary<NSString *, id> *> *out)
 +{
 +  if (nil == snapshot) {
 +    return;
@@ -59,6 +226,19 @@ index 42ea74b..829efed 100644
 +  CGRect frame = snapshot.frame;
 +  BOOL finiteFrame = isfinite(frame.origin.x) && isfinite(frame.origin.y)
 +    && isfinite(frame.size.width) && isfinite(frame.size.height);
++  if (type == XCUIElementTypeKeyboard && finiteFrame && frame.size.width > 0.0 && frame.size.height > 0.0
++      && frame.origin.y < screenH && frame.origin.y + frame.size.height > 0.0) {
++    if (NULL != hasKeyboardOut) {
++      *hasKeyboardOut = YES;
++    }
++    if (NULL != kbRectOut) {
++      *kbRectOut = frame;
++    }
++  }
++  CGRect nextToolbarRect = toolbarRect;
++  if (type == XCUIElementTypeToolbar && finiteFrame && frame.size.width > 0.0 && frame.size.height > 0.0) {
++    nextToolbarRect = frame;
++  }
 +  if (type == XCUIElementTypeCell && finiteFrame && frame.size.width > 0.0 && frame.size.height > 0.0) {
 +    if (frame.origin.x >= screenW || frame.origin.x + frame.size.width <= 0.0
 +        || frame.origin.y >= screenH || frame.origin.y + frame.size.height <= 0.0) {
@@ -154,13 +334,24 @@ index 42ea74b..829efed 100644
 +      if (labelFromId && type == XCUIElementTypeCell) {
 +        item[@"fromId"] = @YES;
 +      }
++      if (kb) {
++        item[@"inKeyboard"] = @YES;
++      } else if (nil != toolbarItemsOut && nextToolbarRect.size.width > 0.0 && nextToolbarRect.size.height > 0.0) {
++        [toolbarItemsOut addObject:@{
++          @"item": item,
++          @"x": @((double)nextToolbarRect.origin.x),
++          @"y": @((double)nextToolbarRect.origin.y),
++          @"w": @((double)nextToolbarRect.size.width),
++          @"h": @((double)nextToolbarRect.size.height),
++        }];
++      }
 +      [out addObject:item];
 +    }
 +  }
 +  NSArray *children = snapshot.children;
 +  for (id<FBXCElementSnapshot> child in children) {
 +    @autoreleasepool {
-+      FBFastUICollect(child, screenW, screenH, sw, sh, includeText, kb, out);
++      FBFastUICollect(child, screenW, screenH, sw, sh, includeText, kb, nextToolbarRect, hasKeyboardOut, kbRectOut, toolbarItemsOut, out);
 +    }
 +  }
 +}
@@ -168,7 +359,7 @@ index 42ea74b..829efed 100644
  @implementation FBDebugCommands
  
  #pragma mark - <FBCommandHandler>
-@@ -27,6 +179,8 @@
+@@ -27,6 +207,8 @@
      [[FBRoute GET:@"/source"].withoutSession respondWithTarget:self action:@selector(handleGetSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"] respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"].withoutSession respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
@@ -177,7 +368,7 @@ index 42ea74b..829efed 100644
    ];
  }
  
-@@ -78,4 +232,84 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
+@@ -78,4 +260,113 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
    return FBResponseWithObject(application.fb_accessibilityTree ?: @{});
  }
  
@@ -233,17 +424,46 @@ index 42ea74b..829efed 100644
 +  BOOL includeText = (nil != textParam
 +                      && ([textParam isEqualToString:@"1"]
 +                          || [textParam caseInsensitiveCompare:@"true"] == NSOrderedSame));
-+  NSMutableArray<NSDictionary<NSString *, id> *> *items = [NSMutableArray array];
-+  FBFastUICollect(snapshot, screenW, screenH, sw, sh, includeText, NO, items);
++  NSMutableArray<NSMutableDictionary<NSString *, id> *> *items = [NSMutableArray array];
++  NSMutableArray<NSDictionary<NSString *, id> *> *toolbarItems = [NSMutableArray array];
++  BOOL hasKeyboard = NO;
++  CGRect kbRect = CGRectZero;
++  FBFastUICollect(snapshot, screenW, screenH, sw, sh, includeText, NO, CGRectZero, &hasKeyboard, &kbRect, toolbarItems, items);
++  if (hasKeyboard && kbRect.size.width > 0.0 && kbRect.size.height > 0.0) {
++    double kbX0 = (double)kbRect.origin.x;
++    double kbX1 = kbX0 + (double)kbRect.size.width;
++    double kbY = (double)kbRect.origin.y;
++    for (NSDictionary<NSString *, id> *entry in toolbarItems) {
++      double tx = [(NSNumber *)entry[@"x"] doubleValue];
++      double ty = [(NSNumber *)entry[@"y"] doubleValue];
++      double tw = [(NSNumber *)entry[@"w"] doubleValue];
++      double th = [(NSNumber *)entry[@"h"] doubleValue];
++      double tBottom = ty + th;
++      if (ty >= kbY - 72.0 && tBottom >= kbY - 16.0 && tBottom <= kbY + 16.0
++          && tx >= kbX0 - 8.0 && (tx + tw) <= kbX1 + 8.0) {
++        NSMutableDictionary<NSString *, id> *it = entry[@"item"];
++        it[@"inKeyboardAccessory"] = @YES;
++      }
++    }
++  }
 +  NSString *appName = snapshot.label.length > 0
 +    ? snapshot.label
 +    : (snapshot.identifier.length > 0 ? snapshot.identifier : @"");
-+  NSDictionary<NSString *, id> *payload = @{
++  NSMutableDictionary<NSString *, id> *payload = [NSMutableDictionary dictionaryWithDictionary:@{
 +    @"bundleId": application.bundleID ?: @"",
 +    @"appName": appName,
 +    @"screen": @[@(sw), @(sh)],
++    @"hasKeyboard": @(hasKeyboard),
 +    @"ui": items,
-+  };
++  }];
++  if (hasKeyboard && kbRect.size.width > 0.0 && kbRect.size.height > 0.0) {
++    payload[@"keyboardRect"] = @{
++      @"x": @((NSInteger)llround(kbRect.origin.x)),
++      @"y": @((NSInteger)llround(kbRect.origin.y)),
++      @"width": @((NSInteger)llround(kbRect.size.width)),
++      @"height": @((NSInteger)llround(kbRect.size.height)),
++    };
++  }
 +  NSError *jsonError = nil;
 +  NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload
 +                                                     options:(NSJSONWritingOptions)0

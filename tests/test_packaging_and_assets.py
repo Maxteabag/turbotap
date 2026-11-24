@@ -35,13 +35,28 @@ class PackagingAndAssetsTests(unittest.TestCase):
             text = f.read()
 
         # Valid unified diff headers covering the core WDA files.
+        self.assertIn("diff --git a/WebDriverAgentLib/Commands/FBCustomCommands.m", text)
         self.assertIn("diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m", text)
         self.assertIn("diff --git a/WebDriverAgentLib/Commands/FBElementCommands.m", text)
         self.assertIn("diff --git a/WebDriverAgentLib/Commands/FBScreenshotCommands.m", text)
 
-        # Expected WDA Turbo v3 routes are declared in the patch.
-        for route in ("/wda/fastTap", "/wda/fastDrag", "/wda/fastKeys", "/wda/fastScreenshot", "/wda/fastUI"):
+        # Expected WDA Turbo v5 routes are declared in the patch.
+        for route in (
+            "/wda/fastLaunch",
+            "/wda/fastTap",
+            "/wda/fastDoubleTap",
+            "/wda/fastPinch",
+            "/wda/fastTapBatch",
+            "/wda/fastDrag",
+            "/wda/fastKeys",
+            "/wda/fastScreenshot",
+            "/wda/fastUI",
+        ):
             self.assertIn(route, text, f"Missing route {route} in wda-turbo.patch")
+
+        # WDA v5 safety invariants: tri-state fast termination + fastUI keyboard metadata.
+        for sym in ("FBTermTimedOut", "hasKeyboard", "keyboardRect", "inKeyboard", "inKeyboardAccessory"):
+            self.assertIn(sym, text, f"Missing symbol {sym} in wda-turbo.patch")
 
         # Inspect only added non-comment ObjC code lines for strict Xcode -Weverything hygiene.
         added_code = []
