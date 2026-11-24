@@ -16,25 +16,23 @@ CLI for driving a real iPhone over Wi-Fi from your terminal or an AI agent (Clau
 
 I put this together because controlling an iPhone one screenshot at a time through an LLM is painfully slow. Grabbing a frame, waiting on the model to pick coordinates, and waiting another second per tap on stock WebDriverAgent turns a 5-tap task into a minute of waiting. `turbotap` takes a whole sequence of steps in one command, runs them locally against a patched WebDriverAgent on the phone, and returns JSON with the text and buttons on screen.
 
-A multi-step flow usually finishes in 3.8-6.5s end to end, compared to 14.4-15.7s on stock WDA.
-
 ## Examples
 
 ```bash
-# Open Settings -> General -> About and read the iOS version (~6.5s)
+# Open Settings -> General -> About and read the iOS version
 turbotap flow launch:com.apple.Preferences scrollto:General tap:General tap:About wait:"iOS Version" read
 
-# Open Spotify -> Your Library -> Liked Songs and read the list (~4.8s)
+# Open Spotify -> Your Library -> Liked Songs and read the list
 turbotap flow open:Spotify tap:"Your Library" tap:"Liked Songs@y>150" wait:songs read:ocr tap:Back
 
-# Open Weather and read the forecast (~2.9s)
+# Open Weather and read the forecast (~0.6-1.1s)
 turbotap flow open:Weather read
 
 # Search the App Store for Angry Birds and install it
 turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" tap:Get
 ```
 
-Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
+Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `assert:`, `assertnot:`, `alert:text`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
 
 ## Requirements
 
@@ -166,7 +164,7 @@ App PINs work the same way. `pintap:cmd:"security find-generic-password -w -s ba
 
 ### How does it read the screen, accessibility tree or screenshots?
 
-Both. `read` grabs a cropped, downscaled screenshot from the phone and OCRs it locally with `libtesseract` (`OEM_LSTM_ONLY`), split into strips that run in parallel in one process with dark-mode pre-inversion and strip caching (180-250ms cold, ~50-65ms cached). OCR sees everything that's drawn, including web views and apps with poor accessibility labels. It also pulls a trimmed accessibility tree (`/source` excluding visibility and other expensive per-node attributes, 250-450ms) to catch what OCR misses: icon-only buttons, app keypad keys, unlabeled controls, switch states and exact field values. The agent gets the merged result as JSON text and tap targets, not images.
+Both. `read` grabs a cropped, downscaled screenshot from the phone and OCRs it locally with `libtesseract` (`OEM_LSTM_ONLY`), split into strips that run in parallel in one process with dark-mode pre-inversion and strip caching (100-180ms cold, ~50ms cached). OCR sees everything that's drawn, including web views and apps with poor accessibility labels. It also pulls the accessibility tree via `/wda/fastUI` (158-198ms with `wda-turbo.patch`, or trimmed `/source` fallback in ~297ms) to catch what OCR misses: icon-only buttons, app keypad keys, unlabeled controls, switch states and exact field values. The agent gets the merged result as JSON text and tap targets, not images.
 
 `read:ocr` skips the tree when you only need text, `read:Y0-Y1` OCRs a single vertical band 3-4x faster, and `ui` or `readel:TEXT` give you just the tree.
 
