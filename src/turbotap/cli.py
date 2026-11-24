@@ -69,6 +69,14 @@ def load_config():
 
 _CFG = load_config()
 MAC_HOST = os.environ.get("WDA_MAC_HOST") or _CFG.get("mac_host") or "mac"
+APP_CACHE_DIR = os.path.expanduser("~/.cache/turbotap")
+SESSION_SETTINGS_TTL = 1800  # seconds before re-applying /appium/settings for the same WDA session
+
+
+def _session_cache_path(base_url="", udid=""):
+    netloc = urllib.parse.urlsplit(base_url).netloc if base_url else ""
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", udid or netloc or "default")
+    return os.path.join(APP_CACHE_DIR, f"session-{key}.json")
 
 
 def resolve_device_settings(url_arg=None, device_arg=None, udid_arg=None):
@@ -106,6 +114,63 @@ class WDAClient:
         self.device_key = device_key
         self.sid = None
         self._conn = None
+
+    def _side_client(self):
+        side = WDAClient(self.base_url, udid=self.udid, device_key=self.device_key)
+        side.sid = self.sid
+        side.turbo = self.turbo
+        return side
+
+    def _session_cache_file(self):
+        return _session_cache_path(self.base_url, self.udid)
+
+    def _load_session_cache(self):
+        try:
+            with open(self._session_cache_file()) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_session_cache(self, updates):
+        if not self.sid:
+            return
+        cur = self._load_session_cache()
+        if cur.get("base_url") != self.base_url or cur.get("sid") != self.sid:
+            cur = {"base_url": self.base_url, "udid": self.udid, "sid": self.sid}
+        cur.update(updates)
+        cur["base_url"] = self.base_url
+        cur["udid"] = self.udid
+        cur["sid"] = self.sid
+        path = self._session_cache_file()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(cur, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _invalidate_session_cache(self, field=None):
+        path = self._session_cache_file()
+        if field is None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return
+        cur = self._load_session_cache()
+        if field in cur:
+            cur.pop(field, None)
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = f"{path}.{os.getpid()}.tmp"
+                with open(tmp, "w") as f:
+                    json.dump(cur, f)
+                os.replace(tmp, path)
+            except OSError:
+                pass
 
     def req(self, method, path, data=None, timeout=25):
         """One persistent keep-alive HTTP connection (re-opened on failure).
@@ -156,13 +221,26 @@ class WDAClient:
             s = self.req("POST", "/session", {"capabilities": caps})
             self.sid = s.get("sessionId") or (s.get("value") or {}).get("sessionId")
         if apply_fast_settings and self.sid:
-            self.req("POST", f"/session/{self.sid}/appium/settings", {
-                "settings": {
-                    "snapshotMaxDepth": 150,
-                    "waitForIdleTimeout": 0,
-                    "screenshotQuality": 2,
-                }
-            })
+            cached = self._load_session_cache()
+            settings_fresh = (
+                cached.get("base_url") == self.base_url
+                and cached.get("sid") == self.sid
+                and cached.get("settings_applied") is True
+                and (time.time() - float(cached.get("settings_ts") or 0)) < SESSION_SETTINGS_TTL
+            )
+            if not settings_fresh:
+                r = self.req("POST", f"/session/{self.sid}/appium/settings", {
+                    "settings": {
+                        "snapshotMaxDepth": 150,
+                        "waitForIdleTimeout": 0,
+                        "screenshotQuality": 2,
+                    }
+                })
+                if not r.get("error"):
+                    self._save_session_cache({
+                        "settings_applied": True,
+                        "settings_ts": time.time(),
+                    })
         return self.sid
 
     def start_wda_on_mac(self, build=False):
@@ -247,6 +325,8 @@ def cmd_preflight(client, _args):
     locked = client.req("GET", "/wda/locked").get("value")
     app = client.req("GET", "/wda/activeAppInfo").get("value", {}).get("bundleId")
     sz = client.req("GET", f"/session/{sid}/window/size").get("value") or {}
+    if sz.get("width") and sz.get("height"):
+        client._save_session_cache({"screen_pt": [int(sz["width"]), int(sz["height"])]})
     dt = (time.perf_counter() - t0) * 1000
     print(json.dumps({
         "ok": True,
@@ -456,6 +536,44 @@ def _thumb_diff(a, b):
     return ImageStat.Stat(d).mean[0]
 
 
+def _frame_reacted(before, cur, x=None, y=None, scale=1.5):
+    """True when cur shows a real UI reaction vs before.
+
+    Combines:
+    - global mean diff (> 1.0) on a 24x48 area-averaged grid (transitions, modals),
+    - local box diff (> 2.5) around the tap point (button highlight, cursor, toggle),
+    - max grid-cell diff (>= 14) anywhere below the status bar (remote localized changes
+      such as a single Calculator digit appearing at the top when tapping a keypad key),
+      while rejecting JPEG quality=0.6 compression noise (max cell <= 1-2).
+    """
+    if before is None or cur is None or before.size != cur.size:
+        return True
+    w, h = before.size
+    top = int(h * 0.06) if h >= 200 else 0
+    grid = (min(24, max(1, w)), min(48, max(1, h - top)))
+    box_resample = getattr(Image, "Resampling", Image).BOX
+    ca = before.crop((0, top, w, h)).resize(grid, box_resample)
+    cb = cur.crop((0, top, w, h)).resize(grid, box_resample)
+    d = ImageChops.difference(ca, cb)
+    if d.getextrema()[1] >= 14:
+        return True
+    if ImageStat.Stat(d).mean[0] > 1.0:
+        return True
+    if x is not None and y is not None and _box_diff(before, cur, x, y, scale, dx=45, dy=25) > 2.5:
+        return True
+    return False
+
+
+def _text_overlap(a, b):
+    """Fraction of unique OCR lines shared between two frames (0.0-1.0)."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a), set(b)
+    return len(sa & sb) / max(len(sa), len(sb))
+
+
 class ScreenReader:
     """Full-screen OCR for any app, no coordinates known in advance.
 
@@ -476,12 +594,24 @@ class ScreenReader:
         self.apis = queue.Queue()
         self.cache = {}
         self.last = None
+        self.last_ts = 0.0
+        self.last_lines = None
         self._pt = None
+        self._pt_from_cache = False
         self._dev = scale / 3.0  # typical 3x iOS Retina; auto-corrected after 1st grab
         if _tess_lib() is not None:
             for _ in range(self.n):  # warm the engines while the first frame is in flight
                 self.pool.submit(self._new_api)
             atexit.register(self._close)
+
+    def set_last(self, img, lines=None, ts=None):
+        self.last = img
+        self.last_lines = lines
+        self.last_ts = time.monotonic() if ts is None else ts
+
+    def invalidate_last(self):
+        self.last_ts = 0.0
+        self.last_lines = None
 
     def _new_api(self):
         lib = _tess_lib()
@@ -494,48 +624,98 @@ class ScreenReader:
 
     def _close(self):
         lib = _tess_lib()
+        if lib is None:
+            return
         while not self.apis.empty():
             lib.TessBaseAPIDelete(self.apis.get_nowait())
 
-    def pt_size(self):
-        if self._pt is None:
-            v = self.c.req("GET", f"/session/{self.c.sid}/window/size").get("value") or {}
-            self._pt = (int(v.get("width") or 430), int(v.get("height") or 932))
+    def pt_size(self, force_refresh=False):
+        if not force_refresh and self._pt is not None:
+            return self._pt
+        if not force_refresh and hasattr(self.c, "_load_session_cache"):
+            cached = self.c._load_session_cache()
+            pt = cached.get("screen_pt")
+            if (
+                cached.get("base_url") == self.c.base_url
+                and (not self.c.sid or cached.get("sid") == self.c.sid)
+                and isinstance(pt, (list, tuple))
+                and len(pt) == 2
+                and all(isinstance(v, (int, float)) and 100 <= v <= 3000 for v in pt)
+            ):
+                self._pt = (int(pt[0]), int(pt[1]))
+                self._pt_from_cache = True
+                return self._pt
+        v = self.c.req("GET", f"/session/{self.c.sid}/window/size").get("value") or {}
+        w, h = int(v.get("width") or 430), int(v.get("height") or 932)
+        self._pt = (w, h)
+        self._pt_from_cache = False
+        if v.get("width") and v.get("height") and hasattr(self.c, "_save_session_cache"):
+            self.c._save_session_cache({"screen_pt": [w, h]})
         return self._pt
 
     def grab(self, y0=0, y1=None):
-        w, h = self.pt_size()
-        y1 = y1 or h
-        out = (round(w * self.scale), round((y1 - y0) * self.scale))
-        img = None
-        if self.c.turbo is not False:
-            r = self.c.req("POST", "/wda/fastScreenshot", {
-                "x0": 0, "x1": w, "y0": y0, "y1": y1, "quality": 0.6, "scale": min(1.0, self._dev)})
-            v = r.get("value")
-            if isinstance(v, str) and v:
-                self.c.turbo = True
-                img = Image.open(io.BytesIO(base64.b64decode(v)))
-                if abs(img.size[0] - out[0]) > 2:
-                    self._dev *= out[0] / img.size[0]
-            elif r.get("error") == 404:
-                self.c.turbo = False
-        if img is None:
-            b64 = self.c.req("GET", "/screenshot").get("value")
-            if not b64:
-                raise RuntimeError("Empty screenshot response")
-            img = Image.open(io.BytesIO(base64.b64decode(b64)))
-            k = img.size[0] / w
-            img = img.crop((0, int(y0 * k), img.size[0], int(y1 * k)))
-        if img.format == "JPEG":
-            img.draft("L", out)
-        img = img.convert("L")
-        if img.size != out:
-            img = img.resize(out)
-        return img
+        full = (y0 == 0 and y1 is None)
+        for attempt in (0, 1):
+            w, h = self.pt_size()
+            y1_eff = h if y1 is None else y1
+            out = (round(w * self.scale), round((y1_eff - y0) * self.scale))
+            img = None
+            if self.c.turbo is not False:
+                payload = {"quality": 0.6, "scale": min(1.0, self._dev)}
+                if not full:
+                    payload.update({"x0": 0, "x1": w, "y0": y0, "y1": y1_eff})
+                r = self.c.req("POST", "/wda/fastScreenshot", payload)
+                v = r.get("value")
+                if isinstance(v, str) and v:
+                    self.c.turbo = True
+                    img = Image.open(io.BytesIO(base64.b64decode(v)))
+                    if img.size[0] > 0 and img.size[1] > 0:
+                        got_ratio = img.size[0] / img.size[1]
+                        exp_ratio = out[0] / out[1]
+                        if self._pt_from_cache and abs(got_ratio - exp_ratio) > 0.03:
+                            if hasattr(self.c, "_invalidate_session_cache"):
+                                self.c._invalidate_session_cache("screen_pt")
+                            w, h = self.pt_size(force_refresh=True)
+                            y1_eff = h if y1 is None else y1
+                            out = (round(w * self.scale), round((y1_eff - y0) * self.scale))
+                            if not full and attempt == 0:
+                                continue
+                        if abs(img.size[0] - out[0]) > 2:
+                            self._dev *= out[0] / img.size[0]
+                elif r.get("error") == 404:
+                    self.c.turbo = False
+                elif r.get("error") and self._pt_from_cache and attempt == 0:
+                    if hasattr(self.c, "_invalidate_session_cache"):
+                        self.c._invalidate_session_cache("screen_pt")
+                    self.pt_size(force_refresh=True)
+                    continue
+            if img is None:
+                b64 = self.c.req("GET", "/screenshot").get("value")
+                if not b64:
+                    raise RuntimeError("Empty screenshot response")
+                img = Image.open(io.BytesIO(base64.b64decode(b64)))
+                if self._pt_from_cache and img.size[0] > 0 and img.size[1] > 0:
+                    got_ratio = img.size[0] / img.size[1]
+                    exp_ratio = w / h
+                    if abs(got_ratio - exp_ratio) > 0.03:
+                        if hasattr(self.c, "_invalidate_session_cache"):
+                            self.c._invalidate_session_cache("screen_pt")
+                        w, h = self.pt_size(force_refresh=True)
+                        y1_eff = h if y1 is None else y1
+                        out = (round(w * self.scale), round((y1_eff - y0) * self.scale))
+                k = img.size[0] / w
+                img = img.crop((0, int(y0 * k), img.size[0], int(y1_eff * k)))
+            if img.format == "JPEG":
+                img.draft("L", out)
+            img = img.convert("L")
+            if img.size != out:
+                img = img.resize(out)
+            return img
 
-    def _cuts(self, img):
+    def _cuts(self, img, data=None):
         """Strip boundaries at the most uniform row near each 1/n of the height."""
-        data, (w, h) = img.tobytes(), img.size
+        w, h = img.size
+        data = data if data is not None else img.tobytes()
         n = self.n
         cuts = [0]
         for i in range(1, n):
@@ -543,9 +723,23 @@ class ScreenReader:
             lo, hi = max(cuts[-1] + 24, t - h // (2 * n)), min(h - 24, t + h // (2 * n))
             if lo >= hi:
                 continue
-            best = min(range(lo, hi), key=lambda y: (
-                max(data[y * w:(y + 1) * w]) - min(data[y * w:(y + 1) * w]), abs(y - t)))
-            cuts.append(best)
+            # Search outward from target row t with stride-2 sampling and early exit on
+            # blank/uniform rows (range <= 2), avoiding scanning every pixel of every row.
+            best_y, best_score = t, (256, 0)
+            max_off = max(t - lo, hi - 1 - t)
+            for off in range(max_off + 1):
+                for y in ((t,) if off == 0 else (t - off, t + off)):
+                    if lo <= y < hi:
+                        row = data[y * w:(y + 1) * w:2]
+                        rng = max(row) - min(row)
+                        sc = (rng, off)
+                        if sc < best_score:
+                            best_score, best_y = sc, y
+                            if rng <= 2:
+                                break
+                if best_score[0] <= 2:
+                    break
+            cuts.append(best_y)
         cuts.append(h)
         return cuts
 
@@ -569,32 +763,52 @@ class ScreenReader:
 
     def read(self, y0=0, y1=None, img=None, **_ignored):
         """[Line] for the screen (or band y0..y1 in points)."""
+        full = (y0 == 0 and y1 is None)
+        fresh_grab = img is None
         img = img if img is not None else self.grab(y0, y1)
-        self.last = img
-        cuts = self._cuts(img)
+        w, _ = img.size
+        data = img.tobytes()
+        mv = memoryview(data)
+        cuts = self._cuts(img, data=data)
         jobs = []
         for a, b in zip(cuts, cuts[1:]):
-            strip = img.crop((0, a, img.size[0], b))
-            jobs.append((a, hashlib.blake2b(strip.tobytes(), digest_size=16).digest(), strip))
+            k = hashlib.blake2b(mv[a * w:b * w], digest_size=16).digest()
+            jobs.append((a, b, k))
         if len(self.cache) > 512:
             self.cache.clear()  # before `todo`, or strips counted as cached vanish (KeyError)
-        todo = [(k, s) for _, k, s in jobs if k not in self.cache]
-        for (k, _), res in zip(todo, self.pool.map(lambda ks: self._ocr(ks[1]), todo)):
-            self.cache[k] = res
+        todo = [(k, img.crop((0, a, w, b))) for a, b, k in jobs if k not in self.cache]
+        if todo:
+            uniq = {}
+            for k, strip in todo:
+                uniq.setdefault(k, strip)
+            items = list(uniq.items())
+            if len(items) == 1:
+                self.cache[items[0][0]] = self._ocr(items[0][1])
+            else:
+                for (k, _), res in zip(items, self.pool.map(lambda ks: self._ocr(ks[1]), items)):
+                    self.cache[k] = res
         s = self.scale
         out = []
-        for a, k, _ in jobs:
+        for a, _, k in jobs:
             for words in self.cache[k]:
                 out.append(Line([(t, x0 / s, (ya + a) / s + y0, x1 / s, (yb + a) / s + y0)
                                  for t, x0, ya, x1, yb in words]))
         out.sort(key=lambda l: (l.y0, l.x0))
+        if full:
+            self.last = img
+            self.last_lines = out
+            if fresh_grab:
+                self.last_ts = time.monotonic()
+        else:
+            self.last = img
+            self.last_lines = None
+            self.last_ts = 0.0
         return out
 
 
 # ---------------------------------------------------------------------------
 # App names -> bundle IDs (open:Spotify) and on-screen controls with coordinates
 # ---------------------------------------------------------------------------
-APP_CACHE_DIR = os.path.expanduser("~/.cache/turbotap")
 # Optional disambiguation when multiple installed apps share a display name.
 APP_PREFER = {k.casefold(): v for k, v in (_CFG.get("app_prefer") or {}).items()}
 
@@ -824,6 +1038,33 @@ class Flow:
         self.bundle = None
         self.reads = []
         self.log = log
+        self._side = None
+        self._ui_pool = None
+        self._last_action_ts = 0.0
+
+    def _get_ui_worker(self):
+        if self._side is None:
+            self._side = self.c._side_client() if hasattr(self.c, "_side_client") else self.c
+        else:
+            self._side.sid = self.c.sid
+        if self._ui_pool is None:
+            self._ui_pool = ThreadPoolExecutor(1)
+        return self._side, self._ui_pool
+
+    def close(self):
+        if self._ui_pool is not None:
+            self._ui_pool.shutdown(wait=False)
+            self._ui_pool = None
+        if self._side is not None and self._side is not self.c and getattr(self._side, "_conn", None) is not None:
+            try:
+                self._side._conn.close()
+            except Exception:
+                pass
+            self._side._conn = None
+
+    def _mark_action(self):
+        self._last_action_ts = time.monotonic()
+        self.r.invalidate_last()
 
     # -- primitives ---------------------------------------------------------
     def guard(self, x, y, text=""):
@@ -833,12 +1074,20 @@ class Flow:
     def lines(self):
         return self.r.read()
 
-    def wait(self, label, timeout=None, stable=False):
+    def _fresh_lines(self, max_age=0.15):
+        """Return OCR lines from a very recent cached frame if available, else None."""
+        if self.r.last is not None and (time.monotonic() - self.r.last_ts) < max_age:
+            if self.r.last_lines is not None:
+                return self.r.last_lines
+            return self.r.read(img=self.r.last)
+        return None
+
+    def wait(self, label, timeout=None, stable=False, initial=None):
         """Poll until label is visible (and, if stable, at the same spot twice).
         label may carry a region: 'Alice@below:Chats', 'Alice@y>300'."""
         label, where = split_where(label)
         end = time.time() + (timeout or self.timeout)
-        prev = None
+        prev = initial
         while time.time() < end:
             m = find_text(self.lines(), label, where=where)
             if m and (not stable or (prev and abs(m.x - prev.x) <= 3 and abs(m.y - prev.y) <= 3)):
@@ -854,25 +1103,32 @@ class Flow:
         raise FlowError(f"{label!r} still on screen")
 
     def settle(self, timeout=2.0, start=None, still=0.6):
+        if start is None and self.r.last is not None and (time.monotonic() - self.r.last_ts) < 0.15:
+            start = self.r.last
         prev, end = start, time.time() + timeout
         while time.time() < end:
             cur = self.r.grab()
             if prev is not None and _thumb_diff(prev, cur) < still:
-                self.r.last = cur
+                self.r.set_last(cur)
+                self._last_action_ts = 0.0
                 return True
             prev = cur
+        if prev is not None and prev is not start:
+            self.r.set_last(prev)
         return False
 
-    def changed_since(self, before, timeout=1.2):
+    def changed_since(self, before, timeout=0.45, x=None, y=None):
         end = time.time() + timeout
         while time.time() < end:
             cur = self.r.grab()
-            if _thumb_diff(before, cur) > 1.5:
+            if _frame_reacted(before, cur, x=x, y=y, scale=self.r.scale):
+                self.r.set_last(cur)
                 return True
         return False
 
     def tap_point(self, x, y, text=""):
         self.guard(x, y, text)
+        self._mark_action()
         self.c.fast_tap(x, y)
 
     def tap_text(self, label):
@@ -881,7 +1137,8 @@ class Flow:
             # The nav-bar chevron OCRs as a lone '<' (Spotify, Messenger): tapping it
             # skips a /source fetch (2.1 s on a long Spotify playlist). y > 55 skips
             # the status bar's '< AppName' return link.
-            chev = next((l for l in self.lines() if l.text.strip() in ("<", "‹", "〈", "«")
+            lines = self._fresh_lines() or self.lines()
+            chev = next((l for l in lines if l.text.strip() in ("<", "‹", "〈", "«")
                          and l.x < 70 and 55 < l.y < 130), None)
             if chev:
                 self.tap_point(chev.x, chev.y, "back")
@@ -891,8 +1148,17 @@ class Flow:
             m = self.tap_form_button(base, where)
             if m:
                 return m
-        if not where and not find_text(self.lines(), base):
-            # Not in the first OCR frame: an exact accessibility label (icon-only
+        # Reuse a very recent frame (< 0.15 s) from the preceding step as Frame #1 if it
+        # already contains the target; otherwise grab a fresh Frame #1 and feed its match
+        # into wait(stable=True) so static screens only need one confirming frame.
+        m0 = None
+        cached_lines = self._fresh_lines()
+        if cached_lines is not None:
+            m0 = find_text(cached_lines, base, where=where)
+        if m0 is None:
+            m0 = find_text(self.lines(), base, where=where)
+        if not where and m0 is None:
+            # Not in the first fresh OCR frame: an exact accessibility label (icon-only
             # Back/Close/Search/tab) is tapped at once instead of after the 2.2 s
             # OCR wait (Messenger Back: 2,979 -> ~800 ms).
             c = exact_control(self.controls(), base, TAP_TYPES + (
@@ -900,7 +1166,7 @@ class Flow:
             if c:
                 return self.tap_control(c)
         try:
-            m = self.wait(label, timeout=min(2.2, self.timeout), stable=True)
+            m = self.wait(label, timeout=min(2.2, self.timeout), stable=True, initial=m0)
         except FlowError:
             # Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct messages)
             # have no visible text for OCR: one /source lookup with coordinates, then
@@ -914,12 +1180,13 @@ class Flow:
             # OCR only found TEXT inside a longer line ('Sign in with another account'
             # for tap:"Sign In", often because the real button's white-on-colour text
             # did not OCR): a control labelled exactly TEXT wins over the substring.
-            c = exact_control(_controls_in_region(self.controls(), self.r.read(img=self.r.last), where), base)
+            cur_lines = self.r.last_lines if self.r.last_lines is not None else self.r.read(img=self.r.last)
+            c = exact_control(_controls_in_region(self.controls(), cur_lines, where), base)
             if c:
                 return self.tap_control(c)
         before = self.r.last
         self.tap_point(m.x, m.y, m.text)
-        if not self.changed_since(before):
+        if not self.changed_since(before, x=m.x, y=m.y):
             # Tapping a switch row's label does nothing: tap the toggle itself, unless
             # the toggle changed already (too small a change to count as a reaction).
             sw = self.switch_near(base, m)
@@ -980,6 +1247,7 @@ class Flow:
         raise FlowError(f"no element labelled {label!r}")
 
     def drag(self, x0, y0, x1, y1, duration=0.12, release=0.02):
+        self._mark_action()
         body = {"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration, "release": release}
         if self.c.turbo is not False:
             r = self.c.req("POST", "/wda/fastDrag", body)
@@ -1001,14 +1269,21 @@ class Flow:
             raise FlowError(f"scroll:{direction}? use down|up")
 
     def scroll(self, direction="down"):
+        before = self.r.last
         self.swipe(direction)
-        self.settle(timeout=2.5)
+        # fastDrag completes synchronously with ~0 release momentum: passing the
+        # pre-swipe frame as start returns in 1 grab if the list hit the end, and
+        # takes the normal 2 grabs whenever the screen actually scrolled.
+        self.settle(timeout=2.5, start=before)
 
     def scroll_to(self, label, where=None, max_swipes=8):
         """Read, swipe, read... without waiting for momentum to end."""
         seen = None
         for i in range(max_swipes + 1):
-            lines = self.r.read(img=self.r.last) if i else self.lines()
+            if i:
+                lines = self.r.read(img=self.r.last)
+            else:
+                lines = self._fresh_lines() or self.lines()
             m = find_text(lines, label, where=where)
             if m:
                 return m
@@ -1023,38 +1298,68 @@ class Flow:
         return ui_controls(self.c, self.r.pt_size())
 
     def read_full(self, ui=True, timeout=2.5):
-        """OCR lines once the text holds still for two frames (a list that is
-        still loading reads as near-blank and 'settle' alone passes on it), plus
-        the labelled controls with coordinates (icon-only tabs and buttons, Cell
-        labels). The tree is fetched on a second connection in parallel with the
-        confirming OCR frame and fetched again if the screen changed meanwhile:
-        a tree requested right after open: still describes the previous app."""
-        side = None
-        if ui:
-            side = WDAClient(self.c.base_url)
-            side.sid = self.c.sid
-        pool = ThreadPoolExecutor(1)
-        end, prev, fut, lines, stable = time.time() + timeout, None, None, [], False
+        """OCR lines once the text holds still (including sparse screens and
+        animated backgrounds like Weather), plus labelled controls with
+        coordinates. Reuses one persistent side connection/worker so /source
+        overlaps with OCR and never discards a fresh completed tree."""
+        side, pool = self._get_ui_worker() if ui else (None, None)
+        pt = self.r.pt_size()
+        status_y = int(pt[1] * 0.06)
+        t0 = time.monotonic()
+        end = t0 + timeout
+        may_be_transitioning = (t0 - self._last_action_ts) < 1.5
+        fut = None
+        fut_texts = None
+        if side and not may_be_transitioning:
+            fut = pool.submit(ui_controls, side, pt, True)
+        prev_texts, prev_img = None, None
+        populated_frames = 0
+        lines, texts = [], []
         while True:
             lines = self.lines()
+            cur_img = self.r.last
             texts = [l.text for l in lines]
-            # 80% of lines unchanged counts as still: animated backgrounds
-            # (Weather) make OCR flicker on a line or two forever.
-            stable = prev is not None and len(texts) > 6 and \
-                len(set(texts) & set(prev)) >= 0.8 * max(len(texts), len(prev))
-            if stable or time.time() > end:
+            has_content = any(l.y >= status_y for l in lines)
+            if has_content:
+                populated_frames += 1
+            if fut is not None and fut_texts is None:
+                fut_texts = texts
+            elapsed = time.monotonic() - t0
+            stable = False
+            if prev_texts is not None:
+                overlap = _text_overlap(texts, prev_texts)
+                img_still = prev_img is not None and _thumb_diff(prev_img, cur_img) < 0.8
+                if has_content:
+                    stable = (
+                        texts == prev_texts
+                        or overlap >= 0.72
+                        or img_still
+                        or (populated_frames >= 3 and overlap >= 0.5)
+                    )
+                elif elapsed >= 0.8 and img_still:
+                    stable = True
+            if stable or time.monotonic() >= end:
                 break
-            prev = texts
-            if side and (fut is None or fut.done()):  # never queue a second tree behind one in flight
-                fut = pool.submit(ui_controls, side, self.r.pt_size(), True)
-        if side and (fut is None or (not stable and fut.done())):
-            fut = pool.submit(ui_controls, side, self.r.pt_size(), True)
-        ui = fut.result() if fut else None
-        if ui:
+            prev_texts, prev_img = texts, cur_img
+            if side and has_content and (
+                fut is None or (fut.done() and fut_texts is not None and _text_overlap(fut_texts, texts) < 0.5)
+            ):
+                fut_texts = texts
+                fut = pool.submit(ui_controls, side, pt, True)
+        if side:
+            fut_fresh = (
+                fut is not None
+                and fut_texts is not None
+                and (_text_overlap(fut_texts, texts) >= 0.5 or (not fut_texts and not texts))
+            )
+            if not fut_fresh:
+                fut = pool.submit(ui_controls, side, pt, True)
+        ui_res = fut.result() if fut else None
+        if ui_res:
             # StaticText only where OCR missed it (white text on photos, huge
             # digits, odd fonts): Weather's city and current temperature.
-            ui = [c for c in ui if c["type"] != "Text" or not find_text(lines, c["label"][:40])]
-        return lines, ui
+            ui_res = [c for c in ui_res if c["type"] != "Text" or not find_text(lines, c["label"][:40])]
+        return lines, ui_res
 
     def search(self, query):
         """Tap the app's search field (or Search button/tab), type query, wait
@@ -1065,16 +1370,29 @@ class Flow:
             find_control(ctl, "Søk", types={"Button", "Tab", "TextField", "SearchField"})
         if not c:
             raise FlowError("no search field or Search button on screen")
+        before = self.r.last
         self.tap_point(c["x"], c["y"], c["label"])
-        # A Search tab opens a page whose field still needs focus: tap it too.
-        if c["type"] != "SearchField":
-            self.settle(timeout=1.5)
-            f = next((c for c in self.controls() if c["type"] in ("SearchField", "TextField")), None)
+        # A Search tab/button opens a page whose field may still need focus: wait for
+        # the transition to react, find the field, and tap it unless already active.
+        if c["type"] not in ("SearchField", "TextField"):
+            if before is not None:
+                self.changed_since(before, timeout=0.6, x=c["x"], y=c["y"])
+            else:
+                self.settle(timeout=0.8)
+            ctl2 = self.controls()
+            f = next((x for x in ctl2 if x["type"] in ("SearchField", "TextField")), None)
             if f:
-                self.tap_point(f["x"], f["y"], f["label"])
-        time.sleep(0.35)  # keyboard focus; typing earlier drops the first characters
+                already_focused = (
+                    abs(f["x"] - c["x"]) <= 15
+                    and abs(f["y"] - c["y"]) <= 15
+                    and any(x["label"].casefold() in ("cancel", "avbryt", "clear text", "tøm tekst") for x in ctl2)
+                )
+                if not already_focused:
+                    self.tap_point(f["x"], f["y"], f["label"])
+        time.sleep(0.18)  # brief keyboard focus beat after fast_tap's ~320 ms round-trip
+        self._mark_action()
         self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": list(query)})
-        self.settle(timeout=2.5, still=0.4)
+        self.settle(timeout=2.0, still=0.5)
         return c["label"]
 
     def back(self):
@@ -1098,11 +1416,14 @@ class Flow:
         verb, _, arg = spec.partition(":")
         verb = verb.strip().lower()
         if verb == "unlock":
+            self._mark_action()
             self.c.unlock_phone()
         elif verb == "home":
+            self._mark_action()
             self.c.req("POST", f"/session/{self.c.sid}/wda/pressButton", {"name": "home"})
             self.bundle = "com.apple.springboard"
         elif verb in ("open", "launch"):
+            self._mark_action()
             arg = resolve_app(arg, udid=self.c.udid, base_url=self.c.base_url)
             if verb == "launch":
                 self.c.req("POST", f"/session/{self.c.sid}/wda/apps/terminate", {"bundleId": arg})
@@ -1122,9 +1443,11 @@ class Flow:
             self.tap_point(x, y)
         elif verb == "type":
             arg = _secret_arg(verb, arg)
+            self._mark_action()
             self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": list(arg)})
         elif verb == "cleartype":
             arg = _secret_arg(verb, arg)
+            self._mark_action()
             els = self.c.req("POST", f"/session/{self.c.sid}/elements",
                              {"using": "class name", "value": "XCUIElementTypeTextField"}).get("value") or []
             secure = False
@@ -1155,12 +1478,14 @@ class Flow:
                 v = el.get("value")
                 eid = v.get("ELEMENT") if isinstance(v, dict) else None
                 if eid:
+                    self._mark_action()
                     self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {})
                     time.sleep(0.3)
                     return lbl
             return "no-kb"
         elif verb == "typedigits":
             # Paced 0.08 s/digit /wda/keys input with exact digit-by-digit read-back verification.
+            self._mark_action()
             if arg.startswith("env:"):
                 raw = os.environ.get(arg[4:], "").strip()
                 if not raw:
@@ -1193,6 +1518,7 @@ class Flow:
             raise FlowError(f"typedigits read-back mismatch (got {len(val)} digits, expected {len(digits)})")
         elif verb == "pintap":
             # Taps digits on FLAG_SECURE PIN keyboards by reading XCUIElementTypeKey rects from /source.
+            self._mark_action()
             if arg.startswith("env:"):
                 digits = os.environ.get(arg[4:], "").strip()
                 if not digits:
@@ -1220,6 +1546,7 @@ class Flow:
             action = arg.strip().lower() or "accept"
             if action not in ("accept", "dismiss"):
                 raise FlowError("alert step must be alert:accept or alert:dismiss")
+            self._mark_action()
             r = self.c.req("POST", f"/session/{self.c.sid}/alert/{action}", {})
             if r.get("error"):
                 return "no-alert"
@@ -1311,10 +1638,13 @@ def cmd_ocr(client, args):
 def cmd_tap_ocr(client, args):
     client.ensure_session(apply_fast_settings=True)
     flow = Flow(client)
-    t0 = time.perf_counter()
-    m = flow.tap_text(args.text)
-    print(json.dumps({"ok": True, "matched": m.text, "x": m.x, "y": m.y,
-                      "ms": round((time.perf_counter() - t0) * 1000)}))
+    try:
+        t0 = time.perf_counter()
+        m = flow.tap_text(args.text)
+        print(json.dumps({"ok": True, "matched": m.text, "x": m.x, "y": m.y,
+                          "ms": round((time.perf_counter() - t0) * 1000)}))
+    finally:
+        flow.close()
 
 
 def cmd_flow(client, args):
@@ -1322,7 +1652,10 @@ def cmd_flow(client, args):
     deny = None if args.no_deny else args.deny
     flow = Flow(client, ScreenReader(client, scale=args.scale), timeout=args.timeout, deny=deny,
                 log=None if args.quiet else sys.stderr)
-    res = flow.run(args.steps)
+    try:
+        res = flow.run(args.steps)
+    finally:
+        flow.close()
     print(json.dumps(res, ensure_ascii=False))
     if not res["ok"]:
         sys.exit(1)
