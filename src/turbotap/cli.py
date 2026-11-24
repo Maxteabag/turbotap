@@ -310,6 +310,9 @@ class WDAClient:
             v = el.get("value")
             eid = v.get("ELEMENT") if isinstance(v, dict) else None
             if not eid:
+                # Face ID or the home press may have already unlocked the device.
+                if self.req("GET", "/wda/locked").get("value") is False:
+                    return True
                 raise RuntimeError("Passcode keypad not found on screen")  # never echo passcode digits
             self.req("POST", f"/session/{self.sid}/element/{eid}/click", {})
             time.sleep(0.1)
@@ -484,10 +487,13 @@ def find_text(lines, label, fuzzy=0.84, where=None):
         ws = ln.words[span[0]:span[1]]
         x = int((min(w[1] for w in ws) + max(w[3] for w in ws)) / 2)
         y = int((min(w[2] for w in ws) + max(w[4] for w in ws)) / 2)
-        cand = (rank, y, Match(x, y, ln.text, ln, rank))
-        if best is None or cand[:2] < best[:2]:
+        # Deprioritize iOS status-bar lines (clock, battery, '< PrevApp' at y < 54)
+        # unless the caller explicitly filtered by region (@y<..., @above:...).
+        in_status = (not where) and (y < 54)
+        cand = (in_status, rank, y, Match(x, y, ln.text, ln, rank))
+        if best is None or cand[:3] < best[:3]:
             best = cand
-    return best[2] if best else None
+    return best[3] if best else None
 
 
 def _region(lines, where):
@@ -511,9 +517,12 @@ def _controls_in_region(controls, lines, where):
         lim = int(kind[2:] if len(kind) > 2 else val)
         return [c for c in controls if (c["y"] > lim if kind[1] == ">" else c["y"] < lim)]
     hdr = find_text(lines, val, fuzzy=0)
-    if not hdr:
+    if hdr:
+        return [c for c in controls if (c["y"] > hdr.line.y1 if kind == "below" else c["y"] < hdr.line.y0)]
+    chdr = find_control(controls, val)
+    if not chdr:
         return []
-    return [c for c in controls if (c["y"] > hdr.line.y1 if kind == "below" else c["y"] < hdr.line.y0)]
+    return [c for c in controls if (c["y"] > chdr["y"] if kind == "below" else c["y"] < chdr["y"])]
 
 
 def _box_diff(a, b, x, y, scale, dx=30, dy=18):
@@ -875,23 +884,29 @@ def resolve_app(arg, udid="", base_url=""):
     raise FlowError(f"no installed app named {arg!r}; close: {names}")
 
 
-CONTROL_TYPES = {"Button", "Tab", "SearchField", "TextField", "SecureTextField", "TextView",
+CONTROL_TYPES = {"Button", "Key", "Tab", "SearchField", "TextField", "SecureTextField", "TextView",
                  "Cell", "Link", "Switch", "Slider", "SegmentedControl", "Image"}
 # Skipping these attributes makes /source 5x cheaper: visibility is what WDA
 # computes slowly (Spotify home: 2,608 ms with them, ~500 ms without; the
 # rect is still included). On-screen filtering is done here from the rect.
 SOURCE_LITE = "/source?format=json&excluded_attributes=visible,accessible,enabled,index"
+_CHEVRON_LABELS = {"chevron", "chevron.right", "chevron.forward"}
 
 
-def ui_controls(client, screen=(430, 932), text=False):
-    """Every on-screen control that has a label, with its centre in points:
-    icon-only tabs/nav buttons OCR cannot see, and Cell labels that often carry
-    more than the pixels (Google Authenticator: 'OpenAI: ..., 123 456, 27
-    seconds before code expires'). One request, ~300-600 ms."""
-    r = client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=30)
-    out, seen = [], set()
+def _parse_ui_controls(root, screen=(430, 932), text=False):
+    """Parse a WDA /source JSON tree into (controls, root_app_name).
 
-    def walk(n):
+    Filters off-screen recycled cells, soft-keyboard typing keys (while keeping
+    app keypad keys such as Calculator/dialer), internal CamelCase/asset Images,
+    edge-clamped overlays, decorative row chevrons, and stacked (Cell, Button)
+    duplicates on the same row.
+    """
+    out, seen = [], {}
+    app_name = ""
+    if isinstance(root, dict) and root.get("type") == "Application":
+        app_name = _clean_text(str(root.get("name") or root.get("label") or ""))
+
+    def walk(n, in_keyboard=False):
         if not isinstance(n, dict):
             return
         t = n.get("type", "")
@@ -900,49 +915,97 @@ def ui_controls(client, screen=(430, 932), text=False):
             x0, y0 = rc.get("x", 0), rc.get("y", 0)
             if x0 >= screen[0] or x0 + rc["width"] <= 0 or y0 >= screen[1] or y0 + rc["height"] <= 0:
                 return  # off-screen recycled table cells can carry stale on-screen child rects
+        kb = in_keyboard or t == "Keyboard"
         raw_lab = n.get("label") or n.get("name") or ""
         lab = _clean_text(str(raw_lab)) if raw_lab else ""
         if t == "Other" and not lab and n.get("value"):
             lab, t = _clean_text(str(n["value"])), "Value"  # unlabelled value text (OTP digits, counters)
         elif t == "StaticText" and text:
             t = "Text"
-        if (t in CONTROL_TYPES or t in ("Value", "Text")) and lab and rc.get("width") and rc.get("height"):
+        if (t in CONTROL_TYPES or t in ("Value", "Text")) and not (t == "Key" and kb) \
+                and lab and rc.get("width", 0) > 0 and rc.get("height", 0) > 0:
             x, y = int(rc["x"] + rc["width"] / 2), int(rc["y"] + rc["height"] / 2)
             if t == "Switch":
                 # A Switch's rect often spans its whole row (label + toggle), and
                 # tapping the row's middle does nothing: x is the toggle itself,
                 # at the right end (the centre of a bare 51 pt UISwitch).
                 x = int(rc["x"] + rc["width"] - min(rc["width"] / 2, 32))
+            is_internal_img = (
+                t == "Image" and " " not in lab
+                and bool(re.search(r"[._-]", lab) or re.search(r"[a-z][A-Z]", lab))
+            )
             key = (lab, x // 4, y // 4)
-            if 0 <= x <= screen[0] and 0 <= y <= screen[1] and key not in seen \
-                    and not (t == "Image" and " " not in lab and re.search(r"[._-]", lab)):
-                seen.add(key)
+            # Strict bounds skip edge-clamped overlays at y == 0 or y == screen[1].
+            if 0 < x < screen[0] and 0 < y < screen[1] and not is_internal_img:
                 item = {"type": t, "label": lab, "x": x, "y": y}
                 val = n.get("value")
                 if t in ("Switch", "Slider", "TextField", "SearchField") and val not in (None, ""):
                     cval = _clean_text(str(val))
                     if cval and cval != lab:
                         item["value"] = cval
-                out.append(item)
+                if key not in seen:
+                    seen[key] = len(out)
+                    out.append(item)
+                elif out[seen[key]]["type"] == "Cell" and t == "Button" and not out[seen[key]].get("value"):
+                    out[seen[key]] = item
         for ch in n.get("children") or []:
-            walk(ch)
+            walk(ch, kb)
 
-    walk(r.get("value") or {})
-    return out
+    walk(root or {})
+
+    # Deduplicate noisy row clutter: drop decorative disclosure 'chevron' buttons
+    # sitting on a list row, and stacked (Cell, Button) pairs on the same row with
+    # the exact same normalized label (prefer Button; keep Cell if it carries extra info).
+    buttons = [c for c in out if c["type"] == "Button"]
+    row_anchors = [c for c in out if c["type"] in ("Cell", "Button")
+                   and c["label"].casefold() not in _CHEVRON_LABELS]
+    deduped = []
+    for c in out:
+        if c["type"] == "Button" and c["label"].casefold() in _CHEVRON_LABELS:
+            if any(abs(c["y"] - r["y"]) <= 10 for r in row_anchors):
+                continue
+        if c["type"] == "Cell" and not c.get("value"):
+            cn = _norm(c["label"])
+            if any(_norm(b["label"]) == cn and abs(c["y"] - b["y"]) <= 8 for b in buttons):
+                continue
+        deduped.append(c)
+    return deduped, app_name
+
+
+def _fetch_ui_controls(client, screen=(430, 932), text=False):
+    r = client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=30)
+    return _parse_ui_controls(r.get("value") or {}, screen=screen, text=text)
+
+
+def ui_controls(client, screen=(430, 932), text=False):
+    """Every on-screen control that has a label, with its centre in points:
+    icon-only tabs/nav buttons OCR cannot see, and Cell labels that often carry
+    more than the pixels (Google Authenticator: 'OpenAI: ..., 123 456, 27
+    seconds before code expires'). One request, ~300-600 ms."""
+    ctl, _ = _fetch_ui_controls(client, screen=screen, text=text)
+    return ctl
 
 
 # Controls a tap:TEXT may land on instead of the OCR text, best type first.
-TAP_TYPES = ("Button", "Link", "Switch", "Tab", "SegmentedControl", "Cell")
+TAP_TYPES = ("Button", "Key", "Link", "Switch", "Tab", "SegmentedControl", "Cell")
 # Shown with 'visible' when a flow step fails, so the next try uses exact labels.
-INTERACTIVE_TYPES = {"Button", "Tab", "Cell", "Link", "Switch", "Slider", "SegmentedControl",
+INTERACTIVE_TYPES = {"Button", "Key", "Tab", "Cell", "Link", "Switch", "Slider", "SegmentedControl",
                      "SearchField", "TextField", "SecureTextField", "TextView"}
+# Editable inputs that raise the keyboard and need a short focus settle before type:.
+INPUT_TYPES = {"TextField", "SearchField", "SecureTextField", "TextView"}
+# Control types matched when wait:TEXT falls back to the accessibility tree.
+WAIT_UI_TYPES = INTERACTIVE_TYPES | {"Text", "Value"}
 # The iOS keyboard toolbar repeats these above the keys; a form's own button wins.
 KB_TOOLBAR_LABELS = {"next", "previous", "neste", "forrige"}
+# Common localized back-button labels (nav chevron shortcut + fallback).
+BACK_LABELS = ("back", "go back", "navigate up", "tilbake")
+# Localized and modern iOS keyboard dismiss buttons (checked in one predicate call).
+DISMISS_KB_LABELS = ("Done", "Ferdig", "Hide keyboard", "Skjul tastatur", "Dismiss", "Lukk")
 
 
 def exact_control(controls, label, types=TAP_TYPES):
     """The control whose label equals label (case-insensitive), preferring
-    Button/Link over Switch/Tab/Cell, then the topmost."""
+    Button/Key/Link over Switch/Tab/Cell, then the topmost."""
     want = _clean_text(label).casefold()
     hits = [c for c in controls if c["type"] in types and c["label"].casefold() == want]
     return min(hits, key=lambda c: (types.index(c["type"]), c["y"], c["x"])) if hits else None
@@ -956,6 +1019,32 @@ def find_control(controls, label, types=None):
         if hits:
             return min(hits, key=lambda c: (c["y"], c["x"]))
     return None
+
+
+def find_control_match(controls, label, types=WAIT_UI_TYPES):
+    """Match label (or 're:REGEX') against accessibility controls.
+    Returns Match(x, y, label, None, rank) or None."""
+    want = _clean_text(label).casefold()
+    rx = re.compile(label[3:], re.I) if label.startswith("re:") else None
+    best = None
+    for c in controls:
+        if types and c["type"] not in types:
+            continue
+        lab = c["label"]
+        if rx:
+            hit = rx.search(lab)
+            if not hit:
+                continue
+            rank = 0 if hit.group(0) == lab else 2
+        else:
+            low = lab.casefold()
+            if want not in low:
+                continue
+            rank = 0 if low == want else (1 if low.startswith(want) or low.endswith(want) else 2)
+        cand = (rank, c["y"], c["x"], Match(c["x"], c["y"], lab, None, rank))
+        if best is None or cand[:3] < best[:3]:
+            best = cand
+    return best[3] if best else None
 
 
 def split_where(arg):
@@ -980,8 +1069,8 @@ FLOW_HELP = """steps (one argument each, run in order):
                         open:com.apple.Preferences); names come from a per-device
                         devicectl cache (~1 ms; refreshed once on an unknown name)
   launch:APP            terminate + activate (fresh start)
-  wait:TEXT             poll until TEXT is on screen (substring, case-insensitive,
-                        OCR-typo tolerant; 're:REGEX' for a regex)
+  wait:TEXT             poll until TEXT is on screen (OCR-first, falls back to
+                        UI controls for colored/icon labels; 're:REGEX' for regex)
   gone:TEXT             poll until TEXT is no longer on screen
   tap:TEXT              wait until TEXT is on screen at the same spot twice, tap its
                         centre, and re-tap once if the screen did not react; text
@@ -1000,7 +1089,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField, type, verify read-back
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects
-  dismisskb             tap Done/Ferdig on the keyboard toolbar if present
+  dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
   alert:accept|dismiss  accept or dismiss an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
   scrollto:TEXT         scroll down (max 8x) until TEXT is visible
@@ -1030,12 +1119,22 @@ class FlowError(RuntimeError):
 
 
 class Flow:
+    _INPUT_FOCUS_SETTLE = 0.35
+
     def __init__(self, client, reader=None, timeout=8.0, deny=DENY_DEFAULT, log=None):
         self.c = client
         self.r = reader or ScreenReader(client)
         self.timeout = timeout
         self.deny = re.compile(deny, re.I) if deny else None
         self.bundle = None
+        self._pending_bundle = None
+        self._pending_bundle_ts = 0.0
+        self._last_app_name = None
+        self._last_app_bundle = None
+        self._switched_from_app_name = None
+        self._switched_at = 0.0
+        self._last_tap_type = None
+        self._last_tap_ts = 0.0
         self.reads = []
         self.log = log
         self._side = None
@@ -1067,6 +1166,31 @@ class Flow:
         self.r.invalidate_last()
 
     # -- primitives ---------------------------------------------------------
+    def _wait_active_app(self, max_wait=1.5, poll=0.04):
+        """After open:/launch:, confirm iOS finished foregrounding the target app
+        before reading /source or interacting. Already-active apps clear on one
+        ~10 ms GET /wda/activeAppInfo."""
+        target = self._pending_bundle
+        if not target:
+            return
+        if time.monotonic() - self._pending_bundle_ts > 2.5:
+            self._pending_bundle = None
+            return
+        deadline = time.monotonic() + max_wait
+        while True:
+            info = self.c.req("GET", "/wda/activeAppInfo", timeout=4)
+            val = info.get("value") if isinstance(info, dict) else None
+            if not isinstance(info, dict) or info.get("error") or not isinstance(val, dict) or "bundleId" not in val:
+                self._pending_bundle = None
+                return
+            if val.get("bundleId") == target:
+                self._pending_bundle = None
+                return
+            if time.monotonic() >= deadline:
+                self._pending_bundle = None
+                return
+            time.sleep(poll)
+
     def guard(self, x, y, text=""):
         if self.deny and text and self.deny.search(text):
             raise FlowError(f"refusing to tap {text!r}: matches --deny")
@@ -1084,22 +1208,43 @@ class Flow:
 
     def wait(self, label, timeout=None, stable=False, initial=None):
         """Poll until label is visible (and, if stable, at the same spot twice).
-        label may carry a region: 'Alice@below:Chats', 'Alice@y>300'."""
+        label may carry a region: 'Alice@below:Chats', 'Alice@y>300'.
+        OCR-first for zero /source overhead on the fast path; falls back to the
+        accessibility tree if OCR misses colored/low-contrast/icon controls."""
+        self._wait_active_app()
         label, where = split_where(label)
-        end = time.time() + (timeout or self.timeout)
+        start = time.time()
+        end = start + (timeout or self.timeout)
         prev = initial
-        while time.time() < end:
-            m = find_text(self.lines(), label, where=where)
+        frames = 0
+        last_ui = 0.0
+        while True:
+            lines = self.lines()
+            frames += 1
+            m = find_text(lines, label, where=where)
             if m and (not stable or (prev and abs(m.x - prev.x) <= 3 and abs(m.y - prev.y) <= 3)):
                 return m
             prev = m
+            now = time.time()
+            if not m and (frames >= 2 or now - start >= 0.4) and (last_ui == 0.0 or now - last_ui >= 0.8):
+                ctl = _controls_in_region(self.controls(text=True), lines, where)
+                last_ui = time.time()
+                cm = find_control_match(ctl, label, types=WAIT_UI_TYPES)
+                if cm:
+                    return cm
+            if time.time() >= end:
+                break
         raise FlowError(f"{label!r}{'@' + where if where else ''} not on screen after {timeout or self.timeout:.0f} s")
 
     def gone(self, label, timeout=None):
+        self._wait_active_app()
+        label, where = split_where(label)
         end = time.time() + (timeout or self.timeout)
-        while time.time() < end:
-            if not find_text(self.lines(), label):
+        while True:
+            if not find_text(self.lines(), label, where=where):
                 return True
+            if time.time() >= end:
+                break
         raise FlowError(f"{label!r} still on screen")
 
     def settle(self, timeout=2.0, start=None, still=0.6):
@@ -1130,10 +1275,14 @@ class Flow:
         self.guard(x, y, text)
         self._mark_action()
         self.c.fast_tap(x, y)
+        self._last_tap_type = None
+        self._last_tap_ts = time.monotonic()
 
     def tap_text(self, label):
+        self._wait_active_app()
         base, where = split_where(label)
-        if base.casefold() == "back":
+        low_base = base.casefold()
+        if low_base in BACK_LABELS:
             # The nav-bar chevron OCRs as a lone '<' (Spotify, Messenger): tapping it
             # skips a /source fetch (2.1 s on a long Spotify playlist). y > 55 skips
             # the status bar's '< AppName' return link.
@@ -1141,10 +1290,10 @@ class Flow:
             chev = next((l for l in lines if l.text.strip() in ("<", "‹", "〈", "«")
                          and l.x < 70 and 55 < l.y < 130), None)
             if chev:
-                self.tap_point(chev.x, chev.y, "back")
+                self.tap_point(chev.x, chev.y, base)
                 self.settle(timeout=1.5)
                 return Match(chev.x, chev.y, "<", chev)
-        if base.casefold() in KB_TOOLBAR_LABELS:
+        if low_base in KB_TOOLBAR_LABELS:
             m = self.tap_form_button(base, where)
             if m:
                 return m
@@ -1159,10 +1308,17 @@ class Flow:
             m0 = find_text(self.lines(), base, where=where)
         if not where and m0 is None:
             # Not in the first fresh OCR frame: an exact accessibility label (icon-only
-            # Back/Close/Search/tab) is tapped at once instead of after the 2.2 s
-            # OCR wait (Messenger Back: 2,979 -> ~800 ms).
-            c = exact_control(self.controls(), base, TAP_TYPES + (
-                "Image", "SearchField", "TextField", "SecureTextField", "TextView", "Slider", "Value"))
+            # Back/Close/Search/tab or keypad Key) is tapped at once instead of after
+            # the 2.2 s OCR wait (Messenger Back: 2,979 -> ~800 ms).
+            ctl = self.controls()
+            ext_types = TAP_TYPES + (
+                "Image", "SearchField", "TextField", "SecureTextField", "TextView", "Slider", "Value")
+            c = exact_control(ctl, base, ext_types)
+            if not c and low_base in BACK_LABELS:
+                for alt in BACK_LABELS:
+                    c = exact_control(ctl, alt, ("Button", "Link"))
+                    if c:
+                        break
             if c:
                 return self.tap_control(c)
         try:
@@ -1176,12 +1332,24 @@ class Flow:
                 return self.tap_control(c)
             x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
             return Match(x, y, f"[el:{label}]", None)
-        if m.rank:
-            # OCR only found TEXT inside a longer line ('Sign in with another account'
-            # for tap:"Sign In", often because the real button's white-on-colour text
-            # did not OCR): a control labelled exactly TEXT wins over the substring.
-            cur_lines = self.r.last_lines if self.r.last_lines is not None else self.r.read(img=self.r.last)
-            c = exact_control(_controls_in_region(self.controls(), cur_lines, where), base)
+        _, h = self.r.pt_size()
+        near_bottom_tab = m.line is not None and m.y > h - 55
+        if m.line is not None and (m.rank or near_bottom_tab):
+            # 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
+            #    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
+            #    labelled exactly TEXT wins over the substring.
+            # 2. near_bottom_tab: OCR matched a tab label near the bottom edge
+            #    (y > h - 55, close to the home indicator): prefer the Tab/Button centre.
+            cur_lines = self.r.last_lines if self.r.last_lines is not None else (
+                self.r.read(img=self.r.last) if self.r.last is not None else [])
+            ctl = _controls_in_region(self.controls(), cur_lines, where)
+            c = exact_control(ctl, base) if m.rank else None
+            if not c and near_bottom_tab:
+                c = exact_control(ctl, base, ("Tab", "Button"))
+                if not c:
+                    near = [x for x in ctl if x["type"] in ("Tab", "Button")
+                            and abs(x["y"] - m.y) <= 35 and abs(x["x"] - m.x) <= 60]
+                    c = find_control(near, base, types={"Tab", "Button"})
             if c:
                 return self.tap_control(c)
         before = self.r.last
@@ -1203,6 +1371,8 @@ class Flow:
 
     def tap_control(self, c):
         self.tap_point(c["x"], c["y"], c["label"])
+        self._last_tap_type = c["type"]
+        self._last_tap_ts = time.monotonic()
         return Match(c["x"], c["y"], f"[{c['type']}:{c['label']}]", None)
 
     def switch_near(self, label, m):
@@ -1229,6 +1399,7 @@ class Flow:
         return Match(x, y, text, None)
 
     def tap_el(self, label, timeout=None):
+        self._wait_active_app()
         q = json.dumps(label)
         preds = [f"label == {q} OR name == {q}", f"label CONTAINS[c] {q} OR name CONTAINS[c] {q}"]
         end = time.time() + (timeout or self.timeout)
@@ -1294,14 +1465,33 @@ class Flow:
             self.scroll("down")
         raise FlowError(f"{label!r} not found while scrolling")
 
-    def controls(self):
-        return ui_controls(self.c, self.r.pt_size())
+    def controls(self, text=False):
+        self._wait_active_app()
+        ctl, app_name = _fetch_ui_controls(self.c, self.r.pt_size(), text=text)
+        if (self._switched_from_app_name and app_name
+                and app_name == self._switched_from_app_name
+                and time.monotonic() - self._switched_at <= 3.0):
+            # /source occasionally lags behind activeAppInfo right after open:;
+            # wait briefly and re-fetch once iOS publishes the new app's tree.
+            for _ in range(3):
+                time.sleep(0.2)
+                ctl, app_name = _fetch_ui_controls(self.c, self.r.pt_size(), text=text)
+                if app_name != self._switched_from_app_name:
+                    break
+        if app_name:
+            self._last_app_name = app_name
+            self._last_app_bundle = self.bundle
+            if app_name != self._switched_from_app_name:
+                self._switched_from_app_name = None
+        return ctl
 
     def read_full(self, ui=True, timeout=2.5):
         """OCR lines once the text holds still (including sparse screens and
         animated backgrounds like Weather), plus labelled controls with
         coordinates. Reuses one persistent side connection/worker so /source
-        overlaps with OCR and never discards a fresh completed tree."""
+        overlaps with OCR, checks active-app freshness, and never discards a
+        fresh completed tree."""
+        self._wait_active_app()
         side, pool = self._get_ui_worker() if ui else (None, None)
         pt = self.r.pt_size()
         status_y = int(pt[1] * 0.06)
@@ -1311,7 +1501,7 @@ class Flow:
         fut = None
         fut_texts = None
         if side and not may_be_transitioning:
-            fut = pool.submit(ui_controls, side, pt, True)
+            fut = pool.submit(_fetch_ui_controls, side, pt, True)
         prev_texts, prev_img = None, None
         populated_frames = 0
         lines, texts = [], []
@@ -1345,7 +1535,7 @@ class Flow:
                 fut is None or (fut.done() and fut_texts is not None and _text_overlap(fut_texts, texts) < 0.5)
             ):
                 fut_texts = texts
-                fut = pool.submit(ui_controls, side, pt, True)
+                fut = pool.submit(_fetch_ui_controls, side, pt, True)
         if side:
             fut_fresh = (
                 fut is not None
@@ -1353,8 +1543,21 @@ class Flow:
                 and (_text_overlap(fut_texts, texts) >= 0.5 or (not fut_texts and not texts))
             )
             if not fut_fresh:
-                fut = pool.submit(ui_controls, side, pt, True)
-        ui_res = fut.result() if fut else None
+                fut = pool.submit(_fetch_ui_controls, side, pt, True)
+        if fut:
+            ui_res, app_name = fut.result()
+            if (self._switched_from_app_name and app_name
+                    and app_name == self._switched_from_app_name
+                    and time.monotonic() - self._switched_at <= 3.0):
+                time.sleep(0.2)
+                ui_res, app_name = _fetch_ui_controls(side, pt, True)
+            if app_name:
+                self._last_app_name = app_name
+                self._last_app_bundle = self.bundle
+                if app_name != self._switched_from_app_name:
+                    self._switched_from_app_name = None
+        else:
+            ui_res = None
         if ui_res:
             # StaticText only where OCR missed it (white text on photos, huge
             # digits, odd fonts): Weather's city and current temperature.
@@ -1396,6 +1599,7 @@ class Flow:
         return c["label"]
 
     def back(self):
+        self._wait_active_app()
         was = {l.text for l in self.lines() if len(l.text) > 3}
         before = self.r.last
         w, h = self.r.pt_size()
@@ -1415,6 +1619,8 @@ class Flow:
     def step(self, spec):
         verb, _, arg = spec.partition(":")
         verb = verb.strip().lower()
+        if verb != "type":
+            self._last_tap_type = None
         if verb == "unlock":
             self._mark_action()
             self.c.unlock_phone()
@@ -1422,13 +1628,25 @@ class Flow:
             self._mark_action()
             self.c.req("POST", f"/session/{self.c.sid}/wda/pressButton", {"name": "home"})
             self.bundle = "com.apple.springboard"
+            self._pending_bundle = None
+            self._switched_from_app_name = None
         elif verb in ("open", "launch"):
             self._mark_action()
             arg = resolve_app(arg, udid=self.c.udid, base_url=self.c.base_url)
+            prev_bundle = self.bundle
             if verb == "launch":
                 self.c.req("POST", f"/session/{self.c.sid}/wda/apps/terminate", {"bundleId": arg})
             self.c.req("POST", f"/session/{self.c.sid}/wda/apps/activate", {"bundleId": arg})
             self.bundle = arg
+            now = time.monotonic()
+            if verb == "launch" or arg != prev_bundle:
+                self._pending_bundle = arg
+                self._pending_bundle_ts = now
+                if self._last_app_name and self._last_app_bundle != arg:
+                    self._switched_from_app_name = self._last_app_name
+                    self._switched_at = now
+                else:
+                    self._switched_from_app_name = None
             return arg
         elif verb in ("wait", "expect"):
             return self.wait(arg).text
@@ -1443,6 +1661,11 @@ class Flow:
             self.tap_point(x, y)
         elif verb == "type":
             arg = _secret_arg(verb, arg)
+            if self._last_tap_type in INPUT_TYPES:
+                rem = self._INPUT_FOCUS_SETTLE - (time.monotonic() - self._last_tap_ts)
+                if rem > 0:
+                    time.sleep(rem)
+            self._last_tap_type = None
             self._mark_action()
             self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": list(arg)})
         elif verb == "cleartype":
@@ -1470,18 +1693,18 @@ class Flow:
                     raise FlowError(f"cleartype read-back mismatch (len {len(val)} vs {len(arg)})")
             return f"len={len(arg)}"
         elif verb == "dismisskb":
-            for lbl in ("Ferdig", "Done"):
-                el = self.c.req("POST", f"/session/{self.c.sid}/element", {
-                    "using": "predicate string",
-                    "value": f"type == 'XCUIElementTypeButton' AND label == '{lbl}'",
-                })
-                v = el.get("value")
-                eid = v.get("ELEMENT") if isinstance(v, dict) else None
-                if eid:
-                    self._mark_action()
-                    self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {})
-                    time.sleep(0.3)
-                    return lbl
+            labels_pred = ", ".join(f"'{lbl}'" for lbl in DISMISS_KB_LABELS)
+            el = self.c.req("POST", f"/session/{self.c.sid}/element", {
+                "using": "predicate string",
+                "value": f"type == 'XCUIElementTypeButton' AND (label IN {{{labels_pred}}} OR name IN {{{labels_pred}}})",
+            })
+            v = el.get("value")
+            eid = v.get("ELEMENT") if isinstance(v, dict) else None
+            if eid:
+                self._mark_action()
+                self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {})
+                time.sleep(0.3)
+                return "dismissed"
             return "no-kb"
         elif verb == "typedigits":
             # Paced 0.08 s/digit /wda/keys input with exact digit-by-digit read-back verification.
