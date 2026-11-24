@@ -1929,6 +1929,8 @@ FLOW_HELP = """steps (one argument each, run in order):
                         open:com.apple.Preferences); names come from a per-device
                         devicectl cache (~1 ms; refreshed once on an unknown name)
   launch:APP            terminate + activate (fresh start)
+  url:URL               open a URL or deep-link directly via WDA /url (https://, maps://,
+                        mailto:, tel:, sms:)
   wait:TEXT             poll until TEXT is on screen (OCR-first, falls back to
                         UI controls + Sauvola OCR for colored/icon labels; 're:REGEX' for regex)
   waitany:A|B|C         poll until ANY '|'-separated target appears (OCR-first, then
@@ -1949,7 +1951,10 @@ FLOW_HELP = """steps (one argument each, run in order):
                         UI controls and --deny between every tap so layout changes never tap
                         stale coordinates; tapbatch:fixed:A,B,C opts into single-snapshot
                         /wda/fastTapBatch dispatch for known stationary keypads (e.g. Calculator)
-  TEXT@below:HEADER     (tap/tapif/tapbatch/longpress/doubletap/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
+  toggle:LABEL[=on|off] idempotently set or flip an iOS Switch control (supports @region;
+                        =on|off|1|0|true|false skips tap when already in desired state and
+                        verifies state after tapping; respects --deny)
+  TEXT@below:HEADER     (tap/tapif/tapbatch/toggle/longpress/doubletap/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
   TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
   longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
                         @region, OCR + UI fallback, respects --deny)
@@ -1970,6 +1975,8 @@ FLOW_HELP = """steps (one argument each, run in order):
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
+  slider:[LABEL=]PCT    set an XCUIElementTypeSlider to 0%-100% or 0.0-1.0 (first slider or
+                        matched by label/name; rejects disabled sliders; respects --deny)
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
@@ -1985,7 +1992,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   settle                wait until two frames in a row are identical
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
-taps, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed."""
+taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed."""
 
 
 _TYPING_FREQ = None  # None = keep legacy WDA default pace; override via TURBOTAP_TYPING_FREQ (e.g. 240)
@@ -2027,6 +2034,42 @@ def _typing_freq():
         except ValueError:
             pass
     return _TYPING_FREQ
+
+
+_TOGGLE_STATES = {
+    "on": True,
+    "1": True,
+    "true": True,
+    "off": False,
+    "0": False,
+    "false": False,
+}
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://|^(?:mailto|tel|sms):.+$", re.I)
+
+
+def _parse_switch_state(val):
+    """Parse an iOS Switch accessibility value into True/False/None."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    s = _clean_text(str(val)).casefold()
+    if s in ("1", "true", "on", "yes"):
+        return True
+    if s in ("0", "false", "off", "no"):
+        return False
+    return None
+
+
+def _is_wda_disabled_value(val):
+    """True only when a WDA /element/{eid}/enabled value explicitly reports False/0."""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return not val
+    if isinstance(val, (int, float)):
+        return val == 0
+    return str(val).strip().casefold() in ("0", "false", "no")
 
 
 def _check_wda_ok(res, action, redact=False):
@@ -3300,6 +3343,192 @@ class Flow:
             raise FlowError(f"picker wheel {idx} failed to set {val!r}: {r.get('body') or r.get('error')}")
         return f"wheel[{idx}]={val}"
 
+    def open_url(self, url):
+        """Open a URL or deep-link directly via WDA POST /session/{sid}/url."""
+        raw = (url or "").strip()
+        if not raw or not _URL_SCHEME_RE.match(raw):
+            raise FlowError(
+                f"invalid URL {url!r}; must include a scheme (e.g. https://..., maps://..., mailto:..., tel:..., sms:...)"
+            )
+        self._mark_action()
+        _check_wda_ok(self.c.req("POST", f"/session/{self.c.sid}/url", {"url": raw}), "url")
+        # Target app may stay the same (e.g. Safari -> new URL) or switch via universal
+        # link/deep-link; clear expected bundle and outgoing-app guard so subsequent
+        # same-app reads are never misclassified as stale.
+        self._switched_from_app_name = None
+        self._switched_at = 0.0
+        self.bundle = None
+        self._pending_bundle = None
+        self._pending_bundle_ts = 0.0
+        return raw
+
+    def toggle(self, spec):
+        """Idempotently set or flip an iOS Switch control: LABEL or LABEL=on|off|1|0|true|false
+        (supports @region). Skips tapping when already in the desired state, enforces --deny and
+        disabled-control rejection, never replays an acknowledged tap, and verifies state once
+        when a desired state was requested."""
+        raw = (spec or "").strip()
+        if not raw:
+            raise FlowError("toggle requires LABEL or LABEL=on|off (e.g. toggle:Wi-Fi=on)")
+        desired = None
+        target = raw
+        left, sep, right = raw.rpartition("=")
+        if sep and right.strip().lower() in _TOGGLE_STATES:
+            desired = _TOGGLE_STATES[right.strip().lower()]
+            target = left.strip()
+        base, where = split_where(target)
+        if desired is None and "=" in base:
+            left2, sep2, right2 = base.rpartition("=")
+            if sep2 and right2.strip().lower() in _TOGGLE_STATES:
+                desired = _TOGGLE_STATES[right2.strip().lower()]
+                base = left2.strip()
+        base = base.strip()
+        if not base:
+            raise FlowError(f"toggle requires a switch label in {spec!r}")
+        self._wait_active_app()
+        ctl = self.controls()
+        needs_lines = bool(where and not where.startswith("y"))
+        lines = (self._fresh_lines() or self.lines()) if needs_lines else []
+        scoped = _controls_in_region(ctl, lines, where) if where else ctl
+        clean_base = _clean_text(base)
+        c = (
+            exact_control(scoped, clean_base, ("Switch",), allow_disabled=False)
+            or find_control(scoped, clean_base, types={"Switch"}, allow_disabled=False)
+        )
+        if not c:
+            if (
+                exact_control(scoped, clean_base, ("Switch",), allow_disabled=True)
+                or find_control(scoped, clean_base, types={"Switch"}, allow_disabled=True)
+            ):
+                raise FlowError(f"{base!r} is disabled")
+            raise FlowError(f"no switch labelled {base!r}")
+        current = _parse_switch_state(c.get("value"))
+        if desired is not None and current is not None and current == desired:
+            return "already on" if desired else "already off"
+        self.guard(c["x"], c["y"], c["label"], action="toggle")
+        before = self.r.last if self.r.last is not None else self.r.grab()
+        try:
+            self.tap_control(c)
+        except Exception:
+            self._invalidate_ctl_cache()
+            raise
+        self.changed_since(before, x=c["x"], y=c["y"])
+        self._invalidate_ctl_cache()
+        if desired is not None:
+            ctl_after = self.controls()
+            self._invalidate_ctl_cache()
+            scoped_after = _controls_in_region(ctl_after, lines, where) if where else ctl_after
+            c_after = (
+                exact_control(scoped_after, c["label"], ("Switch",), allow_disabled=True)
+                or exact_control(scoped_after, clean_base, ("Switch",), allow_disabled=True)
+                or find_control(scoped_after, clean_base, types={"Switch"}, allow_disabled=True)
+            )
+            after_state = _parse_switch_state(c_after.get("value")) if c_after else None
+            if after_state is not None and after_state != desired:
+                raise FlowError(
+                    f"switch {c['label']!r} remained {'on' if after_state else 'off'} after toggle"
+                )
+            if after_state == desired:
+                return "on" if desired else "off"
+        return "toggled"
+
+    def set_slider(self, spec):
+        """Set an XCUIElementTypeSlider to a normalized fraction [0.0, 1.0]:
+        slider:50%, slider:0.5, slider:Brightness=70%, slider:Lysstyrke=0.4."""
+        raw = (spec or "").strip()
+        if not raw:
+            raise FlowError("slider requires PCT or LABEL=PCT (e.g. slider:50% or slider:Brightness=70%)")
+        if "=" in raw:
+            label_part, _, val_part = raw.rpartition("=")
+            target_label = label_part.strip()
+            val_str = val_part.strip()
+            if not target_label:
+                raise FlowError(f"slider label cannot be empty in {spec!r}")
+        else:
+            target_label = None
+            val_str = raw
+        has_pct = val_str.endswith("%")
+        num_str = val_str[:-1].strip() if has_pct else val_str
+        try:
+            num = float(num_str)
+        except ValueError:
+            raise FlowError(f"invalid slider value {spec!r}; expected 0%-100% or 0.0-1.0")
+        if not (num == num and num != float("inf") and num != float("-inf")):
+            raise FlowError(f"slider value must be finite, got {spec!r}")
+        if has_pct:
+            if num < 0.0 or num > 100.0:
+                raise FlowError(f"slider percentage must be in 0%-100%, got {spec!r}")
+            frac = num / 100.0
+        else:
+            if num < 0.0 or num > 100.0:
+                raise FlowError(f"slider value must be in 0.0-1.0 or 0-100, got {spec!r}")
+            frac = num / 100.0 if num > 1.0 else num
+        if target_label:
+            self.guard(0, 0, target_label, action="slider")
+        self._wait_active_app()
+        els_resp = self.c.req("POST", f"/session/{self.c.sid}/elements",
+                              {"using": "class name", "value": "XCUIElementTypeSlider"})
+        _check_wda_ok(els_resp, "slider")
+        els = els_resp.get("value") or []
+        if not els:
+            raise FlowError("no Slider on screen")
+        eid = None
+        matched_label = None
+        if target_label is not None:
+            want = _clean_text(target_label).casefold()
+            sub_hit = None
+            for el_obj in els:
+                if not isinstance(el_obj, dict) or not el_obj:
+                    continue
+                cand_eid = el_obj.get("ELEMENT") or next(iter(el_obj.values()))
+                lab_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{cand_eid}/attribute/label")
+                lab_val = lab_resp.get("value") if isinstance(lab_resp, dict) and not lab_resp.get("error") else None
+                lab = _clean_text(str(lab_val)) if lab_val else ""
+                if lab and lab.casefold() == want:
+                    eid, matched_label = cand_eid, lab
+                    break
+                name_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{cand_eid}/attribute/name")
+                name_val = name_resp.get("value") if isinstance(name_resp, dict) and not name_resp.get("error") else None
+                name = _clean_text(str(name_val)) if name_val else ""
+                if name and name.casefold() == want:
+                    eid, matched_label = cand_eid, name
+                    break
+                if sub_hit is None:
+                    if lab and want in lab.casefold():
+                        sub_hit = (cand_eid, lab)
+                    elif name and want in name.casefold():
+                        sub_hit = (cand_eid, name)
+            if eid is None and sub_hit is not None:
+                eid, matched_label = sub_hit
+            if eid is None:
+                raise FlowError(f"no Slider labelled {target_label!r}")
+            self.guard(0, 0, matched_label, action="slider")
+        else:
+            first = next((e for e in els if isinstance(e, dict) and e), None)
+            if not first:
+                raise FlowError("no Slider on screen")
+            eid = first.get("ELEMENT") or next(iter(first.values()))
+            lab_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/label")
+            lab_val = lab_resp.get("value") if isinstance(lab_resp, dict) and not lab_resp.get("error") else None
+            matched_label = _clean_text(str(lab_val)) if lab_val else None
+            if not matched_label:
+                name_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/name")
+                name_val = name_resp.get("value") if isinstance(name_resp, dict) and not name_resp.get("error") else None
+                matched_label = _clean_text(str(name_val)) if name_val else None
+            if matched_label:
+                self.guard(0, 0, matched_label, action="slider")
+        en_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/enabled")
+        if isinstance(en_resp, dict) and not en_resp.get("error") and _is_wda_disabled_value(en_resp.get("value")):
+            desc = repr(matched_label or target_label) if (matched_label or target_label) else "Slider"
+            raise FlowError(f"{desc} is disabled")
+        self._mark_action()
+        _check_wda_ok(
+            self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/value", {"value": [f"{frac:.2f}"]}),
+            "slider",
+        )
+        pct_str = f"{int(round(frac * 100))}%"
+        return f"{target_label}={pct_str}" if target_label else pct_str
+
     def clipboard(self, content_type="plaintext"):
         """Read iOS pasteboard text via /wda/getPasteboard and record it in reads."""
         try:
@@ -4062,6 +4291,8 @@ class Flow:
                 else:
                     self._switched_from_app_name = None
             return arg
+        elif verb == "url":
+            return self.open_url(arg)
         elif verb in ("wait", "expect"):
             return self.wait(arg).text
         elif verb == "waitany":
@@ -4074,6 +4305,8 @@ class Flow:
             return self.tap_if(arg)
         elif verb == "tapbatch":
             return self.tap_batch(arg)
+        elif verb == "toggle":
+            return self.toggle(arg)
         elif verb == "tapel":
             return self.tap_el(arg)
         elif verb == "tapxy":
@@ -4258,6 +4491,8 @@ class Flow:
             return self.swipe_gesture(arg)
         elif verb == "picker":
             return self.set_picker(arg)
+        elif verb == "slider":
+            return self.set_slider(arg)
         elif verb in ("clipboard", "copy"):
             return self.clipboard(content_type=arg.strip().lower() or "plaintext")
         elif verb == "setclip":
