@@ -93,7 +93,7 @@ if [[ -f "$PROV" ]]; then
   if [[ -n "$UUID" ]]; then
     for pdir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
       mkdir -p "$pdir"
-      [[ -f "$pdir/$UUID.mobileprovision" ]] || cp "$PROV" "$pdir/$UUID.mobileprovision"
+      cp -f "$PROV" "$pdir/$UUID.mobileprovision"
     done
   fi
 else
