@@ -263,7 +263,7 @@ index 42ea74b..829efed 100644
 +
  @end
 diff --git a/WebDriverAgentLib/Commands/FBElementCommands.m b/WebDriverAgentLib/Commands/FBElementCommands.m
-index 97afb7b..c43e621 100644
+index 97afb7b..af67cca 100644
 --- a/WebDriverAgentLib/Commands/FBElementCommands.m
 +++ b/WebDriverAgentLib/Commands/FBElementCommands.m
 @@ -40,6 +40,14 @@
@@ -300,7 +300,7 @@ index 97afb7b..c43e621 100644
  
      [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
  #endif
-@@ -509,6 +529,368 @@
+@@ -509,6 +529,379 @@
    return FBResponseWithOK();
  }
  
@@ -557,9 +557,8 @@ index 97afb7b..c43e621 100644
 +    }
 +    interval = FBClampDouble(interval, 0.01, 5.0);
 +  }
-+  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast tap batch"
-+                                                               interfaceOrientation:UIInterfaceOrientationPortrait];
-+  double step = duration + interval;
++  // Validate all points before synthesizing any touches so a bad point never partially taps.
++  NSMutableArray<NSValue *> *cgPoints = [NSMutableArray arrayWithCapacity:points.count];
 +  for (NSUInteger i = 0U; i < points.count; i++) {
 +    id item = points[i];
 +    double xVal = 0.0;
@@ -575,15 +574,27 @@ index 97afb7b..c43e621 100644
 +    if (!valid) {
 +      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Each point in 'points' must be [x, y] or {\"x\": x, \"y\": y} with finite numbers" traceback:nil]);
 +    }
-+    double offset = (double)i * step;
-+    XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:CGPointMake((CGFloat)xVal, (CGFloat)yVal)
-+                                                                        offset:offset];
-+    [path liftUpAtOffset:offset + duration];
-+    [record addPointerEventPath:path];
++    [cgPoints addObject:[NSValue valueWithCGPoint:CGPointMake((CGFloat)xVal, (CGFloat)yVal)]];
 +  }
-+  NSError *error = nil;
-+  if (!FBSynthesizeEventFast(record, &error)) {
-+    return FBResponseWithUnknownError(error);
++  // iPhone multi-touch synthesis caps concurrent paths per XCSynthesizedEventRecord;
++  // chunk at <= 4 paths per record so long sequences (e.g. 6-digit PINs) never drop trailing taps.
++  const NSUInteger kMaxPathsPerRecord = 4U;
++  double step = duration + interval;
++  for (NSUInteger start = 0U; start < cgPoints.count; start += kMaxPathsPerRecord) {
++    NSUInteger chunkLen = MIN(kMaxPathsPerRecord, cgPoints.count - start);
++    XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast tap batch"
++                                                                 interfaceOrientation:UIInterfaceOrientationPortrait];
++    for (NSUInteger j = 0U; j < chunkLen; j++) {
++      CGPoint pt = cgPoints[start + j].CGPointValue;
++      double offset = (double)j * step;
++      XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:pt offset:offset];
++      [path liftUpAtOffset:offset + duration];
++      [record addPointerEventPath:path];
++    }
++    NSError *error = nil;
++    if (!FBSynthesizeEventFast(record, &error)) {
++      return FBResponseWithUnknownError(error);
++    }
 +  }
 +  return FBResponseWithOK();
 +}
