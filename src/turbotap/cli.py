@@ -576,9 +576,9 @@ class ScreenReader:
         for a, b in zip(cuts, cuts[1:]):
             strip = img.crop((0, a, img.size[0], b))
             jobs.append((a, hashlib.blake2b(strip.tobytes(), digest_size=16).digest(), strip))
-        todo = [(k, s) for _, k, s in jobs if k not in self.cache]
         if len(self.cache) > 512:
-            self.cache.clear()
+            self.cache.clear()  # before `todo`, or strips counted as cached vanish (KeyError)
+        todo = [(k, s) for _, k, s in jobs if k not in self.cache]
         for (k, _), res in zip(todo, self.pool.map(lambda ks: self._ocr(ks[1]), todo)):
             self.cache[k] = res
         s = self.scale
@@ -782,8 +782,8 @@ FLOW_HELP = """steps (one argument each, run in order):
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
   tapxy:X,Y             tap points
-  type:TEXT             type into the focused field via /wda/keys
-  cleartype:TEXT        clear first TextField/SecureTextField, type, verify read-back
+  type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
+  cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField, type, verify read-back
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects
   dismisskb             tap Done/Ferdig on the keyboard toolbar if present
@@ -797,6 +797,18 @@ FLOW_HELP = """steps (one argument each, run in order):
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
 taps on text matching --deny are refused unless --no-deny is passed."""
+
+
+def _secret_arg(verb, arg):
+    """Resolve env:VAR / cmd:COMMAND so passwords and PINs never appear in argv or step logs."""
+    if arg.startswith("env:"):
+        val = os.environ.get(arg[4:], "")
+        if not val:
+            raise FlowError(f"{verb} env var {arg[4:]!r} is empty or unset")
+        return val
+    if arg.startswith("cmd:"):
+        return subprocess.check_output(shlex.split(arg[4:]), text=True).rstrip("\n")
+    return arg
 
 
 class FlowError(RuntimeError):
@@ -1109,8 +1121,10 @@ class Flow:
             x, y = (int(float(v)) for v in arg.split(","))
             self.tap_point(x, y)
         elif verb == "type":
+            arg = _secret_arg(verb, arg)
             self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": list(arg)})
         elif verb == "cleartype":
+            arg = _secret_arg(verb, arg)
             els = self.c.req("POST", f"/session/{self.c.sid}/elements",
                              {"using": "class name", "value": "XCUIElementTypeTextField"}).get("value") or []
             secure = False
