@@ -174,6 +174,9 @@ class WDAClient:
         side._raw_shot = self._raw_shot
         side._fast_ui = self._fast_ui
         side._fast_keys = self._fast_keys
+        side._fast_double_tap = self._fast_double_tap
+        side._fast_pinch = self._fast_pinch
+        side._fast_tap_batch = self._fast_tap_batch
         return side
 
     def _session_cache_file(self):
@@ -347,9 +350,12 @@ class WDAClient:
     # None = not probed yet; True when the wda-turbo patch is running. WDA_TURBO=0
     # forces the stock endpoints (benchmark baseline).
     turbo = False if os.environ.get("WDA_TURBO") == "0" else None
-    _raw_shot = None   # None = not probed; True = binary /wda/fastScreenshot; False = legacy JSON
-    _fast_ui = None    # None = not probed; True = /wda/fastUI; False = fallback to SOURCE_LITE
-    _fast_keys = None  # None = not probed; True = /wda/fastKeys; False = fallback to /wda/keys
+    _raw_shot = None         # None = not probed; True = binary /wda/fastScreenshot; False = legacy JSON
+    _fast_ui = None          # None = not probed; True = /wda/fastUI; False = fallback to SOURCE_LITE
+    _fast_keys = None        # None = not probed; True = /wda/fastKeys; False = fallback to /wda/keys
+    _fast_double_tap = None  # None = not probed; True = /wda/fastDoubleTap; False = fallback to /wda/doubleTap
+    _fast_pinch = None       # None = not probed; True = /wda/fastPinch; False = fallback to /wda/pinch
+    _fast_tap_batch = None   # None = not probed; True = /wda/fastTapBatch; False = sequential fast_tap
 
     def fast_tap(self, x, y, duration=None):
         """Coordinate tap (or long-press when duration is given, e.g. 0.65 s).
@@ -370,6 +376,90 @@ class WDAClient:
         if duration is not None:
             return self.req("POST", f"/session/{self.sid}/wda/touchAndHold", body)
         return self.req("POST", f"/session/{self.sid}/wda/tap", body)
+
+    def fast_double_tap(self, x, y, interval=None, duration=None):
+        """Coordinate double-tap. With wda-turbo v4, POST /wda/fastDoubleTap
+        synthesizes two staggered touch paths in one XCSynthesizedEventRecord
+        via FBSynthesizeEventFast; falls back to stock /session/{sid}/wda/doubleTap
+        on 404 (stock WDA or wda-turbo <= v3)."""
+        body = {"x": int(x), "y": int(y)}
+        if interval is not None:
+            body["interval"] = float(interval)
+        if duration is not None:
+            body["duration"] = float(duration)
+        if self.turbo is not False and self._fast_double_tap is not False:
+            r = self.req("POST", "/wda/fastDoubleTap", body)
+            if isinstance(r, dict):
+                if not r.get("error"):
+                    self._fast_double_tap = True
+                    return r
+                if r.get("error") != 404:
+                    return r
+            self._fast_double_tap = False
+        return self.req("POST", f"/session/{self.sid}/wda/doubleTap", {"x": int(x), "y": int(y)})
+
+    def fast_pinch(self, x, y, scale=2.0, duration=0.18, radius=None):
+        """Two-finger pinch/zoom around (x, y). scale > 1.0 zooms in; 0 < scale < 1.0
+        zooms out. With wda-turbo v4, POST /wda/fastPinch synthesizes two clamped
+        simultaneous touch paths via FBSynthesizeEventFast. On 404, falls back to
+        stock /session/{sid}/wda/pinch (centered on activeApplication) or returns
+        a diagnostic error if unsupported."""
+        sc = float(scale)
+        if not (sc > 0.0 and sc == sc and sc != float("inf")):
+            raise ValueError(f"pinch scale must be finite and > 0, got {scale!r}")
+        body = {"scale": sc, "duration": float(duration)}
+        if x is not None and y is not None:
+            body["x"] = int(x)
+            body["y"] = int(y)
+        if radius is not None:
+            body["radius"] = float(radius)
+        if self.turbo is not False and self._fast_pinch is not False:
+            r = self.req("POST", "/wda/fastPinch", body)
+            if isinstance(r, dict):
+                if not r.get("error"):
+                    self._fast_pinch = True
+                    return r
+                if r.get("error") != 404:
+                    return r
+            self._fast_pinch = False
+        vel = 1.0 if sc >= 1.0 else -1.0
+        fb = self.req("POST", f"/session/{self.sid}/wda/pinch", {"scale": sc, "velocity": vel})
+        if isinstance(fb, dict) and fb.get("error"):
+            return {
+                "error": fb.get("error"),
+                "body": (
+                    "/wda/fastPinch unavailable (requires wda-turbo v4) and stock "
+                    f"/wda/pinch fallback failed: {fb.get('body') or fb.get('error')}"
+                ),
+            }
+        return fb
+
+    def fast_tap_batch(self, points, interval=0.09, duration=0.02):
+        """Sequential multi-tap batch in one synthesized event record via
+        POST /wda/fastTapBatch (one testmanagerd XPC round-trip instead of N).
+        Falls back automatically to sequential fast_tap() calls on 404."""
+        pts = [[int(p[0]), int(p[1])] for p in points]
+        if not pts:
+            return {"value": None}
+        body = {"points": pts, "interval": float(interval), "duration": float(duration)}
+        if self.turbo is not False and self._fast_tap_batch is not False:
+            r = self.req("POST", "/wda/fastTapBatch", body)
+            if isinstance(r, dict):
+                if not r.get("error"):
+                    self._fast_tap_batch = True
+                    return r
+                if r.get("error") != 404:
+                    return r
+            self._fast_tap_batch = False
+        last = {"value": None}
+        dur_arg = float(duration) if float(duration) != 0.02 else None
+        for idx, (px, py) in enumerate(pts):
+            last = self.fast_tap(px, py, duration=dur_arg)
+            if isinstance(last, dict) and last.get("error"):
+                return last
+            if idx + 1 < len(pts) and interval > 0:
+                time.sleep(float(interval))
+        return last
 
     def fast_keys(self, text, frequency=None):
         """Type text into the focused element. With wda-turbo v3, POST /wda/fastKeys
@@ -1503,11 +1593,16 @@ FLOW_HELP = """steps (one argument each, run in order):
   tapif:TEXT            optional tap (~1 s max): tap TEXT (OCR + exact UI control
                         fallback, respects --deny and @region) or return 'skipped'
                         cleanly without failing the flow
-  TEXT@below:HEADER     (tap/tapif/longpress/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
+  TEXT@below:HEADER     (tap/tapif/longpress/doubletap/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
   TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
   longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
                         @region, OCR + UI fallback, respects --deny)
   longpressxy:X,Y[,MS]  long-press points (default 650 ms; optional MS or Ns, e.g. 800 or 0.8s)
+  doubletap:TEXT        double-tap TEXT via /wda/fastDoubleTap (supports @region, OCR + UI
+                        fallback, respects --deny)
+  doubletapxy:X,Y       double-tap points via /wda/fastDoubleTap
+  zoom:in|out|SCALE[@X,Y] two-finger pinch/zoom via /wda/fastPinch (in=2.0, out=0.5, or
+                        positive scale; defaults to screen center)
   search:QUERY          tap the app's search field/Search button, type QUERY, settle
   readel:TEXT           labels of controls containing TEXT (accessibility tree)
   ui                    all labelled on-screen controls with (x, y)
@@ -1517,7 +1612,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
-  pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects
+  pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
@@ -1534,12 +1629,12 @@ FLOW_HELP = """steps (one argument each, run in order):
   settle                wait until two frames in a row are identical
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
-taps and long-presses on text matching --deny are refused unless --no-deny is passed."""
+taps, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed."""
 
 
 _TYPING_FREQ = 240  # verified 27/27 exact on iPhone 17 (-43% to -56% vs WDA's 60 keys/s default)
 _IMAGE_STEP_VERBS = frozenset({
-    "wait", "expect", "waitany", "gone", "tap", "tapif", "longpress",
+    "wait", "expect", "waitany", "gone", "tap", "tapif", "longpress", "doubletap",
     "scroll", "scrollto", "swipe", "back", "read", "search", "settle", "shot",
 })
 _STALE_UI_BACKOFF = (0.05, 0.08, 0.12)
@@ -1615,6 +1710,12 @@ class Flow:
                 self._side._raw_shot = self.c._raw_shot
             if self.c._fast_keys is not None:
                 self._side._fast_keys = self.c._fast_keys
+            if self.c._fast_double_tap is not None:
+                self._side._fast_double_tap = self.c._fast_double_tap
+            if self.c._fast_pinch is not None:
+                self._side._fast_pinch = self.c._fast_pinch
+            if self.c._fast_tap_batch is not None:
+                self._side._fast_tap_batch = self.c._fast_tap_batch
         if self._ui_pool is None:
             self._ui_pool = _thread_pool(1)
         return self._side, self._ui_pool
@@ -2354,6 +2455,63 @@ class Flow:
         self.settle(timeout=1.2)
         return m
 
+    def double_tap_point(self, x, y, text="", interval=None, duration=None):
+        self.guard(x, y, text, action="double-tap")
+        self._mark_action()
+        r = self.c.fast_double_tap(x, y, interval=interval, duration=duration)
+        now = time.monotonic()
+        self._last_action_ts = now
+        self._last_tap_type = None
+        self._last_tap_ts = now
+        return r
+
+    def double_tap_text(self, label):
+        base, _ = split_where(label)
+        if not base.startswith("re:"):
+            self.guard(0, 0, base, action="double-tap")
+        m = self._find_target(label)
+        self.double_tap_point(m.x, m.y, m.text)
+        self.settle(timeout=1.2)
+        return m
+
+    def zoom(self, spec):
+        """Two-finger pinch/zoom: zoom:in|out|SCALE[@X,Y] (defaults to screen center).
+        scale > 1.0 zooms in (in = 2.0); 0 < scale < 1.0 zooms out (out = 0.5)."""
+        self._wait_active_app()
+        raw = (spec or "").strip()
+        if not raw:
+            raise FlowError("zoom expects in|out|SCALE[@X,Y] (e.g. zoom:in, zoom:out@200,450, zoom:1.5)")
+        mode_str, has_at, pos_str = raw.partition("@")
+        mode_str = mode_str.strip().lower()
+        if mode_str == "in":
+            scale = 2.0
+        elif mode_str == "out":
+            scale = 0.5
+        else:
+            try:
+                scale = float(mode_str)
+            except ValueError:
+                raise FlowError(f"invalid zoom scale {spec!r}; use zoom:in|out|SCALE[@X,Y]")
+            if not (scale > 0.0 and scale == scale and scale != float("inf")):
+                raise FlowError(f"zoom scale must be a finite number > 0, got {spec!r}")
+        if has_at:
+            parts = [p.strip() for p in pos_str.split(",")]
+            if len(parts) != 2:
+                raise FlowError(f"invalid zoom coordinates {spec!r}; expected @X,Y")
+            try:
+                cx, cy = int(float(parts[0])), int(float(parts[1]))
+            except ValueError:
+                raise FlowError(f"invalid zoom coordinates {spec!r}; expected @X,Y")
+        else:
+            w, h = self.r.pt_size()
+            cx, cy = w // 2, h // 2
+        self._mark_action()
+        r = self.c.fast_pinch(cx, cy, scale=scale)
+        if isinstance(r, dict) and r.get("error"):
+            raise FlowError(f"zoom failed: {r.get('body') or r.get('error')}")
+        self.settle(timeout=1.5)
+        return f"{scale:g}x@{cx},{cy}"
+
     def drag(self, x0, y0, x1, y1, duration=0.12, release=0.02):
         self._mark_action()
         body = {"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration, "release": release}
@@ -2802,6 +2960,21 @@ class Flow:
             self.long_press_point(x, y, duration=dur)
             self.settle(timeout=1.2)
             return f"{x},{y} ({int(round(dur * 1000))}ms)"
+        elif verb == "doubletap":
+            return self.double_tap_text(arg).text
+        elif verb == "doubletapxy":
+            parts = [p.strip() for p in arg.split(",")]
+            if len(parts) != 2:
+                raise FlowError("doubletapxy expects X,Y (e.g. doubletapxy:200,400)")
+            try:
+                x, y = int(float(parts[0])), int(float(parts[1]))
+            except ValueError:
+                raise FlowError(f"invalid doubletapxy coordinates: {arg!r}")
+            self.double_tap_point(x, y)
+            self.settle(timeout=1.2)
+            return f"{x},{y}"
+        elif verb == "zoom":
+            return self.zoom(arg)
         elif verb == "type":
             arg = _secret_arg(verb, arg)
             if self._last_tap_type in INPUT_TYPES:
@@ -2926,9 +3099,9 @@ class Flow:
             missing = [d for d in digits if d not in coords]
             if missing:
                 raise FlowError(f"pintap found no key rects for {len(set(missing))} of the PIN's digits")  # never echo PIN digits
-            for d in digits:
-                self.c.fast_tap(*coords[d])
-                time.sleep(0.25)
+            # Conservative 150 ms inter-key spacing via /wda/fastTapBatch (one testmanagerd
+            # XPC call; falls back automatically to sequential fast_tap() on stock/v3 WDA).
+            self.c.fast_tap_batch([coords[d] for d in digits], interval=0.15, duration=0.02)
             return f"tapped {len(digits)} digits"
         elif verb == "alert":
             action = arg.strip().lower() or "accept"
