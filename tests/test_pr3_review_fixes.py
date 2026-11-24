@@ -543,6 +543,49 @@ class PR3ReviewFixesTests(unittest.TestCase):
         self.assertEqual(attempts[0], 1)
         self.assertTrue(r_out.get("deadline_exceeded") or r_out.get("error"))
 
+    # Re-review 9: app switch resolving via controls() must discard pre-confirmation OCR frames
+    def test_tapif_app_switch_resolving_discards_pre_confirmation_outgoing_ocr_frame(self):
+        old_img = solid_img(210, size=(430, 932))
+        new_img = solid_img(230, size=(430, 932))
+        old_lines = [make_line("Continue", 70, 190, 110, 210)]
+        ui_calls = [0]
+
+        def switching_ui(qs):
+            ui_calls[0] += 1
+            if ui_calls[0] == 1:
+                return {
+                    "bundleId": "com.apple.oldapp",
+                    "appName": "OldApp",
+                    "screen": [430, 932],
+                    "ui": [{"type": "Button", "label": "Continue", "x": 90, "y": 200}],
+                }
+            return {
+                "bundleId": "com.apple.target",
+                "appName": "TargetApp",
+                "screen": [430, 932],
+                "ui": [{"type": "Button", "label": "Settings", "x": 200, "y": 400}],
+            }
+
+        c = MockWDAClient(active_app="com.apple.target", fast_ui=switching_ui)
+        # Seed reader.last with the outgoing app's cached frame (containing Continue at 90,200),
+        # while the fresh post-confirmation frame has no Continue.
+        r = FakeReader(frames=[(new_img, []), (new_img, [])])
+        r.set_last(old_img, lines=old_lines)
+        flow = cli.Flow(c, reader=r)
+        try:
+            flow.bundle = "com.apple.target"
+            flow._pending_bundle = None
+            flow._pending_bundle_ts = time.monotonic()
+            flow._switched_from_app_name = "OldApp"
+            flow._switched_at = time.monotonic()
+            with mock.patch.object(cli, "_STALE_UI_BACKOFF", (0.01,)):
+                res = flow.tap_if("Continue", timeout=0.5)
+            self.assertEqual(res, "skipped")
+            post_calls = [(m, p) for m, p, _ in c.calls if m == "POST"]
+            self.assertEqual(post_calls, [])
+        finally:
+            flow.close()
+
 
 if __name__ == "__main__":
     unittest.main()

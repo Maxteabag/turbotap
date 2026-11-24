@@ -2590,6 +2590,50 @@ class Flow:
             rem = deadline - t_frame
             if rem <= 0:
                 return "skipped"
+            if not confirmed_fresh_app:
+                # Resolve the pending app switch BEFORE capturing/using any OCR or
+                # Sauvola frame so outgoing-app pixels can never authorize a tap.
+                try:
+                    raw_ctl = self.controls(deadline=deadline)
+                    confirmed_fresh_app = True
+                except (_StaleAppError, FlowError):
+                    rem_after = deadline - time.monotonic()
+                    if rem_after <= 0:
+                        return "skipped"
+                    time.sleep(min(0.05, rem_after))
+                    continue
+                if time.monotonic() >= deadline:
+                    return "skipped"
+                last_ctl = raw_ctl
+                last_ui_check = time.monotonic()
+                last_ui_img = None
+                # Verified target-app tree can supply direct control coordinates
+                # immediately (unless @below/@above needs fresh OCR lines).
+                if not where or not (where.startswith("below:") or where.startswith("above:")):
+                    ctl = _controls_in_region(raw_ctl, [], where)
+                    if base.startswith("re:"):
+                        cm = find_control_match(ctl, base, types=set(ext_types), allow_disabled=False)
+                        if cm:
+                            if time.monotonic() >= deadline:
+                                return "skipped"
+                            self.tap_point(cm.x, cm.y, cm.text, deadline=deadline)
+                            return cm.text
+                    else:
+                        c = exact_control(ctl, base, ext_types)
+                        if not c and low_base in BACK_LABELS:
+                            for alt in BACK_LABELS:
+                                c = exact_control(ctl, alt, ("Button", "Link"))
+                                if c:
+                                    break
+                        if c:
+                            if time.monotonic() >= deadline:
+                                return "skipped"
+                            return self.tap_control(c, deadline=deadline).text
+                # Discard any pre-confirmation cached frame so the upcoming OCR/Sauvola
+                # pass captures a fresh frame from the confirmed target app.
+                if hasattr(self.r, "invalidate_last"):
+                    self.r.invalidate_last()
+                continue
             if frames == 0:
                 lines = self._fresh_lines()
                 if lines is None:
@@ -2606,29 +2650,26 @@ class Flow:
             if time.monotonic() >= deadline:
                 return "skipped"
             cur_img = self.r.last
+            if last_ui_img is None and last_ctl is not None:
+                last_ui_img = cur_img
             stale_app = False
             m = find_text(lines, base, where=where)
             if m:
                 ctl_for_check = last_ctl
                 rem_ctl = deadline - time.monotonic()
-                if (ctl_for_check is None or not confirmed_fresh_app) and rem_ctl > 0:
+                if ctl_for_check is None and rem_ctl > 0:
                     try:
                         ctl_for_check = self.controls(deadline=deadline)
-                        confirmed_fresh_app = True
                         last_ctl = ctl_for_check
                         last_ui_check = time.monotonic()
                         last_ui_img = cur_img
                     except _StaleAppError:
-                        # Outgoing app is still on screen: do NOT dispatch OCR coordinates!
                         confirmed_fresh_app = False
                         stale_app = True
+                        last_ctl = None
                         ctl_for_check = None
                     except FlowError:
                         ctl_for_check = None
-                        if not confirmed_fresh_app:
-                            stale_app = True
-                elif not confirmed_fresh_app:
-                    stale_app = True
                 if time.monotonic() >= deadline:
                     return "skipped"
                 if not stale_app and confirmed_fresh_app:
@@ -2646,15 +2687,13 @@ class Flow:
                     return "skipped"
                 try:
                     raw_ctl = self.controls(deadline=deadline)
-                    confirmed_fresh_app = True
                 except _StaleAppError:
                     confirmed_fresh_app = False
                     stale_app = True
+                    last_ctl = None
                     raw_ctl = []
                 except FlowError:
                     raw_ctl = []
-                    if not confirmed_fresh_app:
-                        stale_app = True
                 if time.monotonic() >= deadline:
                     return "skipped"
                 if not stale_app and confirmed_fresh_app:
