@@ -1,11 +1,12 @@
 diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m b/WebDriverAgentLib/Commands/FBDebugCommands.m
-index 42ea74b..2ca5f1c 100644
+index 42ea74b..8af5009 100644
 --- a/WebDriverAgentLib/Commands/FBDebugCommands.m
 +++ b/WebDriverAgentLib/Commands/FBDebugCommands.m
-@@ -8,13 +8,148 @@
+@@ -8,13 +8,156 @@
  
  #import "FBDebugCommands.h"
  
++#import <CoreFoundation/CoreFoundation.h>
 +#import <math.h>
 +#if !TARGET_OS_WATCH
 +#import <UIKit/UIKit.h>
@@ -36,6 +37,8 @@ index 42ea74b..2ca5f1c 100644
 +  if (type == XCUIElementTypeSwitch) return @"Switch";
 +  if (type == XCUIElementTypeSlider) return @"Slider";
 +  if (type == XCUIElementTypeSegmentedControl) return @"SegmentedControl";
++  if (type == XCUIElementTypePickerWheel) return @"PickerWheel";
++  if (type == XCUIElementTypeStepper) return @"Stepper";
 +  if (type == XCUIElementTypeImage) return @"Image";
 +  return nil;
 +}
@@ -82,6 +85,14 @@ index 42ea74b..2ca5f1c 100644
 +        }
 +      }
 +    }
++  } else if (type == XCUIElementTypePickerWheel && label.length == 0) {
++    id rawVal = snapshot.value;
++    if (nil != rawVal && rawVal != NSNull.null) {
++      NSString *vStr = [NSString stringWithFormat:@"%@", rawVal];
++      if (vStr.length > 0) {
++        label = vStr;
++      }
++    }
 +  }
 +  if (nil != typeName && !(type == XCUIElementTypeKey && kb)
 +      && label.length > 0
@@ -97,7 +108,8 @@ index 42ea74b..2ca5f1c 100644
 +    if (cx > 0 && cx < sw && cy > 0 && cy < sh) {
 +      NSString *valStr = nil;
 +      if (type == XCUIElementTypeSwitch || type == XCUIElementTypeSlider
-+          || type == XCUIElementTypeTextField || type == XCUIElementTypeSearchField) {
++          || type == XCUIElementTypeTextField || type == XCUIElementTypeSearchField
++          || type == XCUIElementTypePickerWheel || type == XCUIElementTypeStepper) {
 +        id rawVal = snapshot.value;
 +        if (type == XCUIElementTypeSwitch) {
 +          if (nil != rawVal && rawVal != NSNull.null) {
@@ -122,22 +134,18 @@ index 42ea74b..2ca5f1c 100644
 +          }
 +        }
 +      }
++      NSMutableDictionary<NSString *, id> *item = [NSMutableDictionary dictionaryWithCapacity:6U];
++      item[@"type"] = typeName;
++      item[@"label"] = label;
++      item[@"x"] = @(cx);
++      item[@"y"] = @(cy);
 +      if (nil != valStr && valStr.length > 0 && ![valStr isEqualToString:label]) {
-+        [out addObject:@{
-+          @"type": typeName,
-+          @"label": label,
-+          @"x": @(cx),
-+          @"y": @(cy),
-+          @"value": valStr,
-+        }];
-+      } else {
-+        [out addObject:@{
-+          @"type": typeName,
-+          @"label": label,
-+          @"x": @(cx),
-+          @"y": @(cy),
-+        }];
++        item[@"value"] = valStr;
 +      }
++      if (!snapshot.enabled) {
++        item[@"enabled"] = @NO;
++      }
++      [out addObject:item];
 +    }
 +  }
 +  NSArray *children = snapshot.children;
@@ -151,7 +159,7 @@ index 42ea74b..2ca5f1c 100644
  @implementation FBDebugCommands
  
  #pragma mark - <FBCommandHandler>
-@@ -27,6 +162,8 @@
+@@ -27,6 +170,8 @@
      [[FBRoute GET:@"/source"].withoutSession respondWithTarget:self action:@selector(handleGetSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"] respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"].withoutSession respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
@@ -160,16 +168,41 @@ index 42ea74b..2ca5f1c 100644
    ];
  }
  
-@@ -78,4 +215,59 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
+@@ -78,4 +223,84 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
    return FBResponseWithObject(application.fb_accessibilityTree ?: @{});
  }
  
 +// wda-turbo: single-snapshot on-device UI control walk (zero per-node customActions /
 +// accessibility IPC, prunes off-screen cells, skips soft-keyboard keys, compact JSON).
++// Optional query params: ?text=1&waitBundle=<bundleId>&waitMs=<ms> (capped at 2000 ms).
 ++ (id<FBResponsePayload>)handleFastUI:(FBRouteRequest *)request
 +{
 +  XCUIApplication *application = XCUIApplication.fb_activeApplication;
++  NSString *waitBundle = request.parameters[@"waitBundle"];
++  NSTimeInterval waitDeadline = 0.0;
++  if (nil != waitBundle && waitBundle.length > 0) {
++    NSString *waitMsParam = request.parameters[@"waitMs"];
++    double waitMs = (nil != waitMsParam && waitMsParam.length > 0) ? [waitMsParam doubleValue] : 1500.0;
++    if (!isfinite(waitMs) || waitMs < 0.0) {
++      waitMs = 0.0;
++    } else if (waitMs > 2000.0) {
++      waitMs = 2000.0;
++    }
++    if (waitMs > 0.0) {
++      waitDeadline = NSProcessInfo.processInfo.systemUptime + (waitMs / 1000.0);
++      while (![application.bundleID isEqualToString:waitBundle]
++             && NSProcessInfo.processInfo.systemUptime < waitDeadline) {
++        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.025, (Boolean)true);
++        application = XCUIApplication.fb_activeApplication;
++      }
++    }
++  }
 +  id<FBXCElementSnapshot> _Nullable snapshot = [application fb_standardSnapshot];
++  if (nil == snapshot && waitDeadline > 0.0 && NSProcessInfo.processInfo.systemUptime < waitDeadline) {
++    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.025, (Boolean)true);
++    application = XCUIApplication.fb_activeApplication;
++    snapshot = [application fb_standardSnapshot];
++  }
 +  if (nil == snapshot) {
 +    return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
 +  }
@@ -221,7 +254,7 @@ index 42ea74b..2ca5f1c 100644
 +
  @end
 diff --git a/WebDriverAgentLib/Commands/FBElementCommands.m b/WebDriverAgentLib/Commands/FBElementCommands.m
-index 97afb7b..c21039f 100644
+index 97afb7b..85b7022 100644
 --- a/WebDriverAgentLib/Commands/FBElementCommands.m
 +++ b/WebDriverAgentLib/Commands/FBElementCommands.m
 @@ -40,6 +40,10 @@
@@ -235,7 +268,7 @@ index 97afb7b..c21039f 100644
  
  @interface FBElementCommands ()
  @end
-@@ -115,6 +119,10 @@
+@@ -115,6 +119,12 @@
  
      [[FBRoute POST:@"/wda/element/:uuid/tap"] respondWithTarget:self action:@selector(handleTap:)],
      [[FBRoute POST:@"/wda/tap"] respondWithTarget:self action:@selector(handleTap:)],
@@ -243,10 +276,12 @@ index 97afb7b..c21039f 100644
 +    [[FBRoute POST:@"/wda/fastTap"].withoutSession respondWithTarget:self action:@selector(handleFastTap:)],
 +    [[FBRoute POST:@"/wda/fastDrag"] respondWithTarget:self action:@selector(handleFastDrag:)],
 +    [[FBRoute POST:@"/wda/fastDrag"].withoutSession respondWithTarget:self action:@selector(handleFastDrag:)],
++    [[FBRoute POST:@"/wda/fastKeys"] respondWithTarget:self action:@selector(handleFastKeys:)],
++    [[FBRoute POST:@"/wda/fastKeys"].withoutSession respondWithTarget:self action:@selector(handleFastKeys:)],
  
      [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
  #endif
-@@ -509,6 +517,93 @@
+@@ -509,6 +519,135 @@
    return FBResponseWithOK();
  }
  
@@ -335,6 +370,48 @@ index 97afb7b..c21039f 100644
 +    return FBResponseWithUnknownError(error);
 +  }
 +  return FBResponseWithOK();
++}
++
++// wda-turbo: synthesize text input via FBSynthesizeEventFast (bypasses FBRunLoopSpinner's
++// 100 ms sleep in FBTypeText) with a fast default typing frequency (240 keys/s).
++// Body: {"value": "text" | ["t","e","x","t"], "frequency": 240 (optional)}
+++ (id<FBResponsePayload>)handleFastKeys:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  id rawValue = a[@"value"];
++  NSString *textToType = nil;
++  if ([rawValue isKindOfClass:NSString.class]) {
++    textToType = (NSString *)rawValue;
++  } else if ([rawValue isKindOfClass:NSArray.class]) {
++    textToType = [(NSArray *)rawValue componentsJoinedByString:@""];
++  } else {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'value' must be a string or array of strings"
++                                                                       traceback:nil]);
++  }
++  if (textToType.length == 0) {
++    return FBResponseWithObject(@{@"fastKeys": @YES});
++  }
++  unsigned long long frequency = 240ULL;
++  id freqArg = a[@"frequency"];
++  if (nil != freqArg && [freqArg respondsToSelector:@selector(longLongValue)]) {
++    long long parsed = [freqArg longLongValue];
++    if (parsed > 0) {
++      frequency = (unsigned long long)parsed;
++    }
++  }
++  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast keys"];
++  XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTextInput];
++  [path typeText:textToType
++        atOffset:0.0
++     typingSpeed:frequency
++    shouldRedact:NO];
++  [record addPointerEventPath:path];
++  NSError *error = nil;
++  if (!FBSynthesizeEventFast(record, &error)) {
++    return FBResponseWithStatus([FBCommandStatus invalidElementStateErrorWithMessage:error.description ?: @"Failed to synthesize key events"
++                                                                           traceback:nil]);
++  }
++  return FBResponseWithObject(@{@"fastKeys": @YES});
 +}
 +
  + (id<FBResponsePayload>)handlePinch:(FBRouteRequest *)request

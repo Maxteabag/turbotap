@@ -123,6 +123,7 @@ class WDAClient:
         side.turbo = self.turbo
         side._raw_shot = self._raw_shot
         side._fast_ui = self._fast_ui
+        side._fast_keys = self._fast_keys
         return side
 
     def _session_cache_file(self):
@@ -294,12 +295,16 @@ class WDAClient:
     turbo = False if os.environ.get("WDA_TURBO") == "0" else None
     _raw_shot = None   # None = not probed; True = binary /wda/fastScreenshot; False = legacy JSON
     _fast_ui = None    # None = not probed; True = /wda/fastUI; False = fallback to SOURCE_LITE
+    _fast_keys = None  # None = not probed; True = /wda/fastKeys; False = fallback to /wda/keys
 
-    def fast_tap(self, x, y):
-        """Coordinate tap. With patches/wda-turbo.patch, /wda/fastTap sends one
-        synthesized touch and skips XCUICoordinate's quiescence wait; stock WDA
-        falls back to legacy /wda/tap (737 ms, vs 1,191 ms for W3C /actions)."""
+    def fast_tap(self, x, y, duration=None):
+        """Coordinate tap (or long-press when duration is given, e.g. 0.65 s).
+        With patches/wda-turbo.patch, /wda/fastTap sends one synthesized touch
+        and skips XCUICoordinate's quiescence wait; stock WDA falls back to
+        /wda/touchAndHold (when duration is set) or legacy /wda/tap."""
         body = {"x": int(x), "y": int(y)}
+        if duration is not None:
+            body["duration"] = float(duration)
         if self.turbo is not False:
             r = self.req("POST", "/wda/fastTap", body)
             if not r.get("error"):
@@ -308,7 +313,28 @@ class WDAClient:
             if r.get("error") != 404:
                 return r
             self.turbo = False
+        if duration is not None:
+            return self.req("POST", f"/session/{self.sid}/wda/touchAndHold", body)
         return self.req("POST", f"/session/{self.sid}/wda/tap", body)
+
+    def fast_keys(self, text, frequency=240):
+        """Type text into the focused element. With wda-turbo v3, POST /wda/fastKeys
+        synthesizes key events via FBSynthesizeEventFast (skipping FBRunLoopSpinner's
+        100 ms polling sleep) at high frequency; falls back to /session/{sid}/wda/keys
+        with frequency on 404 (stock WDA / wda-turbo v2)."""
+        text = str(text)
+        freq = int(frequency) if frequency else 240
+        if self.turbo is not False and self._fast_keys is not False:
+            r = self.req("POST", "/wda/fastKeys", {"value": text, "frequency": freq})
+            if isinstance(r, dict):
+                val = r.get("value")
+                if not r.get("error") and isinstance(val, dict) and val.get("fastKeys"):
+                    self._fast_keys = True
+                    return r
+                if r.get("error") and r.get("error") != 404:
+                    return r
+            self._fast_keys = False
+        return self.req("POST", f"/session/{self.sid}/wda/keys", {"value": list(text), "frequency": freq})
 
     def wait_click(self, predicate=None, class_chain=None, timeout=8.0, poll=0.25, post_wait=0.3):
         deadline = time.time() + timeout
@@ -994,7 +1020,8 @@ def resolve_app(arg, udid="", base_url=""):
 
 
 CONTROL_TYPES = {"Button", "Key", "Tab", "SearchField", "TextField", "SecureTextField", "TextView",
-                 "Cell", "Link", "Switch", "Slider", "SegmentedControl", "Image"}
+                 "Cell", "Link", "Switch", "Slider", "SegmentedControl", "PickerWheel", "Stepper", "Image"}
+_VALUE_CONTROL_TYPES = ("Switch", "Slider", "TextField", "SearchField", "PickerWheel", "Stepper")
 # Skipping these attributes makes /source much cheaper: visibility and
 # nativeAccessibilityElement trigger extra AX attribute queries per node in WDA's
 # XCUIApplication+FBHelpers.m, and ui_controls() only reads type/rect/label/name/value.
@@ -1042,6 +1069,8 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
         lab = _clean_text(str(raw_lab)) if raw_lab else ""
         if t == "Other" and not lab and n.get("value"):
             lab, t = _clean_text(str(n["value"])), "Value"  # unlabelled value text (OTP digits, counters)
+        elif t == "PickerWheel" and not lab and n.get("value"):
+            lab = _clean_text(str(n["value"]))
         elif t == "StaticText" and text:
             t = "Text"
         if (t in CONTROL_TYPES or t in ("Value", "Text")) and not (t == "Key" and kb) \
@@ -1061,10 +1090,13 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
             if 0 < x < screen[0] and 0 < y < screen[1] and not is_internal_img and not _is_internal_cell(t, lab):
                 item = {"type": t, "label": lab, "x": x, "y": y}
                 val = n.get("value")
-                if t in ("Switch", "Slider", "TextField", "SearchField") and val not in (None, ""):
+                if t in _VALUE_CONTROL_TYPES and val not in (None, ""):
                     cval = _clean_text(str(val))
                     if cval and cval != lab:
                         item["value"] = cval
+                raw_en = n.get("enabled") if "enabled" in n else n.get("isEnabled")
+                if raw_en in (False, 0, "0", "false", "False"):
+                    item["enabled"] = False
                 if key not in seen:
                     seen[key] = len(out)
                     out.append(item)
@@ -1094,7 +1126,11 @@ def _dedupe_ui_controls(out):
                 continue
         if c["type"] == "Cell" and not c.get("value"):
             cn = _norm(c["label"])
-            if any(_norm(b["label"]) == cn and abs(c["y"] - b["y"]) <= 8 for b in buttons):
+            if any(
+                _norm(b["label"]) == cn and abs(c["y"] - b["y"]) <= 8
+                and (b.get("enabled") is not False or c.get("enabled") is False)
+                for b in buttons
+            ):
                 continue
         deduped.append(c)
     return deduped
@@ -1129,30 +1165,60 @@ def _parse_fast_ui(data, screen=(430, 932)):
             continue
         item = {"type": t, "label": lab, "x": x, "y": y}
         val = raw.get("value")
-        if t in ("Switch", "Slider", "TextField", "SearchField") and val not in (None, ""):
+        if t in _VALUE_CONTROL_TYPES and val not in (None, ""):
             cval = _clean_text(str(val))
             if cval and cval != lab:
                 item["value"] = cval
+        if raw.get("enabled") is False:
+            item["enabled"] = False
         key = (lab, x // 4, y // 4)
         if key not in seen:
             seen[key] = len(out)
             out.append(item)
-        elif out[seen[key]]["type"] == "Cell" and t == "Button" and not out[seen[key]].get("value"):
+        elif (out[seen[key]]["type"] == "Cell"
+              and t in ("Button", "TextField", "SearchField", "SecureTextField", "TextView")
+              and not out[seen[key]].get("value")):
             out[seen[key]] = item
     return _dedupe_ui_controls(out), app_name
 
 
-def _fetch_ui_controls(client, screen=(430, 932), text=False):
+def _fetch_ui_controls_full(client, screen=(430, 932), text=False,
+                            wait_bundle=None, wait_ms=0, fallback_on_miss=True):
+    """Fetch UI controls via /wda/fastUI (with optional on-device waitBundle/waitMs)
+    or fallback to SOURCE_LITE. Returns (controls, app_name, bundle_id).
+    When fallback_on_miss=False and /wda/fastUI is unavailable, returns (None, '', '')
+    so callers can run activeAppInfo polling before fetching SOURCE_LITE."""
     if getattr(client, "turbo", None) is not False and getattr(client, "_fast_ui", None) is not False:
-        path = "/wda/fastUI?text=1" if text else "/wda/fastUI"
+        params = []
+        if text:
+            params.append(("text", "1"))
+        if wait_bundle and wait_ms and int(wait_ms) > 0:
+            params.append(("waitBundle", str(wait_bundle)))
+            params.append(("waitMs", str(min(2000, int(wait_ms)))))
+        path = "/wda/fastUI" + (f"?{urllib.parse.urlencode(params)}" if params else "")
         r = client.req("GET", path, timeout=30)
         if isinstance(r, dict) and isinstance(r.get("ui"), list):
             client._fast_ui = True
-            return _parse_fast_ui(r, screen=screen)
+            ctl, app_name = _parse_fast_ui(r, screen=screen)
+            bundle_id = str(r.get("bundleId") or "")
+            return ctl, app_name, bundle_id
         if not isinstance(r, dict) or r.get("error") == 404 or (not r.get("error") and "ui" not in r):
             client._fast_ui = False
+        if not fallback_on_miss:
+            return None, "", ""
+    elif not fallback_on_miss:
+        return None, "", ""
     r = client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=30)
-    return _parse_ui_controls(r.get("value") or {}, screen=screen, text=text)
+    ctl, app_name = _parse_ui_controls(r.get("value") or {}, screen=screen, text=text)
+    return ctl, app_name, ""
+
+
+def _fetch_ui_controls(client, screen=(430, 932), text=False, wait_bundle=None, wait_ms=0):
+    """Backward-compatible wrapper returning (controls, app_name)."""
+    ctl, app_name, _ = _fetch_ui_controls_full(
+        client, screen=screen, text=text, wait_bundle=wait_bundle, wait_ms=wait_ms,
+    )
+    return ctl, app_name
 
 
 def ui_controls(client, screen=(430, 932), text=False):
@@ -1186,7 +1252,7 @@ KEY_MAP = {
 }
 # Shown with 'visible' when a flow step fails, so the next try uses exact labels.
 INTERACTIVE_TYPES = {"Button", "Key", "Tab", "Cell", "Link", "Switch", "Slider", "SegmentedControl",
-                     "SearchField", "TextField", "SecureTextField", "TextView"}
+                     "PickerWheel", "Stepper", "SearchField", "TextField", "SecureTextField", "TextView"}
 # Editable inputs that raise the keyboard and need a short focus settle before type:.
 INPUT_TYPES = {"TextField", "SearchField", "SecureTextField", "TextView"}
 # Control types matched when wait:TEXT falls back to the accessibility tree.
@@ -1199,25 +1265,35 @@ BACK_LABELS = ("back", "go back", "navigate up", "tilbake")
 DISMISS_KB_LABELS = ("Done", "Ferdig", "Hide keyboard", "Skjul tastatur", "Dismiss", "Lukk")
 
 
-def exact_control(controls, label, types=TAP_TYPES):
+def exact_control(controls, label, types=TAP_TYPES, allow_disabled=False):
     """The control whose label equals label (case-insensitive), preferring
-    Button/Key/Link over Switch/Tab/Cell, then the topmost."""
+    enabled controls, Button/Key/Link over Switch/Tab/Cell, then the topmost."""
     want = _clean_text(label).casefold()
-    hits = [c for c in controls if c["type"] in types and c["label"].casefold() == want]
-    return min(hits, key=lambda c: (types.index(c["type"]), c["y"], c["x"])) if hits else None
+    hits = [
+        c for c in controls
+        if c["type"] in types
+        and c["label"].casefold() == want
+        and (allow_disabled or c.get("enabled") is not False)
+    ]
+    return min(hits, key=lambda c: (c.get("enabled") is False, types.index(c["type"]), c["y"], c["x"])) if hits else None
 
 
-def find_control(controls, label, types=None):
-    """Exact label > starts with > contains (case-insensitive); topmost wins."""
+def find_control(controls, label, types=None, allow_disabled=False):
+    """Exact label > starts with > contains (case-insensitive); enabled and topmost win."""
     want = label.casefold()
     for test in (lambda l: l == want, lambda l: l.startswith(want), lambda l: want in l):
-        hits = [c for c in controls if test(c["label"].casefold()) and (not types or c["type"] in types)]
+        hits = [
+            c for c in controls
+            if test(c["label"].casefold())
+            and (not types or c["type"] in types)
+            and (allow_disabled or c.get("enabled") is not False)
+        ]
         if hits:
-            return min(hits, key=lambda c: (c["y"], c["x"]))
+            return min(hits, key=lambda c: (c.get("enabled") is False, c["y"], c["x"]))
     return None
 
 
-def find_control_match(controls, label, types=WAIT_UI_TYPES):
+def find_control_match(controls, label, types=WAIT_UI_TYPES, allow_disabled=True):
     """Match label (or 're:REGEX') against accessibility controls.
     Returns Match(x, y, label, None, rank) or None."""
     want = _clean_text(label).casefold()
@@ -1225,6 +1301,8 @@ def find_control_match(controls, label, types=WAIT_UI_TYPES):
     best = None
     for c in controls:
         if types and c["type"] not in types:
+            continue
+        if not allow_disabled and c.get("enabled") is False:
             continue
         lab = c["label"]
         if rx:
@@ -1237,10 +1315,10 @@ def find_control_match(controls, label, types=WAIT_UI_TYPES):
             if want not in low:
                 continue
             rank = 0 if low == want else (1 if low.startswith(want) or low.endswith(want) else 2)
-        cand = (rank, c["y"], c["x"], Match(c["x"], c["y"], lab, None, rank))
-        if best is None or cand[:3] < best[:3]:
+        cand = (c.get("enabled") is False, rank, c["y"], c["x"], Match(c["x"], c["y"], lab, None, rank))
+        if best is None or cand[:4] < best[:4]:
             best = cand
-    return best[3] if best else None
+    return best[4] if best else None
 
 
 def split_where(arg):
@@ -1352,6 +1430,13 @@ class Flow:
             self._side = self.c._side_client() if hasattr(self.c, "_side_client") else self.c
         else:
             self._side.sid = self.c.sid
+            self._side.turbo = self.c.turbo
+            if self.c._fast_ui is not None:
+                self._side._fast_ui = self.c._fast_ui
+            if self.c._raw_shot is not None:
+                self._side._raw_shot = self.c._raw_shot
+            if self.c._fast_keys is not None:
+                self._side._fast_keys = self.c._fast_keys
         if self._ui_pool is None:
             self._ui_pool = ThreadPoolExecutor(1)
         return self._side, self._ui_pool
@@ -1439,7 +1524,7 @@ class Flow:
         except TypeError:
             return None
 
-    def wait(self, label, timeout=None, stable=False, initial=None):
+    def wait(self, label, timeout=None, stable=False, initial=None, allow_disabled=True):
         """Poll until label is visible (and, if stable, at the same spot twice).
         label may carry a region: 'Alice@below:Chats', 'Alice@y>300'.
         OCR-first for zero /source overhead on the fast path; falls back to the
@@ -1464,7 +1549,7 @@ class Flow:
             if not m and (frames >= 2 or now - start >= 0.4) and (last_ui == 0.0 or now - last_ui >= 0.8):
                 ctl = _controls_in_region(self.controls(text=True), lines, where)
                 last_ui = time.time()
-                cm = find_control_match(ctl, label, types=WAIT_UI_TYPES)
+                cm = find_control_match(ctl, label, types=WAIT_UI_TYPES, allow_disabled=allow_disabled)
                 if cm:
                     self._wait_settled_ts = time.monotonic()
                     return cm
@@ -1683,12 +1768,13 @@ class Flow:
                     m_ctl = self.tap_control(c)
                 return m_ctl
         try:
-            m = self.wait(label, timeout=min(2.2, self.timeout), stable=True, initial=m0)
+            m = self.wait(label, timeout=min(2.2, self.timeout), stable=True, initial=m0, allow_disabled=False)
         except FlowError:
             # Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct messages)
             # have no visible text for OCR: one /source lookup with coordinates, then
             # targeted Sauvola fallback, then the slower element-predicate poll.
-            c = None if where else find_control(self.controls(), base)
+            ctl_fb = None if where else self.controls()
+            c = None if ctl_fb is None else find_control(ctl_fb, base)
             if c:
                 return self.tap_control(c)
             slines = self._read_sauvola(self.r.last)
@@ -1697,6 +1783,8 @@ class Flow:
                 if sm:
                     self.tap_point(sm.x, sm.y, sm.text)
                     return sm
+            if ctl_fb is not None and find_control(ctl_fb, base, allow_disabled=True):
+                raise FlowError(f"{base!r} is disabled")
             x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
             return Match(x, y, f"[el:{label}]", None)
         _, h = self.r.pt_size()
@@ -1895,7 +1983,8 @@ class Flow:
         region = (_region(lines, where) or []) if where else lines
         cands = [(l.y, l.x, l.text) for l in region if _norm(l.text) == want]
         cands += [(c["y"], c["x"], c["label"]) for c in _controls_in_region(self.controls(), lines, where)
-                  if c["type"] in ("Button", "Link") and c["label"].casefold() == label.casefold()]
+                  if c["type"] in ("Button", "Link") and c["label"].casefold() == label.casefold()
+                  and c.get("enabled") is not False]
         if not cands:
             return None
         y, x, text = min(cands)
@@ -1971,8 +2060,40 @@ class Flow:
         raise FlowError(f"{label!r} not found while scrolling")
 
     def controls(self, text=False):
-        self._wait_active_app()
-        ctl, app_name = _fetch_ui_controls(self.c, self.r.pt_size(), text=text)
+        pending = (
+            self._pending_bundle
+            if self._pending_bundle and (time.monotonic() - self._pending_bundle_ts) <= 2.5
+            else None
+        )
+        ctl = None
+        app_name = ""
+        if (pending and getattr(self.c, "turbo", None) is not False
+                and getattr(self.c, "_fast_ui", None) is not False):
+            # WDA Turbo v3 single-RTT waitBundle: poll activeApplication on-device
+            # and snapshot in one HTTP call instead of activeAppInfo + fastUI.
+            ctl, app_name, bundle_id = _fetch_ui_controls_full(
+                self.c, self.r.pt_size(), text=text,
+                wait_bundle=pending, wait_ms=1500, fallback_on_miss=False,
+            )
+            if ctl is not None:
+                if bundle_id == pending or not bundle_id:
+                    self._pending_bundle = None
+                else:
+                    # Older WDA Turbo v2 ignored waitBundle and returned previous app.
+                    self._wait_active_app()
+                    ctl, app_name, _ = _fetch_ui_controls_full(self.c, self.r.pt_size(), text=text)
+        if ctl is None:
+            self._wait_active_app()
+            wb = (
+                self.bundle
+                if self._switched_from_app_name and self.bundle
+                and (time.monotonic() - self._switched_at) <= 3.0
+                else None
+            )
+            ctl, app_name, _ = _fetch_ui_controls_full(
+                self.c, self.r.pt_size(), text=text,
+                wait_bundle=wb, wait_ms=600 if wb else 0,
+            )
         if (self._switched_from_app_name and app_name
                 and app_name == self._switched_from_app_name
                 and time.monotonic() - self._switched_at <= 3.0):
@@ -1980,7 +2101,7 @@ class Flow:
             # wait briefly and re-fetch once iOS publishes the new app's tree.
             for _ in range(3):
                 time.sleep(0.2)
-                ctl, app_name = _fetch_ui_controls(self.c, self.r.pt_size(), text=text)
+                ctl, app_name, _ = _fetch_ui_controls_full(self.c, self.r.pt_size(), text=text)
                 if app_name != self._switched_from_app_name:
                     break
         if app_name:
@@ -2124,7 +2245,7 @@ class Flow:
                     self.tap_point(f["x"], f["y"], f["label"])
         time.sleep(0.18)  # brief keyboard focus beat after fast_tap's ~320 ms round-trip
         self._mark_action()
-        self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": list(query)})
+        self.c.fast_keys(query)
         self.settle(timeout=2.0, still=0.5)
         return c["label"]
 
@@ -2201,7 +2322,7 @@ class Flow:
                     time.sleep(rem)
             self._last_tap_type = None
             self._mark_action()
-            self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": list(arg)})
+            self.c.fast_keys(arg)
         elif verb == "key":
             kname = arg.strip().lower()
             ch = KEY_MAP.get(kname)
@@ -2214,7 +2335,7 @@ class Flow:
                     time.sleep(rem)
             self._last_tap_type = None
             self._mark_action()
-            self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": [ch]})
+            self.c.fast_keys(ch)
             return kname
         elif verb == "cleartype":
             arg = _secret_arg(verb, arg)
@@ -2239,7 +2360,7 @@ class Flow:
             time.sleep(0.25)
             self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {})
             time.sleep(0.25)
-            self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": list(arg)})
+            self.c.fast_keys(arg)
             time.sleep(0.35)
             if not secure:
                 val = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/value").get("value") or ""
@@ -2286,7 +2407,7 @@ class Flow:
                     pass
                 time.sleep(0.25)
                 for d in digits:
-                    self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": [d]})
+                    self.c.fast_keys(d)
                     time.sleep(0.08)
                 time.sleep(0.4)
                 val = re.sub(r"\D", "", self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/value").get("value") or "")
@@ -2644,7 +2765,7 @@ def cmd_otp_type(client, args):
         client.req("POST", f"/session/{client.sid}/element/{tfs[0]['ELEMENT']}/click", {})
         time.sleep(0.25)
     for d in code:
-        client.req("POST", f"/session/{client.sid}/wda/keys", {"value": [d]})
+        client.fast_keys(d)
         time.sleep(0.35)
     print(json.dumps({"ok": True, "digits_typed": len(code)}))
 
