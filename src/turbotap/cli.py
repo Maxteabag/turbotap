@@ -11,30 +11,78 @@ WDA_UDID, WDA_MAC_HOST, WDA_PASSCODE_CMD, WDA_PASSCODE), or create
 ~/.config/turbotap/config.json (the legacy ~/.config/iphone-wda/config.json is
 still read when the new file does not exist).
 """
-import argparse
-import atexit
-import base64
-import ctypes
-import ctypes.util
-import difflib
-import hashlib
-import http.client
-import io
 import json
 import os
-import queue
 import re
-import shlex
-import shutil
-import subprocess
 import sys
 import time
-import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
-from PIL import Image, ImageChops, ImageStat
 
 # Must be set before libtesseract/libgomp load: OpenMP threads slow Tesseract down here.
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+# Lazy-loaded heavy modules (PIL ~148 ms, concurrent.futures ~109 ms, http.client ~338 ms,
+# ctypes.util ~118 ms, difflib ~58 ms, hashlib ~42 ms, shutil ~39 ms) so non-image commands
+# (--help, preflight, tree, unlock, install-skill, UI-only flows) start fast, while image
+# flows overlap PIL import with the first WDA request via _preimport_pil_async().
+_PIL = None
+_PIL_PREIMPORT_STARTED = False
+_HTTP_CLIENT = None
+_URLSPLIT = None
+_THREAD_POOL_CLS = None
+
+
+def _pil():
+    global _PIL
+    if _PIL is None:
+        from PIL import Image, ImageChops, ImageStat
+        _PIL = (Image, ImageChops, ImageStat)
+    return _PIL
+
+
+def _preimport_pil_async():
+    global _PIL_PREIMPORT_STARTED
+    if _PIL is not None or _PIL_PREIMPORT_STARTED:
+        return
+    _PIL_PREIMPORT_STARTED = True
+    import threading
+    threading.Thread(target=_pil, name="turbotap-pil-preimport", daemon=True).start()
+
+
+def _http_client():
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        import http.client
+        _HTTP_CLIENT = http.client
+    return _HTTP_CLIENT
+
+
+def _urlsplit(url):
+    global _URLSPLIT
+    if _URLSPLIT is None:
+        from urllib.parse import urlsplit
+        _URLSPLIT = urlsplit
+    return _URLSPLIT(url)
+
+
+def _thread_pool(max_workers):
+    global _THREAD_POOL_CLS
+    if _THREAD_POOL_CLS is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _THREAD_POOL_CLS = ThreadPoolExecutor
+    return _THREAD_POOL_CLS(max_workers)
+
+
+def __getattr__(name):
+    if name in ("Image", "ImageChops", "ImageStat"):
+        img, chops, stat = _pil()
+        return {"Image": img, "ImageChops": chops, "ImageStat": stat}[name]
+    if name == "ThreadPoolExecutor":
+        global _THREAD_POOL_CLS
+        if _THREAD_POOL_CLS is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _THREAD_POOL_CLS = ThreadPoolExecutor
+        return _THREAD_POOL_CLS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 def _default_config_path():
     if os.environ.get("WDA_CONFIG"):
@@ -74,7 +122,7 @@ SESSION_SETTINGS_TTL = 1800  # seconds before re-applying /appium/settings for t
 
 
 def _session_cache_path(base_url="", udid=""):
-    netloc = urllib.parse.urlsplit(base_url).netloc if base_url else ""
+    netloc = _urlsplit(base_url).netloc if base_url else ""
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", udid or netloc or "default")
     return os.path.join(APP_CACHE_DIR, f"session-{key}.json")
 
@@ -104,6 +152,8 @@ def get_passcode():
             "No passcode source configured. Set WDA_PASSCODE, WDA_PASSCODE_CMD, "
             f"or 'passcode_cmd' in {CONFIG_PATH}"
         )
+    import shlex
+    import subprocess
     return subprocess.check_output(shlex.split(cmd_str), text=True).strip()
 
 
@@ -186,13 +236,14 @@ class WDAClient:
     def req_raw(self, method, path, data=None, timeout=25):
         """Raw HTTP request on the same persistent keep-alive connection.
         Returns (status_code, content_type, raw_bytes)."""
+        hc = _http_client()
         body = json.dumps(data).encode() if data is not None else None
         headers = {"Content-Type": "application/json"} if data is not None else {}
-        u = urllib.parse.urlsplit(self.base_url)
+        u = _urlsplit(self.base_url)
         for attempt in (0, 1):
             try:
                 if self._conn is None:
-                    self._conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+                    self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
                 self._conn.timeout = timeout
                 if self._conn.sock is not None:
                     self._conn.sock.settimeout(timeout)
@@ -201,7 +252,7 @@ class WDAClient:
                 raw = resp.read()
                 ct = resp.getheader("Content-Type") or ""
                 return resp.status, ct, raw
-            except (http.client.HTTPException, OSError) as e:
+            except (hc.HTTPException, OSError) as e:
                 self._conn = None
                 if attempt:
                     return 0, "", str(e).encode()
@@ -212,13 +263,14 @@ class WDAClient:
         Measured on Wi-Fi: /status 5.8 ms keep-alive vs 14.6 ms with a new
         urllib socket per call; /screenshot 123 ms vs 150 ms.
         """
+        hc = _http_client()
         body = json.dumps(data).encode() if data is not None else None
         headers = {"Content-Type": "application/json"} if data is not None else {}
-        u = urllib.parse.urlsplit(self.base_url)
+        u = _urlsplit(self.base_url)
         for attempt in (0, 1):
             try:
                 if self._conn is None:
-                    self._conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+                    self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
                 self._conn.timeout = timeout
                 if self._conn.sock is not None:
                     self._conn.sock.settimeout(timeout)
@@ -229,7 +281,7 @@ class WDAClient:
                     # Same shape as the old urllib HTTPError path: callers test .get("error").
                     return {"error": resp.status, "body": raw.decode(errors="replace")[:400]}
                 return json.loads(raw.decode())
-            except (http.client.HTTPException, OSError, ValueError) as e:
+            except (hc.HTTPException, OSError, ValueError) as e:
                 self._conn = None
                 if attempt:
                     return {"error": str(e)}
@@ -238,8 +290,9 @@ class WDAClient:
         st = self.req("GET", "/status", timeout=4)
         if st.get("error"):
             # Wake idle iOS Wi-Fi with one ICMP ping before assuming WDA died.
-            host = urllib.parse.urlsplit(self.base_url).hostname
+            host = _urlsplit(self.base_url).hostname
             if host:
+                import subprocess
                 subprocess.run(["ping", "-c", "1", "-W", "2", host],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 st = self.req("GET", "/status", timeout=6)
@@ -287,6 +340,7 @@ class WDAClient:
         if self.device_key:
             env["WDA_DEVICE"] = self.device_key
         env.setdefault("WDA_PATCH", os.path.join(asset_dir("patches"), "wda-turbo.patch"))
+        import subprocess
         cmd = ["bash", os.path.join(asset_dir("scripts"), "deploy_wda_mac.sh")] + ([] if build else ["--no-build"])
         subprocess.run(cmd, check=True, env=env)
 
@@ -317,13 +371,13 @@ class WDAClient:
             return self.req("POST", f"/session/{self.sid}/wda/touchAndHold", body)
         return self.req("POST", f"/session/{self.sid}/wda/tap", body)
 
-    def fast_keys(self, text, frequency=240):
+    def fast_keys(self, text, frequency=None):
         """Type text into the focused element. With wda-turbo v3, POST /wda/fastKeys
         synthesizes key events via FBSynthesizeEventFast (skipping FBRunLoopSpinner's
         100 ms polling sleep) at high frequency; falls back to /session/{sid}/wda/keys
         with frequency on 404 (stock WDA / wda-turbo v2)."""
         text = str(text)
-        freq = int(frequency) if frequency else 240
+        freq = int(frequency) if frequency else _typing_freq()
         if self.turbo is not False and self._fast_keys is not False:
             r = self.req("POST", "/wda/fastKeys", {"value": text, "frequency": freq})
             if isinstance(r, dict):
@@ -425,6 +479,9 @@ def _tess_lib():
         try:
             if os.environ.get("WDA_OCR") == "binary":  # benchmark baseline: fork per call
                 raise OSError("WDA_OCR=binary")
+            import ctypes
+            import ctypes.util
+            _TESS["ctypes"] = ctypes
             lib = ctypes.CDLL(ctypes.util.find_library("tesseract") or "libtesseract.so.5")
             lib.TessBaseAPICreate.restype = ctypes.c_void_p
             lib.TessBaseAPIInit2.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
@@ -440,7 +497,7 @@ def _tess_lib():
             lib = None
         if lib is not None:
             try:  # Leptonica prints "Error in boxClipToRectangle" for harmless empty boxes
-                ctypes.CDLL(ctypes.util.find_library("leptonica") or "libleptonica.so.6").setMsgSeverity(6)
+                _TESS["ctypes"].CDLL(ctypes.util.find_library("leptonica") or "libleptonica.so.6").setMsgSeverity(6)
             except (OSError, AttributeError):
                 pass
         _TESS["lib"] = lib
@@ -452,10 +509,11 @@ _INVERT_LUT = bytes(255 - i for i in range(256))
 
 def _tesseract_tsv_raw(raw, w, h, api):
     lib = _tess_lib()
+    ctypes_mod = _TESS["ctypes"]
     lib.TessBaseAPISetImage(api, raw, w, h, 1, w)
     ptr = lib.TessBaseAPIGetTsvText(api, 0)
     try:
-        return ctypes.string_at(ptr).decode(errors="replace")
+        return ctypes_mod.string_at(ptr).decode(errors="replace")
     finally:
         lib.TessDeleteText(ptr)
 
@@ -464,6 +522,8 @@ def tesseract_tsv(img, psm=11, api=None, sauvola=False):
     """Tesseract TSV for an 8-bit grayscale PIL image (in-process when api is given)."""
     if api is not None:
         return _tesseract_tsv_raw(img.tobytes(), img.size[0], img.size[1], api)
+    import io
+    import subprocess
     buf = io.BytesIO()
     img.save(buf, format="BMP")
     cmd = ["tesseract", "stdin", "stdout", "--oem", "1", "--psm", str(psm)]
@@ -548,6 +608,7 @@ def find_text(lines, label, fuzzy=0.84, where=None):
                 if span:
                     break
         elif fuzzy and not rx and not any(ch.isdigit() for ch in want):
+            import difflib
             k = max(1, len(want.split()))
             for i in range(max(1, len(words) - k + 1)):
                 if difflib.SequenceMatcher(None, " ".join(words[i:i + k]), want).ratio() >= fuzzy:
@@ -604,6 +665,7 @@ def _box_diff(a, b, x, y, scale, dx=30, dy=18):
            min(a.size[0], int((x + dx) * scale)), min(a.size[1], int((y + dy) * scale)))
     if box[2] <= box[0] or box[3] <= box[1]:
         return 255.0
+    _, ImageChops, ImageStat = _pil()
     return ImageStat.Stat(ImageChops.difference(a.crop(box), b.crop(box))).mean[0]
 
 
@@ -611,6 +673,7 @@ def _thumb_diff(a, b):
     """Mean absolute grey difference of two frames (0-255) on a tiny thumbnail."""
     if a is None or b is None or a.size != b.size:
         return 255.0
+    _, ImageChops, ImageStat = _pil()
     size = (max(1, a.size[0] // 8), max(1, a.size[1] // 8))
     d = ImageChops.difference(a.resize(size), b.resize(size))
     return ImageStat.Stat(d).mean[0]
@@ -628,6 +691,7 @@ def _frame_reacted(before, cur, x=None, y=None, scale=1.5):
     """
     if before is None or cur is None or before.size != cur.size:
         return True
+    Image, ImageChops, ImageStat = _pil()
     w, h = before.size
     top = int(h * 0.06) if h >= 200 else 0
     grid = (min(24, max(1, w)), min(48, max(1, h - top)))
@@ -665,13 +729,13 @@ class ScreenReader:
       unchanged or partly changed screen only OCRs what changed.
     """
 
-    def __init__(self, client, scale=1.5, workers=None, psm=11):
+    def __init__(self, client, scale=1.5, workers=None, psm=11, warm_ocr=True):
         self.c = client
         self.scale = scale
         self.psm = psm
         self.n = workers or int(os.environ.get("WDA_OCR_WORKERS", 0)) or max(2, min(6, os.cpu_count() or 4))
-        self.pool = ThreadPoolExecutor(self.n)
-        self.apis = queue.Queue()
+        self.pool = None
+        self.apis = None
         self.cache = {}
         self.last = None
         self.last_ts = 0.0
@@ -679,7 +743,17 @@ class ScreenReader:
         self._pt = None
         self._pt_from_cache = False
         self._dev = scale / 3.0  # typical 3x iOS Retina; auto-corrected after 1st grab
+        if warm_ocr:
+            self._ensure_ocr()
+
+    def _ensure_ocr(self):
+        if self.pool is not None:
+            return
+        import queue
+        self.pool = _thread_pool(self.n)
+        self.apis = queue.Queue()
         if _tess_lib() is not None:
+            import atexit
             for _ in range(self.n):  # warm the engines while the first frame is in flight
                 self.pool.submit(self._new_api)
             atexit.register(self._close)
@@ -706,7 +780,7 @@ class ScreenReader:
 
     def _close(self):
         lib = _tess_lib()
-        if lib is None:
+        if lib is None or self.apis is None:
             return
         while not self.apis.empty():
             lib.TessBaseAPIDelete(self.apis.get_nowait())
@@ -736,6 +810,9 @@ class ScreenReader:
         return self._pt
 
     def grab(self, y0=0, y1=None):
+        import base64
+        import io
+        Image, _, _ = _pil()
         full = (y0 == 0 and y1 is None)
         for attempt in (0, 1):
             w, h = self.pt_size()
@@ -869,8 +946,10 @@ class ScreenReader:
                 raw = raw.translate(_INVERT_LUT)
         lib = _tess_lib()
         if lib is None:
+            Image, _, _ = _pil()
             tsv = tesseract_tsv(Image.frombytes("L", (w, h), raw), self.psm, sauvola=sauvola)
         else:
+            self._ensure_ocr()
             api = self.apis.get()
             try:
                 if sauvola:
@@ -897,6 +976,8 @@ class ScreenReader:
         a separate cache key prefix b'S' so targeted colored-button fallbacks
         never collide with or slow down default Otsu OCR.
         """
+        import hashlib
+        self._ensure_ocr()
         full = (y0 == 0 and y1 is None)
         fresh_grab = img is None
         img = img if img is not None else self.grab(y0, y1)
@@ -958,7 +1039,7 @@ APP_PREFER = {k.casefold(): v for k, v in (_CFG.get("app_prefer") or {}).items()
 
 
 def _app_cache_path(udid="", base_url=""):
-    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", udid or urllib.parse.urlsplit(base_url).hostname or "default")
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", udid or _urlsplit(base_url).hostname or "default")
     return os.path.join(APP_CACHE_DIR, f"apps-{key}.json")
 
 
@@ -974,6 +1055,8 @@ def _load_apps(refresh=False, udid="", base_url=""):
             pass
     if not udid:
         return []
+    import shlex
+    import subprocess
     out = subprocess.run(
         ["ssh", MAC_HOST, f"xcrun devicectl device info apps --device {shlex.quote(udid)} --include-all-apps "
          "--json-output /tmp/wda-apps.json >/dev/null 2>&1; cat /tmp/wda-apps.json"],
@@ -1015,6 +1098,7 @@ def resolve_app(arg, udid="", base_url=""):
                 if want in APP_PREFER and APP_PREFER[want] in hits:
                     return APP_PREFER[want]
                 raise FlowError(f"{arg!r} matches several apps: {hits}; pass the bundle ID")
+    import difflib
     names = difflib.get_close_matches(want, [_clean_text(a["name"]) for a in apps], n=5, cutoff=0.5)
     raise FlowError(f"no installed app named {arg!r}; close: {names}")
 
@@ -1195,12 +1279,16 @@ def _fetch_ui_controls_full(client, screen=(430, 932), text=False,
         if wait_bundle and wait_ms and int(wait_ms) > 0:
             params.append(("waitBundle", str(wait_bundle)))
             params.append(("waitMs", str(min(2000, int(wait_ms)))))
-        path = "/wda/fastUI" + (f"?{urllib.parse.urlencode(params)}" if params else "")
+        if params:
+            from urllib.parse import urlencode
+            path = f"/wda/fastUI?{urlencode(params)}"
+        else:
+            path = "/wda/fastUI"
         r = client.req("GET", path, timeout=30)
         if isinstance(r, dict) and isinstance(r.get("ui"), list):
             client._fast_ui = True
             ctl, app_name = _parse_fast_ui(r, screen=screen)
-            bundle_id = str(r.get("bundleId") or "")
+            bundle_id = _clean_text(str(r.get("bundleId") or ""))
             return ctl, app_name, bundle_id
         if not isinstance(r, dict) or r.get("error") == 404 or (not r.get("error") and "ui" not in r):
             client._fast_ui = False
@@ -1211,6 +1299,9 @@ def _fetch_ui_controls_full(client, screen=(430, 932), text=False,
     r = client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=30)
     ctl, app_name = _parse_ui_controls(r.get("value") or {}, screen=screen, text=text)
     return ctl, app_name, ""
+
+
+_fetch_ui_controls_meta = _fetch_ui_controls_full
 
 
 def _fetch_ui_controls(client, screen=(430, 932), text=False, wait_bundle=None, wait_ms=0):
@@ -1383,6 +1474,27 @@ FLOW_HELP = """steps (one argument each, run in order):
 taps on text matching --deny are refused unless --no-deny is passed."""
 
 
+_TYPING_FREQ = 240  # verified 27/27 exact on iPhone 17 (-43% to -56% vs WDA's 60 keys/s default)
+_IMAGE_STEP_VERBS = frozenset({
+    "wait", "expect", "waitany", "gone", "tap", "tapif",
+    "scroll", "scrollto", "back", "read", "search", "settle", "shot",
+})
+_STALE_UI_BACKOFF = (0.05, 0.08, 0.12)
+
+
+def _typing_freq():
+    """Keys/sec frequency passed to /wda/keys (default 240, overridable via TURBOTAP_TYPING_FREQ)."""
+    raw = os.environ.get("TURBOTAP_TYPING_FREQ", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _TYPING_FREQ
+
+
 def _secret_arg(verb, arg):
     """Resolve env:VAR / cmd:COMMAND so passwords and PINs never appear in argv or step logs."""
     if arg.startswith("env:"):
@@ -1391,6 +1503,8 @@ def _secret_arg(verb, arg):
             raise FlowError(f"{verb} env var {arg[4:]!r} is empty or unset")
         return val
     if arg.startswith("cmd:"):
+        import shlex
+        import subprocess
         return subprocess.check_output(shlex.split(arg[4:]), text=True).rstrip("\n")
     return arg
 
@@ -1400,7 +1514,7 @@ class FlowError(RuntimeError):
 
 
 class Flow:
-    _INPUT_FOCUS_SETTLE = 0.35
+    _INPUT_FOCUS_SETTLE = 0.25
 
     def __init__(self, client, reader=None, timeout=8.0, deny=DENY_DEFAULT, log=None):
         self.c = client
@@ -1422,6 +1536,7 @@ class Flow:
         self._ui_pool = None
         self._last_action_ts = 0.0
         self._wait_settled_ts = 0.0
+        self._last_reaction_diff = 0.0
         self._ctl_cache = None  # (controls, bundle, ts, img)
         self._last_tap_small_delta = False
 
@@ -1438,7 +1553,7 @@ class Flow:
             if self.c._fast_keys is not None:
                 self._side._fast_keys = self.c._fast_keys
         if self._ui_pool is None:
-            self._ui_pool = ThreadPoolExecutor(1)
+            self._ui_pool = _thread_pool(1)
         return self._side, self._ui_pool
 
     def close(self):
@@ -1465,13 +1580,14 @@ class Flow:
 
     def _mark_action(self, keep_ctl_cache=False):
         self._last_action_ts = time.monotonic()
+        self._last_reaction_diff = 0.0
         if hasattr(self.r, "invalidate_last"):
             self.r.invalidate_last()
         if not keep_ctl_cache:
             self._invalidate_ctl_cache()
 
     # -- primitives ---------------------------------------------------------
-    def _wait_active_app(self, max_wait=1.5, poll=0.04):
+    def _wait_active_app(self, max_wait=1.5, poll=0.03):
         """After open:/launch:, confirm iOS finished foregrounding the target app
         before reading /source or interacting. Already-active apps clear on one
         ~10 ms GET /wda/activeAppInfo. Returns True when a pending switch was
@@ -1534,17 +1650,39 @@ class Flow:
         start = time.time()
         end = start + (timeout or self.timeout)
         prev = initial
+        prev_img = self.r.last if initial is not None else None
+        prev_lines = getattr(self.r, "last_lines", None) if initial is not None else None
         frames = 0
         last_ui = 0.0
         last_sauvola_id = None
         while True:
-            lines = self.lines()
+            if stable and prev is not None and prev.line is not None and prev_img is not None:
+                # Confirm stability with one cheap raw screenshot (~34 ms): if the entire
+                # screen and the target box are pixel-still between two distinct grabs,
+                # skip a redundant second full OCR pass (200-700 ms).
+                cur_img = self.r.grab()
+                if (cur_img is not prev_img
+                        and _thumb_diff(prev_img, cur_img) < 0.8
+                        and _box_diff(prev_img, cur_img, prev.x, prev.y, self.r.scale) < 2.0):
+                    if hasattr(self.r, "set_last"):
+                        self.r.set_last(cur_img, lines=prev_lines)
+                    else:
+                        self.r.last = cur_img
+                    self._wait_settled_ts = time.monotonic()
+                    return prev
+                lines = self.r.read(img=cur_img)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(cur_img, lines=lines)
+            else:
+                lines = self.lines()
             frames += 1
             m = find_text(lines, label, where=where)
             if m and (not stable or (prev and abs(m.x - prev.x) <= 3 and abs(m.y - prev.y) <= 3)):
                 self._wait_settled_ts = time.monotonic()
                 return m
             prev = m
+            prev_img = self.r.last if m is not None else None
+            prev_lines = lines if m is not None else None
             now = time.time()
             if not m and (frames >= 2 or now - start >= 0.4) and (last_ui == 0.0 or now - last_ui >= 0.8):
                 ctl = _controls_in_region(self.controls(text=True), lines, where)
@@ -1650,12 +1788,42 @@ class Flow:
         while time.time() < end:
             cur = self.r.grab()
             if _frame_reacted(before, cur, x=x, y=y, scale=self.r.scale):
+                self._last_reaction_diff = _thumb_diff(before, cur)
                 if hasattr(self.r, "set_last"):
                     self.r.set_last(cur)
                 else:
                     self.r.last = cur
                 return True
         return False
+
+    def _settle_transition(self, max_wait=0.5, still=1.2):
+        """After a full-screen transition (e.g. iOS nav push), wait for the slide
+        animation to settle using cheap ~34 ms raw grabs before spending 200-700 ms
+        on full OCR. Returns (prev_img, settled_img) if active motion was observed
+        and settled, or (None, None) when no motion was in flight."""
+        prev = self.r.last
+        if prev is None:
+            return None, None
+        cur = self.r.grab()
+        if cur is prev or _thumb_diff(prev, cur) < still:
+            return None, None
+        # Active slide/push animation detected: drain cheap raw frames until still.
+        end = time.monotonic() + max_wait
+        prev = cur
+        while time.monotonic() < end:
+            cur = self.r.grab()
+            if cur is not prev and _thumb_diff(prev, cur) < still:
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(cur)
+                else:
+                    self.r.last = cur
+                return prev, cur
+            prev = cur
+        if hasattr(self.r, "set_last"):
+            self.r.set_last(prev)
+        else:
+            self.r.last = prev
+        return None, prev
 
     def tap_point(self, x, y, text=""):
         self.guard(x, y, text)
@@ -1712,7 +1880,7 @@ class Flow:
         return None
 
     def tap_text(self, label):
-        self._wait_active_app()
+        app_confirmed = self._wait_active_app()
         base, where = split_where(label)
         low_base = base.casefold()
         if low_base in BACK_LABELS:
@@ -1734,20 +1902,55 @@ class Flow:
             m_cached = self._try_cached_tap(base)
             if m_cached is not None:
                 return m_cached
-        # Reuse a very recent frame (< 0.15 s) from the preceding step as Frame #1 if it
-        # already contains the target; otherwise grab a fresh Frame #1 and feed its match
-        # into wait(stable=True) so static screens only need one confirming frame.
+        # If the previous tap triggered a full-screen slide/push (_last_reaction_diff >= 2.0),
+        # drain the animation with cheap ~34 ms raw grabs before paying for full OCR on
+        # blurry mid-transition frames.
         m0 = None
-        cached_lines = self._fresh_lines()
-        if cached_lines is not None:
-            m0 = find_text(cached_lines, base, where=where)
-        if m0 is None:
-            m0 = find_text(self.lines(), base, where=where)
+        m0_pixel_stable = False
+        first_lines = None
+        if (self._last_action_ts
+                and (time.monotonic() - self._last_action_ts) < 0.7
+                and self._wait_settled_ts < self._last_action_ts
+                and self._last_reaction_diff >= 2.0
+                and getattr(self.r, "last_lines", None) is None
+                and self.r.last is not None):
+            settled_prev, settled_img = self._settle_transition()
+            if settled_img is not None:
+                first_lines = self.r.read(img=settled_img)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(settled_img, lines=first_lines)
+                m0 = find_text(first_lines, base, where=where)
+                if (m0 is not None and settled_prev is not None and settled_prev is not settled_img
+                        and _thumb_diff(settled_prev, settled_img) < 0.8
+                        and _box_diff(settled_prev, settled_img, m0.x, m0.y, self.r.scale) < 2.0):
+                    m0_pixel_stable = True
+        if first_lines is None:
+            # Reuse a very recent frame (< 0.15 s) from the preceding step as Frame #1 if it
+            # already contains the target; otherwise grab a fresh Frame #1 and feed its match
+            # into wait(stable=True) so static screens only need one confirming frame.
+            cached_lines = self._fresh_lines()
+            if cached_lines is not None:
+                m0 = find_text(cached_lines, base, where=where)
+            if m0 is None:
+                first_lines = self.lines()
+                m0 = find_text(first_lines, base, where=where)
         if m0 is None and self._last_action_ts and (time.monotonic() - self._last_action_ts) < 0.7:
-            # Inside a short post-action transition window (e.g. iOS nav push right
-            # after a previous tap): grab one more OCR frame before paying for a
-            # /source fetch on the outgoing screen.
-            m0 = find_text(self.lines(), base, where=where)
+            # Right after open:/launch: once _wait_active_app() confirmed the app and Frame 1
+            # already rendered page content below the status bar (e.g. Safari before tapping
+            # accessibility-only TextField:Adresse), go straight to controls() instead of
+            # burning a redundant 2nd full OCR pass.
+            _, sh = self.r.pt_size()
+            status_y = int(sh * 0.06)
+            skip_second_ocr = (
+                app_confirmed
+                and first_lines is not None
+                and any(l.y >= status_y for l in first_lines)
+            )
+            if not skip_second_ocr:
+                # Inside a short post-action transition window (e.g. iOS nav push right
+                # after a previous tap): grab one more OCR frame before paying for a
+                # /source fetch on the outgoing screen.
+                m0 = find_text(self.lines(), base, where=where)
         if not where and m0 is None:
             # Not in the first fresh OCR frame: an exact accessibility label (icon-only
             # Back/Close/Search/tab or keypad Key) is tapped at once instead of after
@@ -1767,26 +1970,30 @@ class Flow:
                 if just_opened and before is not None and not self.changed_since(before, x=c["x"], y=c["y"]):
                     m_ctl = self.tap_control(c)
                 return m_ctl
-        try:
-            m = self.wait(label, timeout=min(2.2, self.timeout), stable=True, initial=m0, allow_disabled=False)
-        except FlowError:
-            # Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct messages)
-            # have no visible text for OCR: one /source lookup with coordinates, then
-            # targeted Sauvola fallback, then the slower element-predicate poll.
-            ctl_fb = None if where else self.controls()
-            c = None if ctl_fb is None else find_control(ctl_fb, base)
-            if c:
-                return self.tap_control(c)
-            slines = self._read_sauvola(self.r.last)
-            if slines:
-                sm = find_text(slines, base, where=where)
-                if sm:
-                    self.tap_point(sm.x, sm.y, sm.text)
-                    return sm
-            if ctl_fb is not None and find_control(ctl_fb, base, allow_disabled=True):
-                raise FlowError(f"{base!r} is disabled")
-            x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
-            return Match(x, y, f"[el:{label}]", None)
+        if m0 is not None and m0_pixel_stable:
+            self._wait_settled_ts = time.monotonic()
+            m = m0
+        else:
+            try:
+                m = self.wait(label, timeout=min(2.2, self.timeout), stable=True, initial=m0, allow_disabled=False)
+            except FlowError:
+                # Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct messages)
+                # have no visible text for OCR: one /source lookup with coordinates, then
+                # targeted Sauvola fallback, then the slower element-predicate poll.
+                ctl_fb = None if where else self.controls()
+                c = None if ctl_fb is None else find_control(ctl_fb, base)
+                if c:
+                    return self.tap_control(c)
+                slines = self._read_sauvola(self.r.last)
+                if slines:
+                    sm = find_text(slines, base, where=where)
+                    if sm:
+                        self.tap_point(sm.x, sm.y, sm.text)
+                        return sm
+                if ctl_fb is not None and find_control(ctl_fb, base, allow_disabled=True):
+                    raise FlowError(f"{base!r} is disabled")
+                x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
+                return Match(x, y, f"[el:{label}]", None)
         _, h = self.r.pt_size()
         near_bottom_tab = m.line is not None and m.y > h - 55
         is_form_label = base.rstrip().endswith(":")
@@ -2023,13 +2230,13 @@ class Flow:
 
     def swipe(self, direction="down"):
         """Scroll 40% of the screen without momentum (wda-turbo fastDrag crawls
-        1 pt during the 120 ms hold, so the release velocity is ~0)."""
+        1 pt during the 80 ms hold, so the release velocity is ~0)."""
         w, h = self.r.pt_size()
         a, b = int(h * 0.72), int(h * 0.32)
         if direction == "down":
-            self.drag(w // 2, a, w // 2, b, duration=0.1, release=0.12)
+            self.drag(w // 2, a, w // 2, b, duration=0.08, release=0.08)
         elif direction == "up":
-            self.drag(w // 2, b, w // 2, a, duration=0.1, release=0.12)
+            self.drag(w // 2, b, w // 2, a, duration=0.08, release=0.08)
         else:
             raise FlowError(f"scroll:{direction}? use down|up")
 
@@ -2059,6 +2266,19 @@ class Flow:
             self.scroll("down")
         raise FlowError(f"{label!r} not found while scrolling")
 
+    def _is_stale_ui(self, app_name, bundle_id):
+        """True when a /wda/fastUI or /source tree still belongs to the outgoing app
+        right after open:/launch: (checks bundleId when available, plus app_name)."""
+        now = time.monotonic()
+        if (bundle_id and self.bundle and bundle_id != self.bundle
+                and self._pending_bundle_ts and (now - self._pending_bundle_ts) <= 3.0):
+            return True
+        if (self._switched_from_app_name and app_name
+                and app_name == self._switched_from_app_name
+                and (now - self._switched_at) <= 3.0):
+            return True
+        return False
+
     def controls(self, text=False):
         pending = (
             self._pending_bundle
@@ -2067,6 +2287,7 @@ class Flow:
         )
         ctl = None
         app_name = ""
+        bundle_id = ""
         if (pending and getattr(self.c, "turbo", None) is not False
                 and getattr(self.c, "_fast_ui", None) is not False):
             # WDA Turbo v3 single-RTT waitBundle: poll activeApplication on-device
@@ -2081,7 +2302,7 @@ class Flow:
                 else:
                     # Older WDA Turbo v2 ignored waitBundle and returned previous app.
                     self._wait_active_app()
-                    ctl, app_name, _ = _fetch_ui_controls_full(self.c, self.r.pt_size(), text=text)
+                    ctl, app_name, bundle_id = _fetch_ui_controls_full(self.c, self.r.pt_size(), text=text)
         if ctl is None:
             self._wait_active_app()
             wb = (
@@ -2090,23 +2311,21 @@ class Flow:
                 and (time.monotonic() - self._switched_at) <= 3.0
                 else None
             )
-            ctl, app_name, _ = _fetch_ui_controls_full(
+            ctl, app_name, bundle_id = _fetch_ui_controls_full(
                 self.c, self.r.pt_size(), text=text,
                 wait_bundle=wb, wait_ms=600 if wb else 0,
             )
-        if (self._switched_from_app_name and app_name
-                and app_name == self._switched_from_app_name
-                and time.monotonic() - self._switched_at <= 3.0):
-            # /source occasionally lags behind activeAppInfo right after open:;
-            # wait briefly and re-fetch once iOS publishes the new app's tree.
-            for _ in range(3):
-                time.sleep(0.2)
-                ctl, app_name, _ = _fetch_ui_controls_full(self.c, self.r.pt_size(), text=text)
-                if app_name != self._switched_from_app_name:
+        if self._is_stale_ui(app_name, bundle_id):
+            # /source or /wda/fastUI occasionally lags behind activeAppInfo right after open:;
+            # use short adaptive backoff until iOS publishes the new app's tree.
+            for delay in _STALE_UI_BACKOFF:
+                time.sleep(delay)
+                ctl, app_name, bundle_id = _fetch_ui_controls_full(self.c, self.r.pt_size(), text=text)
+                if not self._is_stale_ui(app_name, bundle_id):
                     break
         if app_name:
             self._last_app_name = app_name
-            self._last_app_bundle = self.bundle
+            self._last_app_bundle = bundle_id or self.bundle
             if app_name != self._switched_from_app_name:
                 self._switched_from_app_name = None
         self._store_ctl_cache(ctl)
@@ -2116,8 +2335,8 @@ class Flow:
         """OCR lines once the text holds still (including sparse screens and
         animated backgrounds like Weather), plus labelled controls with
         coordinates. Reuses one persistent side connection/worker so /source
-        overlaps with OCR, checks active-app freshness, and never discards a
-        fresh completed tree."""
+        overlaps with OCR, checks active-app freshness, reuses fresh wait:
+        frames without redundant OCR, and never discards a fresh completed tree."""
         app_confirmed = self._wait_active_app()
         side, pool = self._get_ui_worker() if ui else (None, None)
         pt = self.r.pt_size()
@@ -2128,18 +2347,51 @@ class Flow:
         # Start /source in parallel with Frame 1 whenever the screen is steady,
         # _wait_active_app() already confirmed the target app after open:/launch:,
         # or wait: already confirmed destination text; stale/splash trees are still
-        # caught by app_name and _text_overlap(fut_texts, texts) < 0.5 below.
+        # caught by bundleId/app_name and _text_overlap(fut_texts, texts) < 0.5 below.
         may_be_transitioning = (not app_confirmed) and (not settled_by_wait) and (t0 - self._last_action_ts) < 1.5
         fut = None
         fut_texts = None
         if side and not may_be_transitioning:
-            fut = pool.submit(_fetch_ui_controls, side, pt, True)
+            fut = pool.submit(_fetch_ui_controls_meta, side, pt, True)
         prev_texts, prev_img = None, None
         populated_frames = 0
         lines, texts = [], []
-        while True:
-            lines = self.lines()
-            cur_img = self.r.last
+        already_stable = False
+        pending_img = None
+        if settled_by_wait:
+            last_ts = getattr(self.r, "last_ts", 0.0)
+            cached_lines = getattr(self.r, "last_lines", None)
+            if (self.r.last is not None and cached_lines is not None
+                    and last_ts and (t0 - last_ts) < 0.25
+                    and any(l.y >= status_y for l in cached_lines)):
+                prev_img = self.r.last
+                prev_texts = [l.text for l in cached_lines]
+                lines, texts = cached_lines, prev_texts
+                populated_frames = 1
+                if fut is not None:
+                    fut_texts = prev_texts
+                # Confirm with one cheap raw grab (~34 ms): if pixel-identical to wait:'s
+                # frame, skip redundant OCR entirely; if changed, OCR that grabbed frame.
+                cur_img = self.r.grab()
+                if cur_img is not prev_img:
+                    if _thumb_diff(prev_img, cur_img) < 0.8:
+                        if hasattr(self.r, "set_last"):
+                            self.r.set_last(cur_img, lines=cached_lines)
+                        else:
+                            self.r.last = cur_img
+                        already_stable = True
+                    else:
+                        pending_img = cur_img
+        while not already_stable:
+            if pending_img is not None:
+                cur_img = pending_img
+                pending_img = None
+                lines = self.r.read(img=cur_img)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(cur_img, lines=lines)
+            else:
+                lines = self.lines()
+                cur_img = self.r.last
             texts = [l.text for l in lines]
             has_content = any(l.y >= status_y for l in lines)
             if has_content:
@@ -2167,7 +2419,7 @@ class Flow:
                 fut is None or (fut.done() and fut_texts is not None and _text_overlap(fut_texts, texts) < 0.5)
             ):
                 fut_texts = texts
-                fut = pool.submit(_fetch_ui_controls, side, pt, True)
+                fut = pool.submit(_fetch_ui_controls_meta, side, pt, True)
         if side:
             fut_fresh = (
                 fut is not None
@@ -2175,17 +2427,18 @@ class Flow:
                 and (_text_overlap(fut_texts, texts) >= 0.5 or (not fut_texts and not texts))
             )
             if not fut_fresh:
-                fut = pool.submit(_fetch_ui_controls, side, pt, True)
+                fut = pool.submit(_fetch_ui_controls_meta, side, pt, True)
         if fut:
-            ui_res, app_name = fut.result()
-            if (self._switched_from_app_name and app_name
-                    and app_name == self._switched_from_app_name
-                    and time.monotonic() - self._switched_at <= 3.0):
-                time.sleep(0.2)
-                ui_res, app_name = _fetch_ui_controls(side, pt, True)
+            ui_res, app_name, bundle_id = fut.result()
+            if self._is_stale_ui(app_name, bundle_id):
+                for delay in _STALE_UI_BACKOFF:
+                    time.sleep(delay)
+                    ui_res, app_name, bundle_id = _fetch_ui_controls_meta(side, pt, True)
+                    if not self._is_stale_ui(app_name, bundle_id):
+                        break
             if app_name:
                 self._last_app_name = app_name
-                self._last_app_bundle = self.bundle
+                self._last_app_bundle = bundle_id or self.bundle
                 if app_name != self._switched_from_app_name:
                     self._switched_from_app_name = None
             self._store_ctl_cache(ui_res, img=self.r.last)
@@ -2243,7 +2496,7 @@ class Flow:
                 )
                 if not already_focused:
                     self.tap_point(f["x"], f["y"], f["label"])
-        time.sleep(0.18)  # brief keyboard focus beat after fast_tap's ~320 ms round-trip
+        time.sleep(0.18)  # brief keyboard focus beat after fast_tap
         self._mark_action()
         self.c.fast_keys(query)
         self.settle(timeout=2.0, still=0.5)
@@ -2357,11 +2610,11 @@ class Flow:
                 raise FlowError("no TextField, SecureTextField, SearchField, or TextView on screen")
             eid = list(els[0].values())[0]
             self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/clear", {})
-            time.sleep(0.25)
+            time.sleep(0.15)
             self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {})
-            time.sleep(0.25)
+            time.sleep(0.15)
             self.c.fast_keys(arg)
-            time.sleep(0.35)
+            time.sleep(0.20)
             if not secure:
                 val = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/value").get("value") or ""
                 if val != arg:
@@ -2422,6 +2675,8 @@ class Flow:
                 if not digits:
                     raise FlowError(f"pintap env var {arg[4:]!r} is empty or unset")
             elif arg.startswith("cmd:"):
+                import shlex
+                import subprocess
                 digits = subprocess.check_output(shlex.split(arg[4:]), text=True).strip()
             else:
                 digits = arg
@@ -2522,6 +2777,7 @@ class Flow:
 
 
 def cmd_ocr(client, args):
+    _preimport_pil_async()
     client.ensure_session(apply_fast_settings=True)
     reader = ScreenReader(client, scale=args.scale)
     t0 = time.perf_counter()
@@ -2534,6 +2790,7 @@ def cmd_ocr(client, args):
 
 
 def cmd_tap_ocr(client, args):
+    _preimport_pil_async()
     client.ensure_session(apply_fast_settings=True)
     flow = Flow(client)
     try:
@@ -2546,9 +2803,13 @@ def cmd_tap_ocr(client, args):
 
 
 def cmd_flow(client, args):
+    needs_ocr = any(s.partition(":")[0].strip().lower() in _IMAGE_STEP_VERBS for s in args.steps)
+    if needs_ocr:
+        _preimport_pil_async()
     client.ensure_session(apply_fast_settings=True)
     deny = None if args.no_deny else args.deny
-    flow = Flow(client, ScreenReader(client, scale=args.scale), timeout=args.timeout, deny=deny,
+    flow = Flow(client, ScreenReader(client, scale=args.scale, warm_ocr=needs_ocr),
+                timeout=args.timeout, deny=deny,
                 log=None if args.quiet else sys.stderr)
     try:
         res = flow.run(args.steps)
@@ -2597,6 +2858,7 @@ def bundled_skills():
 
 
 def _skills_stamp(skills):
+    import hashlib
     h = hashlib.blake2b(digest_size=12)
     for name, src in skills.items():
         for dp, dns, fns in os.walk(src):
@@ -2623,6 +2885,7 @@ def _skill_name(d):
 def install_skills(root, skills, force=False):
     """Copy each bundled skill to root/<name>. A symlink there is replaced (it
     points at some other copy); a real folder only if it is the same skill."""
+    import shutil
     os.makedirs(root, exist_ok=True)
     done = []
     for name, src in skills.items():
@@ -2728,6 +2991,7 @@ def cmd_tree(client, _args):
 
 
 def cmd_screenshot(client, args):
+    import base64
     client.ensure_session(apply_fast_settings=True)
     t0 = time.perf_counter()
     b64 = client.req("GET", "/screenshot").get("value")
@@ -2743,6 +3007,7 @@ def cmd_otp_type(client, args):
     client.ensure_session(apply_fast_settings=True)
     code = args.code
     if not code:
+        import subprocess
         q = f"select ROWID, text from message where text like '{args.pattern}' order by ROWID desc limit 1"
         deadline = time.time() + args.timeout
         while time.time() < deadline:
@@ -2773,15 +3038,19 @@ def cmd_otp_type(client, args):
 def main():
     try:
         _main()
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"turbotap: {os.path.basename(str(e.cmd[1] if len(e.cmd) > 1 else e.cmd[0]))} failed (exit {e.returncode})")
     except (RuntimeError, OSError) as e:
         sys.exit(f"turbotap: {e}")
     except KeyboardInterrupt:
         sys.exit(130)
+    except Exception as e:
+        sp = sys.modules.get("subprocess")
+        if sp is not None and isinstance(e, sp.CalledProcessError):
+            sys.exit(f"turbotap: {os.path.basename(str(e.cmd[1] if len(e.cmd) > 1 else e.cmd[0]))} failed (exit {e.returncode})")
+        raise
 
 
 def _main():
+    import argparse
     p = argparse.ArgumentParser(description="Fast generic WebDriverAgent (WDA) controller for physical iOS devices")
     p.add_argument("--url", default=None, help="WDA base URL (or set WDA_URL / ~/.config/turbotap/config.json)")
     p.add_argument("--device", default=None, help="device key from ~/.config/turbotap/config.json (or WDA_DEVICE)")
