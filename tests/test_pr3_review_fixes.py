@@ -8,7 +8,7 @@ from unittest import mock
 
 import tests  # noqa: F401
 from turbotap import cli
-from tests.helpers import FakeReader, MockWDAClient, make_line, solid_img
+from tests.helpers import FakeReader, MockWDAClient, isolated_cache, make_line, solid_img
 
 
 class PR3ReviewFixesTests(unittest.TestCase):
@@ -456,6 +456,92 @@ class PR3ReviewFixesTests(unittest.TestCase):
             self.assertEqual(legacy_taps, [])
         finally:
             flow.close()
+
+    # Re-review 7: stale outgoing-app tree followed by HTTP 500 with OCR match present must NOT tap outgoing OCR coords
+    def test_stale_ui_with_outgoing_ocr_match_sends_zero_taps(self):
+        img = solid_img(220, size=(430, 932))
+        ocr_lines = [make_line("Continue", 180, 480, 260, 505)]
+        calls = [0]
+
+        def stale_then_500(qs):
+            calls[0] += 1
+            if calls[0] == 1:
+                return {
+                    "bundleId": "com.apple.oldapp",
+                    "appName": "OldApp",
+                    "screen": [430, 932],
+                    "ui": [{"type": "Button", "label": "Continue", "x": 200, "y": 500}],
+                }
+            return {"error": 500, "body": "internal error"}
+
+        c = MockWDAClient(active_app="com.apple.target", fast_ui=stale_then_500)
+        r = FakeReader(frames=[(img, ocr_lines), (img, ocr_lines)])
+        flow = cli.Flow(c, reader=r)
+        try:
+            flow.bundle = "com.apple.target"
+            flow._pending_bundle = None
+            flow._pending_bundle_ts = time.monotonic()
+            flow._switched_from_app_name = "OldApp"
+            flow._switched_at = time.monotonic()
+            with mock.patch.object(cli, "_STALE_UI_BACKOFF", (0.01,)):
+                res = flow.tap_if("Continue", timeout=0.25)
+            self.assertEqual(res, "skipped")
+            self.assertIsNone(flow._ctl_cache)
+            post_calls = [(m, p) for m, p, _ in c.calls if m == "POST"]
+            self.assertEqual(post_calls, [])
+        finally:
+            flow.close()
+
+    # Re-review 8: cold geometry (/window/size) and reconnect retry honor absolute deadline
+    def test_cold_geometry_and_reconnect_respect_absolute_deadline(self):
+        geom_timeouts = []
+
+        def slow_window_size(method, path, data):
+            if path.endswith("/window/size"):
+                time.sleep(0.25)
+                return {"value": {"width": 430, "height": 932}}
+            return None
+
+        c = MockWDAClient(custom_handler=slow_window_size)
+        orig_req = c.req
+
+        def tracking_req(method, path, data=None, timeout=25):
+            if path.endswith("/window/size"):
+                geom_timeouts.append(timeout)
+            return orig_req(method, path, data, timeout=timeout)
+
+        c.req = tracking_req
+        with isolated_cache():
+            reader = cli.ScreenReader(c)
+            flow = cli.Flow(c, reader=reader)
+            try:
+                res = flow.tap_if("Allow", timeout=0.15)
+                self.assertEqual(res, "skipped")
+                self.assertTrue(geom_timeouts)
+                self.assertLessEqual(geom_timeouts[0], 0.2)
+                post_calls = [(m, p) for m, p, _ in c.calls if m == "POST"]
+                self.assertEqual(post_calls, [])
+            finally:
+                flow.close()
+
+        # Verify WDAClient.req() does not start reconnect attempt 1 once deadline expired.
+        attempts = [0]
+
+        class SlowFailConn:
+            def __init__(self, host, port, timeout=None):
+                self.timeout = timeout
+                self.sock = None
+
+            def connect(self):
+                attempts[0] += 1
+                time.sleep(0.12)
+                raise OSError("transient disconnect")
+
+        real_c = cli.WDAClient("http://127.0.0.1:8100")
+        with mock.patch("http.client.HTTPConnection", SlowFailConn):
+            r_out = real_c.req("GET", "/wda/activeAppInfo", timeout=4, deadline=time.monotonic() + 0.08)
+        self.assertEqual(attempts[0], 1)
+        self.assertTrue(r_out.get("deadline_exceeded") or r_out.get("error"))
 
 
 if __name__ == "__main__":

@@ -990,7 +990,7 @@ class ScreenReader:
         while not self.apis.empty():
             lib.TessBaseAPIDelete(self.apis.get_nowait())
 
-    def pt_size(self, force_refresh=False):
+    def pt_size(self, force_refresh=False, deadline=None):
         if not force_refresh and self._pt is not None:
             return self._pt
         if not force_refresh and hasattr(self.c, "_load_session_cache"):
@@ -1006,7 +1006,19 @@ class ScreenReader:
                 self._pt = (int(pt[0]), int(pt[1]))
                 self._pt_from_cache = True
                 return self._pt
-        v = self.c.req("GET", f"/session/{self.c.sid}/window/size").get("value") or {}
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("geometry deadline exceeded")
+            if hasattr(self.c, "_req_with_deadline"):
+                res = self.c._req_with_deadline("GET", f"/session/{self.c.sid}/window/size", timeout=max(0.05, rem), deadline=deadline)
+            else:
+                res = self.c.req("GET", f"/session/{self.c.sid}/window/size", timeout=max(0.05, rem))
+            if (isinstance(res, dict) and (res.get("deadline_exceeded") or res.get("error"))) or time.monotonic() >= deadline:
+                raise TimeoutError("geometry deadline exceeded")
+        else:
+            res = self.c.req("GET", f"/session/{self.c.sid}/window/size")
+        v = res.get("value") or {} if isinstance(res, dict) else {}
         w, h = int(v.get("width") or 430), int(v.get("height") or 932)
         self._pt = (w, h)
         self._pt_from_cache = False
@@ -1032,8 +1044,17 @@ class ScreenReader:
                 raise TimeoutError("screenshot deadline exceeded")
             return max(0.05, r_sec)
 
+        def _get_pt(force_refresh=False):
+            if eff_deadline is not None:
+                _rem()
+                try:
+                    return self.pt_size(force_refresh=force_refresh, deadline=eff_deadline)
+                except TypeError:
+                    return self.pt_size(force_refresh=force_refresh)
+            return self.pt_size(force_refresh=force_refresh)
+
         for attempt in (0, 1):
-            w, h = self.pt_size()
+            w, h = _get_pt()
             y1_eff = h if y1 is None else y1
             out = (round(w * self.scale), round((y1_eff - y0) * self.scale))
             img = None
@@ -1090,7 +1111,7 @@ class ScreenReader:
                             raise TimeoutError("screenshot deadline exceeded")
                         if hasattr(self.c, "_invalidate_session_cache"):
                             self.c._invalidate_session_cache("screen_pt")
-                        self.pt_size(force_refresh=True)
+                        _get_pt(force_refresh=True)
                         continue
                 if raw_bytes is not None:
                     img = Image.open(io.BytesIO(raw_bytes))
@@ -1100,7 +1121,7 @@ class ScreenReader:
                         if self._pt_from_cache and abs(got_ratio - exp_ratio) > 0.03:
                             if hasattr(self.c, "_invalidate_session_cache"):
                                 self.c._invalidate_session_cache("screen_pt")
-                            w, h = self.pt_size(force_refresh=True)
+                            w, h = _get_pt(force_refresh=True)
                             y1_eff = h if y1 is None else y1
                             out = (round(w * self.scale), round((y1_eff - y0) * self.scale))
                             if not full and attempt == 0:
@@ -1122,7 +1143,7 @@ class ScreenReader:
                     if abs(got_ratio - exp_ratio) > 0.03:
                         if hasattr(self.c, "_invalidate_session_cache"):
                             self.c._invalidate_session_cache("screen_pt")
-                        w, h = self.pt_size(force_refresh=True)
+                        w, h = _get_pt(force_refresh=True)
                         y1_eff = h if y1 is None else y1
                         out = (round(w * self.scale), round((y1_eff - y0) * self.scale))
                 k = img.size[0] / w
@@ -1206,7 +1227,7 @@ class ScreenReader:
                 lines.setdefault((p[2], p[3], p[4]), []).append((p[11].strip(), x0, y0, x0 + ww, y0 + hh))
         return list(lines.values())
 
-    def read(self, y0=0, y1=None, img=None, sauvola=False, timeout=None, **_ignored):
+    def read(self, y0=0, y1=None, img=None, sauvola=False, timeout=None, deadline=None, **_ignored):
         """[Line] for the screen (or band y0..y1 in points).
 
         sauvola=True uses Tesseract Sauvola binarization (k=0.15, win=0.80) under
@@ -1218,7 +1239,15 @@ class ScreenReader:
         full = (y0 == 0 and y1 is None)
         fresh_grab = img is None
         if img is None:
-            img = self.grab(y0, y1, timeout=timeout) if timeout is not None else self.grab(y0, y1)
+            if deadline is not None:
+                try:
+                    img = self.grab(y0, y1, timeout=timeout, deadline=deadline)
+                except TypeError:
+                    img = self.grab(y0, y1, timeout=timeout) if timeout is not None else self.grab(y0, y1)
+            elif timeout is not None:
+                img = self.grab(y0, y1, timeout=timeout)
+            else:
+                img = self.grab(y0, y1)
         w, _ = img.size
         data = img.tobytes()
         mv = memoryview(data)
@@ -1848,6 +1877,10 @@ class _DeadlineExceeded(FlowError):
     pass
 
 
+class _StaleAppError(FlowError):
+    pass
+
+
 class Flow:
     _INPUT_FOCUS_SETTLE = 0.25
 
@@ -1930,7 +1963,7 @@ class Flow:
             self._invalidate_ctl_cache()
 
     # -- primitives ---------------------------------------------------------
-    def _wait_active_app(self, max_wait=1.5, poll=0.03):
+    def _wait_active_app(self, max_wait=1.5, poll=0.03, deadline=None):
         """After open:/launch:, confirm iOS finished foregrounding the target app
         before reading /source or interacting. Already-active apps clear on one
         ~10 ms GET /wda/activeAppInfo. Returns True when a pending switch was
@@ -1941,21 +1974,30 @@ class Flow:
         if time.monotonic() - self._pending_bundle_ts > 2.5:
             self._pending_bundle = None
             return False
-        deadline = time.monotonic() + max_wait
+        eff_deadline = time.monotonic() + max_wait
+        if deadline is not None:
+            eff_deadline = min(eff_deadline, deadline)
         while True:
-            rem = deadline - time.monotonic()
+            rem = eff_deadline - time.monotonic()
             if rem <= 0:
                 return False
-            info = self.c.req("GET", "/wda/activeAppInfo", timeout=max(0.05, min(4.0, rem)))
+            if hasattr(self.c, "_req_with_deadline"):
+                info = self.c._req_with_deadline(
+                    "GET", "/wda/activeAppInfo",
+                    timeout=max(0.05, min(4.0, rem)),
+                    deadline=eff_deadline,
+                )
+            else:
+                info = self.c.req("GET", "/wda/activeAppInfo", timeout=max(0.05, min(4.0, rem)))
             val = info.get("value") if isinstance(info, dict) else None
             if not isinstance(info, dict) or info.get("error") or not isinstance(val, dict) or "bundleId" not in val:
-                if time.monotonic() < deadline:
+                if time.monotonic() < eff_deadline and not (isinstance(info, dict) and info.get("deadline_exceeded")):
                     self._pending_bundle = None
                 return False
             if val.get("bundleId") == target:
                 self._pending_bundle = None
                 return True
-            rem = deadline - time.monotonic()
+            rem = eff_deadline - time.monotonic()
             if rem <= 0:
                 return False
             time.sleep(min(poll, rem))
@@ -1964,7 +2006,12 @@ class Flow:
         if self.deny and text and self.deny.search(text):
             raise FlowError(f"refusing to {action} {text!r}: matches --deny")
 
-    def lines(self, timeout=None):
+    def lines(self, timeout=None, deadline=None):
+        if deadline is not None:
+            try:
+                return self.r.read(timeout=timeout, deadline=deadline)
+            except TypeError:
+                pass
         if timeout is not None:
             try:
                 return self.r.read(timeout=timeout)
@@ -2460,7 +2507,12 @@ class Flow:
         respecting --deny."""
         if deadline is not None and time.monotonic() >= deadline:
             return "skipped"
-        _, h = self.r.pt_size()
+        try:
+            _, h = self.r.pt_size(deadline=deadline) if deadline is not None else self.r.pt_size()
+        except TypeError:
+            _, h = self.r.pt_size()
+        except TimeoutError:
+            return "skipped"
         near_bottom_tab = m.line is not None and m.y > h - 55
         is_form_label = base.rstrip().endswith(":")
         resolved_ctl = controls
@@ -2470,7 +2522,9 @@ class Flow:
                 if rem is not None and rem <= 0:
                     return "skipped"
                 try:
-                    resolved_ctl = self.controls(timeout=rem) if rem is not None else self.controls()
+                    resolved_ctl = self.controls(deadline=deadline) if deadline is not None else self.controls()
+                except _StaleAppError:
+                    return "skipped"
                 except FlowError:
                     resolved_ctl = []
             if deadline is not None and time.monotonic() >= deadline:
@@ -2501,11 +2555,12 @@ class Flow:
         Shares one budget across app confirmation, screenshots, UI lookups, and
         tap transport (including 404 fallback); rechecks accessibility controls
         if a prompt arrives mid-window, never dispatches a tap after the deadline,
-        skips explicitly disabled targets consistently, supports @region, and
-        enforces --deny. Returns the matched text/control if tapped, or 'skipped'."""
+        never taps outgoing-app OCR/Sauvola frames on wrong-app rejection, skips
+        explicitly disabled targets consistently, supports @region, and enforces
+        --deny. Returns the matched text/control if tapped, or 'skipped'."""
         try:
             return self._tap_if_impl(label, timeout=timeout)
-        except _DeadlineExceeded:
+        except (_DeadlineExceeded, TimeoutError):
             return "skipped"
 
     def _tap_if_impl(self, label, timeout=1.0):
@@ -2513,7 +2568,7 @@ class Flow:
         deadline = time.monotonic() + eff_timeout
         rem = deadline - time.monotonic()
         if rem > 0:
-            self._wait_active_app(max_wait=min(1.5, rem))
+            self._wait_active_app(max_wait=min(1.5, rem), deadline=deadline)
         if time.monotonic() >= deadline:
             return "skipped"
         base, where = split_where(label)
@@ -2526,6 +2581,10 @@ class Flow:
         prev_texts = None
         prev_img = None
         frames = 0
+        confirmed_fresh_app = not bool(
+            self._pending_bundle
+            or (self._switched_from_app_name and self._switched_at and (time.monotonic() - self._switched_at) <= 3.0)
+        )
         while True:
             t_frame = time.monotonic()
             rem = deadline - t_frame
@@ -2535,96 +2594,117 @@ class Flow:
                 lines = self._fresh_lines()
                 if lines is None:
                     try:
-                        lines = self.lines(timeout=rem)
+                        lines = self.lines(timeout=rem, deadline=deadline)
                     except Exception:
                         return "skipped"
             else:
                 try:
-                    lines = self.lines(timeout=rem)
+                    lines = self.lines(timeout=rem, deadline=deadline)
                 except Exception:
                     return "skipped"
             frames += 1
             if time.monotonic() >= deadline:
                 return "skipped"
             cur_img = self.r.last
+            stale_app = False
             m = find_text(lines, base, where=where)
             if m:
                 ctl_for_check = last_ctl
                 rem_ctl = deadline - time.monotonic()
-                if ctl_for_check is None and rem_ctl > 0:
+                if (ctl_for_check is None or not confirmed_fresh_app) and rem_ctl > 0:
                     try:
-                        ctl_for_check = self.controls(timeout=rem_ctl)
+                        ctl_for_check = self.controls(deadline=deadline)
+                        confirmed_fresh_app = True
                         last_ctl = ctl_for_check
                         last_ui_check = time.monotonic()
                         last_ui_img = cur_img
+                    except _StaleAppError:
+                        # Outgoing app is still on screen: do NOT dispatch OCR coordinates!
+                        confirmed_fresh_app = False
+                        stale_app = True
+                        ctl_for_check = None
                     except FlowError:
                         ctl_for_check = None
+                        if not confirmed_fresh_app:
+                            stale_app = True
+                elif not confirmed_fresh_app:
+                    stale_app = True
                 if time.monotonic() >= deadline:
                     return "skipped"
-                return self._tap_if_ocr_match(m, base, where, lines, controls=ctl_for_check, deadline=deadline)
+                if not stale_app and confirmed_fresh_app:
+                    return self._tap_if_ocr_match(m, base, where, lines, controls=ctl_for_check, deadline=deadline)
             now = time.monotonic()
             screen_changed_since_ui = (
                 last_ui_img is not None and cur_img is not None
                 and cur_img is not last_ui_img and not _content_pixel_still(last_ui_img, cur_img)
             )
-            if now < deadline and (last_ui_check == 0.0 or screen_changed_since_ui or (now - last_ui_check) >= 0.35):
+            if not stale_app and now < deadline and (last_ui_check == 0.0 or screen_changed_since_ui or (now - last_ui_check) >= 0.35):
                 last_ui_check = now
                 last_ui_img = cur_img
                 rem_ctl = deadline - time.monotonic()
                 if rem_ctl <= 0:
                     return "skipped"
                 try:
-                    raw_ctl = self.controls(timeout=rem_ctl)
+                    raw_ctl = self.controls(deadline=deadline)
+                    confirmed_fresh_app = True
+                except _StaleAppError:
+                    confirmed_fresh_app = False
+                    stale_app = True
+                    raw_ctl = []
                 except FlowError:
                     raw_ctl = []
+                    if not confirmed_fresh_app:
+                        stale_app = True
                 if time.monotonic() >= deadline:
                     return "skipped"
-                last_ctl = raw_ctl
-                ctl = _controls_in_region(raw_ctl, lines, where)
-                if base.startswith("re:"):
-                    cm = find_control_match(ctl, base, types=set(ext_types), allow_disabled=False)
-                    if cm:
-                        if time.monotonic() >= deadline:
-                            return "skipped"
-                        self.tap_point(cm.x, cm.y, cm.text, deadline=deadline)
-                        return cm.text
-                else:
-                    c = exact_control(ctl, base, ext_types)
-                    if not c and low_base in BACK_LABELS:
-                        for alt in BACK_LABELS:
-                            c = exact_control(ctl, alt, ("Button", "Link"))
-                            if c:
-                                break
-                    if c:
-                        if time.monotonic() >= deadline:
-                            return "skipped"
-                        return self.tap_control(c, deadline=deadline).text
-                if time.monotonic() < deadline and cur_img is not None and id(cur_img) != last_sauvola_id:
-                    last_sauvola_id = id(cur_img)
-                    slines = self._read_sauvola(cur_img)
-                    if time.monotonic() >= deadline:
-                        return "skipped"
-                    if slines:
-                        sm = find_text(slines, base, where=where)
-                        if sm:
-                            if self._is_disabled_ocr_match(sm, base, slines, where, controls=raw_ctl):
-                                return "skipped"
+                if not stale_app and confirmed_fresh_app:
+                    last_ctl = raw_ctl
+                    ctl = _controls_in_region(raw_ctl, lines, where)
+                    if base.startswith("re:"):
+                        cm = find_control_match(ctl, base, types=set(ext_types), allow_disabled=False)
+                        if cm:
                             if time.monotonic() >= deadline:
                                 return "skipped"
-                            self.tap_point(sm.x, sm.y, sm.text, deadline=deadline)
-                            return sm.text
+                            self.tap_point(cm.x, cm.y, cm.text, deadline=deadline)
+                            return cm.text
+                    else:
+                        c = exact_control(ctl, base, ext_types)
+                        if not c and low_base in BACK_LABELS:
+                            for alt in BACK_LABELS:
+                                c = exact_control(ctl, alt, ("Button", "Link"))
+                                if c:
+                                    break
+                        if c:
+                            if time.monotonic() >= deadline:
+                                return "skipped"
+                            return self.tap_control(c, deadline=deadline).text
+                    if time.monotonic() < deadline and cur_img is not None and id(cur_img) != last_sauvola_id:
+                        last_sauvola_id = id(cur_img)
+                        slines = self._read_sauvola(cur_img)
+                        if time.monotonic() >= deadline:
+                            return "skipped"
+                        if slines:
+                            sm = find_text(slines, base, where=where)
+                            if sm:
+                                if self._is_disabled_ocr_match(sm, base, slines, where, controls=raw_ctl):
+                                    return "skipped"
+                                if time.monotonic() >= deadline:
+                                    return "skipped"
+                                self.tap_point(sm.x, sm.y, sm.text, deadline=deadline)
+                                return sm.text
             cur_texts = [l.text for l in lines]
             in_transition = bool(self._last_action_ts) and (time.monotonic() - self._last_action_ts) < 0.5
-            if prev_texts is not None and not in_transition and cur_texts == prev_texts:
+            if not stale_app and prev_texts is not None and not in_transition and cur_texts == prev_texts:
                 img_still = (prev_img is None or cur_img is None or _content_pixel_still(prev_img, cur_img))
                 if img_still:
                     return "skipped"
-            prev_texts = cur_texts
-            prev_img = cur_img
+            if not stale_app:
+                prev_texts = cur_texts
+                prev_img = cur_img
             rem_after = deadline - time.monotonic()
             if rem_after <= 0:
                 return "skipped"
-            if (time.monotonic() - t_frame) < 0.02:
+            if stale_app or (time.monotonic() - t_frame) < 0.02:
                 time.sleep(min(0.05, rem_after))
 
     def tap_control(self, c, deadline=None):
@@ -2995,9 +3075,10 @@ class Flow:
             return True
         return False
 
-    def controls(self, text=False, timeout=None):
+    def controls(self, text=False, timeout=None, deadline=None):
         start_ts = time.monotonic()
-        deadline = (start_ts + max(0.05, float(timeout))) if timeout is not None else None
+        if deadline is None and timeout is not None:
+            deadline = start_ts + max(0.05, float(timeout))
         expectation = self._snapshot_ui_expectation(start_ts)
         expected_bundle = expectation[0]
         pending = (
@@ -3005,6 +3086,19 @@ class Flow:
             if self._pending_bundle and (start_ts - self._pending_bundle_ts) <= 2.5
             else None
         )
+
+        def _get_screen_pt():
+            if deadline is not None:
+                if time.monotonic() >= deadline:
+                    raise FlowError("UI tree timed out")
+                try:
+                    return self.r.pt_size(deadline=deadline)
+                except TypeError:
+                    return self.r.pt_size()
+                except TimeoutError:
+                    raise FlowError("UI tree timed out")
+            return self.r.pt_size()
+
         ctl = None
         app_name = ""
         bundle_id = ""
@@ -3012,11 +3106,12 @@ class Flow:
                 and getattr(self.c, "_fast_ui", None) is not False):
             # WDA Turbo v3 single-RTT waitBundle: poll activeApplication on-device
             # and snapshot in one HTTP call instead of activeAppInfo + fastUI.
+            screen_pt = _get_screen_pt()
             rem = (deadline - time.monotonic()) if deadline is not None else 30.0
             if rem <= 0:
                 raise FlowError("UI tree timed out")
             ctl, app_name, bundle_id = _fetch_ui_controls_full(
-                self.c, self.r.pt_size(), text=text,
+                self.c, screen_pt, text=text,
                 wait_bundle=pending, wait_ms=min(1500, int(rem * 1000)) if deadline is not None else 1500,
                 fallback_on_miss=False,
                 timeout=rem if deadline is not None else 30,
@@ -3029,26 +3124,27 @@ class Flow:
                     rem = (deadline - time.monotonic()) if deadline is not None else 30.0
                     if rem <= 0:
                         raise FlowError("UI tree timed out")
-                    self._wait_active_app(max_wait=min(1.5, rem))
+                    self._wait_active_app(max_wait=min(1.5, rem), deadline=deadline)
                     rem = (deadline - time.monotonic()) if deadline is not None else 30.0
                     if rem <= 0:
                         raise FlowError("UI tree timed out")
                     ctl, app_name, bundle_id = _fetch_ui_controls_full(
-                        self.c, self.r.pt_size(), text=text,
+                        self.c, screen_pt, text=text,
                         timeout=rem if deadline is not None else 30,
                     )
         if ctl is None:
             rem = (deadline - time.monotonic()) if deadline is not None else 30.0
             if rem <= 0:
                 raise FlowError("UI tree timed out")
-            self._wait_active_app(max_wait=min(1.5, rem))
+            self._wait_active_app(max_wait=min(1.5, rem), deadline=deadline)
+            screen_pt = _get_screen_pt()
             rem = (deadline - time.monotonic()) if deadline is not None else 30.0
             if rem <= 0:
                 raise FlowError("UI tree timed out")
             wb = expected_bundle if expectation[3] and expected_bundle else None
             wb_ms = (min(600, int(rem * 1000)) if deadline is not None else 600) if wb else 0
             ctl, app_name, bundle_id = _fetch_ui_controls_full(
-                self.c, self.r.pt_size(), text=text,
+                self.c, screen_pt, text=text,
                 wait_bundle=wb, wait_ms=wb_ms,
                 timeout=rem if deadline is not None else 30,
             )
@@ -3059,6 +3155,7 @@ class Flow:
             # use short adaptive backoff until iOS publishes the new app's tree.
             # Keep controls and provenance together: never overwrite (app_name, bundle_id)
             # when a retry fails and returns None, or the final stale check would be bypassed.
+            screen_pt = _get_screen_pt()
             for delay in _STALE_UI_BACKOFF:
                 if deadline is not None:
                     rem = deadline - time.monotonic()
@@ -3069,7 +3166,7 @@ class Flow:
                     if rem <= 0:
                         break
                     ctl_try, try_app_name, try_bundle_id = _fetch_ui_controls_full(
-                        self.c, self.r.pt_size(), text=text,
+                        self.c, screen_pt, text=text,
                         wait_bundle=expected_bundle if expected_bundle else None,
                         wait_ms=min(400, int(rem * 1000)) if expected_bundle else 0,
                         timeout=rem,
@@ -3080,7 +3177,7 @@ class Flow:
                 else:
                     time.sleep(delay)
                     ctl_try, try_app_name, try_bundle_id = _fetch_ui_controls_full(
-                        self.c, self.r.pt_size(), text=text,
+                        self.c, screen_pt, text=text,
                         wait_bundle=expected_bundle if expected_bundle else None,
                         wait_ms=400 if expected_bundle else 0,
                     )
@@ -3094,7 +3191,7 @@ class Flow:
             self._invalidate_ctl_cache()
             if expected_bundle:
                 self._pending_bundle = expected_bundle
-            raise FlowError(
+            raise _StaleAppError(
                 f"UI tree still shows outgoing app ({bundle_id or app_name!r}) "
                 f"instead of expected {expected_bundle!r}"
             )
