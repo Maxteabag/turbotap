@@ -1,18 +1,241 @@
+diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m b/WebDriverAgentLib/Commands/FBDebugCommands.m
+index 42ea74b..2ca5f1c 100644
+--- a/WebDriverAgentLib/Commands/FBDebugCommands.m
++++ b/WebDriverAgentLib/Commands/FBDebugCommands.m
+@@ -8,13 +8,148 @@
+ 
+ #import "FBDebugCommands.h"
+ 
++#import <math.h>
++#if !TARGET_OS_WATCH
++#import <UIKit/UIKit.h>
++#endif
++
+ #import "FBRouteRequest.h"
+ #import "FBSession.h"
+ #import "FBXMLGenerationOptions.h"
++#import "FBXCElementSnapshot.h"
++#import "NSDictionary+FBUtf8SafeDictionary.h"
++#import "XCUIApplication.h"
+ #import "XCUIApplication+FBHelpers.h"
+ #import "XCUIElement+FBUtilities.h"
+ #import "FBXPath.h"
+ 
++// wda-turbo: fastUI type filter (if/else chain avoids -Wswitch-enum under -Weverything).
++static NSString * _Nullable FBFastUIControlTypeName(XCUIElementType type)
++{
++  if (type == XCUIElementTypeButton) return @"Button";
++  if (type == XCUIElementTypeKey) return @"Key";
++  if (type == XCUIElementTypeTab) return @"Tab";
++  if (type == XCUIElementTypeSearchField) return @"SearchField";
++  if (type == XCUIElementTypeTextField) return @"TextField";
++  if (type == XCUIElementTypeSecureTextField) return @"SecureTextField";
++  if (type == XCUIElementTypeTextView) return @"TextView";
++  if (type == XCUIElementTypeCell) return @"Cell";
++  if (type == XCUIElementTypeLink) return @"Link";
++  if (type == XCUIElementTypeSwitch) return @"Switch";
++  if (type == XCUIElementTypeSlider) return @"Slider";
++  if (type == XCUIElementTypeSegmentedControl) return @"SegmentedControl";
++  if (type == XCUIElementTypeImage) return @"Image";
++  return nil;
++}
++
++static void FBFastUICollect(id<FBXCElementSnapshot> _Nullable snapshot,
++                            CGFloat screenW,
++                            CGFloat screenH,
++                            NSInteger sw,
++                            NSInteger sh,
++                            BOOL includeText,
++                            BOOL inKeyboard,
++                            NSMutableArray<NSDictionary<NSString *, id> *> *out)
++{
++  if (nil == snapshot) {
++    return;
++  }
++  XCUIElementType type = snapshot.elementType;
++  CGRect frame = snapshot.frame;
++  BOOL finiteFrame = isfinite(frame.origin.x) && isfinite(frame.origin.y)
++    && isfinite(frame.size.width) && isfinite(frame.size.height);
++  if (type == XCUIElementTypeCell && finiteFrame && frame.size.width > 0.0 && frame.size.height > 0.0) {
++    if (frame.origin.x >= screenW || frame.origin.x + frame.size.width <= 0.0
++        || frame.origin.y >= screenH || frame.origin.y + frame.size.height <= 0.0) {
++      return;
++    }
++  }
++  BOOL kb = inKeyboard || (type == XCUIElementTypeKeyboard);
++  NSString *label = snapshot.label;
++  if (label.length == 0) {
++    NSString *ident = snapshot.identifier;
++    label = ident.length > 0 ? ident : nil;
++  }
++  NSString *typeName = FBFastUIControlTypeName(type);
++  if (nil == typeName) {
++    if (type == XCUIElementTypeStaticText && includeText) {
++      typeName = @"Text";
++    } else if (type == XCUIElementTypeOther && label.length == 0) {
++      id rawVal = snapshot.value;
++      if (nil != rawVal && rawVal != NSNull.null) {
++        NSString *vStr = [NSString stringWithFormat:@"%@", rawVal];
++        if (vStr.length > 0) {
++          label = vStr;
++          typeName = @"Value";
++        }
++      }
++    }
++  }
++  if (nil != typeName && !(type == XCUIElementTypeKey && kb)
++      && label.length > 0
++      && finiteFrame && frame.size.width > 0.0 && frame.size.height > 0.0) {
++    CGFloat cxF = frame.origin.x + frame.size.width * (CGFloat)0.5;
++    if (type == XCUIElementTypeSwitch) {
++      CGFloat halfW = frame.size.width * (CGFloat)0.5;
++      cxF = frame.origin.x + frame.size.width - MIN(halfW, (CGFloat)32.0);
++    }
++    CGFloat cyF = frame.origin.y + frame.size.height * (CGFloat)0.5;
++    NSInteger cx = (NSInteger)cxF;
++    NSInteger cy = (NSInteger)cyF;
++    if (cx > 0 && cx < sw && cy > 0 && cy < sh) {
++      NSString *valStr = nil;
++      if (type == XCUIElementTypeSwitch || type == XCUIElementTypeSlider
++          || type == XCUIElementTypeTextField || type == XCUIElementTypeSearchField) {
++        id rawVal = snapshot.value;
++        if (type == XCUIElementTypeSwitch) {
++          if (nil != rawVal && rawVal != NSNull.null) {
++            if ([rawVal respondsToSelector:@selector(boolValue)]) {
++              valStr = [rawVal boolValue] ? @"1" : @"0";
++            } else {
++              valStr = [NSString stringWithFormat:@"%@", rawVal];
++            }
++          }
++        } else {
++          if (nil != rawVal && rawVal != NSNull.null) {
++            NSString *s = [NSString stringWithFormat:@"%@", rawVal];
++            if (s.length > 0) {
++              valStr = s;
++            }
++          }
++          if (nil == valStr && (type == XCUIElementTypeTextField || type == XCUIElementTypeSearchField)) {
++            NSString *ph = snapshot.placeholderValue;
++            if (nil != ph && ph.length > 0) {
++              valStr = ph;
++            }
++          }
++        }
++      }
++      if (nil != valStr && valStr.length > 0 && ![valStr isEqualToString:label]) {
++        [out addObject:@{
++          @"type": typeName,
++          @"label": label,
++          @"x": @(cx),
++          @"y": @(cy),
++          @"value": valStr,
++        }];
++      } else {
++        [out addObject:@{
++          @"type": typeName,
++          @"label": label,
++          @"x": @(cx),
++          @"y": @(cy),
++        }];
++      }
++    }
++  }
++  NSArray *children = snapshot.children;
++  for (id<FBXCElementSnapshot> child in children) {
++    @autoreleasepool {
++      FBFastUICollect(child, screenW, screenH, sw, sh, includeText, kb, out);
++    }
++  }
++}
++
+ @implementation FBDebugCommands
+ 
+ #pragma mark - <FBCommandHandler>
+@@ -27,6 +162,8 @@
+     [[FBRoute GET:@"/source"].withoutSession respondWithTarget:self action:@selector(handleGetSourceCommand:)],
+     [[FBRoute GET:@"/wda/accessibleSource"] respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
+     [[FBRoute GET:@"/wda/accessibleSource"].withoutSession respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
++    [[FBRoute GET:@"/wda/fastUI"] respondWithTarget:self action:@selector(handleFastUI:)],
++    [[FBRoute GET:@"/wda/fastUI"].withoutSession respondWithTarget:self action:@selector(handleFastUI:)],
+   ];
+ }
+ 
+@@ -78,4 +215,59 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
+   return FBResponseWithObject(application.fb_accessibilityTree ?: @{});
+ }
+ 
++// wda-turbo: single-snapshot on-device UI control walk (zero per-node customActions /
++// accessibility IPC, prunes off-screen cells, skips soft-keyboard keys, compact JSON).
+++ (id<FBResponsePayload>)handleFastUI:(FBRouteRequest *)request
++{
++  XCUIApplication *application = XCUIApplication.fb_activeApplication;
++  id<FBXCElementSnapshot> _Nullable snapshot = [application fb_standardSnapshot];
++  if (nil == snapshot) {
++    return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
++  }
++  CGRect rootFrame = snapshot.frame;
++  BOOL rootValid = isfinite(rootFrame.size.width) && isfinite(rootFrame.size.height)
++    && rootFrame.size.width >= 1.0 && rootFrame.size.height >= 1.0;
++  CGFloat screenW = rootValid ? rootFrame.size.width : (CGFloat)0.0;
++  CGFloat screenH = rootValid ? rootFrame.size.height : (CGFloat)0.0;
++#if !TARGET_OS_WATCH
++  if (!rootValid) {
++    CGSize fallbackSize = UIScreen.mainScreen.bounds.size;
++    screenW = fallbackSize.width;
++    screenH = fallbackSize.height;
++  }
++#endif
++  NSInteger sw = (NSInteger)llround(screenW);
++  NSInteger sh = (NSInteger)llround(screenH);
++  NSString *textParam = request.parameters[@"text"];
++  BOOL includeText = (nil != textParam
++                      && ([textParam isEqualToString:@"1"]
++                          || [textParam caseInsensitiveCompare:@"true"] == NSOrderedSame));
++  NSMutableArray<NSDictionary<NSString *, id> *> *items = [NSMutableArray array];
++  FBFastUICollect(snapshot, screenW, screenH, sw, sh, includeText, NO, items);
++  NSString *appName = snapshot.label.length > 0
++    ? snapshot.label
++    : (snapshot.identifier.length > 0 ? snapshot.identifier : @"");
++  NSDictionary<NSString *, id> *payload = @{
++    @"bundleId": application.bundleID ?: @"",
++    @"appName": appName,
++    @"screen": @[@(sw), @(sh)],
++    @"ui": items,
++  };
++  NSError *jsonError = nil;
++  NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload
++                                                     options:(NSJSONWritingOptions)0
++                                                       error:&jsonError];
++  if (nil == jsonData) {
++    jsonData = [NSJSONSerialization dataWithJSONObject:[payload fb_utf8SafeDictionary]
++                                               options:(NSJSONWritingOptions)0
++                                                 error:&jsonError];
++  }
++  if (nil == jsonData) {
++    return nil != jsonError
++      ? FBResponseWithUnknownError(jsonError)
++      : FBResponseWithUnknownErrorFormat(@"Failed to serialize fastUI response");
++  }
++  return FBResponseWithRawData(jsonData, @"application/json;charset=UTF-8");
++}
++
+ @end
 diff --git a/WebDriverAgentLib/Commands/FBElementCommands.m b/WebDriverAgentLib/Commands/FBElementCommands.m
-index 97afb7b..d289081 100644
+index 97afb7b..c21039f 100644
 --- a/WebDriverAgentLib/Commands/FBElementCommands.m
 +++ b/WebDriverAgentLib/Commands/FBElementCommands.m
-@@ -40,6 +40,9 @@
+@@ -40,6 +40,10 @@
  #import "XCUIElement.h"
  #import "XCUIElementQuery.h"
  #import "FBXCodeCompatibility.h"
-+#import "FBXCTestDaemonsProxy.h"
++#import <CoreFoundation/CoreFoundation.h>
++#import <stdatomic.h>
 +#import "XCSynthesizedEventRecord.h"
 +#import "XCPointerEventPath.h"
  
  @interface FBElementCommands ()
  @end
-@@ -115,6 +118,10 @@ + (NSArray *)routes
+@@ -115,6 +119,10 @@
  
      [[FBRoute POST:@"/wda/element/:uuid/tap"] respondWithTarget:self action:@selector(handleTap:)],
      [[FBRoute POST:@"/wda/tap"] respondWithTarget:self action:@selector(handleTap:)],
@@ -23,13 +246,44 @@ index 97afb7b..d289081 100644
  
      [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
  #endif
-@@ -509,6 +516,62 @@ + (NSArray *)routes
+@@ -509,6 +517,93 @@
    return FBResponseWithOK();
  }
  
++// wda-turbo: synthesize an event record and wake the current CFRunLoop immediately
++// upon XPC completion, bypassing FBRunLoopSpinner's 100 ms FBWaitInterval sleep.
++static BOOL FBSynthesizeEventFast(XCSynthesizedEventRecord *record, NSError *__autoreleasing *error)
++{
++  __block NSError *innerError = nil;
++  __block atomic_bool done = false;
++  CFRunLoopRef rl = CFRunLoopGetCurrent();
++  CFRetain(rl);
++  [[XCUIDevice.sharedDevice eventSynthesizer] synthesizeEvent:record
++                                                   completion:^(_Bool result, NSError *invokeError) {
++    (void)result;
++    if (nil != invokeError) {
++      innerError = invokeError;
++    }
++    atomic_store_explicit(&done, true, memory_order_release);
++    CFRunLoopStop(rl);
++    CFRunLoopWakeUp(rl);
++    CFRelease(rl);
++  }];
++  while (!atomic_load_explicit(&done, memory_order_acquire)) {
++    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, (Boolean)true);
++  }
++  if (nil != innerError) {
++    if (error) {
++      *error = innerError;
++    }
++    return NO;
++  }
++  return YES;
++}
++
 +// wda-turbo: tap screen coordinates (points) with one synthesized touch event.
 +// Skips XCUICoordinate's app-quiescence/idle waits that make /wda/tap ~740 ms.
-+// Body: {"x": 215, "y": 600, "duration": 0.05 (s, optional)}
++// Body: {"x": 215, "y": 600, "duration": 0.02 (s, optional)}
 ++ (id<FBResponsePayload>)handleFastTap:(FBRouteRequest *)request
 +{
 +  if (nil == request.arguments[@"x"] || nil == request.arguments[@"y"]) {
@@ -37,14 +291,14 @@ index 97afb7b..d289081 100644
 +  }
 +  CGPoint point = CGPointMake((CGFloat)[request.arguments[@"x"] doubleValue],
 +                              (CGFloat)[request.arguments[@"y"] doubleValue]);
-+  double duration = nil == request.arguments[@"duration"] ? 0.05 : [request.arguments[@"duration"] doubleValue];
++  double duration = nil == request.arguments[@"duration"] ? 0.02 : [request.arguments[@"duration"] doubleValue];
 +  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast tap"
 +                                                               interfaceOrientation:UIInterfaceOrientationPortrait];
 +  XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:point offset:0];
 +  [path liftUpAtOffset:duration];
 +  [record addPointerEventPath:path];
-+  NSError *error;
-+  if (![FBXCTestDaemonsProxy synthesizeEventWithRecord:record error:&error]) {
++  NSError *error = nil;
++  if (!FBSynthesizeEventFast(record, &error)) {
 +    return FBResponseWithUnknownError(error);
 +  }
 +  return FBResponseWithOK();
@@ -76,8 +330,8 @@ index 97afb7b..d289081 100644
 +  }
 +  [path liftUpAtOffset:hold + duration + release];
 +  [record addPointerEventPath:path];
-+  NSError *error;
-+  if (![FBXCTestDaemonsProxy synthesizeEventWithRecord:record error:&error]) {
++  NSError *error = nil;
++  if (!FBSynthesizeEventFast(record, &error)) {
 +    return FBResponseWithUnknownError(error);
 +  }
 +  return FBResponseWithOK();
@@ -87,22 +341,68 @@ index 97afb7b..d289081 100644
  {
    XCUIElement *element = [self targetFromRequest:request];
 diff --git a/WebDriverAgentLib/Commands/FBScreenshotCommands.m b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
-index 9586a19..17bef12 100644
+index 9586a19..f647625 100644
 --- a/WebDriverAgentLib/Commands/FBScreenshotCommands.m
 +++ b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
-@@ -9,6 +9,11 @@
+@@ -9,6 +9,57 @@
  #import "FBScreenshotCommands.h"
  
  #import "XCUIDevice+FBHelpers.h"
++#import <ImageIO/ImageIO.h>
++#import <math.h>
 +#import "FBScreenshot.h"
-+#import "FBImageProcessor.h"
 +#import "FBCommandStatus.h"
 +#import "FBRouteRequest.h"
 +@import UniformTypeIdentifiers;
++
++// wda-turbo: downscale JPEG/PNG via ImageIO thumbnail subsampling (avoids full RGBA
++// UIGraphicsImageRenderer redraw and per-call FBImageProcessor dispatch queue alloc).
++static NSData *FBScaleImageDataFast(NSData *srcData, CGFloat scale, CGFloat quality, UTType *uti)
++{
++  CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)srcData, NULL);
++  if (NULL == src) {
++    return srcData;
++  }
++  NSDictionary *props = (__bridge_transfer NSDictionary *)CGImageSourceCopyPropertiesAtIndex(src, 0, NULL);
++  double pw = [props[(__bridge NSString *)kCGImagePropertyPixelWidth] doubleValue];
++  double ph = [props[(__bridge NSString *)kCGImagePropertyPixelHeight] doubleValue];
++  double maxDim = MAX(pw, ph) * (double)scale;
++  if (maxDim < 16.0) {
++    CFRelease(src);
++    return srcData;
++  }
++  NSDictionary *thumbOpts = @{
++    (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
++    (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform: @YES,
++    (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize: @(llround(maxDim)),
++  };
++  CGImageRef thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)thumbOpts);
++  CFRelease(src);
++  if (NULL == thumb) {
++    return srcData;
++  }
++  NSMutableData *out = [NSMutableData data];
++  CGImageDestinationRef dst = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)out,
++                                                               (__bridge CFStringRef)uti.identifier,
++                                                               1,
++                                                               NULL);
++  if (NULL == dst) {
++    CFRelease(thumb);
++    return srcData;
++  }
++  NSDictionary *encOpts = [uti conformsToType:UTTypePNG]
++    ? nil
++    : @{(__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(quality)};
++  CGImageDestinationAddImage(dst, thumb, (__bridge CFDictionaryRef)encOpts);
++  BOOL ok = CGImageDestinationFinalize(dst);
++  CFRelease(dst);
++  CFRelease(thumb);
++  return ok ? out : srcData;
++}
  
  @implementation FBScreenshotCommands
  
-@@ -20,6 +25,8 @@ + (NSArray *)routes
+@@ -20,6 +71,8 @@
    @[
      [[FBRoute GET:@"/screenshot"].withoutSession.standalone respondWithTarget:self action:@selector(handleGetScreenshot:)],
      [[FBRoute GET:@"/screenshot"].standalone respondWithTarget:self action:@selector(handleGetScreenshot:)],
@@ -111,46 +411,111 @@ index 9586a19..17bef12 100644
    ];
  }
  
-@@ -37,4 +44,39 @@ + (NSArray *)routes
+@@ -37,4 +90,37 @@
    return FBResponseWithObject(screenshot);
  }
  
-+// wda-turbo: {"x0":0,"y0":460,"x1":430,"y1":700,"quality":0.8,"scale":1.0} (points) -> base64 JPEG
-+// of that band only; scale < 1 downscales on the phone before sending.
++// wda-turbo: {"x0":0,"y0":460,"x1":430,"y1":700,"quality":0.8,"scale":1.0,"raw":true} (points) ->
++// raw image/jpeg|image/png when "raw":true, or base64 JSON otherwise; scale < 1 downscales on-device.
 ++ (id<FBResponsePayload>)handleFastScreenshot:(FBRouteRequest *)request
 +{
 +  NSDictionary *a = request.arguments ?: @{};
 +  CGRect rect = CGRectNull;
 +  if (nil != a[@"y0"] || nil != a[@"y1"] || nil != a[@"x0"] || nil != a[@"x1"]) {
 +    CGSize size = UIScreen.mainScreen.bounds.size;
-+    CGFloat x0 = nil == a[@"x0"] ? 0 : [a[@"x0"] doubleValue];
-+    CGFloat y0 = nil == a[@"y0"] ? 0 : [a[@"y0"] doubleValue];
-+    CGFloat x1 = nil == a[@"x1"] ? size.width : [a[@"x1"] doubleValue];
-+    CGFloat y1 = nil == a[@"y1"] ? size.height : [a[@"y1"] doubleValue];
++    CGFloat x0 = nil == a[@"x0"] ? 0 : (CGFloat)[a[@"x0"] doubleValue];
++    CGFloat y0 = nil == a[@"y0"] ? 0 : (CGFloat)[a[@"y0"] doubleValue];
++    CGFloat x1 = nil == a[@"x1"] ? size.width : (CGFloat)[a[@"x1"] doubleValue];
++    CGFloat y1 = nil == a[@"y1"] ? size.height : (CGFloat)[a[@"y1"] doubleValue];
 +    rect = CGRectMake(x0, y0, x1 - x0, y1 - y0);
 +  }
-+  CGFloat quality = nil == a[@"quality"] ? 0.8 : [a[@"quality"] doubleValue];
++  CGFloat quality = nil == a[@"quality"] ? (CGFloat)0.8 : (CGFloat)[a[@"quality"] doubleValue];
 +  UTType *uti = [@"png" isEqualToString:a[@"format"]] ? UTTypePNG : UTTypeJPEG;
-+  NSError *error;
++  NSError *error = nil;
 +  NSData *data = [FBScreenshot takeWithRect:rect compressionQuality:quality uti:uti error:&error];
 +  if (nil == data) {
 +    return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:error.description traceback:nil]);
 +  }
-+  CGFloat scale = nil == a[@"scale"] ? 1.0 : [a[@"scale"] doubleValue];
-+  if (scale > 0 && scale < 1.0) {
-+    NSData *scaled = [[[FBImageProcessor alloc] init] scaledImageWithData:data
-+                                                                      uti:uti
-+                                                            scalingFactor:scale
-+                                                       compressionQuality:quality
-+                                                                    error:&error];
-+    if (nil != scaled) {
-+      data = scaled;
-+    }
++  CGFloat scale = nil == a[@"scale"] ? (CGFloat)1.0 : (CGFloat)[a[@"scale"] doubleValue];
++  if (scale > 0.0 && scale < 1.0) {
++    data = FBScaleImageDataFast(data, scale, quality, uti);
++  }
++  id rawArg = a[@"raw"];
++  if ([rawArg respondsToSelector:@selector(boolValue)] && [rawArg boolValue]) {
++    NSString *ct = [uti conformsToType:UTTypePNG] ? @"image/png" : @"image/jpeg";
++    return FBResponseWithRawData(data, ct);
 +  }
 +  return FBResponseWithObject([data base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0]);
 +}
 +
  @end
+diff --git a/WebDriverAgentLib/Routing/FBResponsePayload.h b/WebDriverAgentLib/Routing/FBResponsePayload.h
+index b29b8f9..404ef61 100644
+--- a/WebDriverAgentLib/Routing/FBResponsePayload.h
++++ b/WebDriverAgentLib/Routing/FBResponsePayload.h
+@@ -52,6 +52,11 @@ id<FBResponsePayload> FBResponseWithUnknownErrorFormat(NSString *errorFormat, ..
+  */
+ id<FBResponsePayload> FBResponseWithStatus(FBCommandStatus *status);
+ 
++/**
++ Returns a raw binary response payload with the given data and Content-Type header (HTTP 200).
++ */
++id<FBResponsePayload> FBResponseWithRawData(NSData *data, NSString *contentType);
++
+ /**
+  Returns a response payload as a NSDictionary for given element.
+  Set compact=NO to include further attributes (defined by FBConfiguration.elementResponseAttributes)
+diff --git a/WebDriverAgentLib/Routing/FBResponsePayload.m b/WebDriverAgentLib/Routing/FBResponsePayload.m
+index 5d0098a..d1cf182 100644
+--- a/WebDriverAgentLib/Routing/FBResponsePayload.m
++++ b/WebDriverAgentLib/Routing/FBResponsePayload.m
+@@ -10,6 +10,7 @@
+ 
+ #import "FBElementCache.h"
+ #import "FBResponseJSONPayload.h"
++#import "RouteResponse.h"
+ #import "FBSession.h"
+ #import "FBMathUtils.h"
+ #import "FBConfiguration.h"
+@@ -88,6 +89,38 @@ id<FBResponsePayload> FBResponseWithUnknownErrorFormat(NSString *format, ...)
+   return payload;
+ }
+ 
++@interface FBResponseRawDataPayload : NSObject <FBResponsePayload>
++@property (nonatomic, strong, readonly) NSData *data;
++@property (nonatomic, copy, readonly) NSString *contentType;
++- (instancetype)initWithData:(NSData *)data contentType:(NSString *)contentType;
++@end
++
++@implementation FBResponseRawDataPayload
++
++- (instancetype)initWithData:(NSData *)data contentType:(NSString *)contentType
++{
++  self = [super init];
++  if (self) {
++    _data = data;
++    _contentType = [contentType copy];
++  }
++  return self;
++}
++
++- (void)dispatchWithResponse:(RouteResponse *)response
++{
++  [response setHeader:@"Content-Type" value:self.contentType];
++  [response setStatusCode:kHTTPStatusCodeOK];
++  [response respondWithData:self.data];
++}
++
++@end
++
++id<FBResponsePayload> FBResponseWithRawData(NSData *data, NSString *contentType)
++{
++  return [[FBResponseRawDataPayload alloc] initWithData:data contentType:contentType];
++}
++
+ id<FBResponsePayload> FBResponseWithStatus(FBCommandStatus *status)
+ {
+   NSMutableDictionary* response = [NSMutableDictionary dictionary];
 diff --git a/WebDriverAgentLib/Utilities/FBScreenshot.h b/WebDriverAgentLib/Utilities/FBScreenshot.h
 index 3604ba2..3beb05e 100644
 --- a/WebDriverAgentLib/Utilities/FBScreenshot.h
@@ -175,7 +540,7 @@ diff --git a/WebDriverAgentLib/Utilities/FBScreenshot.m b/WebDriverAgentLib/Util
 index ee37fa3..7ced618 100644
 --- a/WebDriverAgentLib/Utilities/FBScreenshot.m
 +++ b/WebDriverAgentLib/Utilities/FBScreenshot.m
-@@ -93,18 +93,50 @@ + (NSData *)takeWithScreenID:(long long)screenID
+@@ -93,18 +93,50 @@ NSString *formatTimeInterval(NSTimeInterval interval) {
                                                          error:error];
  }
  
