@@ -90,6 +90,95 @@ class ReadFullTests(unittest.TestCase):
         finally:
             flow.close()
 
+    def test_springboard_system_alert_awareness_in_controls_and_read_full(self):
+        img = solid_img(240, size=(430, 932))
+        lines = [make_line("Allow Paste from Safari?", 40, 380, 390, 405)]
+        alert_buttons = [
+            {"type": "Button", "label": "Don't Allow", "x": 135, "y": 510},
+            {"type": "Button", "label": "Allow Paste", "x": 295, "y": 510},
+        ]
+        sb_alert_ui = _fast_ui(alert_buttons, app_name="SpringBoard", bundle_id="com.apple.springboard")
+
+        # 1. Active SpringBoard system alert over a launched app in controls() and read_full():
+        # surfaces alert controls immediately with 0 _STALE_UI_BACKOFF retries, does NOT cache
+        # under self.bundle, preserves _pending_bundle, and attaches "alert" to step("read").
+        c_alert = MockWDAClient(
+            active_app="com.apple.springboard",
+            fast_ui=sb_alert_ui,
+            alert_text="Allow Paste from Safari?",
+        )
+        r_alert = FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0)
+        flow_alert = cli.Flow(c_alert, reader=r_alert, timeout=1.0)
+        try:
+            flow_alert.step("open:com.example.target")
+            self.assertEqual(flow_alert.bundle, "com.example.target")
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+
+            sleeps = []
+            with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                got_ctl = flow_alert.controls()
+            self.assertEqual([x["label"] for x in got_ctl], ["Don't Allow", "Allow Paste"])
+            self.assertEqual(sleeps, [], "Active SpringBoard alert must not burn _STALE_UI_BACKOFF retries")
+            self.assertIsNone(flow_alert._ctl_cache)
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+            self.assertEqual(flow_alert._last_alert_text, "Allow Paste from Safari?")
+
+            # step("read") (via read_full) surfaces alert buttons without retries, keeps _pending_bundle,
+            # does not cache under self.bundle, and attaches "alert" to the read entry.
+            c_alert.calls.clear()
+            with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                n_lines = flow_alert.step("read")
+            self.assertEqual(n_lines, 1)
+            self.assertEqual(sleeps, [])
+            self.assertIsNone(flow_alert._ctl_cache)
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+            self.assertEqual(flow_alert.reads[-1]["alert"], "Allow Paste from Safari?")
+            self.assertEqual([x["label"] for x in flow_alert.reads[-1]["ui"]], ["Don't Allow", "Allow Paste"])
+            fast_ui_calls = [p for _, p, _ in c_alert.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(len(fast_ui_calls), 1)
+        finally:
+            flow_alert.close()
+
+        # 2. CRITICAL SAFETY INVARIANT: Ordinary outgoing SpringBoard Home Screen
+        # (bundleId="com.apple.springboard" + alert_text=None/empty/404) right after
+        # home -> open:App STILL retries _STALE_UI_BACKOFF and raises _StaleAppError in
+        # controls() / returns ui_res=None in read_full(), never caching or exposing Home Screen icons.
+        sb_home_ui = _fast_ui(
+            [{"type": "Button", "label": "Messages", "x": 90, "y": 220}],
+            app_name="SpringBoard",
+            bundle_id="com.apple.springboard",
+        )
+        for no_alert_val in (None, "   "):
+            c_home = MockWDAClient(
+                active_app="com.example.target",
+                fast_ui=sb_home_ui,
+                alert_text=no_alert_val,
+            )
+            r_home = FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0)
+            flow_home = cli.Flow(c_home, reader=r_home, timeout=1.0)
+            try:
+                flow_home.step("home")
+                flow_home.step("open:com.example.target")
+                sleeps = []
+                with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                    with self.assertRaises(cli._StaleAppError):
+                        flow_home.controls()
+                self.assertEqual(len(sleeps), len(cli._STALE_UI_BACKOFF))
+                self.assertIsNone(flow_home._ctl_cache)
+                self.assertIsNone(flow_home._last_alert_text)
+                self.assertEqual(flow_home._pending_bundle, "com.example.target")
+
+                sleeps.clear()
+                with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                    _, got_ui = flow_home.read_full(ui=True, timeout=0.5)
+                self.assertIsNone(got_ui)
+                self.assertEqual(len(sleeps), len(cli._STALE_UI_BACKOFF))
+                self.assertIsNone(flow_home._ctl_cache)
+                self.assertIsNone(flow_home._last_alert_text)
+                self.assertEqual(flow_home._pending_bundle, "com.example.target")
+            finally:
+                flow_home.close()
+
 
 class TapTextAndCacheTests(unittest.TestCase):
     def test_wait_stable_skips_second_ocr_when_pixel_still(self):
@@ -2099,6 +2188,113 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             self.assertGreater(flow_max._wait_settled_ts, 0.0)
         finally:
             flow_max.close()
+
+    def test_assert_assertnot_and_alert_text_verbs(self):
+        img = solid_img(240, size=(430, 932))
+        lines = [
+            make_line("Profile Header", 20, 100, 180, 124),
+            make_line("Order #4821 Confirmed", 20, 260, 260, 284),
+            make_line("Top Only", 20, 160, 120, 184),
+        ]
+        ui = [
+            {"type": "Button", "label": "ComposeIcon", "x": 380, "y": 820, "enabled": True},
+            {"type": "Button", "label": "DisabledBadge", "x": 380, "y": 320, "enabled": False},
+            {"type": "Text", "label": "Stylized 22°", "x": 200, "y": 360},
+        ]
+        c = MockWDAClient(fast_ui=_fast_ui(ui), alert_text="  Allow\u200b Notifications?  ")
+        r = FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(c, reader=r, timeout=0.5)
+        try:
+            # 1. assert:TEXT matches OCR in 1 frame with 0 UI calls and reuses _fresh_lines().
+            self.assertEqual(flow.step("assert:Order #4821 Confirmed"), "Order #4821 Confirmed")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual([p for _, p, _ in c.calls if p.startswith("/wda/fastUI")], [])
+
+            # Regex and @region reuse _fresh_lines() with 0 extra OCR reads.
+            self.assertEqual(flow.step(r"assert:re:Order\s+#\d+"), "Order #4821 Confirmed")
+            self.assertEqual(flow.step("assert:Order #4821@below:Profile Header"), "Order #4821 Confirmed")
+            self.assertEqual(flow.step("assert:Top Only@y<200"), "Top Only")
+            self.assertEqual(r.read_calls, 1)
+
+            # 2. assert:TEXT falls back to controls(text=True) for icon/disabled/stylized labels.
+            self.assertEqual(flow.step("assert:ComposeIcon@y>700"), "ComposeIcon")
+            self.assertEqual(flow.step("assert:DisabledBadge@below:Profile Header"), "DisabledBadge")
+            self.assertEqual(flow.step(r"assert:re:Stylized\s+\d+°"), "Stylized 22°")
+
+            # 3. assert:TEXT raises clear FlowError when absent or outside @region.
+            with self.assertRaises(cli.FlowError) as ctx_miss:
+                flow.step("assert:Nonexistent Banner")
+            self.assertEqual(str(ctx_miss.exception), "assert failed: 'Nonexistent Banner' not on screen")
+
+            with self.assertRaises(cli.FlowError) as ctx_reg:
+                flow.step("assert:Top Only@y>300")
+            self.assertEqual(str(ctx_reg.exception), "assert failed: 'Top Only@y>300' not on screen")
+
+            with self.assertRaises(cli.FlowError) as ctx_ui_reg:
+                flow.step("assert:ComposeIcon@y<300")
+            self.assertEqual(str(ctx_ui_reg.exception), "assert failed: 'ComposeIcon@y<300' not on screen")
+
+            # 4. assertnot:TEXT checks BOTH OCR and controls(text=True), returning 'absent'.
+            self.assertEqual(flow.step("assertnot:Error Banner"), "absent")
+            self.assertEqual(flow.step(r"assertnot:re:Fatal\s+\d+"), "absent")
+            self.assertEqual(flow.step("assertnot:Top Only@y>300"), "absent")
+            self.assertEqual(flow.step("assertnot:ComposeIcon@y<300"), "absent")
+
+            # Fails when target is present in OCR.
+            with self.assertRaises(cli.FlowError) as ctx_not_ocr:
+                flow.step("assertnot:Order #4821")
+            self.assertEqual(
+                str(ctx_not_ocr.exception),
+                "assertnot failed: 'Order #4821' is on screen (Order #4821 Confirmed)",
+            )
+
+            # Fails when target is present only as an icon-only / UI control (not in OCR).
+            with self.assertRaises(cli.FlowError) as ctx_not_ui:
+                flow.step("assertnot:ComposeIcon@y>700")
+            self.assertEqual(
+                str(ctx_not_ui.exception),
+                "assertnot failed: 'ComposeIcon@y>700' is on screen (ComposeIcon)",
+            )
+
+            with self.assertRaises(cli.FlowError) as ctx_not_re:
+                flow.step(r"assertnot:re:Stylized\s+\d+°")
+            self.assertEqual(
+                str(ctx_not_re.exception),
+                f"assertnot failed: {r're:Stylized\s+\d+°'!r} is on screen (Stylized 22°)",
+            )
+
+            # Zero taps or mutating actions were dispatched by assert / assertnot.
+            self.assertEqual(c.tapped_points, [])
+            self.assertEqual(flow._last_action_ts, 0.0)
+
+            # 5. alert:text reads active alert text and appends {"alert": txt} to reads;
+            # returns "no-alert" when no alert is active; preserves alert:accept and alert:dismiss.
+            self.assertEqual(flow.step("alert:text"), "Allow Notifications?")
+            self.assertEqual(flow.reads[-1], {"alert": "Allow Notifications?"})
+
+            c.alert_text = None
+            reads_len = len(flow.reads)
+            self.assertEqual(flow.step("alert:text"), "no-alert")
+            self.assertEqual(len(flow.reads), reads_len)
+
+            with mock.patch("turbotap.cli.time.sleep"):
+                self.assertEqual(flow.step("alert:accept"), "accept")
+                self.assertEqual(flow.step("alert:dismiss"), "dismiss")
+            with self.assertRaises(cli.FlowError):
+                flow.step("alert:invalid")
+            with self.assertRaises(cli.FlowError):
+                flow.step("assert:re:")
+            with self.assertRaises(cli.FlowError):
+                flow.step("assertnot:re:")
+
+            self.assertIn("assert:TEXT", cli.FLOW_HELP)
+            self.assertIn("assertnot:TEXT", cli.FLOW_HELP)
+            self.assertIn("alert:accept|dismiss|text", cli.FLOW_HELP)
+            self.assertIn("assert", cli._IMAGE_STEP_VERBS)
+            self.assertIn("assertnot", cli._IMAGE_STEP_VERBS)
+            self.assertNotIn("alert", cli._IMAGE_STEP_VERBS)
+        finally:
+            flow.close()
 
 
 class LazyImportAndWarmupTests(unittest.TestCase):

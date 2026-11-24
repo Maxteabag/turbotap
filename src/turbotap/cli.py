@@ -2051,6 +2051,10 @@ FLOW_HELP = """steps (one argument each, run in order):
                         UI controls + Sauvola fallback; per-target @region supported);
                         returns the matched text
   gone:TEXT             poll until TEXT is no longer on screen
+  assert:TEXT           single-frame non-mutating check that TEXT is on screen (OCR + UI
+                        controls fallback; supports @region and 're:REGEX')
+  assertnot:TEXT        single-frame non-mutating check that TEXT is NOT on screen (checks
+                        both OCR and UI controls; supports @region and 're:REGEX')
   tap:TEXT              wait until TEXT is on screen at the same spot twice, tap its
                         centre, and re-tap once if the screen did not react; text
                         OCR cannot see falls back to the control with that label.
@@ -2068,7 +2072,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   toggle:LABEL[=on|off] idempotently set or flip an iOS Switch control (supports @region;
                         =on|off|1|0|true|false skips tap when already in desired state and
                         verifies state after tapping; respects --deny)
-  TEXT@below:HEADER     (tap/tapif/tapbatch/toggle/longpress/doubletap/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
+  TEXT@below:HEADER     (tap/tapif/tapbatch/toggle/longpress/doubletap/swipe:left|right/wait/waitany/assert/assertnot/scrollto) only match under HEADER,
   TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
   longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
                         @region, OCR + UI fallback, respects --deny)
@@ -2094,7 +2098,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
-  alert:accept|dismiss  accept or dismiss an active iOS system alert
+  alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
   scrollto:TEXT         scroll down (max 8x) until TEXT is visible (scrollto:up:TEXT scrolls up)
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
@@ -2111,7 +2115,8 @@ taps, toggles, sliders, double-taps, and long-presses on text matching --deny ar
 
 _TYPING_FREQ = None  # None = keep legacy WDA default pace; override via TURBOTAP_TYPING_FREQ (e.g. 240)
 _IMAGE_STEP_VERBS = frozenset({
-    "wait", "expect", "waitany", "gone", "tap", "tapif", "longpress", "doubletap",
+    "wait", "expect", "waitany", "gone", "assert", "assertnot",
+    "tap", "tapif", "longpress", "doubletap",
     "scroll", "scrollto", "swipe", "back", "read", "search", "settle", "shot",
 })
 _STALE_UI_BACKOFF = (0.05, 0.08, 0.12)
@@ -2251,6 +2256,7 @@ class Flow:
         self._last_reaction_diff = 0.0
         self._ctl_cache = None  # (controls, bundle, ts, img)
         self._last_tap_small_delta = False
+        self._last_alert_text = None
 
     def _get_ui_worker(self):
         if self._side is None:
@@ -2322,6 +2328,7 @@ class Flow:
         eff_deadline = time.monotonic() + max_wait
         if deadline is not None:
             eff_deadline = min(eff_deadline, deadline)
+        checked_sb_alert = False
         while True:
             rem = eff_deadline - time.monotonic()
             if rem <= 0:
@@ -2339,9 +2346,18 @@ class Flow:
                 if time.monotonic() < eff_deadline and not (isinstance(info, dict) and info.get("deadline_exceeded")):
                     self._pending_bundle = None
                 return False
-            if val.get("bundleId") == target:
+            cur_bid = val.get("bundleId")
+            if cur_bid == target:
                 self._pending_bundle = None
                 return True
+            if (
+                not checked_sb_alert
+                and cur_bid == "com.apple.springboard"
+                and target != "com.apple.springboard"
+            ):
+                checked_sb_alert = True
+                if self._active_alert_text(deadline=eff_deadline):
+                    return False
             rem = eff_deadline - time.monotonic()
             if rem <= 0:
                 return False
@@ -2640,6 +2656,44 @@ class Flow:
                 and (m.y * self.r.scale) < int(prev_img.size[1] * 0.06)
             )
         raise FlowError(f"{label!r} still on screen")
+
+    def assert_text(self, arg):
+        """Fast single-frame non-mutating check that TEXT (with optional @region or
+        re:REGEX) is currently visible via OCR or UI controls."""
+        self._wait_active_app()
+        base, where = split_where(arg)
+        if not _clean_text(base) or (base.startswith("re:") and not base[3:].strip()):
+            raise FlowError(f"assert failed: {arg!r} not on screen")
+        lines = self._fresh_lines()
+        if lines is None:
+            lines = self.lines()
+        m = find_text(lines, base, where=where)
+        if m is not None:
+            return m.text
+        ctl = _controls_in_region(self.controls(text=True), lines, where)
+        cm = find_control_match(ctl, base, types=WAIT_UI_TYPES, allow_disabled=True)
+        if cm is not None:
+            return cm.text
+        raise FlowError(f"assert failed: {arg!r} not on screen")
+
+    def assert_not_text(self, arg):
+        """Fast single-frame non-mutating check that TEXT (with optional @region or
+        re:REGEX) is absent from both OCR and UI controls."""
+        self._wait_active_app()
+        base, where = split_where(arg)
+        if not _clean_text(base) or (base.startswith("re:") and not base[3:].strip()):
+            raise FlowError("assertnot requires target text (e.g. assertnot:TEXT)")
+        lines = self._fresh_lines()
+        if lines is None:
+            lines = self.lines()
+        m = find_text(lines, base, where=where)
+        if m is not None:
+            raise FlowError(f"assertnot failed: {arg!r} is on screen ({m.text})")
+        ctl = _controls_in_region(self.controls(text=True), lines, where)
+        cm = find_control_match(ctl, base, types=WAIT_UI_TYPES, allow_disabled=True)
+        if cm is not None:
+            raise FlowError(f"assertnot failed: {arg!r} is on screen ({cm.text})")
+        return "absent"
 
     def settle(self, timeout=2.0, start=None, still=0.6):
         last_ts = getattr(self.r, "last_ts", 0.0)
@@ -3940,17 +3994,39 @@ class Flow:
             return True
         return False
 
+    def _active_alert_text(self, client=None, deadline=None):
+        """Return cleaned non-empty alert text if WDA confirms an active system alert
+        via GET /session/{sid}/alert/text, else None."""
+        c = client if client is not None else self.c
+        path = f"/session/{c.sid}/alert/text"
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return None
+            eff_to = max(0.05, min(4.0, rem))
+            if hasattr(c, "_req_with_deadline"):
+                r = c._req_with_deadline("GET", path, timeout=eff_to, deadline=deadline)
+            else:
+                r = c.req("GET", path, timeout=eff_to)
+        else:
+            r = c.req("GET", path, timeout=4)
+        if isinstance(r, dict) and not r.get("error") and isinstance(r.get("value"), str) and r["value"].strip():
+            return _clean_text(r["value"]) or None
+        return None
+
     def controls(self, text=False, timeout=None, deadline=None, fast_only=False):
         if fast_only and (
             getattr(self.c, "turbo", None) is False
             or getattr(self.c, "_fast_ui", None) is False
         ):
             return None
+        self._last_alert_text = None
         start_ts = time.monotonic()
         if deadline is None and timeout is not None:
             deadline = start_ts + max(0.05, float(timeout))
         expectation = self._snapshot_ui_expectation(start_ts)
         expected_bundle = expectation[0]
+        had_pending = self._pending_bundle
         pending = (
             self._pending_bundle
             if self._pending_bundle and (start_ts - self._pending_bundle_ts) <= 2.5
@@ -3989,7 +4065,11 @@ class Flow:
             if ctl is not None:
                 if bundle_id == pending or not bundle_id:
                     self._pending_bundle = None
-                else:
+                elif not (
+                    bundle_id == "com.apple.springboard"
+                    and expected_bundle
+                    and expected_bundle != "com.apple.springboard"
+                ):
                     # Older WDA Turbo v2 ignored waitBundle and returned previous app.
                     rem = (deadline - time.monotonic()) if deadline is not None else 30.0
                     if rem <= 0:
@@ -4028,6 +4108,18 @@ class Flow:
             raise FlowError("UI tree timed out")
         self._last_ui_retried_stale = False
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
+            if (
+                bundle_id == "com.apple.springboard"
+                and expected_bundle
+                and expected_bundle != "com.apple.springboard"
+            ):
+                alert_txt = self._active_alert_text(deadline=deadline)
+                if alert_txt:
+                    self._last_alert_text = alert_txt
+                    self._invalidate_ctl_cache()
+                    if had_pending:
+                        self._pending_bundle = had_pending
+                    return ctl
             # /source or /wda/fastUI occasionally lags behind activeAppInfo right after open:;
             # use short adaptive backoff until iOS publishes the new app's tree.
             # Keep controls and provenance together: never overwrite (app_name, bundle_id)
@@ -4066,6 +4158,29 @@ class Flow:
                     ctl, app_name, bundle_id = ctl_try, try_app_name, try_bundle_id
                 if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                     break
+                if (
+                    bundle_id == "com.apple.springboard"
+                    and expected_bundle
+                    and expected_bundle != "com.apple.springboard"
+                ):
+                    alert_txt = self._active_alert_text(deadline=deadline)
+                    if alert_txt:
+                        self._last_alert_text = alert_txt
+                        self._invalidate_ctl_cache()
+                        if had_pending:
+                            self._pending_bundle = had_pending
+                        return ctl
+        elif (
+            bundle_id == "com.apple.springboard"
+            and expected_bundle != "com.apple.springboard"
+        ):
+            alert_txt = self._active_alert_text(deadline=deadline)
+            if alert_txt:
+                self._last_alert_text = alert_txt
+                self._invalidate_ctl_cache()
+                if had_pending:
+                    self._pending_bundle = had_pending
+                return ctl
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
             # Never return or cache mismatched outgoing-app coordinates under the target bundle.
             self._invalidate_ctl_cache()
@@ -4092,9 +4207,11 @@ class Flow:
         overlaps with OCR, checks active-app freshness, reuses fresh wait:
         frames without redundant OCR, confirms static screens via cheap
         pixel-still grabs, and never discards a fresh completed tree."""
+        self._last_alert_text = None
         start_ts = time.monotonic()
         expectation = self._snapshot_ui_expectation(start_ts)
         expected_bundle = expectation[0]
+        had_pending_bundle = self._pending_bundle
         pending_bundle = (
             self._pending_bundle
             if self._pending_bundle and (start_ts - self._pending_bundle_ts) <= 2.5
@@ -4224,20 +4341,46 @@ class Flow:
                 fut = pool.submit(_fetch_ui_controls_meta, side, pt, True, wb, wb_ms)
         if fut:
             ui_res, app_name, bundle_id = fut.result()
+            sb_alert_txt = None
             if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
-                for delay in _STALE_UI_BACKOFF:
-                    time.sleep(delay)
-                    ui_try, try_app_name, try_bundle_id = _fetch_ui_controls_meta(
-                        side, pt, True,
-                        expected_bundle if expected_bundle else None,
-                        400 if expected_bundle else 0,
-                    )
-                    if ui_try is None:
-                        break
-                    ui_res, app_name, bundle_id = ui_try, try_app_name, try_bundle_id
-                    if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
-                        break
-            if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
+                if (
+                    bundle_id == "com.apple.springboard"
+                    and expected_bundle
+                    and expected_bundle != "com.apple.springboard"
+                ):
+                    sb_alert_txt = self._active_alert_text(client=side)
+                if not sb_alert_txt:
+                    for delay in _STALE_UI_BACKOFF:
+                        time.sleep(delay)
+                        ui_try, try_app_name, try_bundle_id = _fetch_ui_controls_meta(
+                            side, pt, True,
+                            expected_bundle if expected_bundle else None,
+                            400 if expected_bundle else 0,
+                        )
+                        if ui_try is None:
+                            break
+                        ui_res, app_name, bundle_id = ui_try, try_app_name, try_bundle_id
+                        if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
+                            break
+                        if (
+                            bundle_id == "com.apple.springboard"
+                            and expected_bundle
+                            and expected_bundle != "com.apple.springboard"
+                        ):
+                            sb_alert_txt = self._active_alert_text(client=side)
+                            if sb_alert_txt:
+                                break
+            elif (
+                bundle_id == "com.apple.springboard"
+                and expected_bundle != "com.apple.springboard"
+            ):
+                sb_alert_txt = self._active_alert_text(client=side)
+            if sb_alert_txt:
+                self._last_alert_text = sb_alert_txt
+                self._invalidate_ctl_cache()
+                if had_pending_bundle:
+                    self._pending_bundle = had_pending_bundle
+            elif self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                 # Never return or cache mismatched outgoing-app UI coordinates.
                 self._invalidate_ctl_cache()
                 if expected_bundle:
@@ -4637,6 +4780,10 @@ class Flow:
             return self.wait_any(arg).text
         elif verb == "gone":
             self.gone(arg)
+        elif verb == "assert":
+            return self.assert_text(arg)
+        elif verb == "assertnot":
+            return self.assert_not_text(arg)
         elif verb == "tap":
             return self.tap_text(arg).text
         elif verb == "tapif":
@@ -4813,8 +4960,14 @@ class Flow:
             return f"tapped {len(digits)} digits"
         elif verb == "alert":
             action = arg.strip().lower() or "accept"
+            if action == "text":
+                txt = self._active_alert_text()
+                if txt:
+                    self.reads.append({"alert": txt})
+                    return txt
+                return "no-alert"
             if action not in ("accept", "dismiss"):
-                raise FlowError("alert step must be alert:accept or alert:dismiss")
+                raise FlowError("alert step must be alert:accept, alert:dismiss, or alert:text")
             self._mark_action()
             r = self.c.req("POST", f"/session/{self.c.sid}/alert/{action}", {})
             if r.get("error"):
@@ -4845,6 +4998,7 @@ class Flow:
         elif verb == "back":
             self.back()
         elif verb == "read":
+            self._last_alert_text = None
             ui = None
             if arg and arg != "ocr":
                 y0, y1 = (int(v) for v in arg.split("-"))
@@ -4854,6 +5008,8 @@ class Flow:
             entry = {"lines": [l.as_dict() for l in lines]}
             if ui is not None:
                 entry["ui"] = ui
+            if self._last_alert_text:
+                entry["alert"] = self._last_alert_text
             self.reads.append(entry)
             return len(lines)
         elif verb == "ui":
