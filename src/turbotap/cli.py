@@ -116,6 +116,8 @@ class WDAClient:
         self._conn = None
 
     def _side_client(self):
+        if type(self) is not WDAClient:
+            return self
         side = WDAClient(self.base_url, udid=self.udid, device_key=self.device_key)
         side.sid = self.sid
         side.turbo = self.turbo
@@ -366,6 +368,7 @@ def _tess_lib():
                 raise OSError("WDA_OCR=binary")
             lib = ctypes.CDLL(ctypes.util.find_library("tesseract") or "libtesseract.so.5")
             lib.TessBaseAPICreate.restype = ctypes.c_void_p
+            lib.TessBaseAPIInit2.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
             lib.TessBaseAPIInit3.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
             lib.TessBaseAPISetPageSegMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
             lib.TessBaseAPISetVariable.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
@@ -385,16 +388,23 @@ def _tess_lib():
     return _TESS["lib"]
 
 
+_INVERT_LUT = bytes(255 - i for i in range(256))
+
+
+def _tesseract_tsv_raw(raw, w, h, api):
+    lib = _tess_lib()
+    lib.TessBaseAPISetImage(api, raw, w, h, 1, w)
+    ptr = lib.TessBaseAPIGetTsvText(api, 0)
+    try:
+        return ctypes.string_at(ptr).decode(errors="replace")
+    finally:
+        lib.TessDeleteText(ptr)
+
+
 def tesseract_tsv(img, psm=11, api=None):
     """Tesseract TSV for an 8-bit grayscale PIL image (in-process when api is given)."""
     if api is not None:
-        lib = _tess_lib()
-        lib.TessBaseAPISetImage(api, img.tobytes(), img.size[0], img.size[1], 1, img.size[0])
-        ptr = lib.TessBaseAPIGetTsvText(api, 0)
-        try:
-            return ctypes.string_at(ptr).decode(errors="replace")
-        finally:
-            lib.TessDeleteText(ptr)
+        return _tesseract_tsv_raw(img.tobytes(), img.size[0], img.size[1], api)
     buf = io.BytesIO()
     img.save(buf, format="BMP")
     return subprocess.check_output(
@@ -625,8 +635,10 @@ class ScreenReader:
     def _new_api(self):
         lib = _tess_lib()
         api = lib.TessBaseAPICreate()
-        if lib.TessBaseAPIInit3(api, None, b"eng") != 0:
-            raise RuntimeError("TessBaseAPIInit3 failed (eng.traineddata missing?)")
+        # OEM_LSTM_ONLY (1) matches the CLI --oem 1 fallback and avoids loading
+        # legacy engine tables from combined eng.traineddata.
+        if lib.TessBaseAPIInit2(api, None, b"eng", 1) != 0:
+            raise RuntimeError("TessBaseAPIInit2 failed (eng.traineddata missing?)")
         lib.TessBaseAPISetPageSegMode(api, self.psm)
         lib.TessBaseAPISetVariable(api, b"debug_file", b"/dev/null")
         self.apis.put(api)
@@ -716,9 +728,10 @@ class ScreenReader:
                 img = img.crop((0, int(y0 * k), img.size[0], int(y1_eff * k)))
             if img.format == "JPEG":
                 img.draft("L", out)
-            img = img.convert("L")
+            if img.mode != "L":
+                img = img.convert("L")
             if img.size != out:
-                img = img.resize(out)
+                img = img.resize(out, getattr(Image, "Resampling", Image).BILINEAR)
             return img
 
     def _cuts(self, img, data=None):
@@ -753,13 +766,24 @@ class ScreenReader:
         return cuts
 
     def _ocr(self, strip):
+        return self._ocr_raw(strip.tobytes(), strip.size[0], strip.size[1])
+
+    def _ocr_raw(self, raw, w, h):
+        sample = raw[::19]
+        if sample:
+            if max(sample) - min(sample) < 16:
+                return []  # uniform blank strip
+            if (sum(sample) / len(sample)) < 120:
+                # Pre-invert dark-mode strips so LSTM succeeds on pass 1 instead of
+                # retrying via tessedit_do_invert (kept enabled for mixed-polarity UI).
+                raw = raw.translate(_INVERT_LUT)
         lib = _tess_lib()
         if lib is None:
-            tsv = tesseract_tsv(strip, self.psm)
+            tsv = tesseract_tsv(Image.frombytes("L", (w, h), raw), self.psm)
         else:
             api = self.apis.get()
             try:
-                tsv = tesseract_tsv(strip, self.psm, api)
+                tsv = _tesseract_tsv_raw(raw, w, h, api)
             finally:
                 self.apis.put(api)
         lines = {}
@@ -785,16 +809,17 @@ class ScreenReader:
             jobs.append((a, b, k))
         if len(self.cache) > 512:
             self.cache.clear()  # before `todo`, or strips counted as cached vanish (KeyError)
-        todo = [(k, img.crop((0, a, w, b))) for a, b, k in jobs if k not in self.cache]
+        todo = [(k, data[a * w:b * w], b - a) for a, b, k in jobs if k not in self.cache]
         if todo:
             uniq = {}
-            for k, strip in todo:
-                uniq.setdefault(k, strip)
+            for k, raw, sh in todo:
+                uniq.setdefault(k, (raw, sh))
             items = list(uniq.items())
             if len(items) == 1:
-                self.cache[items[0][0]] = self._ocr(items[0][1])
+                k, (raw, sh) = items[0]
+                self.cache[k] = self._ocr_raw(raw, w, sh)
             else:
-                for (k, _), res in zip(items, self.pool.map(lambda ks: self._ocr(ks[1]), items)):
+                for (k, _), res in zip(items, self.pool.map(lambda it: self._ocr_raw(it[1][0], w, it[1][1]), items)):
                     self.cache[k] = res
         s = self.scale
         out = []
@@ -886,10 +911,14 @@ def resolve_app(arg, udid="", base_url=""):
 
 CONTROL_TYPES = {"Button", "Key", "Tab", "SearchField", "TextField", "SecureTextField", "TextView",
                  "Cell", "Link", "Switch", "Slider", "SegmentedControl", "Image"}
-# Skipping these attributes makes /source 5x cheaper: visibility is what WDA
-# computes slowly (Spotify home: 2,608 ms with them, ~500 ms without; the
-# rect is still included). On-screen filtering is done here from the rect.
-SOURCE_LITE = "/source?format=json&excluded_attributes=visible,accessible,enabled,index"
+# Skipping these attributes makes /source much cheaper: visibility and
+# nativeAccessibilityElement trigger extra AX attribute queries per node in WDA's
+# XCUIApplication+FBHelpers.m, and ui_controls() only reads type/rect/label/name/value.
+SOURCE_LITE = (
+    "/source?format=json&excluded_attributes="
+    "visible,accessible,enabled,index,nativeAccessibilityElement,"
+    "frame,nativeFrame,focused,traits,placeholderValue,minValue,maxValue"
+)
 _CHEVRON_LABELS = {"chevron", "chevron.right", "chevron.forward"}
 
 
@@ -1163,7 +1192,8 @@ class Flow:
 
     def _mark_action(self):
         self._last_action_ts = time.monotonic()
-        self.r.invalidate_last()
+        if hasattr(self.r, "invalidate_last"):
+            self.r.invalidate_last()
 
     # -- primitives ---------------------------------------------------------
     def _wait_active_app(self, max_wait=1.5, poll=0.04):
@@ -1200,9 +1230,11 @@ class Flow:
 
     def _fresh_lines(self, max_age=0.15):
         """Return OCR lines from a very recent cached frame if available, else None."""
-        if self.r.last is not None and (time.monotonic() - self.r.last_ts) < max_age:
-            if self.r.last_lines is not None:
-                return self.r.last_lines
+        last_ts = getattr(self.r, "last_ts", 0.0)
+        if self.r.last is not None and last_ts and (time.monotonic() - last_ts) < max_age:
+            last_lines = getattr(self.r, "last_lines", None)
+            if last_lines is not None:
+                return last_lines
             return self.r.read(img=self.r.last)
         return None
 
@@ -1248,18 +1280,25 @@ class Flow:
         raise FlowError(f"{label!r} still on screen")
 
     def settle(self, timeout=2.0, start=None, still=0.6):
-        if start is None and self.r.last is not None and (time.monotonic() - self.r.last_ts) < 0.15:
+        last_ts = getattr(self.r, "last_ts", 0.0)
+        if start is None and self.r.last is not None and last_ts and (time.monotonic() - last_ts) < 0.15:
             start = self.r.last
         prev, end = start, time.time() + timeout
         while time.time() < end:
             cur = self.r.grab()
             if prev is not None and _thumb_diff(prev, cur) < still:
-                self.r.set_last(cur)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(cur)
+                else:
+                    self.r.last = cur
                 self._last_action_ts = 0.0
                 return True
             prev = cur
         if prev is not None and prev is not start:
-            self.r.set_last(prev)
+            if hasattr(self.r, "set_last"):
+                self.r.set_last(prev)
+            else:
+                self.r.last = prev
         return False
 
     def changed_since(self, before, timeout=0.45, x=None, y=None):
@@ -1267,7 +1306,10 @@ class Flow:
         while time.time() < end:
             cur = self.r.grab()
             if _frame_reacted(before, cur, x=x, y=y, scale=self.r.scale):
-                self.r.set_last(cur)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(cur)
+                else:
+                    self.r.last = cur
                 return True
         return False
 
@@ -1340,7 +1382,8 @@ class Flow:
             #    labelled exactly TEXT wins over the substring.
             # 2. near_bottom_tab: OCR matched a tab label near the bottom edge
             #    (y > h - 55, close to the home indicator): prefer the Tab/Button centre.
-            cur_lines = self.r.last_lines if self.r.last_lines is not None else (
+            last_lines = getattr(self.r, "last_lines", None)
+            cur_lines = last_lines if last_lines is not None else (
                 self.r.read(img=self.r.last) if self.r.last is not None else [])
             ctl = _controls_in_region(self.controls(), cur_lines, where)
             c = exact_control(ctl, base) if m.rank else None
