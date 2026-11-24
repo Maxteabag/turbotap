@@ -549,7 +549,34 @@ class UnlockAndPasteboardTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx_nsb:
                 c_non_sb.unlock_phone()
         self.assertNotIn("9876", str(ctx_nsb.exception))
-        self.assertEqual([p for _, p, _ in c_non_sb.calls if p.endswith("/click")], [])
+        self.assertEqual([p for _, p, _ in c_non_sb.calls if p.endswith("/element") or p.endswith("/click")], [])
+
+        # Legacy path fails redacted with ZERO digit lookups and ZERO clicks when activeAppInfo
+        # errors or returns a missing/empty bundleId while locked.
+        for bad_app_resp in ({"error": 500, "body": "activeAppInfo failed"}, {"value": {"bundleId": ""}}):
+            c_app_err = MockWDAClient(
+                locked=True,
+                fast_ui_404=True,
+                element_map=key_map,
+                custom_handler=lambda m, p, d, resp=bad_app_resp: resp if p == "/wda/activeAppInfo" else None,
+            )
+            with mock.patch.dict(os.environ, {"WDA_PASSCODE": "4821"}), mock.patch("turbotap.cli.time.sleep"):
+                with self.assertRaises(RuntimeError) as ctx_ae:
+                    c_app_err.unlock_phone()
+            self.assertNotIn("4821", str(ctx_ae.exception))
+            self.assertEqual([p for _, p, _ in c_app_err.calls if p.endswith("/element") or p.endswith("/click")], [])
+
+        # If activeAppInfo fails because the phone just unlocked (recheck returns explicit False),
+        # returns True with ZERO digit lookups and ZERO clicks.
+        c_app_err_unlocked = MockWDAClient(
+            locked=[True, True, False],
+            fast_ui_404=True,
+            element_map=key_map,
+            custom_handler=lambda m, p, d: {"error": 500} if p == "/wda/activeAppInfo" else None,
+        )
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "4821"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c_app_err_unlocked.unlock_phone())
+        self.assertEqual([p for _, p, _ in c_app_err_unlocked.calls if p.endswith("/element") or p.endswith("/click")], [])
 
         # Missing keypad while still locked raises without leaking passcode digits.
         c_fail = MockWDAClient(locked=True, active_app="com.apple.springboard", element_map={})

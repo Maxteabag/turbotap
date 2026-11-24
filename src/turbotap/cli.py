@@ -659,6 +659,25 @@ class WDAClient:
                 time.sleep(0.08)
         raise RuntimeError(f"Unable to confirm lock state ({last_err})")
 
+    def _confirm_springboard_locked(self, retries=1):
+        """Require both explicit locked=True AND positive SpringBoard bundle provenance
+        from GET /wda/activeAppInfo. Returns True when confirmed locked on SpringBoard,
+        False when explicitly unlocked, and raises a redacted RuntimeError if SpringBoard
+        cannot be confirmed while locked."""
+        if not self._confirm_locked_state(retries=retries):
+            return False
+        app_r = self.req("GET", "/wda/activeAppInfo")
+        active_bid = ""
+        if isinstance(app_r, dict) and not app_r.get("error"):
+            val = app_r.get("value")
+            if isinstance(val, dict):
+                active_bid = str(val.get("bundleId") or "")
+        if active_bid == "com.apple.springboard":
+            return True
+        if not self._confirm_locked_state(retries=retries):
+            return False
+        raise RuntimeError("Passcode keypad unavailable: unable to confirm SpringBoard lock screen")
+
     def unlock_phone(self):
         self.ensure_session(apply_fast_settings=False)
         if not self._confirm_locked_state(retries=0):
@@ -721,16 +740,8 @@ class WDAClient:
                 time.sleep(0.5)
                 self.req("POST", f"/session/{self.sid}/wda/pressButton", {"name": "home"})
                 time.sleep(2.8)
-            if not self._confirm_locked_state(retries=1):
+            if not self._confirm_springboard_locked(retries=1):
                 return True
-            # Scope legacy XCUIElementTypeKey lookups strictly to SpringBoard lock screen.
-            app_r = self.req("GET", "/wda/activeAppInfo")
-            if isinstance(app_r, dict) and not app_r.get("error"):
-                active_bid = str((app_r.get("value") or {}).get("bundleId") or "")
-                if active_bid and active_bid != "com.apple.springboard":
-                    if not self._confirm_locked_state(retries=1):
-                        return True
-                    raise RuntimeError("Passcode keypad unavailable: lock screen is not active")
             # Screen-size-agnostic XCUIElementTypeKey lookup (works on any iPhone model).
             for d in passcode:
                 el = self.req("POST", f"/session/{self.sid}/element", {
@@ -744,8 +755,8 @@ class WDAClient:
                     if not self._confirm_locked_state(retries=1):
                         return True
                     raise RuntimeError("Passcode keypad not found on screen")  # never echo passcode digits
-                # Re-confirm locked state after lookup in case lookup outlasted an unlock transition.
-                if not self._confirm_locked_state(retries=1):
+                # Re-confirm SpringBoard lock state after lookup in case lookup outlasted an unlock transition.
+                if not self._confirm_springboard_locked(retries=1):
                     return True
                 _check_wda_ok(
                     self.req("POST", f"/session/{self.sid}/element/{eid}/click", {}),
@@ -3976,17 +3987,10 @@ class Flow:
                     low = c["label"].casefold()
                     if low not in dismiss_set:
                         continue
-                    # Require actual keyboard or flush keyboard-accessory toolbar provenance;
-                    # never authorize generic app 'Done'/'Lukk' via a bare Y threshold.
+                    # Require actual keyboard or flush keyboard-accessory toolbar provenance
+                    # for ALL dismiss labels (never authorize unmarked app buttons by position).
                     if c.get("inKeyboard") or c.get("inKeyboardAccessory"):
                         hits.append(c)
-                    elif low in kb_specific and isinstance(kb_rect, dict):
-                        kx0 = float(kb_rect.get("x", 0))
-                        ky0 = float(kb_rect.get("y", 0))
-                        kx1 = kx0 + float(kb_rect.get("width", 0))
-                        ky1 = ky0 + float(kb_rect.get("height", 0))
-                        if kx0 <= c["x"] <= kx1 and ky0 - 68 <= c["y"] <= ky1:
-                            hits.append(c)
                 if not hits:
                     return "no-kb"
                 c = min(

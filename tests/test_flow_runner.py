@@ -748,12 +748,16 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             # Zero slow /element predicate calls when fastUI succeeded.
             self.assertEqual([p for _, p, _ in c.calls if p.endswith("/element")], [])
 
-            # Visible floating keyboard at x=15..195, y=500..700 with ONLY an unrelated app
-            # 'Done' at (335, 730) outside keyboard/accessory -> returns 'no-kb' with ZERO taps!
+            # Visible floating keyboard at x=15..195, y=500..700 with ONLY unrelated app
+            # buttons ('Done' at (335, 730) OR unmarked 'Hide keyboard' at (75, 455) in-band
+            # without keyboard/accessory provenance) -> returns 'no-kb' with ZERO taps!
             c.tapped_points.clear()
             floating_rect = {"x": 15, "y": 500, "width": 180, "height": 200}
             c.fast_ui = _kb_ui(
-                [{"type": "Button", "label": "Done", "x": 335, "y": 730}],
+                [
+                    {"type": "Button", "label": "Done", "x": 335, "y": 730},
+                    {"type": "Button", "label": "Hide keyboard", "x": 75, "y": 455},
+                ],
                 has_kb=True,
                 rect=floating_rect,
             )
