@@ -3021,15 +3021,16 @@ class Flow:
                 x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
                 return Match(x, y, f"[el:{label}]", None)
         _, h = self.r.pt_size()
-        near_bottom_tab = m.line is not None and m.y > h - 55
+        near_bottom_tab = m.line is not None and m.y > h - 28
         is_form_label = base.rstrip().endswith(":")
         resolved_ctl = None
         if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
             # 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
             #    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
             #    labelled exactly TEXT wins over the substring.
-            # 2. near_bottom_tab: OCR matched a tab label near the bottom edge
-            #    (y > h - 55, close to the home indicator): prefer the Tab/Button centre.
+            # 2. near_bottom_tab: OCR matched a label in the Home-indicator zone
+            #    (y > h - 28): prefer the Tab/Button centre (normal tab labels at
+            #    ~h-38..h-50 are already inside the tab hitbox and avoid a /fastUI RTT).
             # 3. is_form_label: classic form label ('To:', 'Subject:', 'Til:', 'Emne:')
             #    where OCR matches the left-aligned label text, but the focusable input
             #    (TextField/TextView/SearchField) spans the row and should be tapped at
@@ -3092,7 +3093,7 @@ class Flow:
             _, h = self.r.pt_size()
         except TimeoutError:
             return "skipped"
-        near_bottom_tab = m.line is not None and m.y > h - 55
+        near_bottom_tab = m.line is not None and m.y > h - 28
         is_form_label = base.rstrip().endswith(":")
         resolved_ctl = controls
         if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
@@ -3592,10 +3593,11 @@ class Flow:
         )
 
     def swipe(self, direction="down"):
-        """Scroll 40% of the screen without momentum (wda-turbo fastDrag crawls
-        1 pt during the 80 ms hold, so the release velocity is ~0)."""
+        """Scroll 54% of the screen without momentum (wda-turbo fastDrag crawls
+        1 pt during the 80 ms hold, so the release velocity is ~0 while keeping
+        46% viewport overlap so no row is skipped)."""
         w, h = self.r.pt_size()
-        a, b = int(h * 0.72), int(h * 0.32)
+        a, b = int(h * 0.76), int(h * 0.22)
         if direction == "down":
             self.drag(w // 2, a, w // 2, b, duration=0.08, release=0.08)
         elif direction == "up":
