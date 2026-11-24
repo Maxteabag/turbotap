@@ -281,6 +281,13 @@ class FindTextMatchingTests(unittest.TestCase):
         ]
         self.assertIsNone(cli.find_text(false_pos, "Om"))
 
+        # Short alphabetic queries must NOT fall through to fuzzy matches on 4-letter
+        # words sharing a 3-letter prefix ('You' must NOT match 'Your').
+        self.assertIsNone(cli.find_text([make_line("Your", 20, 120, 80, 140)], "You"))
+        m_you = cli.find_text([make_line("You", 20, 120, 80, 140)], "You")
+        self.assertIsNotNone(m_you)
+        self.assertEqual(m_you.rank, 0)
+
         # Word-boundary matches (exact, icon-prefixed, or standalone word) still match cleanly.
         m_exact = cli.find_text([make_line("Om", 20, 150, 60, 170)], "Om")
         self.assertIsNotNone(m_exact)

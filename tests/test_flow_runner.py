@@ -1526,6 +1526,58 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             finally:
                 flow_err.close()
 
+            # 10. PR #5 review hardening:
+            # (a) Disabled exact match ('Sync') MUST NOT fall through to enabled substring ('Sync Photos').
+            c.tapped_points.clear()
+            c.fast_ui = _fast_ui([
+                {"type": "Switch", "label": "Sync", "x": 380, "y": 210, "value": "0", "enabled": False},
+                {"type": "Switch", "label": "Sync Photos", "x": 380, "y": 280, "value": "0", "enabled": True},
+            ])
+            with self.assertRaises(cli.FlowError) as ctx_ex_dis:
+                flow.step("toggle:Sync=on")
+            self.assertIn("disabled", str(ctx_ex_dis.exception))
+            self.assertEqual(c.tapped_points, [])
+
+            # (b) Explicit requested state with unreadable initial value refuses with ZERO taps;
+            # disappearing switch or unreadable post-tap state raises FlowError (never reports 'toggled'/'on').
+            c.tapped_points.clear()
+            c.fast_ui = _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210}])
+            with self.assertRaises(cli.FlowError) as ctx_unr:
+                flow.step("toggle:Sync=on")
+            self.assertIn("unreadable initial state", str(ctx_unr.exception))
+            self.assertEqual(c.tapped_points, [])
+
+            c.tapped_points.clear()
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210, "value": "0"}]),
+                _fast_ui([]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            with self.assertRaises(cli.FlowError) as ctx_gone:
+                flow.step("toggle:Sync=on")
+            self.assertIn("disappeared", str(ctx_gone.exception))
+
+            c.tapped_points.clear()
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210, "value": "0"}]),
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210}]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            with self.assertRaises(cli.FlowError) as ctx_unr2:
+                flow.step("toggle:Sync=on")
+            self.assertIn("state unreadable", str(ctx_unr2.exception))
+
+            # (c) Replacement switch with same label at another Y coordinate MUST NOT verify as 'on'.
+            c.tapped_points.clear()
+            c.fast_ui = [
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 210, "value": "0"}]),
+                _fast_ui([{"type": "Switch", "label": "Sync", "x": 380, "y": 540, "value": "1"}]),
+            ]
+            r.set_frames([(img_before, lines), (img_after, lines)])
+            with self.assertRaises(cli.FlowError) as ctx_moved:
+                flow.step("toggle:Sync=on")
+            self.assertIn("disappeared or moved", str(ctx_moved.exception))
+
             self.assertIn("toggle:", cli.FLOW_HELP)
         finally:
             flow.close()
@@ -1669,6 +1721,59 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
                 self.assertIn("slider failed", str(ctx_err.exception))
             finally:
                 flow_err.close()
+
+            # 10. PR #5 review hardening: --deny checks BOTH label and name aliases regardless
+            # of named vs unnamed matching, and attribute/enabled errors refuse with ZERO value POSTs.
+            c_alias = MockWDAClient(
+                elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "sa1"}, {"ELEMENT": "sa2"}]},
+                element_labels={"sa1": "Display", "sa2": "Delete Threshold"},
+                element_names={"sa1": "Delete Threshold", "sa2": "SafeID"},
+                element_enabled={"sa1": True, "sa2": True},
+            )
+            flow_alias = cli.Flow(c_alias, reader=FakeReader(frames=[(img, [])]))
+            try:
+                # Named match via name='SafeID' must still block on label='Delete Threshold'.
+                with self.assertRaises(cli.FlowError) as ctx_a1:
+                    flow_alias.step("slider:SafeID=50%")
+                self.assertIn("--deny", str(ctx_a1.exception))
+                # Unnamed slider:50% hits sa1 (label='Display', name='Delete Threshold') -> blocked!
+                with self.assertRaises(cli.FlowError) as ctx_a2:
+                    flow_alias.step("slider:50%")
+                self.assertIn("--deny", str(ctx_a2.exception))
+                self.assertEqual([p for _, p, _ in c_alias.calls if p.endswith("/value")], [])
+            finally:
+                flow_alias.close()
+
+            # Label/name lookup error while --deny is active refuses with ZERO value POSTs.
+            c_aerr = MockWDAClient(
+                elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "s1"}]},
+                custom_handler=lambda m, p, d: {"error": 500, "body": "attr err"} if "/attribute/name" in p else None,
+            )
+            flow_aerr = cli.Flow(c_aerr, reader=FakeReader(frames=[(img, [])]))
+            try:
+                with self.assertRaises(cli.FlowError) as ctx_ae:
+                    flow_aerr.step("slider:50%")
+                self.assertIn("--deny", str(ctx_ae.exception))
+                self.assertEqual([p for _, p, _ in c_aerr.calls if p.endswith("/value")], [])
+            finally:
+                flow_aerr.close()
+
+            # /enabled lookup error with no verified Slider in controls() refuses with ZERO value POSTs.
+            c_enerr = MockWDAClient(
+                elements_map={"XCUIElementTypeSlider": [{"ELEMENT": "s1"}]},
+                element_labels={"s1": "Brightness"},
+                element_names={"s1": "Brightness"},
+                fast_ui=_fast_ui([]),
+                custom_handler=lambda m, p, d: {"error": 500, "body": "enabled err"} if p.endswith("/enabled") else None,
+            )
+            flow_enerr = cli.Flow(c_enerr, reader=FakeReader(frames=[(img, [])]))
+            try:
+                with self.assertRaises(cli.FlowError) as ctx_ee:
+                    flow_enerr.step("slider:50%")
+                self.assertIn("enabled state", str(ctx_ee.exception))
+                self.assertEqual([p for _, p, _ in c_enerr.calls if p.endswith("/value")], [])
+            finally:
+                flow_enerr.close()
 
             self.assertIn("slider:", cli.FLOW_HELP)
         finally:

@@ -982,7 +982,7 @@ def find_text(lines, label, fuzzy=0.84, where=None):
                             break
                     if span:
                         break
-        elif fuzzy and not rx and not any(ch.isdigit() for ch in want):
+        elif fuzzy and not rx and not short_alpha and not any(ch.isdigit() for ch in want):
             import difflib
             k = max(1, len(want.split()))
             for i in range(max(1, len(words) - k + 1)):
@@ -3568,20 +3568,27 @@ class Flow:
         lines = (self._fresh_lines() or self.lines()) if needs_lines else []
         scoped = _controls_in_region(ctl, lines, where) if where else ctl
         clean_base = _clean_text(base)
-        c = (
-            exact_control(scoped, clean_base, ("Switch",), allow_disabled=False)
-            or find_control(scoped, clean_base, types={"Switch"}, allow_disabled=False)
-        )
-        if not c:
-            if (
-                exact_control(scoped, clean_base, ("Switch",), allow_disabled=True)
-                or find_control(scoped, clean_base, types={"Switch"}, allow_disabled=True)
-            ):
+        # Resolve exact matches BEFORE evaluating enabled state so a disabled exact
+        # match ('Sync') is never silently displaced by an enabled substring ('Sync Photos').
+        exact_any = exact_control(scoped, clean_base, ("Switch",), allow_disabled=True)
+        if exact_any is not None:
+            c = exact_control(scoped, clean_base, ("Switch",), allow_disabled=False)
+            if not c:
                 raise FlowError(f"{base!r} is disabled")
-            raise FlowError(f"no switch labelled {base!r}")
+        else:
+            c = find_control(scoped, clean_base, types={"Switch"}, allow_disabled=False)
+            if not c:
+                if find_control(scoped, clean_base, types={"Switch"}, allow_disabled=True):
+                    raise FlowError(f"{base!r} is disabled")
+                raise FlowError(f"no switch labelled {base!r}")
         current = _parse_switch_state(c.get("value"))
-        if desired is not None and current is not None and current == desired:
-            return "already on" if desired else "already off"
+        if desired is not None:
+            if current is None:
+                raise FlowError(
+                    f"switch {c['label']!r} has unreadable initial state; cannot verify toggle to {'on' if desired else 'off'}"
+                )
+            if current == desired:
+                return "already on" if desired else "already off"
         self.guard(c["x"], c["y"], c["label"], action="toggle")
         before = self.r.last if self.r.last is not None else self.r.grab()
         try:
@@ -3595,18 +3602,29 @@ class Flow:
             ctl_after = self.controls()
             self._invalidate_ctl_cache()
             scoped_after = _controls_in_region(ctl_after, lines, where) if where else ctl_after
-            c_after = (
-                exact_control(scoped_after, c["label"], ("Switch",), allow_disabled=True)
-                or exact_control(scoped_after, clean_base, ("Switch",), allow_disabled=True)
-                or find_control(scoped_after, clean_base, types={"Switch"}, allow_disabled=True)
-            )
-            after_state = _parse_switch_state(c_after.get("value")) if c_after else None
-            if after_state is not None and after_state != desired:
+            want_lab = c["label"].casefold()
+            same_sw = [
+                x for x in scoped_after
+                if x["type"] == "Switch"
+                and x["label"].casefold() == want_lab
+                and abs(x["x"] - c["x"]) <= 24
+                and abs(x["y"] - c["y"]) <= 36
+            ]
+            if not same_sw:
+                raise FlowError(
+                    f"switch {c['label']!r} disappeared or moved after toggle; cannot verify {'on' if desired else 'off'}"
+                )
+            c_after = min(same_sw, key=lambda x: (abs(x["y"] - c["y"]), abs(x["x"] - c["x"])))
+            after_state = _parse_switch_state(c_after.get("value"))
+            if after_state is None:
+                raise FlowError(
+                    f"switch {c['label']!r} state unreadable after toggle; cannot verify {'on' if desired else 'off'}"
+                )
+            if after_state != desired:
                 raise FlowError(
                     f"switch {c['label']!r} remained {'on' if after_state else 'off'} after toggle"
                 )
-            if after_state == desired:
-                return "on" if desired else "off"
+            return "on" if desired else "off"
         return "toggled"
 
     def set_slider(self, spec):
@@ -3649,8 +3667,22 @@ class Flow:
         els = els_resp.get("value") or []
         if not els:
             raise FlowError("no Slider on screen")
+
+        def _read_slider_aliases(cand_eid):
+            lab_r = self.c.req("GET", f"/session/{self.c.sid}/element/{cand_eid}/attribute/label")
+            name_r = self.c.req("GET", f"/session/{self.c.sid}/element/{cand_eid}/attribute/name")
+            lab_err = not isinstance(lab_r, dict) or bool(lab_r.get("error"))
+            name_err = not isinstance(name_r, dict) or bool(name_r.get("error"))
+            lab_v = None if lab_err else lab_r.get("value")
+            name_v = None if name_err else name_r.get("value")
+            lab_s = _clean_text(str(lab_v)) if lab_v else ""
+            name_s = _clean_text(str(name_v)) if name_v else ""
+            return lab_s, name_s, (lab_err or name_err)
+
         eid = None
-        matched_label = None
+        sel_lab = ""
+        sel_name = ""
+        sel_attr_err = False
         if target_label is not None:
             want = _clean_text(target_label).casefold()
             sub_hit = None
@@ -3658,46 +3690,55 @@ class Flow:
                 if not isinstance(el_obj, dict) or not el_obj:
                     continue
                 cand_eid = el_obj.get("ELEMENT") or next(iter(el_obj.values()))
-                lab_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{cand_eid}/attribute/label")
-                lab_val = lab_resp.get("value") if isinstance(lab_resp, dict) and not lab_resp.get("error") else None
-                lab = _clean_text(str(lab_val)) if lab_val else ""
-                if lab and lab.casefold() == want:
-                    eid, matched_label = cand_eid, lab
+                lab, name, attr_err = _read_slider_aliases(cand_eid)
+                if (lab and lab.casefold() == want) or (name and name.casefold() == want):
+                    eid, sel_lab, sel_name, sel_attr_err = cand_eid, lab, name, attr_err
                     break
-                name_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{cand_eid}/attribute/name")
-                name_val = name_resp.get("value") if isinstance(name_resp, dict) and not name_resp.get("error") else None
-                name = _clean_text(str(name_val)) if name_val else ""
-                if name and name.casefold() == want:
-                    eid, matched_label = cand_eid, name
-                    break
-                if sub_hit is None:
-                    if lab and want in lab.casefold():
-                        sub_hit = (cand_eid, lab)
-                    elif name and want in name.casefold():
-                        sub_hit = (cand_eid, name)
+                if sub_hit is None and ((lab and want in lab.casefold()) or (name and want in name.casefold())):
+                    sub_hit = (cand_eid, lab, name, attr_err)
             if eid is None and sub_hit is not None:
-                eid, matched_label = sub_hit
+                eid, sel_lab, sel_name, sel_attr_err = sub_hit
             if eid is None:
                 raise FlowError(f"no Slider labelled {target_label!r}")
-            self.guard(0, 0, matched_label, action="slider")
         else:
             first = next((e for e in els if isinstance(e, dict) and e), None)
             if not first:
                 raise FlowError("no Slider on screen")
             eid = first.get("ELEMENT") or next(iter(first.values()))
-            lab_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/label")
-            lab_val = lab_resp.get("value") if isinstance(lab_resp, dict) and not lab_resp.get("error") else None
-            matched_label = _clean_text(str(lab_val)) if lab_val else None
-            if not matched_label:
-                name_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/name")
-                name_val = name_resp.get("value") if isinstance(name_resp, dict) and not name_resp.get("error") else None
-                matched_label = _clean_text(str(name_val)) if name_val else None
-            if matched_label:
-                self.guard(0, 0, matched_label, action="slider")
+            sel_lab, sel_name, sel_attr_err = _read_slider_aliases(eid)
+
+        # Enforce --deny across BOTH label and name aliases; if deny is active and
+        # either attribute lookup failed, refuse rather than treating error as empty.
+        if self.deny is not None and sel_attr_err:
+            raise FlowError("cannot verify slider label/name against --deny")
+        for alias in (sel_lab, sel_name):
+            if alias:
+                self.guard(0, 0, alias, action="slider")
+
+        matched_label = sel_lab or sel_name or target_label
         en_resp = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/enabled")
-        if isinstance(en_resp, dict) and not en_resp.get("error") and _is_wda_disabled_value(en_resp.get("value")):
-            desc = repr(matched_label or target_label) if (matched_label or target_label) else "Slider"
-            raise FlowError(f"{desc} is disabled")
+        en_verified = False
+        if isinstance(en_resp, dict) and not en_resp.get("error"):
+            en_val = en_resp.get("value")
+            if _is_wda_disabled_value(en_val):
+                desc = repr(matched_label) if matched_label else "Slider"
+                raise FlowError(f"{desc} is disabled")
+            if isinstance(en_val, bool) or (isinstance(en_val, (int, float)) and en_val == 1) \
+                    or str(en_val).strip().casefold() in ("1", "true", "yes"):
+                en_verified = True
+        if not en_verified:
+            # Fallback check via UI tree when /enabled errored or returned an unreadable value.
+            try:
+                ctl_sl = [x for x in self.controls() if x["type"] == "Slider"]
+            except FlowError:
+                ctl_sl = []
+            aliases_cf = {a.casefold() for a in (sel_lab, sel_name, target_label or "") if a}
+            cand_sl = [x for x in ctl_sl if x["label"].casefold() in aliases_cf] if aliases_cf else (ctl_sl if len(ctl_sl) == 1 else [])
+            if not cand_sl:
+                raise FlowError("cannot verify slider enabled state")
+            if any(x.get("enabled") is False for x in cand_sl):
+                desc = repr(matched_label) if matched_label else "Slider"
+                raise FlowError(f"{desc} is disabled")
         self._mark_action()
         _check_wda_ok(
             self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/value", {"value": [f"{frac:.2f}"]}),
