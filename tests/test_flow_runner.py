@@ -706,14 +706,38 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
 
     def test_dismisskb_fast_ui_and_stock_wda_fallback(self):
         img = solid_img(240, size=(120, 240))
-        # FastUI path: ignores disabled Button and non-Button Text, prefers lower keyboard toolbar Done.
+        kb_rect = {"x": 0, "y": 600, "width": 430, "height": 332}
+
+        def _kb_ui(items, has_kb=True, rect=kb_rect):
+            d = _fast_ui(items)
+            d["hasKeyboard"] = has_kb
+            if has_kb and rect is not None:
+                d["keyboardRect"] = rect
+            return d
+
+        # 1. FastUI with NO visible keyboard MUST NOT tap an ordinary app 'Done' button!
+        app_done_only = [
+            {"type": "Button", "label": "Done", "x": 380, "y": 80},
+            {"type": "Button", "label": "Ferdig", "x": 380, "y": 560},
+        ]
+        c_nokb = MockWDAClient(fast_ui=_kb_ui(app_done_only, has_kb=False))
+        flow_nokb = cli.Flow(c_nokb, reader=FakeReader(frames=[(img, [])]), timeout=0.5)
+        try:
+            self.assertEqual(flow_nokb.step("dismisskb"), "no-kb")
+            self.assertEqual(c_nokb.tapped_points, [])
+            self.assertEqual([p for _, p, _ in c_nokb.calls if p.endswith("/element")], [])
+        finally:
+            flow_nokb.close()
+
+        # 2. FastUI with visible keyboard: ignores disabled Button, non-Button Text, and top-bar
+        # app 'Done' (y=80, above keyboard accessory band); taps keyboard accessory 'Ferdig' (y=560).
         ui_with_kb = [
             {"type": "Text", "label": "Done", "x": 100, "y": 600},
             {"type": "Button", "label": "Done", "x": 380, "y": 580, "enabled": False},
             {"type": "Button", "label": "Done", "x": 380, "y": 80},
             {"type": "Button", "label": "Ferdig", "x": 380, "y": 560},
         ]
-        c = MockWDAClient(fast_ui=_fast_ui(ui_with_kb))
+        c = MockWDAClient(fast_ui=_kb_ui(ui_with_kb))
         r = FakeReader(frames=[(img, []), (img.copy(), [])])
         flow = cli.Flow(c, reader=r, timeout=0.5)
         try:
@@ -724,11 +748,17 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             # Zero slow /element predicate calls when fastUI succeeded.
             self.assertEqual([p for _, p, _ in c.calls if p.endswith("/element")], [])
 
-            # FastUI prefers explicit 'Hide keyboard' over generic 'Done'.
+            # Visible keyboard with ONLY an ordinary app top-bar 'Done' (y=80) returns 'no-kb'.
             c.tapped_points.clear()
-            c.fast_ui = _fast_ui([
+            c.fast_ui = _kb_ui([{"type": "Button", "label": "Done", "x": 380, "y": 80}])
+            self.assertEqual(flow.step("dismisskb"), "no-kb")
+            self.assertEqual(c.tapped_points, [])
+
+            # FastUI prefers explicit 'Hide keyboard' (or inKeyboard) over generic 'Done'.
+            c.tapped_points.clear()
+            c.fast_ui = _kb_ui([
                 {"type": "Button", "label": "Done", "x": 380, "y": 560},
-                {"type": "Button", "label": "Hide keyboard", "x": 390, "y": 540},
+                {"type": "Button", "label": "Hide keyboard", "x": 390, "y": 540, "inKeyboard": True},
             ])
             self.assertEqual(flow.step("dismisskb"), "dismissed")
             self.assertEqual(c.tapped_points[-1][:2], (390, 540))
@@ -736,14 +766,17 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             # FastUI succeeds with no dismiss button -> returns 'no-kb' cleanly without predicate fallback.
             c.calls.clear()
             c.tapped_points.clear()
-            c.fast_ui = _fast_ui([{"type": "Button", "label": "Submit", "x": 200, "y": 400}])
+            c.fast_ui = _kb_ui([{"type": "Button", "label": "Submit", "x": 200, "y": 400}])
             self.assertEqual(flow.step("dismisskb"), "no-kb")
             self.assertEqual(c.tapped_points, [])
             self.assertEqual([p for _, p, _ in c.calls if p.endswith("/element")], [])
 
             # Custom --deny blocks dismisskb tap cleanly.
-            flow_deny = cli.Flow(MockWDAClient(fast_ui=_fast_ui([{"type": "Button", "label": "Done", "x": 380, "y": 560}])),
-                                 reader=FakeReader(frames=[(img, [])]), deny=r"done")
+            flow_deny = cli.Flow(
+                MockWDAClient(fast_ui=_kb_ui([{"type": "Button", "label": "Done", "x": 380, "y": 560}])),
+                reader=FakeReader(frames=[(img, [])]),
+                deny=r"done",
+            )
             try:
                 with self.assertRaises(cli.FlowError):
                     flow_deny.step("dismisskb")
@@ -753,26 +786,54 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
         finally:
             flow.close()
 
-        # Stock WDA (fastUI 404): skips SOURCE_LITE and uses single-predicate element + click fallback.
+        # 3. Stock WDA (fastUI 404): requires visible XCUIElementTypeKeyboard and keyboard/accessory
+        # band membership; never clicks ordinary app top-bar 'Done' or clicks when no keyboard is shown.
         labels_pred = ", ".join(f"'{lbl}'" for lbl in cli.DISMISS_KB_LABELS)
         pred = f"type == 'XCUIElementTypeButton' AND (label IN {{{labels_pred}}} OR name IN {{{labels_pred}}})"
-        c_stock = MockWDAClient(fast_ui_404=True, element_map={pred: {"ELEMENT": "kb-done-1"}})
+        c_stock = MockWDAClient(
+            fast_ui_404=True,
+            element_map={("class name", "XCUIElementTypeKeyboard"): {"ELEMENT": "kb-1"}},
+            elements_map={pred: [{"ELEMENT": "app-done"}, {"ELEMENT": "kb-done-1"}]},
+            element_rects={
+                "kb-1": {"x": 0, "y": 600, "width": 430, "height": 332},
+                "app-done": {"x": 340, "y": 60, "width": 70, "height": 40},
+                "kb-done-1": {"x": 340, "y": 556, "width": 70, "height": 40},
+            },
+            element_labels={"app-done": "Done", "kb-done-1": "Done"},
+        )
         flow_stock = cli.Flow(c_stock, reader=FakeReader(frames=[(img, [])]), timeout=0.5)
         try:
             with mock.patch("turbotap.cli.time.sleep"):
                 self.assertEqual(flow_stock.step("dismisskb"), "dismissed")
             self.assertTrue(any(p.endswith("/element/kb-done-1/click") for _, p, _ in c_stock.calls))
+            self.assertFalse(any(p.endswith("/element/app-done/click") for _, p, _ in c_stock.calls))
             self.assertFalse(any(cli.SOURCE_LITE in p for _, p, _ in c_stock.calls))
 
-            # Stock WDA with no matching element returns 'no-kb'.
+            # Stock WDA with no visible keyboard returns 'no-kb' and NEVER clicks app 'Done'.
+            c_stock.calls.clear()
             c_stock.element_map.clear()
             with mock.patch("turbotap.cli.time.sleep"):
                 self.assertEqual(flow_stock.step("dismisskb"), "no-kb")
+            self.assertFalse(any(p.endswith("/click") for _, p, _ in c_stock.calls))
+
+            # Stock WDA with visible keyboard but ONLY top-bar app 'Done' returns 'no-kb'.
+            c_stock.calls.clear()
+            c_stock.element_map[("class name", "XCUIElementTypeKeyboard")] = {"ELEMENT": "kb-1"}
+            c_stock.elements_map[pred] = [{"ELEMENT": "app-done"}]
+            with mock.patch("turbotap.cli.time.sleep"):
+                self.assertEqual(flow_stock.step("dismisskb"), "no-kb")
+            self.assertFalse(any(p.endswith("/click") for _, p, _ in c_stock.calls))
 
             # Stock WDA click HTTP 500 propagates FlowError.
             c_err = MockWDAClient(
                 fast_ui_404=True,
-                element_map={pred: {"ELEMENT": "kb-err"}},
+                element_map={("class name", "XCUIElementTypeKeyboard"): {"ELEMENT": "kb-1"}},
+                elements_map={pred: [{"ELEMENT": "kb-err"}]},
+                element_rects={
+                    "kb-1": {"x": 0, "y": 600, "width": 430, "height": 332},
+                    "kb-err": {"x": 340, "y": 556, "width": 70, "height": 40},
+                },
+                element_labels={"kb-err": "Done"},
                 custom_handler=lambda m, p, d: {"error": 500, "body": "click failed"} if p.endswith("/click") else None,
             )
             flow_err = cli.Flow(c_err, reader=FakeReader(frames=[(img, [])]), timeout=0.5)
@@ -845,26 +906,27 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             make_line("Header", 20, 120, 120, 145),
             make_line("Footer", 20, 700, 120, 725),
         ]
-        ui = [
-            {"type": "Button", "label": "Add", "x": 100, "y": 80},
-            {"type": "Button", "label": "Add", "x": 100, "y": 260},
-            {"type": "Button", "label": "Next", "x": 200, "y": 500},
-            {"type": "Button", "label": "Next", "x": 200, "y": 780},
+        # Stationary Key controls use one /wda/fastTapBatch call with @region support.
+        key_ui = [
+            {"type": "Key", "label": "1", "x": 100, "y": 80},
+            {"type": "Key", "label": "1", "x": 100, "y": 260},
+            {"type": "Key", "label": "2", "x": 200, "y": 500},
+            {"type": "Key", "label": "2", "x": 200, "y": 780},
             {"type": "Button", "label": "Delete", "x": 300, "y": 500},
-            {"type": "Button", "label": "Continue", "x": 300, "y": 600, "enabled": False},
+            {"type": "Key", "label": "3", "x": 300, "y": 600, "enabled": False},
         ]
-        c = MockWDAClient(fast_ui=_fast_ui(ui))
+        c = MockWDAClient(fast_ui=_fast_ui(key_ui))
         r = FakeReader(frames=[(img, lines), (solid_img(100, size=(430, 932)), lines)], pt=(430, 932), scale=1.0)
         flow = cli.Flow(c, reader=r, timeout=0.5)
         try:
-            # @y> filter needs zero OCR calls.
-            self.assertEqual(flow.step("tapbatch:Add@y>200,Next@y<600"), "2 taps")
+            # @y> filter needs zero OCR calls on Key-only batch.
+            self.assertEqual(flow.step("tapbatch:1@y>200,2@y<600"), "2 taps")
             self.assertEqual(r.read_calls, 0)
             self.assertEqual(c.batch_taps[-1]["points"], [[100, 260], [200, 500]])
 
-            # @below and @above grab OCR lines ONCE for the entire batch.
+            # @below and @above grab OCR lines ONCE for the entire Key-only batch.
             r.set_frames([(img, lines), (solid_img(120, size=(430, 932)), lines)])
-            self.assertEqual(flow.step("tapbatch:Add@below:Header,Next@above:Footer"), "2 taps")
+            self.assertEqual(flow.step("tapbatch:1@below:Header,2@above:Footer"), "2 taps")
             self.assertEqual(r.read_calls, 1)
             self.assertEqual(c.batch_taps[-1]["points"], [[100, 260], [200, 500]])
 
@@ -872,21 +934,21 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             c.batch_taps.clear()
             c.tapped_points.clear()
             with self.assertRaises(cli.FlowError) as ctx_deny:
-                flow.step("tapbatch:Add@y>200,Delete")
+                flow.step("tapbatch:1@y>200,Delete")
             self.assertIn("--deny", str(ctx_deny.exception))
             self.assertEqual(c.batch_taps, [])
             self.assertEqual(c.tapped_points, [])
 
             # Disabled control aborts upfront with ZERO taps sent.
             with self.assertRaises(cli.FlowError) as ctx_dis:
-                flow.step("tapbatch:Add@y>200,Continue")
+                flow.step("tapbatch:1@y>200,3")
             self.assertIn("disabled", str(ctx_dis.exception))
             self.assertEqual(c.batch_taps, [])
             self.assertEqual(c.tapped_points, [])
 
             # Missing control aborts upfront with ZERO taps sent.
             with self.assertRaises(cli.FlowError) as ctx_miss:
-                flow.step("tapbatch:Add@y>200,Ghost")
+                flow.step("tapbatch:1@y>200,Ghost")
             self.assertIn("not found", str(ctx_miss.exception))
             self.assertEqual(c.batch_taps, [])
             self.assertEqual(c.tapped_points, [])
@@ -899,27 +961,53 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
 
             # HTTP 500 on /wda/fastTapBatch propagates FlowError without fallback.
             c500 = MockWDAClient(
-                fast_ui=_fast_ui(ui),
+                fast_ui=_fast_ui(key_ui),
                 custom_handler=lambda m, p, d: {"error": 500, "body": "synth error"} if p == "/wda/fastTapBatch" else None,
             )
             flow500 = cli.Flow(c500, reader=FakeReader(frames=[(img, lines)]), timeout=0.5)
             try:
                 with self.assertRaises(cli.FlowError):
-                    flow500.step("tapbatch:Add@y>200,Next@y<600")
+                    flow500.step("tapbatch:1@y>200,2@y<600")
                 self.assertEqual([p for _, p, _ in c500.calls if p == "/wda/fastTap"], [])
                 self.assertIsNone(flow500._ctl_cache)
             finally:
                 flow500.close()
 
-            # 404 on /wda/fastTapBatch falls back to sequential /wda/fastTap.
-            c404 = MockWDAClient(fast_ui=_fast_ui(ui), fast_tap_batch_404=True)
+            # 404 on /wda/fastTapBatch falls back to sequential /wda/fastTap for Key-only batch.
+            c404 = MockWDAClient(fast_ui=_fast_ui(key_ui), fast_tap_batch_404=True)
             flow404 = cli.Flow(c404, reader=FakeReader(frames=[(img, lines), (solid_img(100, size=(430, 932)), lines)]), timeout=0.5)
             try:
                 with mock.patch("turbotap.cli.time.sleep"):
-                    self.assertEqual(flow404.step("tapbatch:Add@y>200,Next@y<600"), "2 taps")
+                    self.assertEqual(flow404.step("tapbatch:1@y>200,2@y<600"), "2 taps")
                 self.assertEqual([(x, y) for x, y, _ in c404.tapped_points], [(100, 260), (200, 500)])
             finally:
                 flow404.close()
+
+            # Non-Key buttons (e.g. Next, Preview) NEVER send blind pre-captured batch coords:
+            # when tapping 'Next' navigates to a screen where 'Delete' sits at 'Preview's old
+            # coordinates (200, 500), live re-resolution rejects with ZERO tap at (200, 500)!
+            screen1 = _fast_ui([
+                {"type": "Button", "label": "Next", "x": 100, "y": 400},
+                {"type": "Button", "label": "Preview", "x": 200, "y": 500},
+            ])
+            screen2 = _fast_ui([
+                {"type": "Button", "label": "Delete", "x": 200, "y": 500},
+            ])
+            tapped_next = [False]
+            c_nav = MockWDAClient(
+                fast_ui=lambda _qs: screen2 if tapped_next[0] else screen1,
+                on_action=lambda kind, _p: tapped_next.__setitem__(0, True) if kind == "tap" else None,
+            )
+            r_nav = FakeReader(frames=[(img, []), (solid_img(80, size=(430, 932)), [])], pt=(430, 932), scale=1.0)
+            flow_nav = cli.Flow(c_nav, reader=r_nav, timeout=0.5)
+            try:
+                with self.assertRaises(cli.FlowError) as ctx_nav:
+                    flow_nav.step("tapbatch:Next,Preview")
+                self.assertIn("not found after previous tap", str(ctx_nav.exception))
+                self.assertEqual(c_nav.batch_taps, [])
+                self.assertEqual([(x, y) for x, y, _ in c_nav.tapped_points], [(100, 400)])
+            finally:
+                flow_nav.close()
 
             # FLOW_HELP documents tapbatch:.
             self.assertIn("tapbatch:", cli.FLOW_HELP)

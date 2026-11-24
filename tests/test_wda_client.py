@@ -371,6 +371,20 @@ class WDAClientCommandsTests(unittest.TestCase):
             ["/wda/fastLaunch", "/wda/apps/launchUnattached", "/session/test-session-1/wda/apps/activate"],
         )
 
+        # 4b. Ambiguous transport drop/timeout on launchUnattached MUST NOT fall back to activate.
+        c_lu_drop = MockWDAClient(
+            fast_launch_404=True,
+            custom_handler=lambda m, p, d: {"error": "RemoteDisconnected"}
+            if p == "/wda/apps/launchUnattached"
+            else None,
+        )
+        r_lu_drop = c_lu_drop.fast_launch("com.example.mail", terminate=False)
+        self.assertEqual(r_lu_drop["error"], "RemoteDisconnected")
+        self.assertEqual(
+            [p for _, p, _ in c_lu_drop.calls],
+            ["/wda/fastLaunch", "/wda/apps/launchUnattached"],
+        )
+
         # 5. If fallback terminate fails, return error immediately without launching.
         c_tfail = MockWDAClient(
             fast_launch_404=True,
@@ -482,7 +496,7 @@ class UnlockAndPasteboardTests(unittest.TestCase):
             f"type == 'XCUIElementTypeKey' AND name == '{d}'": {"ELEMENT": f"key-{d}"}
             for d in "1234"
         }
-        c = MockWDAClient(locked=[True, False], element_map=key_map)
+        c = MockWDAClient(locked=[True, True, False], element_map=key_map)
         with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
             self.assertTrue(c.unlock_phone())
         clicks = [p for _, p, _ in c.calls if p.endswith("/click")]
@@ -490,14 +504,20 @@ class UnlockAndPasteboardTests(unittest.TestCase):
 
         # Face ID race: keypad disappears after digit 1 because phone unlocked mid-entry.
         c_face = MockWDAClient(
-            locked=[True, False],
+            locked=[True, True, False],
             element_map={"type == 'XCUIElementTypeKey' AND name == '1'": {"ELEMENT": "key-1"}},
         )
         with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
             self.assertTrue(c_face.unlock_phone())
 
+        # Face ID unlocks during stock WDA wake wait before any digit click: sends zero clicks.
+        c_stock_face = MockWDAClient(locked=[True, False], fast_ui_404=True, element_map=key_map)
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c_stock_face.unlock_phone())
+        self.assertEqual([p for _, p, _ in c_stock_face.calls if p.endswith("/click")], [])
+
         # Missing keypad while still locked raises without leaking passcode digits.
-        c_fail = MockWDAClient(locked=[True, True], element_map={})
+        c_fail = MockWDAClient(locked=[True, True, True], element_map={})
         with mock.patch.dict(os.environ, {"WDA_PASSCODE": "987654"}), mock.patch("turbotap.cli.time.sleep"):
             with self.assertRaises(RuntimeError) as ctx:
                 c_fail.unlock_phone()
@@ -597,10 +617,45 @@ class UnlockAndPasteboardTests(unittest.TestCase):
         self.assertNotIn("739152", str(ctx_still.exception))
 
         # Turbo v3 (fastUI works, fastTapBatch 404) falls back to sequential fastTap and unlocks.
-        c_v3 = MockWDAClient(locked=[True, False], fast_ui=keypad_ui, fast_tap_batch_404=True)
+        c_v3 = MockWDAClient(locked=[True, True, False], fast_ui=keypad_ui, fast_tap_batch_404=True)
         with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
             self.assertTrue(c_v3.unlock_phone())
         self.assertEqual(len([p for _, p, _ in c_v3.calls if p == "/wda/fastTap"]), 4)
+
+    def test_unlock_ignores_non_springboard_keypad_and_rechecks_locked_before_dispatch(self):
+        # 1. Foreground Calculator keypad (non-SpringBoard bundleId) must NEVER receive passcode taps.
+        calc_ui = {
+            "bundleId": "com.apple.calculator",
+            "appName": "Calculator",
+            "screen": [430, 932],
+            "ui": [
+                {"type": "Key", "label": str(d), "x": 100 + (d % 3) * 110, "y": 400 + (d // 3) * 90}
+                for d in range(10)
+            ],
+        }
+        c_calc = MockWDAClient(locked=[True, False], fast_ui=calc_ui)
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c_calc.unlock_phone())
+        self.assertEqual(c_calc.batch_taps, [])
+        self.assertEqual(c_calc.tapped_points, [])
+        self.assertEqual([p for _, p, _ in c_calc.calls if p.endswith("/click")], [])
+
+        # 2. SpringBoard keypad appears, then Face ID finishes before fastTapBatch dispatch:
+        # pre-dispatch /wda/locked check returns False and sends ZERO digit taps.
+        sb_keypad_ui = {
+            "bundleId": "com.apple.springboard",
+            "appName": "SpringBoard",
+            "screen": [430, 932],
+            "ui": [
+                {"type": "Key", "label": str(d), "x": 100 + (d % 3) * 110, "y": 400 + (d // 3) * 90}
+                for d in range(10)
+            ],
+        }
+        c_race = MockWDAClient(locked=[True, False], fast_ui=sb_keypad_ui)
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c_race.unlock_phone())
+        self.assertEqual(c_race.batch_taps, [])
+        self.assertEqual(c_race.tapped_points, [])
 
     def test_unlock_fast_ui_partial_keys_falls_back_to_predicate_without_third_home(self):
         # fastUI works but lacks digit '9', so after polling (which sends 2nd home at ~0.45s),

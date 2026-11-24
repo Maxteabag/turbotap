@@ -558,7 +558,8 @@ class WDAClient:
         XPC (skipping NotRunning apps) and launches via LSApplicationWorkspace in
         one round-trip. On 404 (stock WDA or wda-turbo <= v4), falls back to
         optional /session/{sid}/wda/apps/terminate + /wda/apps/launchUnattached
-        (falling back to /session/{sid}/wda/apps/activate if launchUnattached fails)."""
+        (falling back to /session/{sid}/wda/apps/activate ONLY on 404 or confirmed
+        no-effect WDA rejection, never on ambiguous transport errors/timeouts)."""
         bid = str(bundle_id)
         body = {"bundleId": bid, "terminate": bool(terminate)}
         if self.turbo is not False and self._fast_launch is not False:
@@ -577,7 +578,17 @@ class WDAClient:
             if isinstance(term, dict) and term.get("error"):
                 return term
         r = self.req("POST", "/wda/apps/launchUnattached", {"bundleId": bid})
-        if isinstance(r, dict) and not r.get("error"):
+        if not isinstance(r, dict) or not r.get("error"):
+            return r
+        err = r.get("error")
+        body_txt = str(r.get("body") or "").lower()
+        confirmed_no_effect = (
+            err == 404
+            or "lsapplicationworkspace failed" in body_txt
+            or "unknown command" in body_txt
+            or "unhandled endpoint" in body_txt
+        )
+        if not confirmed_no_effect:
             return r
         return self.req("POST", f"/session/{self.sid}/wda/apps/activate", {"bundleId": bid})
 
@@ -649,11 +660,11 @@ class WDAClient:
                 if not second_home_sent and eff_elapsed >= 0.45:
                     self.req("POST", f"/session/{self.sid}/wda/pressButton", {"name": "home"})
                     second_home_sent = True
-                ctl, _, _ = _fetch_ui_controls_full(
+                ctl, _, bundle_id = _fetch_ui_controls_full(
                     self, screen=(430, 932), text=False,
                     fallback_on_miss=False, timeout=min(1.5, rem),
                 )
-                if ctl is not None:
+                if ctl is not None and bundle_id == "com.apple.springboard":
                     km = {}
                     for c in ctl:
                         if c.get("type") == "Key" and c.get("enabled") is not False:
@@ -663,7 +674,7 @@ class WDAClient:
                     if passcode and all(d in km for d in passcode):
                         key_map = km
                         break
-                elif self._fast_ui is False:
+                elif ctl is None and self._fast_ui is False:
                     break
                 if self.req("GET", "/wda/locked").get("value") is False:
                     return True
@@ -675,6 +686,10 @@ class WDAClient:
                 time.sleep(dt)
                 virtual_elapsed += dt
         if key_map is not None:
+            # Re-verify lock state right before dispatching digits so Face ID
+            # succeeding between snapshot and dispatch never taps the foreground app.
+            if self.req("GET", "/wda/locked").get("value") is False:
+                return True
             pts = [(key_map[d]["x"], key_map[d]["y"]) for d in passcode]
             _check_wda_ok(
                 self.fast_tap_batch(pts, interval=0.12, duration=0.02),
@@ -686,6 +701,8 @@ class WDAClient:
                 time.sleep(0.5)
                 self.req("POST", f"/session/{self.sid}/wda/pressButton", {"name": "home"})
                 time.sleep(2.8)
+            if self.req("GET", "/wda/locked").get("value") is False:
+                return True
             # Screen-size-agnostic XCUIElementTypeKey lookup (works on any iPhone model).
             for d in passcode:
                 el = self.req("POST", f"/session/{self.sid}/element", {
@@ -1663,6 +1680,8 @@ def _parse_fast_ui(data, screen=(430, 932)):
                 item["value"] = cval
         if _is_explicitly_disabled(raw):
             item["enabled"] = False
+        if raw.get("inKeyboard"):
+            item["inKeyboard"] = True
         key = (lab, x // 4, y // 4)
         if key not in seen:
             seen[key] = len(out)
@@ -1706,6 +1725,9 @@ def _fetch_ui_controls_full(client, screen=(430, 932), text=False,
         r = client._req_with_deadline("GET", path, timeout=max(0.05, rem), deadline=deadline) if hasattr(client, "_req_with_deadline") else client.req("GET", path, timeout=max(0.05, rem))
         if isinstance(r, dict) and isinstance(r.get("ui"), list):
             client._fast_ui = True
+            has_kb = r.get("hasKeyboard")
+            kb_rect = r.get("keyboardRect") if isinstance(r.get("keyboardRect"), dict) else None
+            client._last_fast_ui_kb = (has_kb if isinstance(has_kb, bool) else None, kb_rect)
             ctl, app_name = _parse_fast_ui(r, screen=screen)
             bundle_id = _clean_text(str(r.get("bundleId") or ""))
             return ctl, app_name, bundle_id
@@ -1875,9 +1897,10 @@ FLOW_HELP = """steps (one argument each, run in order):
   tapif:TEXT            optional tap (~1 s max): tap TEXT (OCR + exact UI control
                         fallback, respects --deny and @region) or return 'skipped'
                         cleanly without failing the flow
-  tapbatch:A,B,C        resolve all comma-separated control labels in one UI snapshot
-                        ('\\,' for literal comma; supports @region, checks --deny before
-                        any tap) and dispatch them via /wda/fastTapBatch
+  tapbatch:A,B,C        tap comma-separated control labels ('\\,' for literal comma; supports
+                        @region, checks --deny upfront); stationary Key-only keypads dispatch in
+                        one /wda/fastTapBatch call, while non-Key controls re-resolve live UI
+                        coordinates between taps so screen changes never tap stale spots
   TEXT@below:HEADER     (tap/tapif/tapbatch/longpress/doubletap/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
   TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
   longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
@@ -3714,9 +3737,12 @@ class Flow:
             self.settle()
 
     def tap_batch(self, spec):
-        """Resolve all comma-separated control labels upfront from ONE controls()
-        snapshot (supporting escaped '\\,' and per-label @region), enforce --deny
-        on every target BEFORE dispatching ANY tap, and send via /wda/fastTapBatch."""
+        """Tap comma-separated control labels (supporting escaped '\\,' and per-label
+        @region), validating all upfront targets and --deny BEFORE dispatching any tap.
+        Stationary Key-only keypads (Calculator, dialer, PIN) dispatch in one
+        /wda/fastTapBatch XPC round-trip; any batch containing non-Key controls
+        re-resolves live UI controls + --deny between taps so screen changes never
+        dispatch blind pre-captured coordinates onto a newly appeared element."""
         raw_parts = re.split(r"(?<!\\),", spec or "")
         parts = [p.strip().replace(r"\,", ",").strip() for p in raw_parts if p.strip()]
         if not parts:
@@ -3747,6 +3773,29 @@ class Flow:
                 raise FlowError(f"tapbatch: control {base!r} not found")
             self.guard(c["x"], c["y"], c["label"])
             targets.append(c)
+        stationary_keys_only = all(c["type"] == "Key" for c in targets)
+        if not stationary_keys_only and len(targets) > 1:
+            # Non-Key buttons can navigate or mutate the screen between taps:
+            # tap target 0, then re-resolve each subsequent target from live UI + guard().
+            for idx, (base, where) in enumerate(parsed):
+                if idx == 0:
+                    c = targets[0]
+                else:
+                    cur_ctl = self.controls()
+                    cur_lines = (self.lines() if where and not where.startswith("y") else [])
+                    scoped = _controls_in_region(cur_ctl, cur_lines, where) if where else cur_ctl
+                    c = exact_control(scoped, base, TAP_FORM_TYPES, allow_disabled=False)
+                    if not c:
+                        if exact_control(scoped, base, TAP_FORM_TYPES, allow_disabled=True):
+                            raise FlowError(f"tapbatch: {base!r} became disabled after previous tap")
+                        raise FlowError(f"tapbatch: control {base!r} not found after previous tap")
+                    self.guard(c["x"], c["y"], c["label"])
+                before_step = self.r.last if self.r.last is not None else self.r.grab()
+                self.tap_control(c)
+                if before_step is not None:
+                    self.changed_since(before_step, timeout=0.35, x=c["x"], y=c["y"])
+            self._invalidate_ctl_cache()
+            return f"{len(parsed)} taps"
         before = self.r.last if self.r.last is not None else self.r.grab()
         if self._ctl_cache is None and before is not None:
             self._store_ctl_cache(raw_ctl, img=before)
@@ -3778,42 +3827,113 @@ class Flow:
             self._invalidate_ctl_cache()
         return f"{len(pts)} taps"
 
+    def _visible_keyboard_rect(self):
+        """Return visible XCUIElementTypeKeyboard rect dict or None via stock WDA."""
+        kb_el = self.c.req("POST", f"/session/{self.c.sid}/element", {
+            "using": "class name",
+            "value": "XCUIElementTypeKeyboard",
+        })
+        kv = kb_el.get("value")
+        k_eid = kv.get("ELEMENT") if isinstance(kv, dict) else None
+        if not k_eid:
+            return None
+        kr = self.c.req("GET", f"/session/{self.c.sid}/element/{k_eid}/rect").get("value")
+        if not isinstance(kr, dict):
+            return None
+        kw, kh = kr.get("width", 0), kr.get("height", 0)
+        ky = kr.get("y", 0)
+        _, sh = self.r.pt_size()
+        if kw > 0 and kh > 0 and ky < sh and ky + kh > 0:
+            return kr
+        return None
+
     def dismiss_kb(self):
-        """Dismiss the iOS keyboard via fastUI control lookup when available,
-        falling back to a single-predicate element click on stock WDA."""
+        """Dismiss the iOS keyboard only when a keyboard is actually visible, and
+        only via a keyboard/accessory button (never clicking an ordinary app 'Done'
+        button when no keyboard is shown)."""
+        kb_specific = {"hide keyboard", "skjul tastatur"}
         ctl = self.controls(fast_only=True)
         if ctl is not None:
+            kb_meta = getattr(self.c, "_last_fast_ui_kb", None)
+            has_kb, kb_rect = kb_meta if isinstance(kb_meta, tuple) and len(kb_meta) == 2 else (None, None)
+            if has_kb is False:
+                return "no-kb"
+            if has_kb is None:
+                # Older wda-turbo <= v4 did not report hasKeyboard in /wda/fastUI:
+                # verify a visible XCUIElementTypeKeyboard before touching any button.
+                kb_rect = self._visible_keyboard_rect()
+                if kb_rect is None:
+                    return "no-kb"
+            kb_y = kb_rect.get("y") if isinstance(kb_rect, dict) else None
             dismiss_set = {lbl.casefold() for lbl in DISMISS_KB_LABELS}
-            hits = [
-                c for c in ctl
-                if c["type"] == "Button"
-                and c.get("enabled") is not False
-                and c["label"].casefold() in dismiss_set
-            ]
+            hits = []
+            for c in ctl:
+                if c["type"] != "Button" or c.get("enabled") is False:
+                    continue
+                low = c["label"].casefold()
+                if low not in dismiss_set:
+                    continue
+                is_kb_member = (
+                    bool(c.get("inKeyboard"))
+                    or low in kb_specific
+                    or (kb_y is not None and c["y"] >= kb_y - 68 and c["y"] >= 140)
+                )
+                if is_kb_member:
+                    hits.append(c)
             if not hits:
                 return "no-kb"
-            kb_specific = {"hide keyboard", "skjul tastatur"}
-            c = min(hits, key=lambda item: (item["label"].casefold() not in kb_specific, -item["y"], item["x"]))
+            c = min(
+                hits,
+                key=lambda item: (
+                    not bool(item.get("inKeyboard")),
+                    item["label"].casefold() not in kb_specific,
+                    -item["y"],
+                    item["x"],
+                ),
+            )
             self.tap_point(c["x"], c["y"], c["label"])
             self._invalidate_ctl_cache()
             self.settle(timeout=0.6)
             return "dismissed"
+        kb_rect = self._visible_keyboard_rect()
+        if kb_rect is None:
+            return "no-kb"
+        kb_y = kb_rect["y"]
         labels_pred = ", ".join(f"'{lbl}'" for lbl in DISMISS_KB_LABELS)
-        el = self.c.req("POST", f"/session/{self.c.sid}/element", {
+        res = self.c.req("POST", f"/session/{self.c.sid}/elements", {
             "using": "predicate string",
             "value": f"type == 'XCUIElementTypeButton' AND (label IN {{{labels_pred}}} OR name IN {{{labels_pred}}})",
         })
-        v = el.get("value")
-        eid = v.get("ELEMENT") if isinstance(v, dict) else None
-        if eid:
-            self._mark_action()
-            _check_wda_ok(
-                self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {}),
-                "dismisskb",
-            )
-            time.sleep(0.3)
-            return "dismissed"
-        return "no-kb"
+        els = res.get("value")
+        if not isinstance(els, list) or not els:
+            return "no-kb"
+        cands = []
+        for el_obj in els:
+            if not isinstance(el_obj, dict):
+                continue
+            eid = el_obj.get("ELEMENT") or next(iter(el_obj.values()), None)
+            if not eid:
+                continue
+            rc = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/rect").get("value")
+            if not isinstance(rc, dict) or not rc.get("width") or not rc.get("height"):
+                continue
+            cx = int(rc["x"] + rc["width"] / 2)
+            cy = int(rc["y"] + rc["height"] / 2)
+            if cy >= kb_y - 68 and cy >= 140:
+                cands.append((cy, cx, eid))
+        if not cands:
+            return "no-kb"
+        cy, cx, eid = max(cands, key=lambda item: (item[0], -item[1]))
+        lbl_r = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/label")
+        lbl = str(lbl_r.get("value") or "dismisskb") if isinstance(lbl_r, dict) and not lbl_r.get("error") else "dismisskb"
+        self.guard(cx, cy, lbl)
+        self._mark_action()
+        _check_wda_ok(
+            self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {}),
+            "dismisskb",
+        )
+        time.sleep(0.3)
+        return "dismissed"
 
     # -- step runner --------------------------------------------------------
     def step(self, spec):

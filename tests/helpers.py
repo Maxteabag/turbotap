@@ -113,6 +113,7 @@ class MockWDAClient(cli.WDAClient):
         element_map=None,
         element_rects=None,
         element_values=None,
+        element_labels=None,
         screenshot_b64=None,
         on_action=None,
         custom_handler=None,
@@ -144,6 +145,7 @@ class MockWDAClient(cli.WDAClient):
         self.element_map = dict(element_map or {})
         self.element_rects = dict(element_rects or {})
         self.element_values = dict(element_values or {})
+        self.element_labels = dict(element_labels or {})
         self.focused_eid = next(iter(self.element_values), None)
         self.screenshot_b64 = screenshot_b64
         self.on_action = on_action
@@ -314,6 +316,8 @@ class MockWDAClient(cli.WDAClient):
                 return {"value": None}
             if sub == "rect":
                 return {"value": self.element_rects.get(eid, {})}
+            if sub == "attribute/label":
+                return {"value": self.element_labels.get(eid, "")}
             if sub == "attribute/value":
                 v = self.element_values.get(eid, "")
                 if callable(v):
