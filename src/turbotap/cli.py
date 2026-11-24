@@ -2346,6 +2346,14 @@ def cmd_install_skill(args):
 
 def cmd_deploy(client, args):
     """Clone/patch/build (unless --no-build) and start WDA on the Mac host."""
+    # If an existing WDA instance is reachable and the device is locked, unlock it
+    # first: once the old runner stops, Xcode cannot launch WDA on a locked iPhone.
+    try:
+        st = client.req("GET", "/status", timeout=3)
+        if not st.get("error"):
+            client.unlock_phone()
+    except Exception:
+        pass
     client.start_wda_on_mac(build=not args.no_build)
 
 
