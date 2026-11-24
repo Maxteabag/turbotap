@@ -7,7 +7,7 @@ Stock WebDriverAgent (WDA) is built for test suites. Those care about correctnes
 `turbotap flow` runs every step in one Python process over a single keep-alive HTTP connection to WDA (`http.client.HTTPConnection`, reopened only after an error).
 
 - `/status` takes 5.8 ms over a kept-alive connection and 14.6 ms when each call opens a new `urllib` socket. `/screenshot` takes 123 ms against 150 ms.
-- **Per-CLI session & screen-size cache (`~/.cache/turbotap/session-*.json`).** Each CLI invocation used to re-apply WDA fast settings (`POST /session/:id/appium/settings`, ~80 ms) and query `/session/:id/window/size` (~172 ms, because WDA takes a full accessibility snapshot just to read `wdFrame`). `turbotap` now caches `settings_applied` (30-minute TTL, keyed by device URL and `sessionId`) and `screen_pt` on disk. `screen_pt` self-heals automatically if any screenshot's aspect ratio drifts (e.g. rotation or another device). On a real iPhone over Wi-Fi, this cut `ensure_session` from 88 ms to 14 ms and first `pt_size` from 172 ms to 0 ms.
+- **Per-CLI lazy imports & session cache (`~/.cache/turbotap/session-*.json`).** Heavy modules (`PIL`, `http.client`, `concurrent.futures`, `ctypes`, `difflib`, `shutil`) are loaded lazily, cutting `import turbotap.cli` from 169 ms to **55 ms (-67.5%)** and `--help` from 149 ms to **57 ms (-61.9%)**. UI-only flows (`open:APP ui`) skip Pillow and Tesseract init altogether, while OCR flows pre-import Pillow in a background thread overlapped with `ensure_session`. Each CLI invocation also caches `settings_applied` (30-minute TTL, keyed by device URL and `sessionId`) and `screen_pt` on disk (`ensure_session` 88 -> 14 ms; first `pt_size` 172 -> 0 ms, self-healing on aspect-ratio drift).
 - What matters most is that the LLM is out of the loop between steps. One agent turn costs 15-25 s, and a local step costs 200-350 ms.
 
 ## 2. Taps without the quiescence wait (`/wda/fastTap`)
@@ -46,12 +46,12 @@ A cold full-screen grab + OCR takes ~180-250 ms; a repeat read of a still screen
 
 Stock `/source` is slow because WDA computes expensive AX attributes for every node — `visible`, `nativeAccessibilityElement`, `minValue`, `maxValue`, and unconditional per-node `customActions` — and pretty-prints 50-200 KB of nested JSON. On Spotify's home screen stock `/source` took 2,608 ms.
 
-With `wda-turbo.patch` v2, `GET /wda/fastUI` walks `[XCUIApplication.fb_activeApplication fb_standardSnapshot]` directly on-device (zero `customActions` IPC, pruning off-screen recycled `Cell` subtrees and soft-keyboard `Keyboard > Key` nodes in Objective-C) and emits compact JSON (`bundleId`, `appName`, `screen`, flat `ui` list) in **~158-198 ms** (min 172 ms on Settings — **13× faster than stock `/source`** and **2.4× faster than v1**).
+With `wda-turbo.patch` v3, `GET /wda/fastUI` walks `[XCUIApplication.fb_activeApplication fb_standardSnapshot]` directly on-device (zero `customActions` IPC, pruning off-screen recycled `Cell` subtrees and soft-keyboard `Keyboard > Key` nodes in Objective-C, exposing `PickerWheel`/`Stepper` values and `"enabled": false` on disabled buttons) and emits compact JSON (`bundleId`, `appName`, `screen`, flat `ui` list) in **~158-198 ms** (**13× faster than stock `/source`**). Right after `open:`/`launch:`, passing `?waitBundle=<id>&waitMs=1500` polls `XCUIApplication.fb_activeApplication` on-device every 25 ms (`CFRunLoopRunInMode`) and snapshots in a single HTTP round-trip instead of burning separate `/wda/activeAppInfo` polls plus client-side sleeps.
 
 When talking to older `wda-turbo` or stock WDA, `turbotap` falls back automatically to:
 
 ```
-/source?format=json&excluded_attributes=visible,accessible,enabled,index,nativeAccessibilityElement,frame,nativeFrame,focused,traits,placeholderValue,minValue,maxValue
+/source?format=json&excluded_attributes=visible,accessible,index,nativeAccessibilityElement,frame,nativeFrame,focused,traits,placeholderValue,minValue,maxValue
 ```
 
 which trims ~46% of payload and brings v1 `/source` down from ~453 ms to ~297 ms. On both paths, client-side cleanup drops:
@@ -85,15 +85,19 @@ A plain synthesized swipe flings: UIKit keeps the last finger velocity and coast
 
 ## Measured results
 
-| Operation | Stock WDA | turbotap v0.2 | turbotap (WDA v2) |
+| Operation | Stock WDA | turbotap v0.2 | turbotap (WDA v4) |
 |---|---:|---:|---:|
+| CLI import / `--help` | ~150-170 ms | ~150-170 ms | **~55-57 ms** (-67.5% lazy imports) |
 | Session startup (`ensure_session`) | ~88 ms | ~88 ms | **~14 ms** (cached) |
 | First screen size (`pt_size`) | ~172 ms | ~172 ms | **~0 ms** (cached) |
 | Tap (`/wda/fastTap`) | 740-1,200 ms | ~323 ms | **~260 ms** (min 243 ms) |
+| Double-tap / pinch-zoom | ~900 ms+ | ~900 ms+ | **~279 ms / ~431 ms** (`/wda/fastDoubleTap`, `/wda/fastPinch`) |
+| 6-key keypad batch | ~2,600 ms | ~2,600 ms | **~607 ms** (`/wda/fastTapBatch`, chunked `<=4` paths/record) |
+| Type 27 chars (`/wda/fastKeys`) | ~725 ms | ~725 ms | **~350 ms** (opt-in `TURBOTAP_TYPING_FREQ=240`; default keeps legacy WDA pace) |
 | Grab frame (`/wda/fastScreenshot`) | 123-244 ms | ~49 ms | **~34 ms** (min 24-30 ms, raw JPEG) |
-| Read screen (OCR) | ~1,470 ms | 180-250 ms | **~100-180 ms** (~50 ms cached; -36% dark mode) |
-| Scroll until settled | ~2,000 ms | 150-370 ms | **150-350 ms** |
-| UI tree (`/wda/fastUI`) | ~2,600 ms | ~453 ms | **~158-198 ms** (297 ms on v1 fallback) |
-| Multi-step flow | 14.4-15.7 s | 5.2-15.9 s | **1.2-6.4 s** (-23% vs v0.3, -40%+ vs v0.2) |
+| Read screen (`read` / OCR) | ~1,470 ms | 180-250 ms | **~100-180 ms** OCR (`~565-800 ms` full `read` via pixel-still check) |
+| Scroll until settled | ~2,000 ms | 150-370 ms | **150-350 ms** (`dur=0.08, rel=0.08`) |
+| UI tree (`/wda/fastUI`) | ~2,600 ms | ~453 ms | **~158-198 ms** (single-RTT `waitBundle`; 297 ms v1 fallback) |
+| Multi-step flow | 14.4-15.7 s | 5.2-15.9 s | **0.6-5.1 s** |
 
 `WDA_TURBO=0` forces the stock endpoints and `WDA_OCR=binary` forces a fork of the `tesseract` binary per call. Use them to reproduce the baseline on your own phone.

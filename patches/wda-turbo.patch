@@ -1,11 +1,12 @@
 diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m b/WebDriverAgentLib/Commands/FBDebugCommands.m
-index 42ea74b..2ca5f1c 100644
+index 42ea74b..829efed 100644
 --- a/WebDriverAgentLib/Commands/FBDebugCommands.m
 +++ b/WebDriverAgentLib/Commands/FBDebugCommands.m
-@@ -8,13 +8,148 @@
+@@ -8,13 +8,165 @@
  
  #import "FBDebugCommands.h"
  
++#import <CoreFoundation/CoreFoundation.h>
 +#import <math.h>
 +#if !TARGET_OS_WATCH
 +#import <UIKit/UIKit.h>
@@ -36,6 +37,8 @@ index 42ea74b..2ca5f1c 100644
 +  if (type == XCUIElementTypeSwitch) return @"Switch";
 +  if (type == XCUIElementTypeSlider) return @"Slider";
 +  if (type == XCUIElementTypeSegmentedControl) return @"SegmentedControl";
++  if (type == XCUIElementTypePickerWheel) return @"PickerWheel";
++  if (type == XCUIElementTypeStepper) return @"Stepper";
 +  if (type == XCUIElementTypeImage) return @"Image";
 +  return nil;
 +}
@@ -64,9 +67,15 @@ index 42ea74b..2ca5f1c 100644
 +  }
 +  BOOL kb = inKeyboard || (type == XCUIElementTypeKeyboard);
 +  NSString *label = snapshot.label;
++  BOOL labelFromId = NO;
 +  if (label.length == 0) {
 +    NSString *ident = snapshot.identifier;
-+    label = ident.length > 0 ? ident : nil;
++    if (ident.length > 0) {
++      label = ident;
++      labelFromId = YES;
++    } else {
++      label = nil;
++    }
 +  }
 +  NSString *typeName = FBFastUIControlTypeName(type);
 +  if (nil == typeName) {
@@ -80,6 +89,14 @@ index 42ea74b..2ca5f1c 100644
 +          label = vStr;
 +          typeName = @"Value";
 +        }
++      }
++    }
++  } else if (type == XCUIElementTypePickerWheel && label.length == 0) {
++    id rawVal = snapshot.value;
++    if (nil != rawVal && rawVal != NSNull.null) {
++      NSString *vStr = [NSString stringWithFormat:@"%@", rawVal];
++      if (vStr.length > 0) {
++        label = vStr;
 +      }
 +    }
 +  }
@@ -97,7 +114,8 @@ index 42ea74b..2ca5f1c 100644
 +    if (cx > 0 && cx < sw && cy > 0 && cy < sh) {
 +      NSString *valStr = nil;
 +      if (type == XCUIElementTypeSwitch || type == XCUIElementTypeSlider
-+          || type == XCUIElementTypeTextField || type == XCUIElementTypeSearchField) {
++          || type == XCUIElementTypeTextField || type == XCUIElementTypeSearchField
++          || type == XCUIElementTypePickerWheel || type == XCUIElementTypeStepper) {
 +        id rawVal = snapshot.value;
 +        if (type == XCUIElementTypeSwitch) {
 +          if (nil != rawVal && rawVal != NSNull.null) {
@@ -122,22 +140,21 @@ index 42ea74b..2ca5f1c 100644
 +          }
 +        }
 +      }
++      NSMutableDictionary<NSString *, id> *item = [NSMutableDictionary dictionaryWithCapacity:6U];
++      item[@"type"] = typeName;
++      item[@"label"] = label;
++      item[@"x"] = @(cx);
++      item[@"y"] = @(cy);
 +      if (nil != valStr && valStr.length > 0 && ![valStr isEqualToString:label]) {
-+        [out addObject:@{
-+          @"type": typeName,
-+          @"label": label,
-+          @"x": @(cx),
-+          @"y": @(cy),
-+          @"value": valStr,
-+        }];
-+      } else {
-+        [out addObject:@{
-+          @"type": typeName,
-+          @"label": label,
-+          @"x": @(cx),
-+          @"y": @(cy),
-+        }];
++        item[@"value"] = valStr;
 +      }
++      if (!snapshot.enabled) {
++        item[@"enabled"] = @NO;
++      }
++      if (labelFromId && type == XCUIElementTypeCell) {
++        item[@"fromId"] = @YES;
++      }
++      [out addObject:item];
 +    }
 +  }
 +  NSArray *children = snapshot.children;
@@ -151,7 +168,7 @@ index 42ea74b..2ca5f1c 100644
  @implementation FBDebugCommands
  
  #pragma mark - <FBCommandHandler>
-@@ -27,6 +162,8 @@
+@@ -27,6 +179,8 @@
      [[FBRoute GET:@"/source"].withoutSession respondWithTarget:self action:@selector(handleGetSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"] respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"].withoutSession respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
@@ -160,16 +177,41 @@ index 42ea74b..2ca5f1c 100644
    ];
  }
  
-@@ -78,4 +215,59 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
+@@ -78,4 +232,84 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
    return FBResponseWithObject(application.fb_accessibilityTree ?: @{});
  }
  
 +// wda-turbo: single-snapshot on-device UI control walk (zero per-node customActions /
 +// accessibility IPC, prunes off-screen cells, skips soft-keyboard keys, compact JSON).
++// Optional query params: ?text=1&waitBundle=<bundleId>&waitMs=<ms> (capped at 2000 ms).
 ++ (id<FBResponsePayload>)handleFastUI:(FBRouteRequest *)request
 +{
 +  XCUIApplication *application = XCUIApplication.fb_activeApplication;
++  NSString *waitBundle = request.parameters[@"waitBundle"];
++  NSTimeInterval waitDeadline = 0.0;
++  if (nil != waitBundle && waitBundle.length > 0) {
++    NSString *waitMsParam = request.parameters[@"waitMs"];
++    double waitMs = (nil != waitMsParam && waitMsParam.length > 0) ? [waitMsParam doubleValue] : 1500.0;
++    if (!isfinite(waitMs) || waitMs < 0.0) {
++      waitMs = 0.0;
++    } else if (waitMs > 2000.0) {
++      waitMs = 2000.0;
++    }
++    if (waitMs > 0.0) {
++      waitDeadline = NSProcessInfo.processInfo.systemUptime + (waitMs / 1000.0);
++      while (![application.bundleID isEqualToString:waitBundle]
++             && NSProcessInfo.processInfo.systemUptime < waitDeadline) {
++        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.025, (Boolean)true);
++        application = XCUIApplication.fb_activeApplication;
++      }
++    }
++  }
 +  id<FBXCElementSnapshot> _Nullable snapshot = [application fb_standardSnapshot];
++  if (nil == snapshot && waitDeadline > 0.0 && NSProcessInfo.processInfo.systemUptime < waitDeadline) {
++    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.025, (Boolean)true);
++    application = XCUIApplication.fb_activeApplication;
++    snapshot = [application fb_standardSnapshot];
++  }
 +  if (nil == snapshot) {
 +    return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
 +  }
@@ -221,32 +263,44 @@ index 42ea74b..2ca5f1c 100644
 +
  @end
 diff --git a/WebDriverAgentLib/Commands/FBElementCommands.m b/WebDriverAgentLib/Commands/FBElementCommands.m
-index 97afb7b..c21039f 100644
+index 97afb7b..af67cca 100644
 --- a/WebDriverAgentLib/Commands/FBElementCommands.m
 +++ b/WebDriverAgentLib/Commands/FBElementCommands.m
-@@ -40,6 +40,10 @@
+@@ -40,6 +40,14 @@
  #import "XCUIElement.h"
  #import "XCUIElementQuery.h"
  #import "FBXCodeCompatibility.h"
 +#import <CoreFoundation/CoreFoundation.h>
++#import <math.h>
 +#import <stdatomic.h>
++#if !TARGET_OS_WATCH
++#import <UIKit/UIKit.h>
++#endif
 +#import "XCSynthesizedEventRecord.h"
 +#import "XCPointerEventPath.h"
  
  @interface FBElementCommands ()
  @end
-@@ -115,6 +119,10 @@
+@@ -115,6 +123,18 @@
  
      [[FBRoute POST:@"/wda/element/:uuid/tap"] respondWithTarget:self action:@selector(handleTap:)],
      [[FBRoute POST:@"/wda/tap"] respondWithTarget:self action:@selector(handleTap:)],
 +    [[FBRoute POST:@"/wda/fastTap"] respondWithTarget:self action:@selector(handleFastTap:)],
 +    [[FBRoute POST:@"/wda/fastTap"].withoutSession respondWithTarget:self action:@selector(handleFastTap:)],
++    [[FBRoute POST:@"/wda/fastDoubleTap"] respondWithTarget:self action:@selector(handleFastDoubleTap:)],
++    [[FBRoute POST:@"/wda/fastDoubleTap"].withoutSession respondWithTarget:self action:@selector(handleFastDoubleTap:)],
++    [[FBRoute POST:@"/wda/fastPinch"] respondWithTarget:self action:@selector(handleFastPinch:)],
++    [[FBRoute POST:@"/wda/fastPinch"].withoutSession respondWithTarget:self action:@selector(handleFastPinch:)],
++    [[FBRoute POST:@"/wda/fastTapBatch"] respondWithTarget:self action:@selector(handleFastTapBatch:)],
++    [[FBRoute POST:@"/wda/fastTapBatch"].withoutSession respondWithTarget:self action:@selector(handleFastTapBatch:)],
 +    [[FBRoute POST:@"/wda/fastDrag"] respondWithTarget:self action:@selector(handleFastDrag:)],
 +    [[FBRoute POST:@"/wda/fastDrag"].withoutSession respondWithTarget:self action:@selector(handleFastDrag:)],
++    [[FBRoute POST:@"/wda/fastKeys"] respondWithTarget:self action:@selector(handleFastKeys:)],
++    [[FBRoute POST:@"/wda/fastKeys"].withoutSession respondWithTarget:self action:@selector(handleFastKeys:)],
  
      [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
  #endif
-@@ -509,6 +517,93 @@
+@@ -509,6 +529,379 @@
    return FBResponseWithOK();
  }
  
@@ -281,6 +335,43 @@ index 97afb7b..c21039f 100644
 +  return YES;
 +}
 +
++static BOOL FBExtractFiniteDouble(id _Nullable raw, double *outVal)
++{
++  if (nil == raw || ![raw respondsToSelector:@selector(doubleValue)]) {
++    return NO;
++  }
++  double v = [raw doubleValue];
++  if (!isfinite(v)) {
++    return NO;
++  }
++  if (outVal) {
++    *outVal = v;
++  }
++  return YES;
++}
++
++static double FBClampDouble(double v, double lo, double hi)
++{
++  if (v < lo) {
++    return lo;
++  }
++  if (v > hi) {
++    return hi;
++  }
++  return v;
++}
++
++static CGFloat FBClampCGFloat(CGFloat v, CGFloat lo, CGFloat hi)
++{
++  if (v < lo) {
++    return lo;
++  }
++  if (v > hi) {
++    return hi;
++  }
++  return v;
++}
++
 +// wda-turbo: tap screen coordinates (points) with one synthesized touch event.
 +// Skips XCUICoordinate's app-quiescence/idle waits that make /wda/tap ~740 ms.
 +// Body: {"x": 215, "y": 600, "duration": 0.02 (s, optional)}
@@ -300,6 +391,210 @@ index 97afb7b..c21039f 100644
 +  NSError *error = nil;
 +  if (!FBSynthesizeEventFast(record, &error)) {
 +    return FBResponseWithUnknownError(error);
++  }
++  return FBResponseWithOK();
++}
++
++// wda-turbo: double-tap screen coordinates (points) in one synthesized event record.
++// Uses two staggered XCPointerEventPath touches (matching FBW3CActionsSynthesizer) via
++// FBSynthesizeEventFast, bypassing XCUICoordinate's quiescence wait and FBRunLoopSpinner.
++// Body: {"x": 215, "y": 600, "interval": 0.08 (s, optional), "duration": 0.02 (s, optional)}
+++ (id<FBResponsePayload>)handleFastDoubleTap:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  double xVal = 0.0;
++  double yVal = 0.0;
++  if (!FBExtractFiniteDouble(a[@"x"], &xVal) || !FBExtractFiniteDouble(a[@"y"], &yVal)) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'x' and 'y' are required finite numbers" traceback:nil]);
++  }
++  double duration = 0.02;
++  if (nil != a[@"duration"]) {
++    if (!FBExtractFiniteDouble(a[@"duration"], &duration)) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'duration' must be a finite number" traceback:nil]);
++    }
++    duration = FBClampDouble(duration, 0.005, 5.0);
++  }
++  double interval = 0.08;
++  if (nil != a[@"interval"]) {
++    if (!FBExtractFiniteDouble(a[@"interval"], &interval)) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'interval' must be a finite number" traceback:nil]);
++    }
++    interval = FBClampDouble(interval, 0.01, 2.0);
++  }
++  CGPoint point = CGPointMake((CGFloat)xVal, (CGFloat)yVal);
++  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast double tap"
++                                                               interfaceOrientation:UIInterfaceOrientationPortrait];
++  XCPointerEventPath *tap1 = [[XCPointerEventPath alloc] initForTouchAtPoint:point offset:0.0];
++  [tap1 liftUpAtOffset:duration];
++  [record addPointerEventPath:tap1];
++  double secondStart = duration + interval;
++  XCPointerEventPath *tap2 = [[XCPointerEventPath alloc] initForTouchAtPoint:point offset:secondStart];
++  [tap2 liftUpAtOffset:secondStart + duration];
++  [record addPointerEventPath:tap2];
++  NSError *error = nil;
++  if (!FBSynthesizeEventFast(record, &error)) {
++    return FBResponseWithUnknownError(error);
++  }
++  return FBResponseWithOK();
++}
++
++// wda-turbo: two-finger pinch/zoom around (x, y) in one synthesized event record.
++// scale > 1.0 zooms in (fingers move outward); 0 < scale < 1.0 zooms out (fingers move inward).
++// Finger endpoints are clamped inside screen bounds with an edge margin.
++// Body: {"x": cx (optional), "y": cy (optional), "scale": 2.0, "radius": 80 (pt, optional), "duration": 0.18 (s, optional)}
+++ (id<FBResponsePayload>)handleFastPinch:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  double scale = 0.0;
++  if (!FBExtractFiniteDouble(a[@"scale"], &scale) || scale <= 0.0) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'scale' is required and must be a finite number > 0" traceback:nil]);
++  }
++  CGSize screenSize = CGSizeMake((CGFloat)430.0, (CGFloat)932.0);
++#if !TARGET_OS_WATCH
++  CGSize mainSize = UIScreen.mainScreen.bounds.size;
++  if (isfinite((double)mainSize.width) && isfinite((double)mainSize.height)
++      && mainSize.width >= (CGFloat)1.0 && mainSize.height >= (CGFloat)1.0) {
++    screenSize = mainSize;
++  }
++#endif
++  double cxVal = (double)screenSize.width * 0.5;
++  double cyVal = (double)screenSize.height * 0.5;
++  if (nil != a[@"x"] || nil != a[@"y"]) {
++    if (!FBExtractFiniteDouble(a[@"x"], &cxVal) || !FBExtractFiniteDouble(a[@"y"], &cyVal)) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Both 'x' and 'y' must be finite numbers when provided" traceback:nil]);
++    }
++  }
++  if (fabs(scale - 1.0) < 0.01) {
++    return FBResponseWithOK();
++  }
++  double maxRadius = MAX(20.0, MIN((double)screenSize.width, (double)screenSize.height) * 0.45);
++  double radius = 80.0;
++  if (nil != a[@"radius"]) {
++    if (!FBExtractFiniteDouble(a[@"radius"], &radius)) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'radius' must be a finite number" traceback:nil]);
++    }
++  }
++  radius = FBClampDouble(radius, 20.0, maxRadius);
++  double duration = 0.18;
++  if (nil != a[@"duration"]) {
++    if (!FBExtractFiniteDouble(a[@"duration"], &duration)) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'duration' must be a finite number" traceback:nil]);
++    }
++  }
++  duration = FBClampDouble(duration, 0.05, 3.0);
++
++  double startR = 0.0;
++  double endR = 0.0;
++  if (scale > 1.0) {
++    startR = MAX(20.0, radius / scale);
++    endR = MIN(maxRadius, startR * scale);
++  } else {
++    startR = MAX(24.0, radius);
++    endR = MAX(16.0, startR * scale);
++  }
++
++  CGFloat margin = (CGFloat)8.0;
++  CGFloat maxX = MAX(margin, screenSize.width - margin);
++  CGFloat maxY = MAX(margin, screenSize.height - margin);
++  CGFloat cx = FBClampCGFloat((CGFloat)cxVal, margin, maxX);
++  CGFloat cy = FBClampCGFloat((CGFloat)cyVal, margin, maxY);
++  // 45-degree diagonal finger axis avoids left-edge back swipe interference.
++  const double diag = 0.7071067811865475;
++  CGFloat startD = (CGFloat)(startR * diag);
++  CGFloat endD = (CGFloat)(endR * diag);
++
++  CGPoint p1Start = CGPointMake(FBClampCGFloat(cx - startD, margin, maxX),
++                                FBClampCGFloat(cy - startD, margin, maxY));
++  CGPoint p1End = CGPointMake(FBClampCGFloat(cx - endD, margin, maxX),
++                              FBClampCGFloat(cy - endD, margin, maxY));
++  CGPoint p2Start = CGPointMake(FBClampCGFloat(cx + startD, margin, maxX),
++                                FBClampCGFloat(cy + startD, margin, maxY));
++  CGPoint p2End = CGPointMake(FBClampCGFloat(cx + endD, margin, maxX),
++                              FBClampCGFloat(cy + endD, margin, maxY));
++
++  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast pinch"
++                                                               interfaceOrientation:UIInterfaceOrientationPortrait];
++  XCPointerEventPath *finger1 = [[XCPointerEventPath alloc] initForTouchAtPoint:p1Start offset:0.0];
++  [finger1 moveToPoint:p1End atOffset:duration];
++  [finger1 liftUpAtOffset:duration + 0.02];
++  XCPointerEventPath *finger2 = [[XCPointerEventPath alloc] initForTouchAtPoint:p2Start offset:0.0];
++  [finger2 moveToPoint:p2End atOffset:duration];
++  [finger2 liftUpAtOffset:duration + 0.02];
++  [record addPointerEventPath:finger1];
++  [record addPointerEventPath:finger2];
++  NSError *error = nil;
++  if (!FBSynthesizeEventFast(record, &error)) {
++    return FBResponseWithUnknownError(error);
++  }
++  return FBResponseWithOK();
++}
++
++// wda-turbo: sequential multi-tap batch in a single XCSynthesizedEventRecord
++// (one testmanagerd XPC round-trip instead of N) via staggered XCPointerEventPath touches.
++// Body: {"points": [[x1, y1], ...], "interval": 0.09 (s, optional), "duration": 0.02 (s, optional)}
+++ (id<FBResponsePayload>)handleFastTapBatch:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  id rawPoints = a[@"points"];
++  if (![rawPoints isKindOfClass:NSArray.class]) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'points' must be a non-empty array of [x, y] pairs" traceback:nil]);
++  }
++  NSArray *points = (NSArray *)rawPoints;
++  if (points.count == 0U || points.count > 64U) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'points' must contain between 1 and 64 points" traceback:nil]);
++  }
++  double duration = 0.02;
++  if (nil != a[@"duration"]) {
++    if (!FBExtractFiniteDouble(a[@"duration"], &duration)) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'duration' must be a finite number" traceback:nil]);
++    }
++    duration = FBClampDouble(duration, 0.005, 5.0);
++  }
++  double interval = 0.09;
++  if (nil != a[@"interval"]) {
++    if (!FBExtractFiniteDouble(a[@"interval"], &interval)) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'interval' must be a finite number" traceback:nil]);
++    }
++    interval = FBClampDouble(interval, 0.01, 5.0);
++  }
++  // Validate all points before synthesizing any touches so a bad point never partially taps.
++  NSMutableArray<NSValue *> *cgPoints = [NSMutableArray arrayWithCapacity:points.count];
++  for (NSUInteger i = 0U; i < points.count; i++) {
++    id item = points[i];
++    double xVal = 0.0;
++    double yVal = 0.0;
++    BOOL valid = NO;
++    if ([item isKindOfClass:NSArray.class] && ((NSArray *)item).count >= 2U) {
++      NSArray *pair = (NSArray *)item;
++      valid = FBExtractFiniteDouble(pair[0U], &xVal) && FBExtractFiniteDouble(pair[1U], &yVal);
++    } else if ([item isKindOfClass:NSDictionary.class]) {
++      NSDictionary *dict = (NSDictionary *)item;
++      valid = FBExtractFiniteDouble(dict[@"x"], &xVal) && FBExtractFiniteDouble(dict[@"y"], &yVal);
++    }
++    if (!valid) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Each point in 'points' must be [x, y] or {\"x\": x, \"y\": y} with finite numbers" traceback:nil]);
++    }
++    [cgPoints addObject:[NSValue valueWithCGPoint:CGPointMake((CGFloat)xVal, (CGFloat)yVal)]];
++  }
++  // iPhone multi-touch synthesis caps concurrent paths per XCSynthesizedEventRecord;
++  // chunk at <= 4 paths per record so long sequences (e.g. 6-digit PINs) never drop trailing taps.
++  const NSUInteger kMaxPathsPerRecord = 4U;
++  double step = duration + interval;
++  for (NSUInteger start = 0U; start < cgPoints.count; start += kMaxPathsPerRecord) {
++    NSUInteger chunkLen = MIN(kMaxPathsPerRecord, cgPoints.count - start);
++    XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast tap batch"
++                                                                 interfaceOrientation:UIInterfaceOrientationPortrait];
++    for (NSUInteger j = 0U; j < chunkLen; j++) {
++      CGPoint pt = cgPoints[start + j].CGPointValue;
++      double offset = (double)j * step;
++      XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:pt offset:offset];
++      [path liftUpAtOffset:offset + duration];
++      [record addPointerEventPath:path];
++    }
++    NSError *error = nil;
++    if (!FBSynthesizeEventFast(record, &error)) {
++      return FBResponseWithUnknownError(error);
++    }
 +  }
 +  return FBResponseWithOK();
 +}
@@ -335,6 +630,51 @@ index 97afb7b..c21039f 100644
 +    return FBResponseWithUnknownError(error);
 +  }
 +  return FBResponseWithOK();
++}
++
++// wda-turbo: synthesize text input via FBSynthesizeEventFast (bypasses FBRunLoopSpinner's
++// 100 ms sleep in FBTypeText), preserving WDA's default maxTypingFrequency unless overridden.
++// Body: {"value": "text" | ["t","e","x","t"], "frequency": N (optional)}
+++ (id<FBResponsePayload>)handleFastKeys:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  id rawValue = a[@"value"];
++  NSString *textToType = nil;
++  if ([rawValue isKindOfClass:NSString.class]) {
++    textToType = (NSString *)rawValue;
++  } else if ([rawValue isKindOfClass:NSArray.class]) {
++    textToType = [(NSArray *)rawValue componentsJoinedByString:@""];
++  } else {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'value' must be a string or array of strings"
++                                                                       traceback:nil]);
++  }
++  if (textToType.length == 0) {
++    return FBResponseWithObject(@{@"fastKeys": @YES});
++  }
++  unsigned long long frequency = (unsigned long long)FBConfiguration.sharedInstance.maxTypingFrequency;
++  if (frequency == 0ULL) {
++    frequency = 60ULL;
++  }
++  id freqArg = a[@"frequency"];
++  if (nil != freqArg && [freqArg respondsToSelector:@selector(longLongValue)]) {
++    long long parsed = [freqArg longLongValue];
++    if (parsed > 0) {
++      frequency = (unsigned long long)parsed;
++    }
++  }
++  XCSynthesizedEventRecord *record = [[XCSynthesizedEventRecord alloc] initWithName:@"wda-turbo fast keys"];
++  XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTextInput];
++  [path typeText:textToType
++        atOffset:0.0
++     typingSpeed:frequency
++    shouldRedact:NO];
++  [record addPointerEventPath:path];
++  NSError *error = nil;
++  if (!FBSynthesizeEventFast(record, &error)) {
++    return FBResponseWithStatus([FBCommandStatus invalidElementStateErrorWithMessage:error.description ?: @"Failed to synthesize key events"
++                                                                           traceback:nil]);
++  }
++  return FBResponseWithObject(@{@"fastKeys": @YES});
 +}
 +
  + (id<FBResponsePayload>)handlePinch:(FBRouteRequest *)request

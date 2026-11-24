@@ -93,7 +93,7 @@ if [[ -f "$PROV" ]]; then
   if [[ -n "$UUID" ]]; then
     for pdir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
       mkdir -p "$pdir"
-      [[ -f "$pdir/$UUID.mobileprovision" ]] || cp "$PROV" "$pdir/$UUID.mobileprovision"
+      cp -f "$PROV" "$pdir/$UUID.mobileprovision"
     done
   fi
 else
@@ -134,9 +134,20 @@ txt2 = re.sub(r"buildSettings = \{[^{}]*INFOPLIST_FILE = WebDriverAgentRunner/In
 open(p, "w").write(txt2)
 PYEOF
   fi
-  "$XB" build-for-testing -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
-    -destination generic/platform=iOS -derivedDataPath "$DD" "${SIGN[@]}" >/var/tmp/wda-turbo-build.log 2>&1 \
-    || { tail -25 /var/tmp/wda-turbo-build.log; exit 1; }
+  if ! "$XB" build-for-testing -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
+      -destination generic/platform=iOS -derivedDataPath "$DD" "${SIGN[@]}" >/var/tmp/wda-turbo-build.log 2>&1; then
+    if [[ -n "${UUID:-}" ]] && grep -q "ProcessProductPackaging" /var/tmp/wda-turbo-build.log; then
+      for pdir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+        mkdir -p "$pdir"
+        cp -f "$PROV" "$pdir/$UUID.mobileprovision"
+      done
+      "$XB" build-for-testing -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
+        -destination generic/platform=iOS -derivedDataPath "$DD" "${SIGN[@]}" >/var/tmp/wda-turbo-build.log 2>&1 \
+        || { tail -25 /var/tmp/wda-turbo-build.log; exit 1; }
+    else
+      tail -25 /var/tmp/wda-turbo-build.log; exit 1
+    fi
+  fi
   echo "build ok"
 fi
 # Stop any WebDriverAgentRunner test session for this device (no pkill -f).

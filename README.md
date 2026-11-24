@@ -34,7 +34,7 @@ turbotap flow open:Weather read
 turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" tap:Get
 ```
 
-Run `turbotap flow --help` to see all available verbs (including `gone:`, `key:`, `re:` regexes, and `read:Y0-Y1` band OCR).
+Run `turbotap flow --help` to see all available verbs (including `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
 
 ## Requirements
 
@@ -102,13 +102,17 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 
 | Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
+| CLI startup (`--help` / UI-only) | ~150-210ms | **~55ms** | Lazy-loads Pillow/OCR; UI-only flows skip Tesseract init |
 | Session startup | ~88ms (uncached) | ~14ms | Caches fast settings & screen size per device |
 | Tap | 740-1200ms | ~260ms | Instant-wake `CFRunLoopStop` touch synthesis (`0.02s`) |
+| Type text (27 chars) | ~725ms | **~350ms** (opt-in `240/s`) | `/wda/fastKeys` keeps legacy pace by default; set `TURBOTAP_TYPING_FREQ=240` for turbo |
+| Double-tap / pinch-zoom | ~900ms+ | **~280ms / ~430ms** | `/wda/fastDoubleTap` and `/wda/fastPinch` (single-record `CFRunLoopStop`) |
+| Multi-tap keypad (6 keys) | ~2600ms | **~607ms** | `/wda/fastTapBatch` (auto-chunked `<=4` paths/record for iOS multi-touch cap) |
 | Grab frame | 123-244ms | ~34ms | On-device ImageIO thumbnail + raw binary JPEG |
 | Read screen (OCR) | ~1470ms | 100-180ms | Parallel LSTM OCR + dark-strip pre-invert + caching (~50ms cached) |
-| Scroll | ~2000ms | 150-350ms | Clean drag stop with no fling momentum |
-| UI tree | ~2600ms | 158-198ms | On-device `/wda/fastUI` (falls back to trimmed `/source` ~297ms) |
-| Multi-step flow | 14.4-15.7s | 1.2-6.4s | Single process, persistent connection, safe keypad/tab cache |
+| Scroll | ~2000ms | 150-350ms | Clean drag stop with no fling momentum (`dur=0.08, rel=0.08`) |
+| UI tree | ~2600ms | 158-198ms | Single-RTT `/wda/fastUI?waitBundle=...` (trimmed `/source` fallback ~297ms) |
+| Multi-step flow | 14.4-15.7s | **1.0-6.0s** | Single process, persistent connection, pixel-still confirmation, keypad cache |
 
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) explains each trick behind these numbers: session caching, strip-parallel OCR, zero-momentum drag, trimmed UI trees, app-switch freshness, and iOS quirks.
 
