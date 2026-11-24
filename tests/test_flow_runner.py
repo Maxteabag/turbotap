@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest
@@ -461,6 +462,164 @@ class TapTextAndCacheTests(unittest.TestCase):
             self.assertEqual(c_btn.typed_history[-1][1], "world")
         finally:
             flow_btn.close()
+
+    def test_tap_text_speculative_fast_ui_overlaps_ocr_miss_and_reuses_result(self):
+        img = solid_img(240, size=(430, 932))
+        ocr_lines = [make_line("Bookmarks", 40, 200, 150, 224)]
+        events = []
+
+        class SlowOCRReader(FakeReader):
+            def read(self, y0=0, y1=None, img=None, sauvola=False):
+                events.append(("ocr_start", time.monotonic()))
+                time.sleep(0.08)
+                res = super().read(y0=y0, y1=y1, img=img, sauvola=sauvola)
+                events.append(("ocr_end", time.monotonic()))
+                return res
+
+        def timed_fast_ui(_qs):
+            events.append(("ui_start", time.monotonic()))
+            time.sleep(0.08)
+            events.append(("ui_end", time.monotonic()))
+            return _fast_ui(
+                [{"type": "TextField", "label": "Address", "x": 215, "y": 820}],
+                app_name="Browser",
+                bundle_id="com.example.browser",
+            )
+
+        c = MockWDAClient(active_app="com.example.browser", fast_ui=timed_fast_ui)
+        r = SlowOCRReader(frames=[(img, ocr_lines)], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(c, reader=r, timeout=1.0)
+        try:
+            flow.step("open:com.example.browser")
+            t0 = time.monotonic()
+            m = flow.tap_text("Address")
+            elapsed = time.monotonic() - t0
+
+            self.assertEqual((m.x, m.y), (215, 820))
+            self.assertEqual(c.tapped_points[-1][:2], (215, 820))
+            # Harvested the single in-flight speculative /wda/fastUI with 0 extra UI calls.
+            ui_calls = [p for _, p, _ in c.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(len(ui_calls), 1)
+            self.assertEqual(r.read_calls, 1)
+            # /wda/fastUI started before OCR finished (true overlap) and total time is ~1x not 2x.
+            by_name = dict(events)
+            self.assertLess(by_name["ui_start"], by_name["ocr_end"])
+            self.assertLess(elapsed, 0.15)
+        finally:
+            flow.close()
+
+        # When OCR hits a form label (is_form_label) or substring (rank > 0) and speculative
+        # fastUI ran in parallel, resolved_ctl harvests it with 1 total /wda/fastUI call.
+        c2 = MockWDAClient(fast_ui=_fast_ui([
+            {"type": "TextField", "label": "Subject", "x": 230, "y": 210},
+        ]))
+        r2 = FakeReader(
+            frames=[
+                (img, [make_line("Subject:", 20, 200, 90, 220)]),
+                (img.copy(), [make_line("Subject:", 20, 200, 90, 220)]),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow2 = cli.Flow(c2, reader=r2, timeout=1.0)
+        try:
+            m_sub = flow2.tap_text("Subject:")
+            self.assertEqual((m_sub.x, m_sub.y), (230, 210))
+            ui_calls2 = [p for _, p, _ in c2.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(len(ui_calls2), 1)
+        finally:
+            flow2.close()
+
+    def test_tap_text_speculative_fast_ui_rejects_stale_app_never_caches_or_taps(self):
+        img = solid_img(240, size=(430, 932))
+        ocr_lines = [make_line("Home", 40, 180, 120, 205)]
+
+        # Case A: speculative fastUI returns outgoing app, fallback self.controls() gets target app.
+        c = MockWDAClient(
+            active_app="com.example.target",
+            fast_ui=[
+                _fast_ui(
+                    [{"type": "Button", "label": "Compose", "x": 50, "y": 50}],
+                    app_name="OldApp",
+                    bundle_id="com.example.old",
+                ),
+                _fast_ui(
+                    [{"type": "Button", "label": "Compose", "x": 360, "y": 840}],
+                    app_name="TargetApp",
+                    bundle_id="com.example.target",
+                ),
+            ],
+        )
+        r = FakeReader(frames=[(img, ocr_lines)], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(c, reader=r, timeout=1.0)
+        try:
+            flow._last_app_name = "OldApp"
+            flow._last_app_bundle = "com.example.old"
+            flow.step("open:com.example.target")
+            m = flow.tap_text("Compose")
+            # Stale (50, 50) was rejected; target (360, 840) was tapped.
+            self.assertEqual((m.x, m.y), (360, 840))
+            self.assertEqual(c.tapped_points, [(360, 840, None)])
+            self.assertEqual(flow._last_app_name, "TargetApp")
+        finally:
+            flow.close()
+
+        # Case B: delayed stale speculative reply crossing the 3s window is STILL rejected,
+        # never cached, and restores _pending_bundle so fallback self.controls() also rejects.
+        def delayed_stale_ui(_qs):
+            time.sleep(0.18)
+            return _fast_ui(
+                [{"type": "Button", "label": "Compose", "x": 50, "y": 50}],
+                app_name="OldApp",
+                bundle_id="com.example.old",
+            )
+
+        c_stale = MockWDAClient(active_app="com.example.target", fast_ui=delayed_stale_ui)
+        r_stale = FakeReader(frames=[(img, ocr_lines)], pt=(430, 932), scale=1.0)
+        flow_stale = cli.Flow(c_stale, reader=r_stale, timeout=1.0)
+        try:
+            flow_stale.bundle = "com.example.target"
+            flow_stale._pending_bundle = None
+            flow_stale._pending_bundle_ts = time.monotonic() - 2.90
+            flow_stale._switched_from_app_name = "OldApp"
+            flow_stale._switched_at = time.monotonic() - 2.90
+            with mock.patch.object(cli, "_STALE_UI_BACKOFF", ()):
+                with self.assertRaises(cli._StaleAppError):
+                    flow_stale.tap_text("Compose")
+            self.assertIsNone(flow_stale._ctl_cache)
+            self.assertEqual(c_stale.tapped_points, [])
+            self.assertEqual(flow_stale._pending_bundle, "com.example.target")
+        finally:
+            flow_stale.close()
+
+    def test_tap_text_ocr_rank0_hit_does_not_block_on_slow_speculative_fast_ui(self):
+        img = solid_img(240, size=(430, 932))
+        img_after = solid_img(80, size=(430, 932))
+        lines = [make_line("About", 40, 200, 120, 224)]
+        ui_started = threading.Event()
+        release_ui = threading.Event()
+
+        def slow_fast_ui(_qs):
+            ui_started.set()
+            release_ui.wait(timeout=2.0)
+            return _fast_ui([{"type": "Button", "label": "About", "x": 80, "y": 212}])
+
+        c = MockWDAClient(fast_ui=slow_fast_ui)
+        r = FakeReader(frames=[(img, lines), (img.copy(), lines), (img_after, [])], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(c, reader=r, timeout=1.0)
+        try:
+            t0 = time.monotonic()
+            m = flow.tap_text("About")
+            elapsed = time.monotonic() - t0
+
+            self.assertEqual(m.text, "About")
+            self.assertEqual(len(c.tapped_points), 1)
+            # Returned immediately without waiting on the blocked slow_fast_ui thread.
+            self.assertLess(elapsed, 0.15)
+            self.assertFalse(release_ui.is_set())
+        finally:
+            release_ui.set()
+            flow.close()
 
 
 class FlowVerbsAndGuardsTests(unittest.TestCase):
@@ -1490,6 +1649,165 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             self.assertIn("slider:", cli.FLOW_HELP)
         finally:
             flow.close()
+
+    def test_scrollto_then_tap_reuses_settled_lines_without_redundant_ocr(self):
+        img1 = solid_img(240, size=(430, 932))
+        img2 = solid_img(180, size=(430, 932))
+        img2_confirm1 = solid_img(180, size=(430, 932))
+        img2_confirm2 = solid_img(180, size=(430, 932))
+        img_after_tap = solid_img(60, size=(430, 932))
+
+        l1 = [make_line("Wi-Fi", 30, 200, 100, 224)]
+        l2 = [make_line("Generelt", 30, 400, 130, 424)]
+
+        class AgingReadReader(FakeReader):
+            def read(self, y0=0, y1=None, img=None, sauvola=False):
+                # Simulate real ScreenReader.read(img=self.r.last): OCR takes ~250ms and
+                # does not update last_ts when fresh_grab=False, leaving last_ts stale.
+                res = super().read(y0=y0, y1=y1, img=img, sauvola=sauvola)
+                if img is not None and not sauvola:
+                    self.last_ts = time.monotonic() - 0.30
+                return res
+
+        c = MockWDAClient(fast_ui=_fast_ui([{"type": "Cell", "label": "Generelt", "x": 80, "y": 412}]))
+        # Frame sequence:
+        # 0: initial scrollto read (img1, l1)
+        # 1: settle grab 1 after scroll down (img2, l2)
+        # 2: settle grab 2 confirming still (img2_confirm1, l2) -> r.last = img2_confirm1
+        # 3: wait(stable=True) confirm grab inside tap:Generelt (img2_confirm2, l2)
+        # 4: changed_since() grab after tap (img_after_tap, [])
+        r = AgingReadReader(
+            frames=[
+                (img1, l1),
+                (img2, l2),
+                (img2_confirm1, l2),
+                (img2_confirm2, l2),
+                (img_after_tap, []),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow = cli.Flow(c, reader=r, timeout=1.0)
+        try:
+            res_scroll = flow.step("scrollto:Generelt")
+            self.assertEqual(res_scroll, "Generelt")
+            self.assertEqual(len(c.drags), 1)
+            self.assertGreater(c.drags[0]["fromY"], c.drags[0]["toY"])
+            # scroll_to refreshed last_ts and _wait_settled_ts on the settled frame.
+            self.assertLess(time.monotonic() - r.last_ts, 0.15)
+            self.assertGreater(flow._wait_settled_ts, 0.0)
+            reads_after_scroll = r.read_calls
+            grabs_after_scroll = r.grab_calls
+
+            res_tap = flow.step("tap:Generelt")
+            self.assertEqual(res_tap, "Generelt")
+            # Zero redundant full OCR passes during tap:Generelt!
+            self.assertEqual(r.read_calls, reads_after_scroll)
+            # Only 1 cheap confirm grab + 1 post-tap changed_since grab, and 0 /wda/fastUI calls.
+            self.assertEqual(r.grab_calls - grabs_after_scroll, 2)
+            self.assertEqual([p for _, p, _ in c.calls if p.startswith("/wda/fastUI")], [])
+            self.assertEqual(c.tapped_points[-1][:2], (80, 412))
+        finally:
+            flow.close()
+
+    def test_scrollto_bidirectional_up_down_region_regex_and_stop_at_top(self):
+        img_bot = solid_img(240, size=(430, 932))
+        img_mid1 = solid_img(210, size=(430, 932))
+        img_mid2 = solid_img(210, size=(430, 932))
+        img_top1 = solid_img(180, size=(430, 932))
+        img_top2 = solid_img(180, size=(430, 932))
+
+        l_bot = [make_line("General", 30, 60, 120, 80), make_line("Bottom Item", 30, 600, 160, 624)]
+        l_mid = [make_line("General", 30, 60, 120, 80), make_line("Item 42", 30, 320, 120, 344)]
+        l_top = [make_line("General", 30, 260, 120, 284), make_line("Top Header", 30, 140, 160, 164)]
+
+        # 1. scrollto:up:General@y>100 scrolls UP (fromY < toY), skips y=70 header, finds y=272.
+        c = MockWDAClient()
+        r = FakeReader(
+            frames=[
+                (img_bot, l_bot),
+                (img_mid1, l_mid),
+                (img_mid2, l_mid),
+                (img_top1, l_top),
+                (img_top2, l_top),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow = cli.Flow(c, reader=r, timeout=1.0)
+        try:
+            self.assertEqual(flow.step("scrollto:up:General@y>100"), "General")
+            self.assertEqual(len(c.drags), 2)
+            for d in c.drags:
+                self.assertLess(d["fromY"], d["toY"], "scrollto:up must swipe upward (fromY < toY)")
+        finally:
+            flow.close()
+
+        # 2. scrollto:up:re:Item\s+\d+ supports regex while scrolling up.
+        c_re = MockWDAClient()
+        r_re = FakeReader(
+            frames=[
+                (img_bot, l_bot),
+                (img_mid1, l_mid),
+                (img_mid2, l_mid),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_re = cli.Flow(c_re, reader=r_re, timeout=1.0)
+        try:
+            self.assertEqual(flow_re.step(r"scrollto:up:re:Item\s+\d+"), "Item 42")
+            self.assertEqual(len(c_re.drags), 1)
+            self.assertLess(c_re.drags[0]["fromY"], c_re.drags[0]["toY"])
+        finally:
+            flow_re.close()
+
+        # 3. scrollto:down:TEXT explicitly scrolls down (fromY > toY).
+        c_dn = MockWDAClient()
+        r_dn = FakeReader(
+            frames=[
+                (img_top1, l_top),
+                (img_bot, l_bot),
+                (img_bot.copy(), l_bot),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_dn = cli.Flow(c_dn, reader=r_dn, timeout=1.0)
+        try:
+            self.assertEqual(flow_dn.step("scrollto:down:Bottom Item"), "Bottom Item")
+            self.assertEqual(len(c_dn.drags), 1)
+            self.assertGreater(c_dn.drags[0]["fromY"], c_dn.drags[0]["toY"])
+        finally:
+            flow_dn.close()
+
+        # 4. scrollto:up:Missing stops cleanly at top of list when content stops changing.
+        c_stop = MockWDAClient()
+        r_stop = FakeReader(
+            frames=[
+                (img_top1, l_top),
+                (img_top2, l_top),
+                (img_top2.copy(), l_top),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_stop = cli.Flow(c_stop, reader=r_stop, timeout=1.0)
+        try:
+            with self.assertRaises(cli.FlowError) as ctx:
+                flow_stop.step("scrollto:up:MissingTop")
+            self.assertIn("MissingTop", str(ctx.exception))
+            # Stopped after 1 swipe saw identical lines (not max_swipes=8).
+            self.assertEqual(len(c_stop.drags), 1)
+            self.assertLess(c_stop.drags[0]["fromY"], c_stop.drags[0]["toY"])
+
+            # Empty targets rejected cleanly.
+            for bad in ("scrollto:", "scrollto:up:", "scrollto:down:"):
+                with self.assertRaises(cli.FlowError):
+                    flow_stop.step(bad)
+            self.assertIn("scrollto:up:TEXT", cli.FLOW_HELP)
+        finally:
+            flow_stop.close()
 
 
 class LazyImportAndWarmupTests(unittest.TestCase):

@@ -1982,7 +1982,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
   alert:accept|dismiss  accept or dismiss an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
-  scrollto:TEXT         scroll down (max 8x) until TEXT is visible
+  scrollto:TEXT         scroll down (max 8x) until TEXT is visible (scrollto:up:TEXT scrolls up)
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
   swipe:left|right:TEXT horizontal row swipe on TEXT's row (damped 80%->30% / 20%->70% to reveal
                         row actions without triggering full-width destructive delete)
@@ -2567,6 +2567,13 @@ class Flow:
         return m
 
     def tap_text(self, label):
+        start_ts = time.monotonic()
+        spec_expectation = self._snapshot_ui_expectation(start_ts)
+        pending_bundle = (
+            self._pending_bundle
+            if self._pending_bundle and (start_ts - self._pending_bundle_ts) <= 2.5
+            else None
+        )
         app_confirmed = self._wait_active_app()
         base, where = split_where(label)
         low_base = base.casefold()
@@ -2589,174 +2596,285 @@ class Flow:
             m_cached = self._try_cached_tap(base)
             if m_cached is not None:
                 return m_cached
-        # If the previous tap triggered a full-screen slide/push (_last_reaction_diff >= 2.0),
-        # drain the animation with cheap ~34 ms raw grabs before paying for full OCR on
-        # blurry mid-transition frames.
-        m0 = None
-        m0_pixel_stable = False
-        first_lines = None
-        if (self._last_action_ts
-                and (time.monotonic() - self._last_action_ts) < 0.7
-                and self._wait_settled_ts < self._last_action_ts
-                and self._last_reaction_diff >= 2.0
-                and getattr(self.r, "last_lines", None) is None
-                and self.r.last is not None):
-            settled_prev, settled_img = self._settle_transition()
-            if settled_img is not None:
-                first_lines = self.r.read(img=settled_img)
-                if hasattr(self.r, "set_last"):
-                    self.r.set_last(settled_img, lines=first_lines)
-                m0 = find_text(first_lines, base, where=where)
-                if (m0 is not None and settled_prev is not None and settled_prev is not settled_img
-                        and (_content_pixel_still(settled_prev, settled_img)
-                             or _thumb_diff(settled_prev, settled_img) < 0.8)
-                        and _box_diff(settled_prev, settled_img, m0.x, m0.y, self.r.scale) < 2.0):
-                    m0_pixel_stable = True
-        if first_lines is None:
-            # Reuse a very recent frame (< 0.15 s) from the preceding step as Frame #1 if it
-            # already contains the target; otherwise grab a fresh Frame #1 and feed its match
-            # into wait(stable=True) so static screens only need one confirming frame.
-            cached_lines = self._fresh_lines()
-            if cached_lines is not None:
-                m0 = find_text(cached_lines, base, where=where)
-            if m0 is None:
-                first_lines = self.lines()
-                m0 = find_text(first_lines, base, where=where)
-        if (m0 is None and self._last_action_ts
-                and not self._last_action_is_typing
-                and (time.monotonic() - self._last_action_ts) < 0.7):
-            # Right after open:/launch: once _wait_active_app() confirmed the app and Frame 1
-            # already rendered page content below the status bar (e.g. Safari before tapping
-            # accessibility-only TextField:Adresse), go straight to controls() instead of
-            # burning a redundant 2nd full OCR pass.
-            _, sh = self.r.pt_size()
-            status_y = int(sh * 0.06)
-            skip_second_ocr = (
-                app_confirmed
-                and first_lines is not None
-                and any(l.y >= status_y for l in first_lines)
+
+        spec_fut = None
+        spec_side = None
+        spec_ctl_harvested = None
+
+        def _launch_spec_ui(settled_transition=False):
+            nonlocal spec_fut, spec_side, spec_expectation
+            if spec_fut is not None or self._ctl_cache is not None:
+                return
+            if getattr(self.c, "turbo", None) is False or getattr(self.c, "_fast_ui", None) is False:
+                return
+            if base.startswith("re:"):
+                return
+            if type(self).controls is not Flow.controls or "controls" in self.__dict__:
+                return
+            now = time.monotonic()
+            if (not app_confirmed
+                    and not settled_transition
+                    and not pending_bundle
+                    and not self._last_action_is_typing
+                    and self._last_action_ts
+                    and (now - self._last_action_ts) < 0.7
+                    and self._wait_settled_ts < self._last_action_ts):
+                return
+            if not (spec_expectation[2] or spec_expectation[3]):
+                spec_expectation = self._snapshot_ui_expectation(now)
+            expected_bundle = spec_expectation[0]
+            wb = None
+            wb_ms = 0
+            if app_confirmed and expected_bundle:
+                wb, wb_ms = expected_bundle, 600
+            elif pending_bundle:
+                wb, wb_ms = pending_bundle, 1500
+            elif spec_expectation[3] and expected_bundle:
+                wb, wb_ms = expected_bundle, 600
+            spec_side, pool = self._get_ui_worker()
+            pt = self.r.pt_size()
+            spec_fut = pool.submit(
+                _fetch_ui_controls_full, spec_side, pt, False, wb, wb_ms, False,
             )
-            if not skip_second_ocr:
-                # Inside a short post-action transition window (e.g. iOS nav push right
-                # after a previous tap): grab one more OCR frame before paying for a
-                # /source fetch on the outgoing screen.
-                first_lines = self.lines()
-                m0 = find_text(first_lines, base, where=where)
-        if m0 is None and not base.startswith("re:"):
-            # Not in the first fresh OCR frame: an exact accessibility label (icon-only
-            # Back/Close/Search/tab or keypad Key) is tapped at once instead of after
-            # the 2.2 s OCR wait (Messenger Back: 2,979 -> ~800 ms), honoring @region.
-            ctl = self.controls()
-            scoped = _controls_in_region(ctl, first_lines or [], where) if where else ctl
-            ext_types = TAP_FORM_TYPES + ("Image", "Slider", "Value")
-            c = exact_control(scoped, base, ext_types)
-            if not c and low_base in BACK_LABELS:
-                for alt in BACK_LABELS:
-                    c = exact_control(scoped, alt, ("Button", "Link"))
-                    if c:
-                        break
-            if c:
-                return self.tap_control(c)
-            if exact_control(scoped, base, ext_types, allow_disabled=True):
-                raise FlowError(f"{base!r} is disabled")
-        if m0 is not None and m0_pixel_stable:
-            self._wait_settled_ts = time.monotonic()
-            m = m0
-        else:
+
+        def _discard_spec_ui():
+            nonlocal spec_fut
+            if spec_fut is not None:
+                spec_fut.cancel()
+                spec_fut = None
+
+        def _harvest_spec_ui(block=False):
+            nonlocal spec_fut, spec_ctl_harvested
+            if spec_ctl_harvested is not None:
+                return spec_ctl_harvested
+            if spec_fut is None:
+                return None
+            if not block and not spec_fut.done():
+                return None
+            fut = spec_fut
+            spec_fut = None
             try:
-                m = self.wait(label, timeout=min(2.2, self.timeout), stable=True, initial=m0, allow_disabled=False)
-            except FlowError:
-                # Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct messages)
-                # have no visible text for OCR: one /source lookup with coordinates, then
-                # targeted Sauvola fallback, then the slower element-predicate poll.
-                last_lines = getattr(self.r, "last_lines", None)
-                cur_lines = last_lines if last_lines is not None else (first_lines or [])
-                raw_ctl_fb = self.controls()
-                ctl_fb = _controls_in_region(raw_ctl_fb, cur_lines, where) if where else raw_ctl_fb
-                if base.startswith("re:"):
-                    cm = find_control_match(ctl_fb, base, types=WAIT_UI_TYPES, allow_disabled=False)
-                    if cm:
-                        self.tap_point(cm.x, cm.y, cm.text)
-                        return cm
-                else:
-                    c = find_control(ctl_fb, base)
-                    if c:
-                        return self.tap_control(c)
-                slines = self._read_sauvola(self.r.last)
-                if slines:
-                    sm = find_text(slines, base, where=where)
-                    if sm:
-                        if self._is_disabled_ocr_match(sm, base, slines, where, controls=raw_ctl_fb):
-                            raise FlowError(f"{base!r} is disabled")
-                        self.tap_point(sm.x, sm.y, sm.text)
-                        return sm
-                if base.startswith("re:"):
-                    if find_control_match(ctl_fb, base, types=WAIT_UI_TYPES, allow_disabled=True):
-                        raise FlowError(f"{base!r} is disabled")
-                elif find_control(ctl_fb, base, allow_disabled=True):
-                    raise FlowError(f"{base!r} is disabled")
-                if where or base.startswith("re:"):
-                    raise
-                x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
-                return Match(x, y, f"[el:{label}]", None)
-        _, h = self.r.pt_size()
-        near_bottom_tab = m.line is not None and m.y > h - 55
-        is_form_label = base.rstrip().endswith(":")
-        resolved_ctl = None
-        if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
-            # 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
-            #    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
-            #    labelled exactly TEXT wins over the substring.
-            # 2. near_bottom_tab: OCR matched a tab label near the bottom edge
-            #    (y > h - 55, close to the home indicator): prefer the Tab/Button centre.
-            # 3. is_form_label: classic form label ('To:', 'Subject:', 'Til:', 'Emne:')
-            #    where OCR matches the left-aligned label text, but the focusable input
-            #    (TextField/TextView/SearchField) spans the row and should be tapped at
-            #    its centre.
-            last_lines = getattr(self.r, "last_lines", None)
-            cur_lines = last_lines if last_lines is not None else (
-                self.r.read(img=self.r.last) if self.r.last is not None else [])
-            resolved_ctl = self.controls()
-            ctl = _controls_in_region(resolved_ctl, cur_lines, where)
-            c = exact_control(ctl, base, TAP_FORM_TYPES) if (m.rank or is_form_label) else None
-            if not c and is_form_label:
-                c = self.input_near(base, m, controls=ctl)
-            if not c and near_bottom_tab:
-                c = exact_control(ctl, base, ("Tab", "Button"))
-                if not c:
-                    near = [x for x in ctl if x["type"] in ("Tab", "Button")
-                            and abs(x["y"] - m.y) <= 35 and abs(x["x"] - m.x) <= 60]
-                    c = find_control(near, base, types={"Tab", "Button"})
-            if c:
-                return self.tap_control(c)
-        if m.line is not None:
-            cur_lines = getattr(self.r, "last_lines", None) or []
-            if self._is_disabled_ocr_match(m, base, cur_lines, where, controls=resolved_ctl):
-                raise FlowError(f"{base!r} is disabled")
-        # Take a fresh pre-tap baseline when m came from wait()'s UI fallback so
-        # changed_since() measures the tap cleanly (used for switch/input companion
-        # resolution and cache invalidation; never replays an acknowledged tap).
-        before = self.r.grab() if m.line is None else self.r.last
-        self.tap_point(m.x, m.y, m.text)
-        if not self.changed_since(before, x=m.x, y=m.y):
-            self._invalidate_ctl_cache()
-            # Tapping a switch row's label does nothing: tap the distinct toggle
-            # control on that row, unless the toggle itself already flipped.
-            ctl = resolved_ctl if resolved_ctl is not None else self.controls()
-            sw = self.switch_near(base, m, controls=ctl)
-            if sw and (abs(sw["x"] - m.x) > 12 or abs(sw["y"] - m.y) > 12):
-                if _box_diff(before, self.r.grab(), sw["x"], sw["y"], self.r.scale) < 4:
-                    return self.tap_control(sw)
-                return m
-            # Tapping a form field's static label may not focus its input: tap a
-            # distinct row-aligned TextField/TextView/SearchField/SecureTextField.
-            inp = self.input_near(base, m, controls=ctl)
-            if inp and (abs(inp["x"] - m.x) > 12 or abs(inp["y"] - m.y) > 12):
-                return self.tap_control(inp)
-        elif self._ctl_cache is not None and self.r.last is not None:
-            if _thumb_diff(self._ctl_cache[3], self.r.last) >= _CTL_CACHE_MAX_DIFF:
+                ctl, app_name, bundle_id = fut.result()
+            except Exception:
+                return None
+            if spec_side is not None and spec_side is not self.c and spec_side._fast_ui is not None:
+                self.c._fast_ui = spec_side._fast_ui
+            if ctl is None:
+                return None
+            if self._is_stale_ui(app_name, bundle_id, expectation=spec_expectation):
+                # Never cache or tap outgoing-app controls; restore pending bundle so
+                # the fallback self.controls() enforces the expectation even past 3 s.
                 self._invalidate_ctl_cache()
-        return m
+                if spec_expectation[0]:
+                    self._pending_bundle = spec_expectation[0]
+                return None
+            expected_bundle = spec_expectation[0]
+            if bundle_id and expected_bundle and bundle_id == expected_bundle:
+                self._pending_bundle = None
+            if app_name:
+                self._last_app_name = app_name
+                self._last_app_bundle = bundle_id or expected_bundle
+                if app_name != self._switched_from_app_name:
+                    self._switched_from_app_name = None
+            self._store_ctl_cache(ctl, img=self.r.last)
+            spec_ctl_harvested = ctl
+            return ctl
+
+        try:
+            # If the previous tap triggered a full-screen slide/push (_last_reaction_diff >= 2.0),
+            # drain the animation with cheap ~34 ms raw grabs before paying for full OCR on
+            # blurry mid-transition frames.
+            m0 = None
+            m0_pixel_stable = False
+            first_lines = None
+            if (self._last_action_ts
+                    and (time.monotonic() - self._last_action_ts) < 0.7
+                    and self._wait_settled_ts < self._last_action_ts
+                    and self._last_reaction_diff >= 2.0
+                    and getattr(self.r, "last_lines", None) is None
+                    and self.r.last is not None):
+                settled_prev, settled_img = self._settle_transition()
+                if settled_img is not None:
+                    _launch_spec_ui(settled_transition=settled_prev is not None)
+                    first_lines = self.r.read(img=settled_img)
+                    if hasattr(self.r, "set_last"):
+                        self.r.set_last(settled_img, lines=first_lines)
+                    m0 = find_text(first_lines, base, where=where)
+                    if (m0 is not None and settled_prev is not None and settled_prev is not settled_img
+                            and (_content_pixel_still(settled_prev, settled_img)
+                                 or _thumb_diff(settled_prev, settled_img) < 0.8)
+                            and _box_diff(settled_prev, settled_img, m0.x, m0.y, self.r.scale) < 2.0):
+                        m0_pixel_stable = True
+            if first_lines is None:
+                # Reuse a very recent frame (< 0.15 s) from the preceding step as Frame #1 if it
+                # already contains the target; otherwise grab a fresh Frame #1 and feed its match
+                # into wait(stable=True) so static screens only need one confirming frame.
+                cached_lines = self._fresh_lines()
+                if cached_lines is not None:
+                    m0 = find_text(cached_lines, base, where=where)
+                if m0 is None:
+                    _launch_spec_ui()
+                    first_lines = self.lines()
+                    m0 = find_text(first_lines, base, where=where)
+            frame1_img = self.r.last
+            if (m0 is None and self._last_action_ts
+                    and not self._last_action_is_typing
+                    and (time.monotonic() - self._last_action_ts) < 0.7):
+                # Right after open:/launch: once _wait_active_app() confirmed the app and Frame 1
+                # already rendered page content below the status bar (e.g. Safari before tapping
+                # accessibility-only TextField:Adresse), go straight to controls() instead of
+                # burning a redundant 2nd full OCR pass.
+                _, sh = self.r.pt_size()
+                status_y = int(sh * 0.06)
+                skip_second_ocr = (
+                    app_confirmed
+                    and first_lines is not None
+                    and any(l.y >= status_y for l in first_lines)
+                )
+                if not skip_second_ocr:
+                    # Inside a short post-action transition window (e.g. iOS nav push right
+                    # after a previous tap): grab one more OCR frame before paying for a
+                    # /source fetch on the outgoing screen.
+                    first_lines = self.lines()
+                    m0 = find_text(first_lines, base, where=where)
+                    if (spec_fut is not None
+                            and (frame1_img is None or self.r.last is None
+                                 or (frame1_img is not self.r.last
+                                     and not _content_pixel_still(frame1_img, self.r.last)))):
+                        _discard_spec_ui()
+                    frame1_img = self.r.last
+            if m0 is None and not base.startswith("re:"):
+                # Not in the first fresh OCR frame: an exact accessibility label (icon-only
+                # Back/Close/Search/tab or keypad Key) is tapped at once instead of after
+                # the 2.2 s OCR wait (Messenger Back: 2,979 -> ~800 ms), honoring @region.
+                ctl = _harvest_spec_ui(block=True)
+                if ctl is None:
+                    ctl = self.controls()
+                scoped = _controls_in_region(ctl, first_lines or [], where) if where else ctl
+                ext_types = TAP_FORM_TYPES + ("Image", "Slider", "Value")
+                c = exact_control(scoped, base, ext_types)
+                if not c and low_base in BACK_LABELS:
+                    for alt in BACK_LABELS:
+                        c = exact_control(scoped, alt, ("Button", "Link"))
+                        if c:
+                            break
+                if c:
+                    return self.tap_control(c)
+                if exact_control(scoped, base, ext_types, allow_disabled=True):
+                    raise FlowError(f"{base!r} is disabled")
+            if m0 is not None and m0_pixel_stable:
+                self._wait_settled_ts = time.monotonic()
+                m = m0
+            else:
+                try:
+                    m = self.wait(label, timeout=min(2.2, self.timeout), stable=True, initial=m0, allow_disabled=False)
+                except FlowError:
+                    _discard_spec_ui()
+                    # Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct messages)
+                    # have no visible text for OCR: one /source lookup with coordinates, then
+                    # targeted Sauvola fallback, then the slower element-predicate poll.
+                    last_lines = getattr(self.r, "last_lines", None)
+                    cur_lines = last_lines if last_lines is not None else (first_lines or [])
+                    raw_ctl_fb = self.controls()
+                    ctl_fb = _controls_in_region(raw_ctl_fb, cur_lines, where) if where else raw_ctl_fb
+                    if base.startswith("re:"):
+                        cm = find_control_match(ctl_fb, base, types=WAIT_UI_TYPES, allow_disabled=False)
+                        if cm:
+                            self.tap_point(cm.x, cm.y, cm.text)
+                            return cm
+                    else:
+                        c = find_control(ctl_fb, base)
+                        if c:
+                            return self.tap_control(c)
+                    slines = self._read_sauvola(self.r.last)
+                    if slines:
+                        sm = find_text(slines, base, where=where)
+                        if sm:
+                            if self._is_disabled_ocr_match(sm, base, slines, where, controls=raw_ctl_fb):
+                                raise FlowError(f"{base!r} is disabled")
+                            self.tap_point(sm.x, sm.y, sm.text)
+                            return sm
+                    if base.startswith("re:"):
+                        if find_control_match(ctl_fb, base, types=WAIT_UI_TYPES, allow_disabled=True):
+                            raise FlowError(f"{base!r} is disabled")
+                    elif find_control(ctl_fb, base, allow_disabled=True):
+                        raise FlowError(f"{base!r} is disabled")
+                    if where or base.startswith("re:"):
+                        raise
+                    x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
+                    return Match(x, y, f"[el:{label}]", None)
+                if (spec_fut is not None
+                        and frame1_img is not None and self.r.last is not None
+                        and frame1_img is not self.r.last
+                        and not _content_pixel_still(frame1_img, self.r.last)
+                        and _thumb_diff(frame1_img, self.r.last) >= 0.8):
+                    _discard_spec_ui()
+            _, h = self.r.pt_size()
+            near_bottom_tab = m.line is not None and m.y > h - 55
+            is_form_label = base.rstrip().endswith(":")
+            # Harvest speculative fastUI for free if already done (caches controls
+            # and avoids a redundant self.controls() call); never block rank=0 OCR hits.
+            resolved_ctl = _harvest_spec_ui(block=False)
+            if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
+                # 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
+                #    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
+                #    labelled exactly TEXT wins over the substring.
+                # 2. near_bottom_tab: OCR matched a tab label near the bottom edge
+                #    (y > h - 55, close to the home indicator): prefer the Tab/Button centre.
+                # 3. is_form_label: classic form label ('To:', 'Subject:', 'Til:', 'Emne:')
+                #    where OCR matches the left-aligned label text, but the focusable input
+                #    (TextField/TextView/SearchField) spans the row and should be tapped at
+                #    its centre.
+                last_lines = getattr(self.r, "last_lines", None)
+                cur_lines = last_lines if last_lines is not None else (
+                    self.r.read(img=self.r.last) if self.r.last is not None else [])
+                if resolved_ctl is None:
+                    resolved_ctl = _harvest_spec_ui(block=True)
+                if resolved_ctl is None:
+                    resolved_ctl = self.controls()
+                ctl = _controls_in_region(resolved_ctl, cur_lines, where)
+                c = exact_control(ctl, base, TAP_FORM_TYPES) if (m.rank or is_form_label) else None
+                if not c and is_form_label:
+                    c = self.input_near(base, m, controls=ctl)
+                if not c and near_bottom_tab:
+                    c = exact_control(ctl, base, ("Tab", "Button"))
+                    if not c:
+                        near = [x for x in ctl if x["type"] in ("Tab", "Button")
+                                and abs(x["y"] - m.y) <= 35 and abs(x["x"] - m.x) <= 60]
+                        c = find_control(near, base, types={"Tab", "Button"})
+                if c:
+                    return self.tap_control(c)
+            if m.line is not None:
+                cur_lines = getattr(self.r, "last_lines", None) or []
+                if self._is_disabled_ocr_match(m, base, cur_lines, where, controls=resolved_ctl):
+                    raise FlowError(f"{base!r} is disabled")
+            _discard_spec_ui()
+            # Take a fresh pre-tap baseline when m came from wait()'s UI fallback so
+            # changed_since() measures the tap cleanly (used for switch/input companion
+            # resolution and cache invalidation; never replays an acknowledged tap).
+            before = self.r.grab() if m.line is None else self.r.last
+            self.tap_point(m.x, m.y, m.text)
+            if not self.changed_since(before, x=m.x, y=m.y):
+                self._invalidate_ctl_cache()
+                # Tapping a switch row's label does nothing: tap the distinct toggle
+                # control on that row, unless the toggle itself already flipped.
+                ctl = resolved_ctl if resolved_ctl is not None else self.controls()
+                sw = self.switch_near(base, m, controls=ctl)
+                if sw and (abs(sw["x"] - m.x) > 12 or abs(sw["y"] - m.y) > 12):
+                    if _box_diff(before, self.r.grab(), sw["x"], sw["y"], self.r.scale) < 4:
+                        return self.tap_control(sw)
+                    return m
+                # Tapping a form field's static label may not focus its input: tap a
+                # distinct row-aligned TextField/TextView/SearchField/SecureTextField.
+                inp = self.input_near(base, m, controls=ctl)
+                if inp and (abs(inp["x"] - m.x) > 12 or abs(inp["y"] - m.y) > 12):
+                    return self.tap_control(inp)
+            elif self._ctl_cache is not None and self.r.last is not None:
+                if _thumb_diff(self._ctl_cache[3], self.r.last) >= _CTL_CACHE_MAX_DIFF:
+                    self._invalidate_ctl_cache()
+            return m
+        finally:
+            _discard_spec_ui()
 
     def _tap_if_ocr_match(self, m, base, where, lines, controls=None, deadline=None):
         """Tap an OCR match found by tap_if, preferring an exact control on
@@ -3555,8 +3673,14 @@ class Flow:
         # takes the normal 2 grabs whenever the screen actually scrolled.
         self.settle(timeout=2.5, start=before)
 
-    def scroll_to(self, label, where=None, max_swipes=8):
+    def scroll_to(self, label, where=None, max_swipes=8, direction="down"):
         """Read, swipe, read... without waiting for momentum to end."""
+        direction = (direction or "down").strip().lower()
+        if direction not in ("down", "up"):
+            raise FlowError(f"scrollto:{direction}? use down|up")
+        if not label:
+            raise FlowError("scrollto requires target text (e.g. scrollto:TEXT or scrollto:up:TEXT)")
+        self._wait_active_app()
         seen = None
         for i in range(max_swipes + 1):
             if i:
@@ -3565,13 +3689,16 @@ class Flow:
                 lines = self._fresh_lines() or self.lines()
             m = find_text(lines, label, where=where)
             if m:
+                if self.r.last is not None and hasattr(self.r, "set_last"):
+                    self.r.set_last(self.r.last, lines=lines)
+                self._wait_settled_ts = time.monotonic()
                 return m
             texts = [l.text for l in lines]
             if texts == seen:
                 break  # nothing moved: end of the list
             seen = texts
-            self.scroll("down")
-        raise FlowError(f"{label!r} not found while scrolling")
+            self.scroll(direction)
+        raise FlowError(f"{label!r} not found while scrolling {direction}")
 
     def _snapshot_ui_expectation(self, now=None):
         """Snapshot the expected bundle and outgoing app name at the START of a UI
@@ -4486,7 +4613,14 @@ class Flow:
         elif verb == "scroll":
             self.scroll(arg or "down")
         elif verb == "scrollto":
-            return self.scroll_to(*split_where(arg)).text
+            direction = "down"
+            target = arg
+            pfx, sep, rest = arg.partition(":")
+            if sep and pfx.strip().lower() in ("up", "down"):
+                direction = pfx.strip().lower()
+                target = rest
+            label, where = split_where(target)
+            return self.scroll_to(label, where=where, direction=direction).text
         elif verb == "swipe":
             return self.swipe_gesture(arg)
         elif verb == "picker":
