@@ -121,6 +121,8 @@ class WDAClient:
         side = WDAClient(self.base_url, udid=self.udid, device_key=self.device_key)
         side.sid = self.sid
         side.turbo = self.turbo
+        side._raw_shot = self._raw_shot
+        side._fast_ui = self._fast_ui
         return side
 
     def _session_cache_file(self):
@@ -173,6 +175,35 @@ class WDAClient:
                 os.replace(tmp, path)
             except OSError:
                 pass
+
+    def _supports_req_raw(self):
+        """True for real WDAClient or subclasses that override req_raw; False for
+        test doubles that only override req() so they keep working without sockets."""
+        cls = type(self)
+        return cls.req_raw is not WDAClient.req_raw or cls.req is WDAClient.req
+
+    def req_raw(self, method, path, data=None, timeout=25):
+        """Raw HTTP request on the same persistent keep-alive connection.
+        Returns (status_code, content_type, raw_bytes)."""
+        body = json.dumps(data).encode() if data is not None else None
+        headers = {"Content-Type": "application/json"} if data is not None else {}
+        u = urllib.parse.urlsplit(self.base_url)
+        for attempt in (0, 1):
+            try:
+                if self._conn is None:
+                    self._conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+                self._conn.timeout = timeout
+                if self._conn.sock is not None:
+                    self._conn.sock.settimeout(timeout)
+                self._conn.request(method, path, body=body, headers=headers)
+                resp = self._conn.getresponse()
+                raw = resp.read()
+                ct = resp.getheader("Content-Type") or ""
+                return resp.status, ct, raw
+            except (http.client.HTTPException, OSError) as e:
+                self._conn = None
+                if attempt:
+                    return 0, "", str(e).encode()
 
     def req(self, method, path, data=None, timeout=25):
         """One persistent keep-alive HTTP connection (re-opened on failure).
@@ -261,6 +292,8 @@ class WDAClient:
     # None = not probed yet; True when the wda-turbo patch is running. WDA_TURBO=0
     # forces the stock endpoints (benchmark baseline).
     turbo = False if os.environ.get("WDA_TURBO") == "0" else None
+    _raw_shot = None   # None = not probed; True = binary /wda/fastScreenshot; False = legacy JSON
+    _fast_ui = None    # None = not probed; True = /wda/fastUI; False = fallback to SOURCE_LITE
 
     def fast_tap(self, x, y):
         """Coordinate tap. With patches/wda-turbo.patch, /wda/fastTap sends one
@@ -685,11 +718,47 @@ class ScreenReader:
                 payload = {"quality": 0.6, "scale": min(1.0, self._dev)}
                 if not full:
                     payload.update({"x0": 0, "x1": w, "y0": y0, "y1": y1_eff})
-                r = self.c.req("POST", "/wda/fastScreenshot", payload)
-                v = r.get("value")
-                if isinstance(v, str) and v:
-                    self.c.turbo = True
-                    img = Image.open(io.BytesIO(base64.b64decode(v)))
+                use_raw = (
+                    getattr(self.c, "_raw_shot", None) is not False
+                    and hasattr(self.c, "req_raw")
+                    and (not hasattr(self.c, "_supports_req_raw") or self.c._supports_req_raw())
+                )
+                raw_bytes = None
+                r = None
+                if use_raw:
+                    payload["raw"] = True
+                    status, ct, body = self.c.req_raw("POST", "/wda/fastScreenshot", payload)
+                    if status == 200 and ct.lower().startswith("image/") and body:
+                        self.c.turbo = True
+                        self.c._raw_shot = True
+                        raw_bytes = body
+                    elif status == 200 and body:
+                        # Older wda-turbo ignored "raw": true and returned JSON base64.
+                        self.c._raw_shot = False
+                        try:
+                            r = json.loads(body.decode())
+                        except ValueError:
+                            r = {"error": "invalid json"}
+                    elif status == 404:
+                        r = {"error": 404}
+                    else:
+                        r = {"error": status or "connection failed"}
+                else:
+                    r = self.c.req("POST", "/wda/fastScreenshot", payload)
+                if raw_bytes is None and isinstance(r, dict):
+                    v = r.get("value")
+                    if isinstance(v, str) and v:
+                        self.c.turbo = True
+                        raw_bytes = base64.b64decode(v)
+                    elif r.get("error") == 404:
+                        self.c.turbo = False
+                    elif r.get("error") and self._pt_from_cache and attempt == 0:
+                        if hasattr(self.c, "_invalidate_session_cache"):
+                            self.c._invalidate_session_cache("screen_pt")
+                        self.pt_size(force_refresh=True)
+                        continue
+                if raw_bytes is not None:
+                    img = Image.open(io.BytesIO(raw_bytes))
                     if img.size[0] > 0 and img.size[1] > 0:
                         got_ratio = img.size[0] / img.size[1]
                         exp_ratio = out[0] / out[1]
@@ -703,13 +772,6 @@ class ScreenReader:
                                 continue
                         if abs(img.size[0] - out[0]) > 2:
                             self._dev *= out[0] / img.size[0]
-                elif r.get("error") == 404:
-                    self.c.turbo = False
-                elif r.get("error") and self._pt_from_cache and attempt == 0:
-                    if hasattr(self.c, "_invalidate_session_cache"):
-                        self.c._invalidate_session_cache("screen_pt")
-                    self.pt_size(force_refresh=True)
-                    continue
             if img is None:
                 b64 = self.c.req("GET", "/screenshot").get("value")
                 if not b64:
@@ -984,9 +1046,13 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
 
     walk(root or {})
 
-    # Deduplicate noisy row clutter: drop decorative disclosure 'chevron' buttons
-    # sitting on a list row, and stacked (Cell, Button) pairs on the same row with
-    # the exact same normalized label (prefer Button; keep Cell if it carries extra info).
+    return _dedupe_ui_controls(out), app_name
+
+
+def _dedupe_ui_controls(out):
+    """Drop decorative disclosure 'chevron' buttons sitting on a list row, and
+    stacked (Cell, Button) pairs on the same row with the exact same normalized
+    label (prefer Button; keep Cell if it carries extra info)."""
     buttons = [c for c in out if c["type"] == "Button"]
     row_anchors = [c for c in out if c["type"] in ("Cell", "Button")
                    and c["label"].casefold() not in _CHEVRON_LABELS]
@@ -1000,10 +1066,60 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
             if any(_norm(b["label"]) == cn and abs(c["y"] - b["y"]) <= 8 for b in buttons):
                 continue
         deduped.append(c)
-    return deduped, app_name
+    return deduped
+
+
+def _parse_fast_ui(data, screen=(430, 932)):
+    """Normalize and deduplicate a /wda/fastUI JSON dict into (controls, app_name)."""
+    scr = data.get("screen")
+    if (isinstance(scr, (list, tuple)) and len(scr) == 2
+            and all(isinstance(v, (int, float)) and v > 0 for v in scr)):
+        eff_screen = (int(scr[0]), int(scr[1]))
+    else:
+        eff_screen = screen
+    app_name = _clean_text(str(data.get("appName") or ""))
+    out, seen = [], {}
+    for raw in data.get("ui") or []:
+        if not isinstance(raw, dict):
+            continue
+        t = raw.get("type") or ""
+        lab = _clean_text(str(raw.get("label") or ""))
+        if not t or not lab:
+            continue
+        try:
+            x, y = int(raw["x"]), int(raw["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        is_internal_img = (
+            t == "Image" and " " not in lab
+            and bool(re.search(r"[._-]", lab) or re.search(r"[a-z][A-Z]", lab))
+        )
+        if not (0 < x < eff_screen[0] and 0 < y < eff_screen[1]) or is_internal_img:
+            continue
+        item = {"type": t, "label": lab, "x": x, "y": y}
+        val = raw.get("value")
+        if t in ("Switch", "Slider", "TextField", "SearchField") and val not in (None, ""):
+            cval = _clean_text(str(val))
+            if cval and cval != lab:
+                item["value"] = cval
+        key = (lab, x // 4, y // 4)
+        if key not in seen:
+            seen[key] = len(out)
+            out.append(item)
+        elif out[seen[key]]["type"] == "Cell" and t == "Button" and not out[seen[key]].get("value"):
+            out[seen[key]] = item
+    return _dedupe_ui_controls(out), app_name
 
 
 def _fetch_ui_controls(client, screen=(430, 932), text=False):
+    if getattr(client, "turbo", None) is not False and getattr(client, "_fast_ui", None) is not False:
+        path = "/wda/fastUI?text=1" if text else "/wda/fastUI"
+        r = client.req("GET", path, timeout=30)
+        if isinstance(r, dict) and isinstance(r.get("ui"), list):
+            client._fast_ui = True
+            return _parse_fast_ui(r, screen=screen)
+        if not isinstance(r, dict) or r.get("error") == 404 or (not r.get("error") and "ui" not in r):
+            client._fast_ui = False
     r = client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=30)
     return _parse_ui_controls(r.get("value") or {}, screen=screen, text=text)
 
