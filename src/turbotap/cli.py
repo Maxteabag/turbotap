@@ -3592,10 +3592,11 @@ class Flow:
         )
 
     def swipe(self, direction="down"):
-        """Scroll 40% of the screen without momentum (wda-turbo fastDrag crawls
-        1 pt during the 80 ms hold, so the release velocity is ~0)."""
+        """Scroll 54% of the screen without momentum (wda-turbo fastDrag crawls
+        1 pt during the 80 ms hold, so the release velocity is ~0 while keeping
+        46% viewport overlap so no row is skipped)."""
         w, h = self.r.pt_size()
-        a, b = int(h * 0.72), int(h * 0.32)
+        a, b = int(h * 0.76), int(h * 0.22)
         if direction == "down":
             self.drag(w // 2, a, w // 2, b, duration=0.08, release=0.08)
         elif direction == "up":
