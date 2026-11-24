@@ -1,0 +1,76 @@
+--- a/WebDriverAgentLib/Commands/FBScreenshotCommands.m
++++ b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
+@@ -15,6 +15,7 @@
+ #import "FBCommandStatus.h"
+ #import "FBRouteRequest.h"
+ @import UniformTypeIdentifiers;
++@import Vision;
+ 
+ // wda-turbo: downscale JPEG/PNG via ImageIO thumbnail subsampling (avoids full RGBA
+ // UIGraphicsImageRenderer redraw and per-call FBImageProcessor dispatch queue alloc).
+@@ -73,6 +74,10 @@
+     [[FBRoute GET:@"/screenshot"].standalone respondWithTarget:self action:@selector(handleGetScreenshot:)],
+     [[FBRoute POST:@"/wda/fastScreenshot"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastScreenshot:)],
+     [[FBRoute POST:@"/wda/fastScreenshot"].standalone respondWithTarget:self action:@selector(handleFastScreenshot:)],
++    [[FBRoute POST:@"/wda/fastOCR"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastOCR:)],
++    [[FBRoute POST:@"/wda/fastOCR"].standalone respondWithTarget:self action:@selector(handleFastOCR:)],
++    [[FBRoute POST:@"/wda/fastRead"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastOCR:)],
++    [[FBRoute POST:@"/wda/fastRead"].standalone respondWithTarget:self action:@selector(handleFastOCR:)],
+   ];
+ }
+ 
+@@ -123,4 +128,54 @@
+   return FBResponseWithObject([data base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0]);
+ }
+ 
++// Both route names expose the same line-level result. Coordinates are fractions
++// of the oriented screenshot, with an origin at the top left.
+++ (id<FBResponsePayload>)handleFastOCR:(FBRouteRequest *)request
++{
++  NSDictionary *args = request.arguments;
++  id mode = args[@"mode"] ?: @"fast";
++  if (![@"fast" isEqual:mode] && ![@"accurate" isEqual:mode]) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"mode must be fast or accurate" traceback:nil]);
++  }
++  for (NSString *key in args) {
++    if (![@"mode" isEqual:key]) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Only mode is supported" traceback:nil]);
++    }
++  }
++
++  @autoreleasepool {
++    NSData *png = XCUIScreen.mainScreen.screenshot.PNGRepresentation;
++    if (png.length == 0) {
++      return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:@"No screenshot available" traceback:nil]);
++    }
++    VNRecognizeTextRequest *ocr = [[VNRecognizeTextRequest alloc] init];
++    BOOL accurate = [@"accurate" isEqual:mode];
++    ocr.recognitionLevel = accurate ? VNRequestTextRecognitionLevelAccurate : VNRequestTextRecognitionLevelFast;
++    ocr.usesLanguageCorrection = accurate;
++    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithData:png options:@{}];
++    NSError *error = nil;
++    if (![handler performRequests:@[ocr] error:&error]) {
++      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Vision text recognition failed" traceback:nil]);
++    }
++
++    NSMutableArray *lines = [NSMutableArray array];
++    for (VNRecognizedTextObservation *item in ocr.results) {
++      VNRecognizedText *best = [item topCandidates:1].firstObject;
++      if (best.string.length == 0) {
++        continue;
++      }
++      CGRect box = item.boundingBox;
++      [lines addObject:@{
++        @"text": best.string,
++        @"confidence": @(best.confidence),
++        @"x": @(CGRectGetMinX(box)),
++        @"y": @(1.0 - CGRectGetMaxY(box)),
++        @"width": @(CGRectGetWidth(box)),
++        @"height": @(CGRectGetHeight(box)),
++      }];
++    }
++    return FBResponseWithObject(@{@"mode": mode, @"lines": lines});
++  }
++}
++
+ @end
