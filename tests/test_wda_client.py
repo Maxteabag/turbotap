@@ -496,9 +496,9 @@ class UnlockAndPasteboardTests(unittest.TestCase):
             f"type == 'XCUIElementTypeKey' AND name == '{d}'": {"ELEMENT": f"key-{d}"}
             for d in "1234"
         }
-        # Legacy path confirms locked initially, before loop, and after each digit lookup (6 True -> False).
+        # Legacy path confirms locked initially, and before each digit lookup + click (9 True -> False).
         c = MockWDAClient(
-            locked=[True, True, True, True, True, True, False],
+            locked=[True] * 9 + [False],
             active_app="com.apple.springboard",
             element_map=key_map,
         )
@@ -509,7 +509,7 @@ class UnlockAndPasteboardTests(unittest.TestCase):
 
         # Face ID race: keypad disappears after digit 1 because phone unlocked mid-entry.
         c_face = MockWDAClient(
-            locked=[True, True, True, False],
+            locked=[True, True, True, True, False],
             active_app="com.apple.springboard",
             element_map={"type == 'XCUIElementTypeKey' AND name == '1'": {"ELEMENT": "key-1"}},
         )
@@ -527,16 +527,44 @@ class UnlockAndPasteboardTests(unittest.TestCase):
             self.assertTrue(c_stock_face.unlock_phone())
         self.assertEqual([p for _, p, _ in c_stock_face.calls if p.endswith("/click")], [])
 
-        # Face ID unlocks while legacy digit-1 lookup was in flight: post-lookup lock check skips click!
-        c_post_lookup_face = MockWDAClient(
-            locked=[True, True, False],
-            active_app="com.apple.springboard",
+        # Face ID unlocks to SpringBoard Home Screen DURING activeAppInfo right before clicking
+        # digit 1: final /wda/locked read sees False -> exits True with ZERO clicks!
+        app_calls = [0]
+        unlocked_during_app = [False]
+
+        def app_unlock_handler(method, path, data):
+            if path == "/wda/activeAppInfo":
+                app_calls[0] += 1
+                if app_calls[0] >= 2:
+                    unlocked_during_app[0] = True
+                return {"value": {"bundleId": "com.apple.springboard", "name": "SpringBoard"}}
+            if path == "/wda/locked":
+                return {"value": not unlocked_during_app[0]}
+            return None
+
+        c_app_race = MockWDAClient(
             fast_ui_404=True,
             element_map=key_map,
+            custom_handler=app_unlock_handler,
         )
         with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
-            self.assertTrue(c_post_lookup_face.unlock_phone())
-        self.assertEqual([p for _, p, _ in c_post_lookup_face.calls if p.endswith("/click")], [])
+            self.assertTrue(c_app_race.unlock_phone())
+        self.assertEqual([p for _, p, _ in c_app_race.calls if p.endswith("/click")], [])
+
+        # Phone unlocks between digit 1 click and digit 2: pre-lookup gate stops BEFORE digit 2
+        # lookup, issuing ONLY 1 /element lookup and 1 /click total!
+        unlocked_after_d1 = [False]
+        c_between_digits = MockWDAClient(
+            fast_ui_404=True,
+            active_app="com.apple.springboard",
+            element_map=key_map,
+            on_action=lambda kind, _p: unlocked_after_d1.__setitem__(0, True) if kind == "click" else None,
+            custom_handler=lambda m, p, d: {"value": not unlocked_after_d1[0]} if p == "/wda/locked" else None,
+        )
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c_between_digits.unlock_phone())
+        self.assertEqual(len([p for _, p, _ in c_between_digits.calls if p.endswith("/element")]), 1)
+        self.assertEqual(len([p for _, p, _ in c_between_digits.calls if p.endswith("/click")]), 1)
 
         # Legacy path refuses to click keys when foreground app is not SpringBoard (e.g. Calculator).
         c_non_sb = MockWDAClient(
@@ -566,10 +594,10 @@ class UnlockAndPasteboardTests(unittest.TestCase):
             self.assertNotIn("4821", str(ctx_ae.exception))
             self.assertEqual([p for _, p, _ in c_app_err.calls if p.endswith("/element") or p.endswith("/click")], [])
 
-        # If activeAppInfo fails because the phone just unlocked (recheck returns explicit False),
+        # If activeAppInfo fails because the phone just unlocked (final locked check returns explicit False),
         # returns True with ZERO digit lookups and ZERO clicks.
         c_app_err_unlocked = MockWDAClient(
-            locked=[True, True, False],
+            locked=[True, False],
             fast_ui_404=True,
             element_map=key_map,
             custom_handler=lambda m, p, d: {"error": 500} if p == "/wda/activeAppInfo" else None,

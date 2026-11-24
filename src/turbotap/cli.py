@@ -660,22 +660,23 @@ class WDAClient:
         raise RuntimeError(f"Unable to confirm lock state ({last_err})")
 
     def _confirm_springboard_locked(self, retries=1):
-        """Require both explicit locked=True AND positive SpringBoard bundle provenance
-        from GET /wda/activeAppInfo. Returns True when confirmed locked on SpringBoard,
-        False when explicitly unlocked, and raises a redacted RuntimeError if SpringBoard
-        cannot be confirmed while locked."""
-        if not self._confirm_locked_state(retries=retries):
-            return False
+        """Require positive SpringBoard bundle provenance from GET /wda/activeAppInfo
+        followed by explicit locked=True from GET /wda/locked as the FINAL read.
+        Returns True when confirmed locked on SpringBoard, False when explicitly
+        unlocked, and raises a redacted RuntimeError if SpringBoard cannot be
+        confirmed while locked."""
         app_r = self.req("GET", "/wda/activeAppInfo")
         active_bid = ""
         if isinstance(app_r, dict) and not app_r.get("error"):
             val = app_r.get("value")
             if isinstance(val, dict):
                 active_bid = str(val.get("bundleId") or "")
-        if active_bid == "com.apple.springboard":
-            return True
+        # Final read is always /wda/locked so Face ID unlocking during activeAppInfo
+        # (even while SpringBoard Home Screen stays foreground) exits cleanly.
         if not self._confirm_locked_state(retries=retries):
             return False
+        if active_bid == "com.apple.springboard":
+            return True
         raise RuntimeError("Passcode keypad unavailable: unable to confirm SpringBoard lock screen")
 
     def unlock_phone(self):
@@ -740,10 +741,12 @@ class WDAClient:
                 time.sleep(0.5)
                 self.req("POST", f"/session/{self.sid}/wda/pressButton", {"name": "home"})
                 time.sleep(2.8)
-            if not self._confirm_springboard_locked(retries=1):
-                return True
             # Screen-size-agnostic XCUIElementTypeKey lookup (works on any iPhone model).
+            # Verify SpringBoard bundle + locked=True (as the final read) immediately before
+            # EACH digit lookup and EACH click.
             for d in passcode:
+                if not self._confirm_springboard_locked(retries=1):
+                    return True
                 el = self.req("POST", f"/session/{self.sid}/element", {
                     "using": "predicate string",
                     "value": f"type == 'XCUIElementTypeKey' AND name == '{d}'",
@@ -755,7 +758,6 @@ class WDAClient:
                     if not self._confirm_locked_state(retries=1):
                         return True
                     raise RuntimeError("Passcode keypad not found on screen")  # never echo passcode digits
-                # Re-confirm SpringBoard lock state after lookup in case lookup outlasted an unlock transition.
                 if not self._confirm_springboard_locked(retries=1):
                     return True
                 _check_wda_ok(
