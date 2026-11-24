@@ -932,6 +932,8 @@ def find_text(lines, label, fuzzy=0.84, where=None):
             return None
     want = _norm(label)
     rx = re.compile(label[3:], re.I) if label.startswith("re:") else None
+    short_alpha = (not rx) and bool(want) and len(want) <= 3 and want.isalpha()
+    wb_rx = re.compile(rf"(?<!\w){re.escape(want)}(?!\w)") if short_alpha else None
     best = None
     for ln in lines:
         t = _norm(ln.text)
@@ -943,28 +945,39 @@ def find_text(lines, label, fuzzy=0.84, where=None):
             ok = bool(hit)
             need = _norm(hit.group(0)) if hit else ""
         else:
-            ok = want in t
+            ok = bool(wb_rx.search(t)) if wb_rx is not None else (want in t)
             if t == want:
                 rank = 0
             else:
-                m_icon = re.match(r"^[^\w\s]\s+(.+)$", t) if want else None
-                if m_icon and m_icon.group(1) == want:
+                # Strip a leading 1-3 char non-alphabetic icon glyph (e.g. '©', '@', '[5]', '2]')
+                # when the rest of the line equals want; keep numbered items ('1 Foo') as rank 1.
+                m_icon = re.match(r"^(\S{1,3})\s+(.+)$", t) if want else None
+                if (m_icon and m_icon.group(2) == want
+                        and re.search(r"[^\w]", m_icon.group(1))
+                        and not any(ch.isalpha() for ch in m_icon.group(1))):
                     rank = 0
                     icon_stripped = True
-                elif t.startswith(want) or t.endswith(want):
+                elif ok and (t.startswith(want) or t.endswith(want)):
                     rank = 1
                 else:
                     rank = 2
             need = want
         span = None
         if ok:
-            if icon_stripped and len(ln.words) >= 2 and not re.search(r"\w", ln.words[0][0]):
+            if (icon_stripped and len(ln.words) >= 2
+                    and re.search(r"[^\w]", ln.words[0][0])
+                    and not any(ch.isalpha() for ch in ln.words[0][0])):
                 span = (1, len(ln.words))
             else:
                 n = len(words)
                 for size in range(1, n + 1):
                     for i in range(n - size + 1):
-                        if need in " ".join(words[i:i + size]):
+                        chunk = " ".join(words[i:i + size])
+                        if wb_rx is not None:
+                            if wb_rx.search(chunk):
+                                span = (i, i + size)
+                                break
+                        elif need in chunk:
                             span = (i, i + size)
                             break
                     if span:
@@ -2979,6 +2992,7 @@ class Flow:
             # Harvest speculative fastUI for free if already done (caches controls
             # and avoids a redundant self.controls() call); never block rank=0 OCR hits.
             resolved_ctl = _harvest_spec_ui(block=False)
+            resolved_from_spec = resolved_ctl is not None
             if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
                 # 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
                 #    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
@@ -2994,6 +3008,7 @@ class Flow:
                     self.r.read(img=self.r.last) if self.r.last is not None else [])
                 if resolved_ctl is None:
                     resolved_ctl = _harvest_spec_ui(block=True)
+                    resolved_from_spec = resolved_ctl is not None
                 if resolved_ctl is None:
                     resolved_ctl = self.controls()
                 ctl = _controls_in_region(resolved_ctl, cur_lines, where)
@@ -3006,6 +3021,17 @@ class Flow:
                         near = [x for x in ctl if x["type"] in ("Tab", "Button")
                                 and abs(x["y"] - m.y) <= 35 and abs(x["x"] - m.x) <= 60]
                         c = find_control(near, base, types={"Tab", "Button"})
+                if c and resolved_from_spec and m.rank <= 1 and abs(c["y"] - m.y) > 40:
+                    # Layout shifted vertically (e.g. async header card appeared) between
+                    # speculative fastUI and settled OCR: discard stale speculative coords.
+                    self._invalidate_ctl_cache()
+                    resolved_ctl = self.controls()
+                    ctl = _controls_in_region(resolved_ctl, cur_lines, where)
+                    c = exact_control(ctl, base, TAP_FORM_TYPES) if (m.rank or is_form_label) else None
+                    if not c and is_form_label:
+                        c = self.input_near(base, m, controls=ctl)
+                    if not c and near_bottom_tab:
+                        c = exact_control(ctl, base, ("Tab", "Button"))
                 if c:
                     return self.tap_control(c)
             if m.line is not None:
@@ -3845,6 +3871,7 @@ class Flow:
         if not label:
             raise FlowError("scrollto requires target text (e.g. scrollto:TEXT or scrollto:up:TEXT)")
         self._wait_active_app()
+        _, sh = self.r.pt_size()
         seen = None
         for i in range(max_swipes + 1):
             if i:
@@ -3852,13 +3879,25 @@ class Flow:
             else:
                 lines = self._fresh_lines() or self.lines()
             m = find_text(lines, label, where=where)
-            if m:
-                if self.r.last is not None and hasattr(self.r, "set_last"):
-                    self.r.set_last(self.r.last, lines=lines)
-                self._wait_settled_ts = time.monotonic()
-                return m
             texts = [l.text for l in lines]
-            if texts == seen:
+            at_end = (texts == seen)
+            # If scrolling down reveals the target clipped under the iOS bottom home
+            # indicator / tab bar (y > sh - 55), scroll one more step into the tappable
+            # middle of the viewport (unless already at the end of the list or scoped).
+            if m and not (direction == "down" and not where and m.y > sh - 55 and i < max_swipes and not at_end):
+                just_launched = (
+                    i == 0
+                    and bool(self._pending_bundle_ts)
+                    and (time.monotonic() - self._pending_bundle_ts) < 1.5
+                )
+                if not just_launched:
+                    if self.r.last is not None and hasattr(self.r, "set_last"):
+                        self.r.set_last(self.r.last, lines=lines)
+                    self._wait_settled_ts = time.monotonic()
+                return m
+            if at_end:
+                if m:
+                    return m
                 break  # nothing moved: end of the list
             seen = texts
             self.scroll(direction)

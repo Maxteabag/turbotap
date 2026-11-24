@@ -1991,6 +1991,27 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
         finally:
             flow_stop.close()
 
+        # When scrollto (down) sees the target clipped in the bottom home-indicator strip
+        # (y > sh - 55), it scrolls once more to bring it cleanly into the tappable viewport.
+        edge_img1 = solid_img(240, size=(430, 932))
+        edge_img2 = solid_img(200, size=(430, 932))
+        c_edge = MockWDAClient()
+        r_edge = FakeReader(
+            frames=[
+                (edge_img1, [make_line("Generelt", 40, 895, 160, 915)]),  # y=905 > 932-55=877
+                (edge_img2, [make_line("Generelt", 40, 500, 160, 520)]),  # y=510 cleanly tappable
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_edge = cli.Flow(c_edge, reader=r_edge, timeout=1.0)
+        try:
+            with mock.patch.object(flow_edge, "scroll", side_effect=lambda d="down": r_edge.set_last(edge_img2)):
+                m_edge = flow_edge.scroll_to("Generelt")
+            self.assertEqual(m_edge.y, 510)
+        finally:
+            flow_edge.close()
+
 
 class LazyImportAndWarmupTests(unittest.TestCase):
     def test_import_and_help_do_not_load_pil_or_http_client(self):

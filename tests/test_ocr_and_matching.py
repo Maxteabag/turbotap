@@ -271,6 +271,40 @@ class FindTextMatchingTests(unittest.TestCase):
         self.assertIsNotNone(m_top)
         self.assertEqual(m_top.y, 20)
 
+    def test_short_alpha_word_boundary_and_multichar_icon_prefix(self):
+        # Short alphabetic labels (<= 3 chars like 'Om', 'OK', 'On') must NOT match
+        # mid-word inside unrelated words like '@ Zoom' or 'Home'.
+        false_pos = [
+            make_line("@ Zoom", 20, 120, 120, 140),
+            make_line("Home Screen", 20, 180, 160, 200),
+            make_line("Kommentarer", 20, 240, 180, 260),
+        ]
+        self.assertIsNone(cli.find_text(false_pos, "Om"))
+
+        # Word-boundary matches (exact, icon-prefixed, or standalone word) still match cleanly.
+        m_exact = cli.find_text([make_line("Om", 20, 150, 60, 170)], "Om")
+        self.assertIsNotNone(m_exact)
+        self.assertEqual(m_exact.rank, 0)
+
+        m_phrase = cli.find_text([make_line("Zoom Om enheten", 20, 150, 260, 170)], "Om")
+        self.assertIsNotNone(m_phrase)
+        # Span centers on 'Om' (middle word), not 'Zoom' (first word).
+        self.assertGreater(m_phrase.x, 90)
+
+        # Multi-char non-alpha row icon prefixes ('[5] Generelt', '2] Generelt', '© Generelt')
+        # strip to rank 0 centered on the label, while numbered items ('1 Generelt') stay rank 1.
+        for txt in ("[5] Generelt", "2] Generelt", "© Generelt"):
+            ln = cli.Line([(txt.split()[0], 20, 200, 42, 220), ("Generelt", 50, 200, 150, 220)])
+            m = cli.find_text([ln], "Generelt")
+            self.assertIsNotNone(m)
+            self.assertEqual(m.rank, 0, f"expected rank 0 for {txt!r}")
+            self.assertEqual(m.x, 100)  # centered on 'Generelt' [50..150], skipping icon
+
+        num_ln = cli.Line([("1", 20, 200, 32, 220), ("Generelt", 50, 200, 150, 220)])
+        m_num = cli.find_text([num_ln], "Generelt")
+        self.assertIsNotNone(m_num)
+        self.assertEqual(m_num.rank, 1)
+
 
 class FrameReactedTests(unittest.TestCase):
     def test_identical_and_jpeg_noise_frames_rejected(self):
