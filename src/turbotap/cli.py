@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 
 # Must be set before libtesseract/libgomp load: OpenMP threads slow Tesseract down here.
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
@@ -914,6 +915,25 @@ def _norm(s):
     return re.sub(r"\s+", " ", s.lower()).strip()
 
 
+_ACCENT_TRANS = str.maketrans({
+    "ø": "o", "Ø": "O",
+    "æ": "ae", "Æ": "Ae",
+    "ß": "ss", "ẞ": "Ss",
+    "ð": "d", "Ð": "D",
+    "đ": "d", "Đ": "D",
+    "ł": "l", "Ł": "L",
+    "œ": "oe", "Œ": "Oe",
+})
+
+
+def _fold_accents(s):
+    """Strip combining diacritics (NFKD) and transliterate Nordic/European letters."""
+    if not s or s.isascii():
+        return s
+    s = s.translate(_ACCENT_TRANS)
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+
+
 class Match:
     """rank: 0 exact line, 1 line starts/ends with it, 2 substring, 3 fuzzy."""
     __slots__ = ("x", "y", "text", "line", "rank")
@@ -922,10 +942,59 @@ class Match:
         self.x, self.y, self.text, self.line, self.rank = x, y, text, line, rank
 
 
+def _match_line_tokens(ln, cur_t, cur_words, cur_want, cur_wb_rx):
+    ok = bool(cur_wb_rx.search(cur_t)) if cur_wb_rx is not None else (cur_want in cur_t)
+    if not ok:
+        return None
+    icon_stripped = False
+    if cur_t == cur_want:
+        rank = 0
+    else:
+        # Strip a leading 1-3 char non-alphabetic icon glyph (e.g. '©', '@', '[5]', '2]')
+        # when the rest of the line equals want; keep numbered items ('1 Foo') as rank 1.
+        m_icon = re.match(r"^(\S{1,3})\s+(.+)$", cur_t) if cur_want else None
+        if (m_icon and m_icon.group(2) == cur_want
+                and re.search(r"[^\w]", m_icon.group(1))
+                and not any(ch.isalpha() for ch in m_icon.group(1))):
+            rank = 0
+            icon_stripped = True
+        elif cur_t.startswith(cur_want) or cur_t.endswith(cur_want):
+            rank = 1
+        else:
+            rank = 2
+    span = None
+    if (icon_stripped and len(ln.words) >= 2
+            and re.search(r"[^\w]", ln.words[0][0])
+            and not any(ch.isalpha() for ch in ln.words[0][0])):
+        span = (1, len(ln.words))
+    else:
+        n = len(cur_words)
+        for size in range(1, n + 1):
+            for i in range(n - size + 1):
+                chunk = " ".join(cur_words[i:i + size])
+                if cur_wb_rx is not None:
+                    if cur_wb_rx.search(chunk):
+                        span = (i, i + size)
+                        break
+                elif cur_want in chunk:
+                    span = (i, i + size)
+                    break
+            if span:
+                break
+    return (rank, icon_stripped, span) if span else None
+
+
 def find_text(lines, label, fuzzy=0.84, where=None):
     """Best on-screen match for label: exact line > line starts/ends with it >
-    contains it > fuzzy word window (OCR typos); ties go to the topmost. 're:'
+    contains it > fuzzy word window (OCR typos); exact diacritics beat
+    diacritic-folded matches at the same rank; ties go to the topmost. 're:'
     prefix = regex. Returns the centre of the matching words, not the line."""
+    if lines and isinstance(lines[0], str):
+        lines = [
+            Line([(w, i * 40, idx * 24 + 100, (i + 1) * 40, idx * 24 + 120)
+                  for i, w in enumerate(s.split() or [s])]) if isinstance(s, str) else s
+            for idx, s in enumerate(lines)
+        ]
     if where:
         lines = _region(lines, where)
         if lines is None:
@@ -934,61 +1003,60 @@ def find_text(lines, label, fuzzy=0.84, where=None):
     rx = re.compile(label[3:], re.I) if label.startswith("re:") else None
     short_alpha = (not rx) and bool(want) and len(want) <= 3 and want.isalpha()
     wb_rx = re.compile(rf"(?<!\w){re.escape(want)}(?!\w)") if short_alpha else None
+    want_f = _fold_accents(want) if not rx else ""
+    short_alpha_f = (not rx) and bool(want_f) and (short_alpha or (len(want_f) <= 3 and want_f.isalpha()))
+    wb_rx_f = re.compile(rf"(?<!\w){re.escape(want_f)}(?!\w)") if short_alpha_f else None
     best = None
     for ln in lines:
         t = _norm(ln.text)
         words = [_norm(w[0]) for w in ln.words]
         icon_stripped = False
+        folded = False
+        span = None
+        rank = 2
         if rx:
             hit = rx.search(ln.text)
             rank = 0 if hit and hit.group(0) == ln.text else 2
             ok = bool(hit)
             need = _norm(hit.group(0)) if hit else ""
-        else:
-            ok = bool(wb_rx.search(t)) if wb_rx is not None else (want in t)
-            if t == want:
-                rank = 0
-            else:
-                # Strip a leading 1-3 char non-alphabetic icon glyph (e.g. '©', '@', '[5]', '2]')
-                # when the rest of the line equals want; keep numbered items ('1 Foo') as rank 1.
-                m_icon = re.match(r"^(\S{1,3})\s+(.+)$", t) if want else None
-                if (m_icon and m_icon.group(2) == want
-                        and re.search(r"[^\w]", m_icon.group(1))
-                        and not any(ch.isalpha() for ch in m_icon.group(1))):
-                    rank = 0
-                    icon_stripped = True
-                elif ok and (t.startswith(want) or t.endswith(want)):
-                    rank = 1
-                else:
-                    rank = 2
-            need = want
-        span = None
-        if ok:
-            if (icon_stripped and len(ln.words) >= 2
-                    and re.search(r"[^\w]", ln.words[0][0])
-                    and not any(ch.isalpha() for ch in ln.words[0][0])):
-                span = (1, len(ln.words))
-            else:
+            if ok:
                 n = len(words)
                 for size in range(1, n + 1):
                     for i in range(n - size + 1):
-                        chunk = " ".join(words[i:i + size])
-                        if wb_rx is not None:
-                            if wb_rx.search(chunk):
-                                span = (i, i + size)
-                                break
-                        elif need in chunk:
+                        if need in " ".join(words[i:i + size]):
                             span = (i, i + size)
                             break
                     if span:
                         break
-        elif fuzzy and not rx and not short_alpha and not any(ch.isdigit() for ch in want):
-            import difflib
-            k = max(1, len(want.split()))
-            for i in range(max(1, len(words) - k + 1)):
-                if difflib.SequenceMatcher(None, " ".join(words[i:i + k]), want).ratio() >= fuzzy:
-                    span, rank = (i, min(len(words), i + k)), 3
-                    break
+        else:
+            res = _match_line_tokens(ln, t, words, want, wb_rx)
+            t_f = _fold_accents(t)
+            words_f = None
+            if (res is None or res[0] > 0) and (t_f != t or want_f != want):
+                words_f = [_fold_accents(w) for w in words]
+                res_f = _match_line_tokens(ln, t_f, words_f, want_f, wb_rx_f)
+                if res_f is not None and (res is None or (res_f[0], True, res_f[1]) < (res[0], False, res[1])):
+                    rank, icon_stripped, span = res_f
+                    folded = True
+            if span is None and res is not None:
+                rank, icon_stripped, span = res
+                folded = False
+            if (span is None and fuzzy and not short_alpha and not short_alpha_f
+                    and not any(ch.isdigit() for ch in want)):
+                import difflib
+                k = max(1, len(want.split()))
+                for i in range(max(1, len(words) - k + 1)):
+                    if difflib.SequenceMatcher(None, " ".join(words[i:i + k]), want).ratio() >= fuzzy:
+                        span, rank, folded = (i, min(len(words), i + k)), 3, False
+                        break
+                if span is None and (t_f != t or want_f != want):
+                    if words_f is None:
+                        words_f = [_fold_accents(w) for w in words]
+                    k_f = max(1, len(want_f.split()))
+                    for i in range(max(1, len(words_f) - k_f + 1)):
+                        if difflib.SequenceMatcher(None, " ".join(words_f[i:i + k_f]), want_f).ratio() >= fuzzy:
+                            span, rank, folded = (i, min(len(words_f), i + k_f)), 3, True
+                            break
         if not span:
             continue
         ws = ln.words[span[0]:span[1]]
@@ -997,10 +1065,10 @@ def find_text(lines, label, fuzzy=0.84, where=None):
         # Deprioritize iOS status-bar lines (clock, battery, '< PrevApp' at y < 54)
         # unless the caller explicitly filtered by region (@y<..., @above:...).
         in_status = (not where) and (y < 54)
-        cand = (in_status, rank, icon_stripped, y, Match(x, y, ln.text, ln, rank))
-        if best is None or cand[:4] < best[:4]:
+        cand = (in_status, rank, folded, icon_stripped, y, Match(x, y, ln.text, ln, rank))
+        if best is None or cand[:5] < best[:5]:
             best = cand
-    return best[4] if best else None
+    return best[5] if best else None
 
 
 def _region(lines, where):
@@ -3781,14 +3849,21 @@ class Flow:
         self.settle(timeout=2.5, start=before)
 
     def scroll_to(self, label, where=None, max_swipes=8, direction="down"):
-        """Read, swipe, read... without waiting for momentum to end."""
+        """Read, swipe, read... without waiting for momentum to end.
+        OCR-first (zero controls() calls when OCR finds label); falls back to
+        controls(text=True) only on a blank/image-heavy initial frame (no OCR
+        lines below the status bar on i == 0) or upon reaching the end of scrolling
+        (at_end or i == max_swipes) without an OCR hit."""
         direction = (direction or "down").strip().lower()
         if direction not in ("down", "up"):
             raise FlowError(f"scrollto:{direction}? use down|up")
+        if where is None and "@" in (label or ""):
+            label, where = split_where(label)
         if not label:
             raise FlowError("scrollto requires target text (e.g. scrollto:TEXT or scrollto:up:TEXT)")
         self._wait_active_app()
         _, sh = self.r.pt_size()
+        status_y = max(54, int(sh * 0.06))
         seen = None
         for i in range(max_swipes + 1):
             if i:
@@ -3812,10 +3887,22 @@ class Flow:
                         self.r.set_last(self.r.last, lines=lines)
                     self._wait_settled_ts = time.monotonic()
                 return m
-            if at_end:
+            if not m and (
+                (i == 0 and not any(l.y >= status_y for l in lines))
+                or at_end
+                or i == max_swipes
+            ):
+                ctl = _controls_in_region(self.controls(text=True), lines, where)
+                cm = find_control_match(ctl, label, types=WAIT_UI_TYPES, allow_disabled=True)
+                if cm:
+                    if self.r.last is not None and hasattr(self.r, "set_last"):
+                        self.r.set_last(self.r.last, lines=lines)
+                    self._wait_settled_ts = time.monotonic()
+                    return cm
+            if at_end or i == max_swipes:
                 if m:
                     return m
-                break  # nothing moved: end of the list
+                break  # nothing moved or swipe limit reached
             seen = texts
             self.scroll(direction)
         raise FlowError(f"{label!r} not found while scrolling {direction}")

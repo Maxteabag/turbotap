@@ -1992,6 +1992,114 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
         finally:
             flow_edge.close()
 
+    def test_scrollto_accessibility_fallback_blank_i0_at_end_max_swipes_regions_regex_and_zero_ui_on_ocr(self):
+        img1 = solid_img(240, size=(430, 932))
+        img2 = solid_img(200, size=(430, 932))
+        img3 = solid_img(160, size=(430, 932))
+
+        # 1. Normal OCR hit on i == 0 and after scrolling makes ZERO controls() (/wda/fastUI) calls.
+        c_ocr = MockWDAClient(fast_ui=_fast_ui([{"type": "Button", "label": "Generelt", "x": 80, "y": 400}]))
+        r_ocr = FakeReader(
+            frames=[
+                (img1, [make_line("Wi-Fi", 30, 200, 100, 224)]),
+                (img2, [make_line("Generelt", 30, 400, 130, 424)]),
+                (img2.copy(), [make_line("Generelt", 30, 400, 130, 424)]),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_ocr = cli.Flow(c_ocr, reader=r_ocr, timeout=1.0)
+        try:
+            self.assertEqual(flow_ocr.step("scrollto:Generelt"), "Generelt")
+            self.assertEqual([p for _, p, _ in c_ocr.calls if p.startswith("/wda/fastUI") or "/source" in p], [])
+        finally:
+            flow_ocr.close()
+
+        # 2. Blank-OCR screen on i == 0 (or only status-bar lines y < 54) falls back to
+        # controls(text=True) immediately with ZERO scrolls and updates _wait_settled_ts.
+        c_blank = MockWDAClient(
+            fast_ui=_fast_ui([
+                {"type": "Button", "label": "Share Photo", "x": 360, "y": 120},
+                {"type": "Button", "label": "Share Photo", "x": 360, "y": 780},
+            ])
+        )
+        r_blank = FakeReader(
+            frames=[(img1, [make_line("09:41", 20, 12, 70, 30)])],  # only status-bar line (y=21 < 55)
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_blank = cli.Flow(c_blank, reader=r_blank, timeout=1.0)
+        try:
+            m_blank = flow_blank.scroll_to("Share Photo", where="y>500")
+            self.assertEqual((m_blank.text, m_blank.x, m_blank.y), ("Share Photo", 360, 780))
+            self.assertEqual(c_blank.drags, [])
+            self.assertGreater(flow_blank._wait_settled_ts, 0.0)
+            ui_paths = [p for _, p, _ in c_blank.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(ui_paths, ["/wda/fastUI?text=1"])
+        finally:
+            flow_blank.close()
+
+        # 3. Scrolling down to at_end (list stops moving) without an OCR hit checks
+        # controls(text=True) once at the end, honoring @below:HEADER and re:REGEX.
+        l_top = [make_line("Account", 30, 160, 120, 184)]
+        l_end = [make_line("Actions Header", 30, 260, 180, 284)]
+        c_end = MockWDAClient(
+            fast_ui=_fast_ui([
+                {"type": "Button", "label": "Action 7", "x": 200, "y": 140},  # above header
+                {"type": "Button", "label": "Action 42", "x": 200, "y": 420},  # below header
+            ])
+        )
+        r_end = FakeReader(
+            frames=[
+                (img1, l_top),
+                (img2, l_end),
+                (img2.copy(), l_end),
+                (img2.copy(), l_end),  # at_end: texts == seen
+                (img2.copy(), l_end),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_end = cli.Flow(c_end, reader=r_end, timeout=1.0)
+        try:
+            res_end = flow_end.step(r"scrollto:re:Action\s+\d+@below:Actions Header")
+            self.assertEqual(res_end, "Action 42")
+            self.assertEqual(len(c_end.drags), 2)
+            # Only 1 UI fetch, and only once at_end was reached.
+            ui_paths = [p for _, p, _ in c_end.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(ui_paths, ["/wda/fastUI?text=1"])
+            self.assertGreater(flow_end._wait_settled_ts, 0.0)
+        finally:
+            flow_end.close()
+
+        # 4. Scrolling up to i == max_swipes without at_end checks controls(text=True) on the final frame.
+        c_max = MockWDAClient(
+            fast_ui=_fast_ui([{"type": "Button", "label": "TopFilterIcon", "x": 380, "y": 110}])
+        )
+        r_max = FakeReader(
+            frames=[
+                (img1, [make_line("Row 3", 30, 400, 110, 424)]),
+                (img2, [make_line("Row 2", 30, 400, 110, 424)]),
+                (img2.copy(), [make_line("Row 2", 30, 400, 110, 424)]),
+                (img3, [make_line("Row 1", 30, 400, 110, 424)]),
+                (img3.copy(), [make_line("Row 1", 30, 400, 110, 424)]),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_max = cli.Flow(c_max, reader=r_max, timeout=1.0)
+        try:
+            m_max = flow_max.scroll_to("TopFilterIcon@above:Row 1", max_swipes=2, direction="up")
+            self.assertEqual((m_max.text, m_max.x, m_max.y), ("TopFilterIcon", 380, 110))
+            self.assertEqual(len(c_max.drags), 2)
+            for d in c_max.drags:
+                self.assertLess(d["fromY"], d["toY"])
+            ui_paths = [p for _, p, _ in c_max.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(ui_paths, ["/wda/fastUI?text=1"])
+            self.assertGreater(flow_max._wait_settled_ts, 0.0)
+        finally:
+            flow_max.close()
+
 
 class LazyImportAndWarmupTests(unittest.TestCase):
     def test_import_and_help_do_not_load_pil_or_http_client(self):
