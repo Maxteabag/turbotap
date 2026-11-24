@@ -90,6 +90,220 @@ class ReadFullTests(unittest.TestCase):
         finally:
             flow.close()
 
+    def test_springboard_system_alert_awareness_in_controls_and_read_full(self):
+        img = solid_img(240, size=(430, 932))
+        lines = [make_line("Allow Paste from Safari?", 40, 380, 390, 405)]
+        mixed_sb_controls = [
+            {"type": "Button", "label": "Settings", "x": 85, "y": 210},
+            {"type": "Button", "label": "Don't Allow", "x": 135, "y": 510},
+            {"type": "Button", "label": "Allow Paste", "x": 295, "y": 510},
+        ]
+        sb_alert_ui = _fast_ui(mixed_sb_controls, app_name="SpringBoard", bundle_id="com.apple.springboard")
+
+        # 1. Mixed SpringBoard tree with an active system alert over a pending target app,
+        # INCLUDING a duplicate-label collision ("OK" at background (75, 150) vs alert (200, 500)):
+        # - Generic action/control paths (controls() default allow_alert=False, tapif:Settings)
+        #   NEVER treat the SpringBoard alert as target-app confirmation and dispatch ZERO taps
+        #   to unrelated background SpringBoard controls.
+        # - Read-only alert inspection (read / ui / controls(allow_alert=True)) NEVER promotes
+        #   flat /wda/fastUI coordinates by label alone; when compact fastUI lacks alert ancestry
+        #   metadata, it fetches hierarchical /source to expose ONLY verified Alert descendants
+        #   (background (75, 150) OK and Settings are strictly absent), or returns ui=[] plus
+        #   coordinate-free alert_buttons when no Alert subtree is available.
+        dup_mixed_sb_controls = [
+            {"type": "Button", "label": "Settings", "x": 85, "y": 210},
+            {"type": "Button", "label": "OK", "x": 75, "y": 150},    # background collision!
+            {"type": "Button", "label": "OK", "x": 200, "y": 500},   # alert button in flat fastUI
+            {"type": "Button", "label": "Don't Allow", "x": 135, "y": 510},
+            {"type": "Button", "label": "Allow Paste", "x": 295, "y": 510},
+        ]
+        sb_alert_ui = _fast_ui(dup_mixed_sb_controls, app_name="SpringBoard", bundle_id="com.apple.springboard")
+        sb_source_with_dup = {
+            "type": "Application",
+            "name": "SpringBoard",
+            "children": [
+                {"type": "Button", "label": "Settings", "rect": {"x": 50, "y": 180, "width": 70, "height": 60}},
+                {"type": "Button", "label": "OK", "rect": {"x": 45, "y": 130, "width": 60, "height": 40}},
+                {
+                    "type": "Alert",
+                    "label": "Allow Paste from Safari?",
+                    "rect": {"x": 60, "y": 360, "width": 310, "height": 180},
+                    "children": [
+                        {"type": "Button", "label": "OK", "rect": {"x": 160, "y": 480, "width": 80, "height": 40}},
+                        {"type": "Button", "label": "Don't Allow", "rect": {"x": 80, "y": 490, "width": 110, "height": 40}},
+                        {"type": "Button", "label": "Allow Paste", "rect": {"x": 240, "y": 490, "width": 110, "height": 40}},
+                    ],
+                },
+            ],
+        }
+        c_alert = MockWDAClient(
+            active_app="com.apple.springboard",
+            fast_ui=sb_alert_ui,
+            source_tree=sb_source_with_dup,
+            alert_text="Allow Paste from Safari?",
+            alert_buttons=["OK", "Don't Allow", "Allow Paste"],
+        )
+        r_alert = FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0)
+        flow_alert = cli.Flow(c_alert, reader=r_alert, timeout=1.0)
+        try:
+            flow_alert.step("open:com.example.target")
+            self.assertEqual(flow_alert.bundle, "com.example.target")
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+
+            # Generic controls() rejects SpringBoard alert immediately (0 backoff sleeps)
+            # so action verbs never mistake an alert for target-app confirmation.
+            sleeps = []
+            with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                with self.assertRaises(cli._StaleAppError):
+                    flow_alert.controls()
+            self.assertEqual(sleeps, [], "Active SpringBoard alert must not burn _STALE_UI_BACKOFF retries")
+            self.assertIsNone(flow_alert._ctl_cache)
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+            self.assertEqual(flow_alert._last_alert_text, "Allow Paste from Safari?")
+
+            # tapif:Settings and tapif:OK must NOT tap any background SpringBoard control.
+            self.assertEqual(flow_alert.tap_if("Settings", timeout=0.15), "skipped")
+            self.assertEqual(flow_alert.tap_if("OK", timeout=0.15), "skipped")
+            self.assertEqual(c_alert.tapped_points, [])
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+
+            # Explicit read-only inspection (step("ui") / controls(allow_alert=True)) fetches
+            # hierarchical /source and exposes ONLY Alert descendants: alert OK at (200, 500),
+            # never background OK at (75, 150) and never Settings.
+            sleeps.clear()
+            with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                n_ui = flow_alert.step("ui")
+            self.assertEqual(n_ui, 3)
+            self.assertEqual(sleeps, [])
+            ui_got = flow_alert.reads[-1]["ui"]
+            self.assertEqual([(x["label"], x["x"], x["y"]) for x in ui_got], [
+                ("OK", 200, 500),
+                ("Don't Allow", 135, 510),
+                ("Allow Paste", 295, 510),
+            ])
+            self.assertNotIn((75, 150), [(x["x"], x["y"]) for x in ui_got])
+            self.assertEqual(flow_alert.reads[-1]["alert"], "Allow Paste from Safari?")
+            self.assertIsNone(flow_alert._ctl_cache)
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+
+            # step("read") (via read_full) surfaces ONLY verified Alert descendants without retries,
+            # keeps _pending_bundle, does not cache, and attaches "alert".
+            c_alert.calls.clear()
+            with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                n_lines = flow_alert.step("read")
+            self.assertEqual(n_lines, 1)
+            self.assertEqual(sleeps, [])
+            self.assertIsNone(flow_alert._ctl_cache)
+            self.assertEqual(flow_alert._pending_bundle, "com.example.target")
+            self.assertEqual(flow_alert.reads[-1]["alert"], "Allow Paste from Safari?")
+            read_ui = flow_alert.reads[-1]["ui"]
+            self.assertEqual([(x["label"], x["x"], x["y"]) for x in read_ui], [
+                ("OK", 200, 500),
+                ("Don't Allow", 135, 510),
+                ("Allow Paste", 295, 510),
+            ])
+            self.assertNotIn((75, 150), [(x["x"], x["y"]) for x in read_ui])
+            fast_ui_calls = [p for _, p, _ in c_alert.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(len(fast_ui_calls), 1)
+        finally:
+            flow_alert.close()
+
+        # 1b. When compact fastUI lacks alert ancestry AND /source has no Alert subtree (or fails),
+        # ui/read MUST NOT return any flat coordinates (even when /wda/alert/buttons returns "OK"),
+        # exposing ui=[] plus coordinate-free alert_buttons instead.
+        c_no_ancestry = MockWDAClient(
+            active_app="com.apple.springboard",
+            fast_ui=sb_alert_ui,
+            source_tree={"error": 500, "body": "source failed"},
+            alert_text="Allow Paste from Safari?",
+            alert_buttons=["OK", "Don't Allow"],
+        )
+        flow_no_anc = cli.Flow(c_no_ancestry, reader=FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0), timeout=1.0)
+        try:
+            flow_no_anc.step("open:com.example.target")
+            self.assertEqual(flow_no_anc.step("ui"), 0)
+            self.assertEqual(flow_no_anc.reads[-1]["ui"], [])
+            self.assertEqual(flow_no_anc.reads[-1]["alert"], "Allow Paste from Safari?")
+            self.assertEqual(flow_no_anc.reads[-1]["alert_buttons"], ["OK", "Don't Allow"])
+            flow_no_anc.step("read")
+            self.assertEqual(flow_no_anc.reads[-1]["ui"], [])
+            self.assertEqual(flow_no_anc.reads[-1]["alert"], "Allow Paste from Safari?")
+            self.assertEqual(flow_no_anc.reads[-1]["alert_buttons"], ["OK", "Don't Allow"])
+        finally:
+            flow_no_anc.close()
+
+        source_alert_tree = {
+            "type": "Application",
+            "name": "SpringBoard",
+            "children": [
+                {"type": "Button", "label": "Settings", "rect": {"x": 50, "y": 180, "width": 70, "height": 70}},
+                {
+                    "type": "Alert",
+                    "label": "Restore App?",
+                    "rect": {"x": 60, "y": 360, "width": 310, "height": 180},
+                    "children": [
+                        {"type": "Button", "label": "Cancel", "rect": {"x": 80, "y": 490, "width": 120, "height": 44}},
+                        {"type": "Button", "label": "Restore", "rect": {"x": 220, "y": 490, "width": 120, "height": 44}},
+                    ],
+                },
+            ],
+        }
+        c_src_alert = MockWDAClient(
+            active_app="com.apple.springboard",
+            fast_ui={"error": 404},
+            source_tree=source_alert_tree,
+            alert_text="Restore App?",
+            alert_buttons=None,
+        )
+        flow_src_alert = cli.Flow(c_src_alert, reader=FakeReader(frames=[(img, lines)], pt=(430, 932), scale=1.0), timeout=1.0)
+        try:
+            flow_src_alert.step("open:com.example.target")
+            ctl_src = flow_src_alert.controls(allow_alert=True)
+            self.assertEqual([x["label"] for x in ctl_src], ["Cancel", "Restore"])
+            self.assertTrue(all("inAlert" not in x for x in ctl_src))
+        finally:
+            flow_src_alert.close()
+
+        # 2. CRITICAL SAFETY INVARIANT: Ordinary outgoing SpringBoard Home Screen
+        # (bundleId="com.apple.springboard" + alert_text=None/empty/404) right after
+        # home -> open:App STILL retries _STALE_UI_BACKOFF and raises _StaleAppError in
+        # controls() / returns ui_res=None in read_full(), never caching or exposing Home Screen icons.
+        sb_home_ui = _fast_ui(
+            [{"type": "Button", "label": "Messages", "x": 90, "y": 220}],
+            app_name="SpringBoard",
+            bundle_id="com.apple.springboard",
+        )
+        for no_alert_val in (None, "   "):
+            c_home = MockWDAClient(
+                active_app="com.example.target",
+                fast_ui=sb_home_ui,
+                alert_text=no_alert_val,
+            )
+            r_home = FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0)
+            flow_home = cli.Flow(c_home, reader=r_home, timeout=1.0)
+            try:
+                flow_home.step("home")
+                flow_home.step("open:com.example.target")
+                sleeps = []
+                with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                    with self.assertRaises(cli._StaleAppError):
+                        flow_home.controls()
+                self.assertEqual(len(sleeps), len(cli._STALE_UI_BACKOFF))
+                self.assertIsNone(flow_home._ctl_cache)
+                self.assertIsNone(flow_home._last_alert_text)
+                self.assertEqual(flow_home._pending_bundle, "com.example.target")
+
+                sleeps.clear()
+                with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
+                    _, got_ui = flow_home.read_full(ui=True, timeout=0.5)
+                self.assertIsNone(got_ui)
+                self.assertEqual(len(sleeps), len(cli._STALE_UI_BACKOFF))
+                self.assertIsNone(flow_home._ctl_cache)
+                self.assertIsNone(flow_home._last_alert_text)
+                self.assertEqual(flow_home._pending_bundle, "com.example.target")
+            finally:
+                flow_home.close()
+
 
 class TapTextAndCacheTests(unittest.TestCase):
     def test_wait_stable_skips_second_ocr_when_pixel_still(self):
@@ -1991,6 +2205,252 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
             self.assertEqual(m_edge.y, 510)
         finally:
             flow_edge.close()
+
+    def test_scrollto_accessibility_fallback_blank_i0_at_end_max_swipes_regions_regex_and_zero_ui_on_ocr(self):
+        img1 = solid_img(240, size=(430, 932))
+        img2 = solid_img(200, size=(430, 932))
+        img3 = solid_img(160, size=(430, 932))
+
+        # 1. Normal OCR hit on i == 0 and after scrolling makes ZERO controls() (/wda/fastUI) calls.
+        c_ocr = MockWDAClient(fast_ui=_fast_ui([{"type": "Button", "label": "Generelt", "x": 80, "y": 400}]))
+        r_ocr = FakeReader(
+            frames=[
+                (img1, [make_line("Wi-Fi", 30, 200, 100, 224)]),
+                (img2, [make_line("Generelt", 30, 400, 130, 424)]),
+                (img2.copy(), [make_line("Generelt", 30, 400, 130, 424)]),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_ocr = cli.Flow(c_ocr, reader=r_ocr, timeout=1.0)
+        try:
+            self.assertEqual(flow_ocr.step("scrollto:Generelt"), "Generelt")
+            self.assertEqual([p for _, p, _ in c_ocr.calls if p.startswith("/wda/fastUI") or "/source" in p], [])
+        finally:
+            flow_ocr.close()
+
+        # 2. Blank-OCR screen on i == 0 (or only status-bar lines y < 54) falls back to
+        # controls(text=True) immediately with ZERO scrolls and updates _wait_settled_ts.
+        c_blank = MockWDAClient(
+            fast_ui=_fast_ui([
+                {"type": "Button", "label": "Share Photo", "x": 360, "y": 120},
+                {"type": "Button", "label": "Share Photo", "x": 360, "y": 780},
+            ])
+        )
+        r_blank = FakeReader(
+            frames=[(img1, [make_line("09:41", 20, 12, 70, 30)])],  # only status-bar line (y=21 < 55)
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_blank = cli.Flow(c_blank, reader=r_blank, timeout=1.0)
+        try:
+            m_blank = flow_blank.scroll_to("Share Photo", where="y>500")
+            self.assertEqual((m_blank.text, m_blank.x, m_blank.y), ("Share Photo", 360, 780))
+            self.assertEqual(c_blank.drags, [])
+            self.assertGreater(flow_blank._wait_settled_ts, 0.0)
+            ui_paths = [p for _, p, _ in c_blank.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(ui_paths, ["/wda/fastUI?text=1"])
+        finally:
+            flow_blank.close()
+
+        # 3. Scrolling down to at_end (list stops moving) without an OCR hit checks
+        # controls(text=True) once at the end, honoring @below:HEADER and re:REGEX.
+        l_top = [make_line("Account", 30, 160, 120, 184)]
+        l_end = [make_line("Actions Header", 30, 260, 180, 284)]
+        c_end = MockWDAClient(
+            fast_ui=_fast_ui([
+                {"type": "Button", "label": "Action 7", "x": 200, "y": 140},  # above header
+                {"type": "Button", "label": "Action 42", "x": 200, "y": 420},  # below header
+            ])
+        )
+        r_end = FakeReader(
+            frames=[
+                (img1, l_top),
+                (img2, l_end),
+                (img2.copy(), l_end),
+                (img2.copy(), l_end),  # at_end: texts == seen
+                (img2.copy(), l_end),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_end = cli.Flow(c_end, reader=r_end, timeout=1.0)
+        try:
+            res_end = flow_end.step(r"scrollto:re:Action\s+\d+@below:Actions Header")
+            self.assertEqual(res_end, "Action 42")
+            self.assertEqual(len(c_end.drags), 2)
+            # Only 1 UI fetch, and only once at_end was reached.
+            ui_paths = [p for _, p, _ in c_end.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(ui_paths, ["/wda/fastUI?text=1"])
+            self.assertGreater(flow_end._wait_settled_ts, 0.0)
+        finally:
+            flow_end.close()
+
+        # 4. Scrolling up to i == max_swipes without at_end checks controls(text=True) on the final frame.
+        c_max = MockWDAClient(
+            fast_ui=_fast_ui([{"type": "Button", "label": "TopFilterIcon", "x": 380, "y": 110}])
+        )
+        r_max = FakeReader(
+            frames=[
+                (img1, [make_line("Row 3", 30, 400, 110, 424)]),
+                (img2, [make_line("Row 2", 30, 400, 110, 424)]),
+                (img2.copy(), [make_line("Row 2", 30, 400, 110, 424)]),
+                (img3, [make_line("Row 1", 30, 400, 110, 424)]),
+                (img3.copy(), [make_line("Row 1", 30, 400, 110, 424)]),
+            ],
+            pt=(430, 932),
+            scale=1.0,
+        )
+        flow_max = cli.Flow(c_max, reader=r_max, timeout=1.0)
+        try:
+            m_max = flow_max.scroll_to("TopFilterIcon@above:Row 1", max_swipes=2, direction="up")
+            self.assertEqual((m_max.text, m_max.x, m_max.y), ("TopFilterIcon", 380, 110))
+            self.assertEqual(len(c_max.drags), 2)
+            for d in c_max.drags:
+                self.assertLess(d["fromY"], d["toY"])
+            ui_paths = [p for _, p, _ in c_max.calls if p.startswith("/wda/fastUI")]
+            self.assertEqual(ui_paths, ["/wda/fastUI?text=1"])
+            self.assertGreater(flow_max._wait_settled_ts, 0.0)
+        finally:
+            flow_max.close()
+
+    def test_assert_assertnot_and_alert_text_verbs(self):
+        img = solid_img(240, size=(430, 932))
+        lines = [
+            make_line("Profile Header", 20, 100, 180, 124),
+            make_line("Order #4821 Confirmed", 20, 260, 260, 284),
+            make_line("Top Only", 20, 160, 120, 184),
+        ]
+        ui = [
+            {"type": "Button", "label": "ComposeIcon", "x": 380, "y": 820, "enabled": True},
+            {"type": "Button", "label": "DisabledBadge", "x": 380, "y": 320, "enabled": False},
+            {"type": "Text", "label": "Stylized 22°", "x": 200, "y": 360},
+        ]
+        c = MockWDAClient(fast_ui=_fast_ui(ui), alert_text="  Allow\u200b Notifications?  ")
+        r = FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(c, reader=r, timeout=0.5)
+        try:
+            # 1. assert:TEXT matches OCR in 1 frame with 0 UI calls and reuses _fresh_lines().
+            self.assertEqual(flow.step("assert:Order #4821 Confirmed"), "Order #4821 Confirmed")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual([p for _, p, _ in c.calls if p.startswith("/wda/fastUI")], [])
+
+            # Regex and @region reuse _fresh_lines() with 0 extra OCR reads.
+            self.assertEqual(flow.step(r"assert:re:Order\s+#\d+"), "Order #4821 Confirmed")
+            self.assertEqual(flow.step("assert:Order #4821@below:Profile Header"), "Order #4821 Confirmed")
+            self.assertEqual(flow.step("assert:Top Only@y<200"), "Top Only")
+            self.assertEqual(r.read_calls, 1)
+
+            # 2. assert:TEXT falls back to controls(text=True) for icon/disabled/stylized labels.
+            self.assertEqual(flow.step("assert:ComposeIcon@y>700"), "ComposeIcon")
+            self.assertEqual(flow.step("assert:DisabledBadge@below:Profile Header"), "DisabledBadge")
+            self.assertEqual(flow.step(r"assert:re:Stylized\s+\d+°"), "Stylized 22°")
+
+            # 3. assert:TEXT raises clear FlowError when absent or outside @region.
+            with self.assertRaises(cli.FlowError) as ctx_miss:
+                flow.step("assert:Nonexistent Banner")
+            self.assertEqual(str(ctx_miss.exception), "assert failed: 'Nonexistent Banner' not on screen")
+
+            with self.assertRaises(cli.FlowError) as ctx_reg:
+                flow.step("assert:Top Only@y>300")
+            self.assertEqual(str(ctx_reg.exception), "assert failed: 'Top Only@y>300' not on screen")
+
+            with self.assertRaises(cli.FlowError) as ctx_ui_reg:
+                flow.step("assert:ComposeIcon@y<300")
+            self.assertEqual(str(ctx_ui_reg.exception), "assert failed: 'ComposeIcon@y<300' not on screen")
+
+            # 4. assertnot:TEXT checks BOTH OCR and controls(text=True), returning 'absent'.
+            self.assertEqual(flow.step("assertnot:Error Banner"), "absent")
+            self.assertEqual(flow.step(r"assertnot:re:Fatal\s+\d+"), "absent")
+            self.assertEqual(flow.step("assertnot:Top Only@y>300"), "absent")
+            self.assertEqual(flow.step("assertnot:ComposeIcon@y<300"), "absent")
+
+            # Fails when target is present in OCR.
+            with self.assertRaises(cli.FlowError) as ctx_not_ocr:
+                flow.step("assertnot:Order #4821")
+            self.assertEqual(
+                str(ctx_not_ocr.exception),
+                "assertnot failed: 'Order #4821' is on screen (Order #4821 Confirmed)",
+            )
+
+            # Fails when target is present only as an icon-only / UI control (not in OCR).
+            with self.assertRaises(cli.FlowError) as ctx_not_ui:
+                flow.step("assertnot:ComposeIcon@y>700")
+            self.assertEqual(
+                str(ctx_not_ui.exception),
+                "assertnot failed: 'ComposeIcon@y>700' is on screen (ComposeIcon)",
+            )
+
+            with self.assertRaises(cli.FlowError) as ctx_not_re:
+                flow.step(r"assertnot:re:Stylized\s+\d+°")
+            self.assertEqual(
+                str(ctx_not_re.exception),
+                f"assertnot failed: {r're:Stylized\s+\d+°'!r} is on screen (Stylized 22°)",
+            )
+
+            # Zero taps or mutating actions were dispatched by assert / assertnot.
+            self.assertEqual(c.tapped_points, [])
+            self.assertEqual(flow._last_action_ts, 0.0)
+
+            # 5. alert:text reads active alert text and appends {"alert": txt} to reads;
+            # returns "no-alert" when no alert is active; preserves alert:accept and alert:dismiss.
+            self.assertEqual(flow.step("alert:text"), "Allow Notifications?")
+            self.assertEqual(flow.reads[-1], {"alert": "Allow Notifications?"})
+
+            c.alert_text = None
+            reads_len = len(flow.reads)
+            self.assertEqual(flow.step("alert:text"), "no-alert")
+            self.assertEqual(len(flow.reads), reads_len)
+
+            # HTTP 500 or unknown 404 on /alert/text must raise FlowError, NOT report "no-alert".
+            c.alert_text = {"error": 500, "body": "internal server error"}
+            with self.assertRaises(cli.FlowError):
+                flow.step("alert:text")
+            c.alert_text = {"error": 404, "body": "unknown command"}
+            with self.assertRaises(cli.FlowError):
+                flow.step("alert:text")
+
+            with mock.patch("turbotap.cli.time.sleep"):
+                self.assertEqual(flow.step("alert:accept"), "accept")
+                self.assertEqual(flow.step("alert:dismiss"), "dismiss")
+            with self.assertRaises(cli.FlowError):
+                flow.step("alert:invalid")
+            with self.assertRaises(cli.FlowError):
+                flow.step("assert:re:")
+            with self.assertRaises(cli.FlowError):
+                flow.step("assertnot:re:")
+
+            self.assertIn("assert:TEXT", cli.FLOW_HELP)
+            self.assertIn("assertnot:TEXT", cli.FLOW_HELP)
+            self.assertIn("alert:accept|dismiss|text", cli.FLOW_HELP)
+            self.assertIn("assert", cli._IMAGE_STEP_VERBS)
+            self.assertIn("assertnot", cli._IMAGE_STEP_VERBS)
+            self.assertNotIn("alert", cli._IMAGE_STEP_VERBS)
+        finally:
+            flow.close()
+
+        # 6. assertnot:TEXT must FAIL (never report "absent") when both UI endpoints fail (HTTP 500),
+        # while still succeeding on older WDA (404 /wda/fastUI -> 200 /source fallback) and genuine empty trees.
+        c_err = MockWDAClient(
+            fast_ui={"error": 500, "body": "boom"},
+            source_tree={"error": 500, "body": "boom"},
+        )
+        flow_err = cli.Flow(c_err, reader=FakeReader(frames=[(img, [])], pt=(430, 932), scale=1.0), timeout=0.5)
+        try:
+            with self.assertRaises(cli.FlowError):
+                flow_err.step("assertnot:Pending Approval")
+        finally:
+            flow_err.close()
+
+        c_old = MockWDAClient(
+            fast_ui={"error": 404},
+            source_tree={"type": "Application", "name": "Demo", "children": []},
+        )
+        flow_old = cli.Flow(c_old, reader=FakeReader(frames=[(img, [])], pt=(430, 932), scale=1.0), timeout=0.5)
+        try:
+            self.assertEqual(flow_old.step("assertnot:Pending Approval"), "absent")
+        finally:
+            flow_old.close()
 
 
 class LazyImportAndWarmupTests(unittest.TestCase):

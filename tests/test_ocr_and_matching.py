@@ -312,6 +312,113 @@ class FindTextMatchingTests(unittest.TestCase):
         self.assertIsNotNone(m_num)
         self.assertEqual(m_num.rank, 1)
 
+    def test_fold_accents_and_diacritic_folded_find_text(self):
+        # 1. _fold_accents NFKD + Nordic/European transliteration contract.
+        expected_folds = {
+            "På": "Pa",
+            "Søk": "Sok",
+            "Åpne": "Apne",
+            "Håndskrift": "Handskrift",
+            "Café": "Cafe",
+            "Über": "Uber",
+            "Straße": "Strasse",
+            "Ære": "Aere",
+            "Đorđe": "Dorde",
+            "ð": "d",
+            "Małgorzata": "Malgorzata",
+            "Cœur": "Coeur",
+            "Œuvre": "Oeuvre",
+            "plain ascii": "plain ascii",
+        }
+        for raw, folded in expected_folds.items():
+            self.assertEqual(cli._fold_accents(raw), folded, f"_fold_accents({raw!r}) mismatch")
+
+        # 2. Diacritic-folded OCR hits on Frame 1 when eng.traineddata drops/transliterates accents.
+        for query, ocr_txt in (
+            ("På", "Pa"),
+            ("Søk", "Sok"),
+            ("Åpne", "Apne"),
+            ("Håndskrift", "Handskrift"),
+            ("Café", "Cafe"),
+            ("Über", "Uber"),
+            ("Straße", "Strasse"),
+            ("Ære", "Aere"),
+        ):
+            m = cli.find_text([make_line(ocr_txt, 20, 160, 140, 180)], query)
+            self.assertIsNotNone(m, f"expected {query!r} to match {ocr_txt!r}")
+            self.assertEqual(m.rank, 0)
+            self.assertEqual(m.text, ocr_txt)
+
+        # 3. Exact unfolded match (folded=False) ALWAYS beats a folded match (folded=True)
+        # at the same rank, even when the folded match sits higher on screen (smaller y).
+        both_lines = [
+            make_line("Pa", 20, 120, 80, 140),   # rank 0, folded=True, y=130 (higher)
+            make_line("På", 20, 260, 80, 280),   # rank 0, folded=False, y=270 (lower)
+        ]
+        m_exact_wins = cli.find_text(both_lines, "På")
+        self.assertIsNotNone(m_exact_wins)
+        self.assertEqual(m_exact_wins.text, "På")
+        self.assertEqual(m_exact_wins.y, 270)
+
+        # Same at rank 1 (prefix/suffix): unfolded rank 1 beats higher folded rank 1,
+        # while folded rank 0 still beats unfolded rank 1.
+        rank1_lines = [
+            make_line("Sok i meldinger", 20, 120, 200, 140),  # rank 1, folded=True
+            make_line("Søk i meldinger", 20, 240, 200, 260),  # rank 1, folded=False
+        ]
+        m_r1 = cli.find_text(rank1_lines, "Søk")
+        self.assertIsNotNone(m_r1)
+        self.assertEqual(m_r1.text, "Søk i meldinger")
+        self.assertEqual(m_r1.y, 250)
+
+        rank0_vs_rank1 = [
+            make_line("Søk i meldinger", 20, 120, 200, 140),  # rank 1, folded=False
+            make_line("Sok", 20, 240, 80, 260),               # rank 0, folded=True
+        ]
+        m_r0_folded = cli.find_text(rank0_vs_rank1, "Søk")
+        self.assertIsNotNone(m_r0_folded)
+        self.assertEqual(m_r0_folded.rank, 0)
+        self.assertEqual(m_r0_folded.text, "Sok")
+
+        # 4. CRITICAL SAFETY INVARIANT: short_alpha word-boundary contract (<= 3 letters,
+        # NO fuzzy fallback) holds on diacritic-folded queries too.
+        self.assertIsNone(cli.find_text([make_line("Paper", 20, 120, 100, 140)], "På"))
+        self.assertIsNone(cli.find_text([make_line("Socks", 20, 120, 100, 140)], "Søk"))
+        self.assertIsNone(cli.find_text([make_line("Soks", 20, 120, 100, 140)], "Søk"))
+        self.assertIsNone(cli.find_text([make_line("Your", 20, 120, 100, 140)], "You"))
+        self.assertIsNone(cli.find_text(["Paper"], "På"))
+        self.assertIsNone(cli.find_text(["Socks"], "Søk"))
+        self.assertIsNone(cli.find_text(["Your"], "You"))
+
+        # Standalone and icon-prefixed folded matches return rank 0 centered on the text span.
+        m_pa = cli.find_text([make_line("Pa", 40, 150, 100, 170)], "På")
+        self.assertIsNotNone(m_pa)
+        self.assertEqual((m_pa.rank, m_pa.x, m_pa.y), (0, 70, 160))
+
+        ln_icon_pa = cli.Line([("©", 20, 200, 42, 220), ("Pa", 60, 200, 120, 220)])
+        m_icon_pa = cli.find_text([ln_icon_pa], "På")
+        self.assertIsNotNone(m_icon_pa)
+        self.assertEqual(m_icon_pa.rank, 0)
+        self.assertEqual(m_icon_pa.x, 90)  # centered on 'Pa' [60..120], skipping '©'
+
+        ln_icon_apne = cli.Line([("[5]", 20, 260, 44, 280), ("Apne", 60, 260, 140, 280)])
+        m_icon_apne = cli.find_text([ln_icon_apne], "Åpne")
+        self.assertIsNotNone(m_icon_apne)
+        self.assertEqual(m_icon_apne.rank, 0)
+        self.assertEqual(m_icon_apne.x, 100)  # centered on 'Apne' [60..140], skipping '[5]'
+
+        # 5. All-combining-mark queries that fold to empty must NEVER match unrelated text.
+        self.assertIsNone(cli.find_text([make_line("Settings", 20, 120, 140, 140)], "\u0301"))
+        self.assertIsNone(cli.find_text(["Settings"], "\u0301"))
+        self.assertIsNone(cli.find_text([make_line("Settings", 20, 120, 140, 140)], "\u0301\u0308"))
+        self.assertIsNone(cli.find_text([make_line("Settings", 20, 120, 140, 140)], "   "))
+
+        # 6. Regex ('re:') queries remain strict and untouched by accent folding.
+        self.assertIsNone(cli.find_text([make_line("Pa", 20, 120, 80, 140)], r"re:^På$"))
+        m_rx_exact = cli.find_text([make_line("På", 20, 120, 80, 140)], r"re:^På$")
+        self.assertIsNotNone(m_rx_exact)
+        self.assertEqual(m_rx_exact.rank, 0)
+
 
 class FrameReactedTests(unittest.TestCase):
     def test_identical_and_jpeg_noise_frames_rejected(self):

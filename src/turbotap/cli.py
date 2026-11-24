@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 
 # Must be set before libtesseract/libgomp load: OpenMP threads slow Tesseract down here.
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
@@ -914,6 +915,25 @@ def _norm(s):
     return re.sub(r"\s+", " ", s.lower()).strip()
 
 
+_ACCENT_TRANS = str.maketrans({
+    "ø": "o", "Ø": "O",
+    "æ": "ae", "Æ": "Ae",
+    "ß": "ss", "ẞ": "Ss",
+    "ð": "d", "Ð": "D",
+    "đ": "d", "Đ": "D",
+    "ł": "l", "Ł": "L",
+    "œ": "oe", "Œ": "Oe",
+})
+
+
+def _fold_accents(s):
+    """Strip combining diacritics (NFKD) and transliterate Nordic/European letters."""
+    if not s or s.isascii():
+        return s
+    s = s.translate(_ACCENT_TRANS)
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+
+
 class Match:
     """rank: 0 exact line, 1 line starts/ends with it, 2 substring, 3 fuzzy."""
     __slots__ = ("x", "y", "text", "line", "rank")
@@ -922,73 +942,123 @@ class Match:
         self.x, self.y, self.text, self.line, self.rank = x, y, text, line, rank
 
 
+def _match_line_tokens(ln, cur_t, cur_words, cur_want, cur_wb_rx):
+    ok = bool(cur_wb_rx.search(cur_t)) if cur_wb_rx is not None else (cur_want in cur_t)
+    if not ok:
+        return None
+    icon_stripped = False
+    if cur_t == cur_want:
+        rank = 0
+    else:
+        # Strip a leading 1-3 char non-alphabetic icon glyph (e.g. '©', '@', '[5]', '2]')
+        # when the rest of the line equals want; keep numbered items ('1 Foo') as rank 1.
+        m_icon = re.match(r"^(\S{1,3})\s+(.+)$", cur_t) if cur_want else None
+        if (m_icon and m_icon.group(2) == cur_want
+                and re.search(r"[^\w]", m_icon.group(1))
+                and not any(ch.isalpha() for ch in m_icon.group(1))):
+            rank = 0
+            icon_stripped = True
+        elif cur_t.startswith(cur_want) or cur_t.endswith(cur_want):
+            rank = 1
+        else:
+            rank = 2
+    span = None
+    if (icon_stripped and len(ln.words) >= 2
+            and re.search(r"[^\w]", ln.words[0][0])
+            and not any(ch.isalpha() for ch in ln.words[0][0])):
+        span = (1, len(ln.words))
+    else:
+        n = len(cur_words)
+        for size in range(1, n + 1):
+            for i in range(n - size + 1):
+                chunk = " ".join(cur_words[i:i + size])
+                if cur_wb_rx is not None:
+                    if cur_wb_rx.search(chunk):
+                        span = (i, i + size)
+                        break
+                elif cur_want in chunk:
+                    span = (i, i + size)
+                    break
+            if span:
+                break
+    return (rank, icon_stripped, span) if span else None
+
+
 def find_text(lines, label, fuzzy=0.84, where=None):
     """Best on-screen match for label: exact line > line starts/ends with it >
-    contains it > fuzzy word window (OCR typos); ties go to the topmost. 're:'
+    contains it > fuzzy word window (OCR typos); exact diacritics beat
+    diacritic-folded matches at the same rank; ties go to the topmost. 're:'
     prefix = regex. Returns the centre of the matching words, not the line."""
+    if lines and isinstance(lines[0], str):
+        lines = [
+            Line([(w, i * 40, idx * 24 + 100, (i + 1) * 40, idx * 24 + 120)
+                  for i, w in enumerate(s.split() or [s])]) if isinstance(s, str) else s
+            for idx, s in enumerate(lines)
+        ]
     if where:
         lines = _region(lines, where)
         if lines is None:
             return None
     want = _norm(label)
     rx = re.compile(label[3:], re.I) if label.startswith("re:") else None
+    if not rx and not want:
+        return None
     short_alpha = (not rx) and bool(want) and len(want) <= 3 and want.isalpha()
     wb_rx = re.compile(rf"(?<!\w){re.escape(want)}(?!\w)") if short_alpha else None
+    want_f = _norm(_fold_accents(want)) if not rx else ""
+    short_alpha_f = (not rx) and bool(want_f) and (short_alpha or (len(want_f) <= 3 and want_f.isalpha()))
+    wb_rx_f = re.compile(rf"(?<!\w){re.escape(want_f)}(?!\w)") if short_alpha_f else None
     best = None
     for ln in lines:
         t = _norm(ln.text)
         words = [_norm(w[0]) for w in ln.words]
         icon_stripped = False
+        folded = False
+        span = None
+        rank = 2
         if rx:
             hit = rx.search(ln.text)
             rank = 0 if hit and hit.group(0) == ln.text else 2
             ok = bool(hit)
             need = _norm(hit.group(0)) if hit else ""
-        else:
-            ok = bool(wb_rx.search(t)) if wb_rx is not None else (want in t)
-            if t == want:
-                rank = 0
-            else:
-                # Strip a leading 1-3 char non-alphabetic icon glyph (e.g. '©', '@', '[5]', '2]')
-                # when the rest of the line equals want; keep numbered items ('1 Foo') as rank 1.
-                m_icon = re.match(r"^(\S{1,3})\s+(.+)$", t) if want else None
-                if (m_icon and m_icon.group(2) == want
-                        and re.search(r"[^\w]", m_icon.group(1))
-                        and not any(ch.isalpha() for ch in m_icon.group(1))):
-                    rank = 0
-                    icon_stripped = True
-                elif ok and (t.startswith(want) or t.endswith(want)):
-                    rank = 1
-                else:
-                    rank = 2
-            need = want
-        span = None
-        if ok:
-            if (icon_stripped and len(ln.words) >= 2
-                    and re.search(r"[^\w]", ln.words[0][0])
-                    and not any(ch.isalpha() for ch in ln.words[0][0])):
-                span = (1, len(ln.words))
-            else:
+            if ok:
                 n = len(words)
                 for size in range(1, n + 1):
                     for i in range(n - size + 1):
-                        chunk = " ".join(words[i:i + size])
-                        if wb_rx is not None:
-                            if wb_rx.search(chunk):
-                                span = (i, i + size)
-                                break
-                        elif need in chunk:
+                        if need in " ".join(words[i:i + size]):
                             span = (i, i + size)
                             break
                     if span:
                         break
-        elif fuzzy and not rx and not short_alpha and not any(ch.isdigit() for ch in want):
-            import difflib
-            k = max(1, len(want.split()))
-            for i in range(max(1, len(words) - k + 1)):
-                if difflib.SequenceMatcher(None, " ".join(words[i:i + k]), want).ratio() >= fuzzy:
-                    span, rank = (i, min(len(words), i + k)), 3
-                    break
+        else:
+            res = _match_line_tokens(ln, t, words, want, wb_rx)
+            t_f = _fold_accents(t)
+            words_f = None
+            if want_f and t_f and (res is None or res[0] > 0) and (t_f != t or want_f != want):
+                words_f = [_fold_accents(w) for w in words]
+                res_f = _match_line_tokens(ln, t_f, words_f, want_f, wb_rx_f)
+                if res_f is not None and (res is None or (res_f[0], True, res_f[1]) < (res[0], False, res[1])):
+                    rank, icon_stripped, span = res_f
+                    folded = True
+            if span is None and res is not None:
+                rank, icon_stripped, span = res
+                folded = False
+            if (span is None and fuzzy and not short_alpha and not short_alpha_f
+                    and not any(ch.isdigit() for ch in want)):
+                import difflib
+                k = max(1, len(want.split()))
+                for i in range(max(1, len(words) - k + 1)):
+                    if difflib.SequenceMatcher(None, " ".join(words[i:i + k]), want).ratio() >= fuzzy:
+                        span, rank, folded = (i, min(len(words), i + k)), 3, False
+                        break
+                if span is None and want_f and t_f and (t_f != t or want_f != want):
+                    if words_f is None:
+                        words_f = [_fold_accents(w) for w in words]
+                    k_f = max(1, len(want_f.split()))
+                    for i in range(max(1, len(words_f) - k_f + 1)):
+                        if difflib.SequenceMatcher(None, " ".join(words_f[i:i + k_f]), want_f).ratio() >= fuzzy:
+                            span, rank, folded = (i, min(len(words_f), i + k_f)), 3, True
+                            break
         if not span:
             continue
         ws = ln.words[span[0]:span[1]]
@@ -997,10 +1067,10 @@ def find_text(lines, label, fuzzy=0.84, where=None):
         # Deprioritize iOS status-bar lines (clock, battery, '< PrevApp' at y < 54)
         # unless the caller explicitly filtered by region (@y<..., @above:...).
         in_status = (not where) and (y < 54)
-        cand = (in_status, rank, icon_stripped, y, Match(x, y, ln.text, ln, rank))
-        if best is None or cand[:4] < best[:4]:
+        cand = (in_status, rank, folded, icon_stripped, y, Match(x, y, ln.text, ln, rank))
+        if best is None or cand[:5] < best[:5]:
             best = cand
-    return best[4] if best else None
+    return best[5] if best else None
 
 
 def _region(lines, where):
@@ -1644,7 +1714,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
     if isinstance(root, dict) and root.get("type") == "Application":
         app_name = _clean_text(str(root.get("name") or root.get("label") or ""))
 
-    def walk(n, in_keyboard=False):
+    def walk(n, in_keyboard=False, in_alert=False):
         if not isinstance(n, dict):
             return
         t = n.get("type", "")
@@ -1654,6 +1724,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
             if x0 >= screen[0] or x0 + rc["width"] <= 0 or y0 >= screen[1] or y0 + rc["height"] <= 0:
                 return  # off-screen recycled table cells can carry stale on-screen child rects
         kb = in_keyboard or t == "Keyboard"
+        al = in_alert or t == "Alert"
         raw_label = n.get("label") or ""
         raw_name = n.get("name") or ""
         label_from_id = (not bool(raw_label)) and bool(raw_name)
@@ -1691,6 +1762,8 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
                         item["value"] = cval
                 if _is_explicitly_disabled(n):
                     item["enabled"] = False
+                if al:
+                    item["inAlert"] = True
                 if key not in seen:
                     seen[key] = len(out)
                     out.append(item)
@@ -1702,7 +1775,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
                       and not (out[seen[key]].get("enabled") is not False and item.get("enabled") is False)):
                     out[seen[key]] = item
         for ch in n.get("children") or []:
-            walk(ch, kb)
+            walk(ch, kb, al)
 
     walk(root or {})
 
@@ -1775,6 +1848,8 @@ def _parse_fast_ui(data, screen=(430, 932)):
             item["inKeyboard"] = True
         if raw.get("inKeyboardAccessory"):
             item["inKeyboardAccessory"] = True
+        if raw.get("inAlert"):
+            item["inAlert"] = True
         key = (lab, x // 4, y // 4)
         if key not in seen:
             seen[key] = len(out)
@@ -1836,9 +1911,9 @@ def _fetch_ui_controls_full(client, screen=(430, 932), text=False,
     if rem <= 0:
         return None, "", ""
     r = client._req_with_deadline("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=max(0.05, rem), deadline=deadline) if hasattr(client, "_req_with_deadline") else client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=max(0.05, rem))
-    if isinstance(r, dict) and r.get("error") and timeout is not None and timeout < 30:
+    if not isinstance(r, dict) or r.get("error") or not isinstance(r.get("value"), dict):
         return None, "", ""
-    ctl, app_name = _parse_ui_controls(r.get("value") or {}, screen=screen, text=text)
+    ctl, app_name = _parse_ui_controls(r["value"], screen=screen, text=text)
     return ctl, app_name, ""
 
 
@@ -1859,7 +1934,21 @@ def ui_controls(client, screen=(430, 932), text=False):
     more than the pixels (Google Authenticator: 'OpenAI: ..., 123 456, 27
     seconds before code expires'). One request, ~300-600 ms."""
     ctl, _ = _fetch_ui_controls(client, screen=screen, text=text)
+    return _strip_alert_meta(ctl or [])
+
+
+def _strip_alert_meta(ctl):
+    if not ctl:
+        return ctl
+    if any("inAlert" in c for c in ctl):
+        return [{k: v for k, v in c.items() if k != "inAlert"} for c in ctl]
     return ctl
+
+
+def _is_springboard_ui(app_name, bundle_id):
+    return bundle_id == "com.apple.springboard" or (
+        not bundle_id and (app_name or "").strip().casefold() == "springboard"
+    )
 
 
 # Controls a tap:TEXT may land on instead of the OCR text, best type first.
@@ -1983,6 +2072,10 @@ FLOW_HELP = """steps (one argument each, run in order):
                         UI controls + Sauvola fallback; per-target @region supported);
                         returns the matched text
   gone:TEXT             poll until TEXT is no longer on screen
+  assert:TEXT           single-frame non-mutating check that TEXT is on screen (OCR + UI
+                        controls fallback; supports @region and 're:REGEX')
+  assertnot:TEXT        single-frame non-mutating check that TEXT is NOT on screen (checks
+                        both OCR and UI controls; supports @region and 're:REGEX')
   tap:TEXT              wait until TEXT is on screen at the same spot twice, tap its
                         centre, and re-tap once if the screen did not react; text
                         OCR cannot see falls back to the control with that label.
@@ -2000,7 +2093,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   toggle:LABEL[=on|off] idempotently set or flip an iOS Switch control (supports @region;
                         =on|off|1|0|true|false skips tap when already in desired state and
                         verifies state after tapping; respects --deny)
-  TEXT@below:HEADER     (tap/tapif/tapbatch/toggle/longpress/doubletap/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
+  TEXT@below:HEADER     (tap/tapif/tapbatch/toggle/longpress/doubletap/swipe:left|right/wait/waitany/assert/assertnot/scrollto) only match under HEADER,
   TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
   longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
                         @region, OCR + UI fallback, respects --deny)
@@ -2026,7 +2119,7 @@ FLOW_HELP = """steps (one argument each, run in order):
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
-  alert:accept|dismiss  accept or dismiss an active iOS system alert
+  alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
   scrollto:TEXT         scroll down (max 8x) until TEXT is visible (scrollto:up:TEXT scrolls up)
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
@@ -2043,7 +2136,8 @@ taps, toggles, sliders, double-taps, and long-presses on text matching --deny ar
 
 _TYPING_FREQ = None  # None = keep legacy WDA default pace; override via TURBOTAP_TYPING_FREQ (e.g. 240)
 _IMAGE_STEP_VERBS = frozenset({
-    "wait", "expect", "waitany", "gone", "tap", "tapif", "longpress", "doubletap",
+    "wait", "expect", "waitany", "gone", "assert", "assertnot",
+    "tap", "tapif", "longpress", "doubletap",
     "scroll", "scrollto", "swipe", "back", "read", "search", "settle", "shot",
 })
 _STALE_UI_BACKOFF = (0.05, 0.08, 0.12)
@@ -2183,6 +2277,8 @@ class Flow:
         self._last_reaction_diff = 0.0
         self._ctl_cache = None  # (controls, bundle, ts, img)
         self._last_tap_small_delta = False
+        self._last_alert_text = None
+        self._last_alert_buttons = None
 
     def _get_ui_worker(self):
         if self._side is None:
@@ -2254,6 +2350,7 @@ class Flow:
         eff_deadline = time.monotonic() + max_wait
         if deadline is not None:
             eff_deadline = min(eff_deadline, deadline)
+        checked_sb_alert = False
         while True:
             rem = eff_deadline - time.monotonic()
             if rem <= 0:
@@ -2271,9 +2368,18 @@ class Flow:
                 if time.monotonic() < eff_deadline and not (isinstance(info, dict) and info.get("deadline_exceeded")):
                     self._pending_bundle = None
                 return False
-            if val.get("bundleId") == target:
+            cur_bid = val.get("bundleId")
+            if cur_bid == target:
                 self._pending_bundle = None
                 return True
+            if (
+                not checked_sb_alert
+                and cur_bid == "com.apple.springboard"
+                and target != "com.apple.springboard"
+            ):
+                checked_sb_alert = True
+                if self._active_alert_text(deadline=eff_deadline):
+                    return False
             rem = eff_deadline - time.monotonic()
             if rem <= 0:
                 return False
@@ -2572,6 +2678,44 @@ class Flow:
                 and (m.y * self.r.scale) < int(prev_img.size[1] * 0.06)
             )
         raise FlowError(f"{label!r} still on screen")
+
+    def assert_text(self, arg):
+        """Fast single-frame non-mutating check that TEXT (with optional @region or
+        re:REGEX) is currently visible via OCR or UI controls."""
+        self._wait_active_app()
+        base, where = split_where(arg)
+        if not _clean_text(base) or (base.startswith("re:") and not base[3:].strip()):
+            raise FlowError(f"assert failed: {arg!r} not on screen")
+        lines = self._fresh_lines()
+        if lines is None:
+            lines = self.lines()
+        m = find_text(lines, base, where=where)
+        if m is not None:
+            return m.text
+        ctl = _controls_in_region(self.controls(text=True), lines, where)
+        cm = find_control_match(ctl, base, types=WAIT_UI_TYPES, allow_disabled=True)
+        if cm is not None:
+            return cm.text
+        raise FlowError(f"assert failed: {arg!r} not on screen")
+
+    def assert_not_text(self, arg):
+        """Fast single-frame non-mutating check that TEXT (with optional @region or
+        re:REGEX) is absent from both OCR and UI controls."""
+        self._wait_active_app()
+        base, where = split_where(arg)
+        if not _clean_text(base) or (base.startswith("re:") and not base[3:].strip()):
+            raise FlowError("assertnot requires target text (e.g. assertnot:TEXT)")
+        lines = self._fresh_lines()
+        if lines is None:
+            lines = self.lines()
+        m = find_text(lines, base, where=where)
+        if m is not None:
+            raise FlowError(f"assertnot failed: {arg!r} is on screen ({m.text})")
+        ctl = _controls_in_region(self.controls(text=True), lines, where)
+        cm = find_control_match(ctl, base, types=WAIT_UI_TYPES, allow_disabled=True)
+        if cm is not None:
+            raise FlowError(f"assertnot failed: {arg!r} is on screen ({cm.text})")
+        return "absent"
 
     def settle(self, timeout=2.0, start=None, still=0.6):
         last_ts = getattr(self.r, "last_ts", 0.0)
@@ -3781,14 +3925,21 @@ class Flow:
         self.settle(timeout=2.5, start=before)
 
     def scroll_to(self, label, where=None, max_swipes=8, direction="down"):
-        """Read, swipe, read... without waiting for momentum to end."""
+        """Read, swipe, read... without waiting for momentum to end.
+        OCR-first (zero controls() calls when OCR finds label); falls back to
+        controls(text=True) only on a blank/image-heavy initial frame (no OCR
+        lines below the status bar on i == 0) or upon reaching the end of scrolling
+        (at_end or i == max_swipes) without an OCR hit."""
         direction = (direction or "down").strip().lower()
         if direction not in ("down", "up"):
             raise FlowError(f"scrollto:{direction}? use down|up")
+        if where is None and "@" in (label or ""):
+            label, where = split_where(label)
         if not label:
             raise FlowError("scrollto requires target text (e.g. scrollto:TEXT or scrollto:up:TEXT)")
         self._wait_active_app()
         _, sh = self.r.pt_size()
+        status_y = max(54, int(sh * 0.06))
         seen = None
         for i in range(max_swipes + 1):
             if i:
@@ -3812,10 +3963,22 @@ class Flow:
                         self.r.set_last(self.r.last, lines=lines)
                     self._wait_settled_ts = time.monotonic()
                 return m
-            if at_end:
+            if not m and (
+                (i == 0 and not any(l.y >= status_y for l in lines))
+                or at_end
+                or i == max_swipes
+            ):
+                ctl = _controls_in_region(self.controls(text=True), lines, where)
+                cm = find_control_match(ctl, label, types=WAIT_UI_TYPES, allow_disabled=True)
+                if cm:
+                    if self.r.last is not None and hasattr(self.r, "set_last"):
+                        self.r.set_last(self.r.last, lines=lines)
+                    self._wait_settled_ts = time.monotonic()
+                    return cm
+            if at_end or i == max_swipes:
                 if m:
                     return m
-                break  # nothing moved: end of the list
+                break  # nothing moved or swipe limit reached
             seen = texts
             self.scroll(direction)
         raise FlowError(f"{label!r} not found while scrolling {direction}")
@@ -3853,17 +4016,121 @@ class Flow:
             return True
         return False
 
-    def controls(self, text=False, timeout=None, deadline=None, fast_only=False):
+    def _query_alert_text(self, client=None, deadline=None):
+        """Query WDA GET /session/{sid}/alert/text and preserve three states:
+        ('present', cleaned_text), ('absent', None), or ('error', detail)."""
+        c = client if client is not None else self.c
+        path = f"/session/{c.sid}/alert/text"
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return "error", "deadline exceeded"
+            eff_to = max(0.05, min(4.0, rem))
+            if hasattr(c, "_req_with_deadline"):
+                r = c._req_with_deadline("GET", path, timeout=eff_to, deadline=deadline)
+            else:
+                r = c.req("GET", path, timeout=eff_to)
+        else:
+            r = c.req("GET", path, timeout=4)
+        if not isinstance(r, dict):
+            return "error", "invalid response"
+        if not r.get("error"):
+            val = r.get("value")
+            if isinstance(val, str):
+                cleaned = _clean_text(val)
+                return ("present", cleaned) if cleaned else ("absent", None)
+            if val is None:
+                return "absent", None
+            return "error", f"unexpected alert value: {val!r}"
+        err = r.get("error")
+        parts = [str(r.get("body") or "")]
+        val = r.get("value")
+        if isinstance(val, dict):
+            parts.append(str(val.get("error") or ""))
+            parts.append(str(val.get("message") or ""))
+        blob = " ".join(parts).casefold()
+        no_alert_markers = (
+            "no such alert",
+            "nosuchalert",
+            "no alert",
+            "modal dialog",
+            "unable to find an alert",
+        )
+        if err == 404 and any(m in blob for m in no_alert_markers):
+            return "absent", None
+        return "error", f"alert query failed ({err})"
+
+    def _active_alert_text(self, client=None, deadline=None):
+        """Return cleaned non-empty alert text only when WDA confirms an active alert."""
+        status, txt = self._query_alert_text(client=client, deadline=deadline)
+        return txt if status == "present" else None
+
+    def _active_alert_buttons(self, client=None, deadline=None):
+        """Return ordered cleaned list of active alert button labels from WDA's alert API."""
+        c = client if client is not None else self.c
+        path = f"/session/{c.sid}/wda/alert/buttons"
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return []
+            eff_to = max(0.05, min(4.0, rem))
+            if hasattr(c, "_req_with_deadline"):
+                r = c._req_with_deadline("GET", path, timeout=eff_to, deadline=deadline)
+            else:
+                r = c.req("GET", path, timeout=eff_to)
+        else:
+            r = c.req("GET", path, timeout=4)
+        if isinstance(r, dict) and not r.get("error") and isinstance(r.get("value"), list):
+            return [_clean_text(s) for s in r["value"] if isinstance(s, str) and _clean_text(s)]
+        return []
+
+    def _extract_alert_controls(self, ctl, client=None, deadline=None, screen_pt=None, text=False):
+        """Return alert controls ONLY when their source proves XCUIElementTypeAlert
+        ancestry (inAlert=True). Never promotes flat /wda/fastUI coordinates by label
+        alone (which would leak same-labelled background controls). When a compact tree
+        lacks ancestry metadata, fetches the hierarchical /source tree for verified
+        Alert descendants; if still unavailable, returns [] and records coordinate-free
+        button labels from /wda/alert/buttons in self._last_alert_buttons."""
+        self._last_alert_buttons = None
+        in_alert = [c for c in (ctl or []) if c.get("inAlert")]
+        if in_alert:
+            return _strip_alert_meta(in_alert)
+        c = client if client is not None else self.c
+        path = f"/session/{c.sid}{SOURCE_LITE}"
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem > 0:
+                eff_to = max(0.05, rem)
+                r = c._req_with_deadline("GET", path, timeout=eff_to, deadline=deadline) if hasattr(c, "_req_with_deadline") else c.req("GET", path, timeout=eff_to)
+            else:
+                r = None
+        else:
+            r = c.req("GET", path, timeout=10)
+        if isinstance(r, dict) and not r.get("error") and isinstance(r.get("value"), dict):
+            scr = screen_pt if screen_pt is not None else self.r.pt_size()
+            src_ctl, _ = _parse_ui_controls(r["value"], screen=scr, text=text)
+            src_alert = [x for x in src_ctl if x.get("inAlert")]
+            if src_alert:
+                return _strip_alert_meta(src_alert)
+        btns = self._active_alert_buttons(client=c, deadline=deadline)
+        if btns:
+            self._last_alert_buttons = btns
+        return []
+
+    def controls(self, text=False, timeout=None, deadline=None, fast_only=False, allow_alert=False):
         if fast_only and (
             getattr(self.c, "turbo", None) is False
             or getattr(self.c, "_fast_ui", None) is False
         ):
             return None
+        self._last_alert_text = None
+        self._last_alert_buttons = None
         start_ts = time.monotonic()
         if deadline is None and timeout is not None:
             deadline = start_ts + max(0.05, float(timeout))
         expectation = self._snapshot_ui_expectation(start_ts)
         expected_bundle = expectation[0]
+        had_pending = self._pending_bundle
         pending = (
             self._pending_bundle
             if self._pending_bundle and (start_ts - self._pending_bundle_ts) <= 2.5
@@ -3902,7 +4169,11 @@ class Flow:
             if ctl is not None:
                 if bundle_id == pending or not bundle_id:
                     self._pending_bundle = None
-                else:
+                elif not (
+                    bundle_id == "com.apple.springboard"
+                    and expected_bundle
+                    and expected_bundle != "com.apple.springboard"
+                ):
                     # Older WDA Turbo v2 ignored waitBundle and returned previous app.
                     rem = (deadline - time.monotonic()) if deadline is not None else 30.0
                     if rem <= 0:
@@ -3938,9 +4209,28 @@ class Flow:
         if ctl is None:
             if fast_only:
                 return None
-            raise FlowError("UI tree timed out")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise FlowError("UI tree timed out")
+            raise FlowError("UI tree unavailable")
         self._last_ui_retried_stale = False
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
+            if (
+                _is_springboard_ui(app_name, bundle_id)
+                and expected_bundle
+                and expected_bundle != "com.apple.springboard"
+            ):
+                alert_txt = self._active_alert_text(deadline=deadline)
+                if alert_txt:
+                    self._last_alert_text = alert_txt
+                    self._invalidate_ctl_cache()
+                    if had_pending:
+                        self._pending_bundle = had_pending
+                    if allow_alert:
+                        return self._extract_alert_controls(ctl, deadline=deadline, screen_pt=_get_screen_pt(), text=text)
+                    raise _StaleAppError(
+                        f"System alert active on SpringBoard ({alert_txt!r}) "
+                        f"instead of expected {expected_bundle!r}"
+                    )
             # /source or /wda/fastUI occasionally lags behind activeAppInfo right after open:;
             # use short adaptive backoff until iOS publishes the new app's tree.
             # Keep controls and provenance together: never overwrite (app_name, bundle_id)
@@ -3979,6 +4269,39 @@ class Flow:
                     ctl, app_name, bundle_id = ctl_try, try_app_name, try_bundle_id
                 if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                     break
+                if (
+                    _is_springboard_ui(app_name, bundle_id)
+                    and expected_bundle
+                    and expected_bundle != "com.apple.springboard"
+                ):
+                    alert_txt = self._active_alert_text(deadline=deadline)
+                    if alert_txt:
+                        self._last_alert_text = alert_txt
+                        self._invalidate_ctl_cache()
+                        if had_pending:
+                            self._pending_bundle = had_pending
+                        if allow_alert:
+                            return self._extract_alert_controls(ctl, deadline=deadline, screen_pt=screen_pt, text=text)
+                        raise _StaleAppError(
+                            f"System alert active on SpringBoard ({alert_txt!r}) "
+                            f"instead of expected {expected_bundle!r}"
+                        )
+        elif (
+            _is_springboard_ui(app_name, bundle_id)
+            and expected_bundle != "com.apple.springboard"
+        ):
+            alert_txt = self._active_alert_text(deadline=deadline)
+            if alert_txt:
+                self._last_alert_text = alert_txt
+                self._invalidate_ctl_cache()
+                if had_pending:
+                    self._pending_bundle = had_pending
+                if allow_alert:
+                    return self._extract_alert_controls(ctl, deadline=deadline, screen_pt=_get_screen_pt(), text=text)
+                raise _StaleAppError(
+                    f"System alert active on SpringBoard ({alert_txt!r}) "
+                    f"instead of expected {expected_bundle!r}"
+                )
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
             # Never return or cache mismatched outgoing-app coordinates under the target bundle.
             self._invalidate_ctl_cache()
@@ -3995,6 +4318,7 @@ class Flow:
             self._last_app_bundle = bundle_id or expected_bundle
             if app_name != self._switched_from_app_name:
                 self._switched_from_app_name = None
+        ctl = _strip_alert_meta(ctl)
         self._store_ctl_cache(ctl)
         return ctl
 
@@ -4005,9 +4329,12 @@ class Flow:
         overlaps with OCR, checks active-app freshness, reuses fresh wait:
         frames without redundant OCR, confirms static screens via cheap
         pixel-still grabs, and never discards a fresh completed tree."""
+        self._last_alert_text = None
+        self._last_alert_buttons = None
         start_ts = time.monotonic()
         expectation = self._snapshot_ui_expectation(start_ts)
         expected_bundle = expectation[0]
+        had_pending_bundle = self._pending_bundle
         pending_bundle = (
             self._pending_bundle
             if self._pending_bundle and (start_ts - self._pending_bundle_ts) <= 2.5
@@ -4137,20 +4464,47 @@ class Flow:
                 fut = pool.submit(_fetch_ui_controls_meta, side, pt, True, wb, wb_ms)
         if fut:
             ui_res, app_name, bundle_id = fut.result()
+            sb_alert_txt = None
             if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
-                for delay in _STALE_UI_BACKOFF:
-                    time.sleep(delay)
-                    ui_try, try_app_name, try_bundle_id = _fetch_ui_controls_meta(
-                        side, pt, True,
-                        expected_bundle if expected_bundle else None,
-                        400 if expected_bundle else 0,
-                    )
-                    if ui_try is None:
-                        break
-                    ui_res, app_name, bundle_id = ui_try, try_app_name, try_bundle_id
-                    if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
-                        break
-            if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
+                if (
+                    _is_springboard_ui(app_name, bundle_id)
+                    and expected_bundle
+                    and expected_bundle != "com.apple.springboard"
+                ):
+                    sb_alert_txt = self._active_alert_text(client=side)
+                if not sb_alert_txt:
+                    for delay in _STALE_UI_BACKOFF:
+                        time.sleep(delay)
+                        ui_try, try_app_name, try_bundle_id = _fetch_ui_controls_meta(
+                            side, pt, True,
+                            expected_bundle if expected_bundle else None,
+                            400 if expected_bundle else 0,
+                        )
+                        if ui_try is None:
+                            break
+                        ui_res, app_name, bundle_id = ui_try, try_app_name, try_bundle_id
+                        if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
+                            break
+                        if (
+                            _is_springboard_ui(app_name, bundle_id)
+                            and expected_bundle
+                            and expected_bundle != "com.apple.springboard"
+                        ):
+                            sb_alert_txt = self._active_alert_text(client=side)
+                            if sb_alert_txt:
+                                break
+            elif (
+                _is_springboard_ui(app_name, bundle_id)
+                and expected_bundle != "com.apple.springboard"
+            ):
+                sb_alert_txt = self._active_alert_text(client=side)
+            if sb_alert_txt:
+                self._last_alert_text = sb_alert_txt
+                self._invalidate_ctl_cache()
+                if had_pending_bundle:
+                    self._pending_bundle = had_pending_bundle
+                ui_res = self._extract_alert_controls(ui_res or [], client=side, screen_pt=pt, text=True)
+            elif self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                 # Never return or cache mismatched outgoing-app UI coordinates.
                 self._invalidate_ctl_cache()
                 if expected_bundle:
@@ -4164,7 +4518,9 @@ class Flow:
                     self._last_app_bundle = bundle_id or expected_bundle
                     if app_name != self._switched_from_app_name:
                         self._switched_from_app_name = None
-                self._store_ctl_cache(ui_res, img=self.r.last)
+                ui_res = _strip_alert_meta(ui_res)
+                if ui_res is not None:
+                    self._store_ctl_cache(ui_res, img=self.r.last)
         else:
             ui_res = None
         if ui_res:
@@ -4550,6 +4906,10 @@ class Flow:
             return self.wait_any(arg).text
         elif verb == "gone":
             self.gone(arg)
+        elif verb == "assert":
+            return self.assert_text(arg)
+        elif verb == "assertnot":
+            return self.assert_not_text(arg)
         elif verb == "tap":
             return self.tap_text(arg).text
         elif verb == "tapif":
@@ -4726,8 +5086,16 @@ class Flow:
             return f"tapped {len(digits)} digits"
         elif verb == "alert":
             action = arg.strip().lower() or "accept"
+            if action == "text":
+                status, txt = self._query_alert_text()
+                if status == "present":
+                    self.reads.append({"alert": txt})
+                    return txt
+                if status == "absent":
+                    return "no-alert"
+                raise FlowError(f"alert:text failed: {txt}")
             if action not in ("accept", "dismiss"):
-                raise FlowError("alert step must be alert:accept or alert:dismiss")
+                raise FlowError("alert step must be alert:accept, alert:dismiss, or alert:text")
             self._mark_action()
             r = self.c.req("POST", f"/session/{self.c.sid}/alert/{action}", {})
             if r.get("error"):
@@ -4758,6 +5126,8 @@ class Flow:
         elif verb == "back":
             self.back()
         elif verb == "read":
+            self._last_alert_text = None
+            self._last_alert_buttons = None
             ui = None
             if arg and arg != "ocr":
                 y0, y1 = (int(v) for v in arg.split("-"))
@@ -4767,11 +5137,22 @@ class Flow:
             entry = {"lines": [l.as_dict() for l in lines]}
             if ui is not None:
                 entry["ui"] = ui
+            if self._last_alert_text:
+                entry["alert"] = self._last_alert_text
+            if self._last_alert_buttons:
+                entry["alert_buttons"] = self._last_alert_buttons
             self.reads.append(entry)
             return len(lines)
         elif verb == "ui":
-            ui = self.controls()
-            self.reads.append({"ui": ui})
+            self._last_alert_text = None
+            self._last_alert_buttons = None
+            ui = self.controls(allow_alert=True)
+            entry = {"ui": ui}
+            if self._last_alert_text:
+                entry["alert"] = self._last_alert_text
+            if self._last_alert_buttons:
+                entry["alert_buttons"] = self._last_alert_buttons
+            self.reads.append(entry)
             return len(ui)
         elif verb == "readel":
             end = time.time() + self.timeout

@@ -117,6 +117,8 @@ class MockWDAClient(cli.WDAClient):
         element_names=None,
         element_enabled=None,
         screenshot_b64=None,
+        alert_text=None,
+        alert_buttons=None,
         on_action=None,
         custom_handler=None,
     ):
@@ -152,6 +154,8 @@ class MockWDAClient(cli.WDAClient):
         self.element_enabled = dict(element_enabled or {})
         self.focused_eid = next(iter(self.element_values), None)
         self.screenshot_b64 = screenshot_b64
+        self.alert_text = alert_text
+        self.alert_buttons = alert_buttons
         self.on_action = on_action
         self.custom_handler = custom_handler
         self.typed_history = []
@@ -252,6 +256,8 @@ class MockWDAClient(cli.WDAClient):
         if clean_path.endswith("/source"):
             if qs.get("format") == ["json"]:
                 src = self.source_tree(qs) if callable(self.source_tree) else _pop_or_last(self.source_tree)
+                if isinstance(src, dict) and "error" in src:
+                    return src
                 return {"value": src}
             return {"value": self.source_xml}
 
@@ -349,6 +355,27 @@ class MockWDAClient(cli.WDAClient):
                     v = v.pop(0) if len(v) > 1 else v[0]
                 return {"value": v}
 
+        if clean_path.endswith("/alert/text"):
+            txt = self.alert_text() if callable(self.alert_text) else _pop_or_last(self.alert_text)
+            if isinstance(txt, dict):
+                return txt
+            if txt is not None:
+                return {"value": txt}
+            return {"error": 404, "body": "no such alert"}
+        if clean_path.endswith("/wda/alert/buttons"):
+            if callable(self.alert_buttons):
+                btns = self.alert_buttons()
+            elif isinstance(self.alert_buttons, list) and (
+                not self.alert_buttons or isinstance(self.alert_buttons[0], str)
+            ):
+                btns = self.alert_buttons
+            else:
+                btns = _pop_or_last(self.alert_buttons)
+            if isinstance(btns, dict):
+                return btns
+            if btns is not None:
+                return {"value": list(btns)}
+            return {"error": 404, "body": "no such alert"}
         if clean_path.endswith("/alert/accept") or clean_path.endswith("/alert/dismiss"):
             return {"value": None}
 
