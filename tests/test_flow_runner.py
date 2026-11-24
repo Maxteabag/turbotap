@@ -100,19 +100,48 @@ class ReadFullTests(unittest.TestCase):
         ]
         sb_alert_ui = _fast_ui(mixed_sb_controls, app_name="SpringBoard", bundle_id="com.apple.springboard")
 
-        # 1. Mixed SpringBoard tree with an active system alert over a pending target app:
+        # 1. Mixed SpringBoard tree with an active system alert over a pending target app,
+        # INCLUDING a duplicate-label collision ("OK" at background (75, 150) vs alert (200, 500)):
         # - Generic action/control paths (controls() default allow_alert=False, tapif:Settings)
         #   NEVER treat the SpringBoard alert as target-app confirmation and dispatch ZERO taps
         #   to unrelated background SpringBoard controls.
-        # - Read-only alert inspection (read / ui / controls(allow_alert=True)) exits without
-        #   _STALE_UI_BACKOFF retries, exposes ONLY provable alert buttons via /wda/alert/buttons
-        #   (dropping unrelated "Settings"), does NOT cache under self.bundle, preserves
-        #   _pending_bundle, and attaches "alert".
+        # - Read-only alert inspection (read / ui / controls(allow_alert=True)) NEVER promotes
+        #   flat /wda/fastUI coordinates by label alone; when compact fastUI lacks alert ancestry
+        #   metadata, it fetches hierarchical /source to expose ONLY verified Alert descendants
+        #   (background (75, 150) OK and Settings are strictly absent), or returns ui=[] plus
+        #   coordinate-free alert_buttons when no Alert subtree is available.
+        dup_mixed_sb_controls = [
+            {"type": "Button", "label": "Settings", "x": 85, "y": 210},
+            {"type": "Button", "label": "OK", "x": 75, "y": 150},    # background collision!
+            {"type": "Button", "label": "OK", "x": 200, "y": 500},   # alert button in flat fastUI
+            {"type": "Button", "label": "Don't Allow", "x": 135, "y": 510},
+            {"type": "Button", "label": "Allow Paste", "x": 295, "y": 510},
+        ]
+        sb_alert_ui = _fast_ui(dup_mixed_sb_controls, app_name="SpringBoard", bundle_id="com.apple.springboard")
+        sb_source_with_dup = {
+            "type": "Application",
+            "name": "SpringBoard",
+            "children": [
+                {"type": "Button", "label": "Settings", "rect": {"x": 50, "y": 180, "width": 70, "height": 60}},
+                {"type": "Button", "label": "OK", "rect": {"x": 45, "y": 130, "width": 60, "height": 40}},
+                {
+                    "type": "Alert",
+                    "label": "Allow Paste from Safari?",
+                    "rect": {"x": 60, "y": 360, "width": 310, "height": 180},
+                    "children": [
+                        {"type": "Button", "label": "OK", "rect": {"x": 160, "y": 480, "width": 80, "height": 40}},
+                        {"type": "Button", "label": "Don't Allow", "rect": {"x": 80, "y": 490, "width": 110, "height": 40}},
+                        {"type": "Button", "label": "Allow Paste", "rect": {"x": 240, "y": 490, "width": 110, "height": 40}},
+                    ],
+                },
+            ],
+        }
         c_alert = MockWDAClient(
             active_app="com.apple.springboard",
             fast_ui=sb_alert_ui,
+            source_tree=sb_source_with_dup,
             alert_text="Allow Paste from Safari?",
-            alert_buttons=["Don't Allow", "Allow Paste"],
+            alert_buttons=["OK", "Don't Allow", "Allow Paste"],
         )
         r_alert = FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0)
         flow_alert = cli.Flow(c_alert, reader=r_alert, timeout=1.0)
@@ -132,25 +161,32 @@ class ReadFullTests(unittest.TestCase):
             self.assertEqual(flow_alert._pending_bundle, "com.example.target")
             self.assertEqual(flow_alert._last_alert_text, "Allow Paste from Safari?")
 
-            # tapif:Settings must NOT tap the unrelated background SpringBoard control.
-            res_tapif = flow_alert.tap_if("Settings", timeout=0.15)
-            self.assertEqual(res_tapif, "skipped")
+            # tapif:Settings and tapif:OK must NOT tap any background SpringBoard control.
+            self.assertEqual(flow_alert.tap_if("Settings", timeout=0.15), "skipped")
+            self.assertEqual(flow_alert.tap_if("OK", timeout=0.15), "skipped")
             self.assertEqual(c_alert.tapped_points, [])
             self.assertEqual(flow_alert._pending_bundle, "com.example.target")
 
-            # Explicit read-only inspection (step("ui") / controls(allow_alert=True))
-            # exposes ONLY the alert buttons from /wda/alert/buttons, never "Settings".
+            # Explicit read-only inspection (step("ui") / controls(allow_alert=True)) fetches
+            # hierarchical /source and exposes ONLY Alert descendants: alert OK at (200, 500),
+            # never background OK at (75, 150) and never Settings.
             sleeps.clear()
             with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
                 n_ui = flow_alert.step("ui")
-            self.assertEqual(n_ui, 2)
+            self.assertEqual(n_ui, 3)
             self.assertEqual(sleeps, [])
-            self.assertEqual([x["label"] for x in flow_alert.reads[-1]["ui"]], ["Don't Allow", "Allow Paste"])
+            ui_got = flow_alert.reads[-1]["ui"]
+            self.assertEqual([(x["label"], x["x"], x["y"]) for x in ui_got], [
+                ("OK", 200, 500),
+                ("Don't Allow", 135, 510),
+                ("Allow Paste", 295, 510),
+            ])
+            self.assertNotIn((75, 150), [(x["x"], x["y"]) for x in ui_got])
             self.assertEqual(flow_alert.reads[-1]["alert"], "Allow Paste from Safari?")
             self.assertIsNone(flow_alert._ctl_cache)
             self.assertEqual(flow_alert._pending_bundle, "com.example.target")
 
-            # step("read") (via read_full) surfaces ONLY alert buttons without retries,
+            # step("read") (via read_full) surfaces ONLY verified Alert descendants without retries,
             # keeps _pending_bundle, does not cache, and attaches "alert".
             c_alert.calls.clear()
             with mock.patch("turbotap.cli.time.sleep", side_effect=lambda s: sleeps.append(s)):
@@ -160,26 +196,41 @@ class ReadFullTests(unittest.TestCase):
             self.assertIsNone(flow_alert._ctl_cache)
             self.assertEqual(flow_alert._pending_bundle, "com.example.target")
             self.assertEqual(flow_alert.reads[-1]["alert"], "Allow Paste from Safari?")
-            self.assertEqual([x["label"] for x in flow_alert.reads[-1]["ui"]], ["Don't Allow", "Allow Paste"])
+            read_ui = flow_alert.reads[-1]["ui"]
+            self.assertEqual([(x["label"], x["x"], x["y"]) for x in read_ui], [
+                ("OK", 200, 500),
+                ("Don't Allow", 135, 510),
+                ("Allow Paste", 295, 510),
+            ])
+            self.assertNotIn((75, 150), [(x["x"], x["y"]) for x in read_ui])
             fast_ui_calls = [p for _, p, _ in c_alert.calls if p.startswith("/wda/fastUI")]
             self.assertEqual(len(fast_ui_calls), 1)
         finally:
             flow_alert.close()
 
-        # 1b. Flat fastUI without /wda/alert/buttons exposes [] (never leaks background controls);
-        # /source Alert subtree exposes ONLY Alert descendants (never outside sibling Settings).
-        c_no_btns = MockWDAClient(
+        # 1b. When compact fastUI lacks alert ancestry AND /source has no Alert subtree (or fails),
+        # ui/read MUST NOT return any flat coordinates (even when /wda/alert/buttons returns "OK"),
+        # exposing ui=[] plus coordinate-free alert_buttons instead.
+        c_no_ancestry = MockWDAClient(
             active_app="com.apple.springboard",
             fast_ui=sb_alert_ui,
+            source_tree={"error": 500, "body": "source failed"},
             alert_text="Allow Paste from Safari?",
-            alert_buttons=None,
+            alert_buttons=["OK", "Don't Allow"],
         )
-        flow_no_btns = cli.Flow(c_no_btns, reader=FakeReader(frames=[(img, lines)], pt=(430, 932), scale=1.0), timeout=1.0)
+        flow_no_anc = cli.Flow(c_no_ancestry, reader=FakeReader(frames=[(img, lines), (img.copy(), lines)], pt=(430, 932), scale=1.0), timeout=1.0)
         try:
-            flow_no_btns.step("open:com.example.target")
-            self.assertEqual(flow_no_btns.controls(allow_alert=True), [])
+            flow_no_anc.step("open:com.example.target")
+            self.assertEqual(flow_no_anc.step("ui"), 0)
+            self.assertEqual(flow_no_anc.reads[-1]["ui"], [])
+            self.assertEqual(flow_no_anc.reads[-1]["alert"], "Allow Paste from Safari?")
+            self.assertEqual(flow_no_anc.reads[-1]["alert_buttons"], ["OK", "Don't Allow"])
+            flow_no_anc.step("read")
+            self.assertEqual(flow_no_anc.reads[-1]["ui"], [])
+            self.assertEqual(flow_no_anc.reads[-1]["alert"], "Allow Paste from Safari?")
+            self.assertEqual(flow_no_anc.reads[-1]["alert_buttons"], ["OK", "Don't Allow"])
         finally:
-            flow_no_btns.close()
+            flow_no_anc.close()
 
         source_alert_tree = {
             "type": "Application",

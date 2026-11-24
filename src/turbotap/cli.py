@@ -2278,6 +2278,7 @@ class Flow:
         self._ctl_cache = None  # (controls, bundle, ts, img)
         self._last_tap_small_delta = False
         self._last_alert_text = None
+        self._last_alert_buttons = None
 
     def _get_ui_worker(self):
         if self._side is None:
@@ -4065,13 +4066,13 @@ class Flow:
         return txt if status == "present" else None
 
     def _active_alert_buttons(self, client=None, deadline=None):
-        """Return cleaned set of active alert button labels from WDA's alert API."""
+        """Return ordered cleaned list of active alert button labels from WDA's alert API."""
         c = client if client is not None else self.c
         path = f"/session/{c.sid}/wda/alert/buttons"
         if deadline is not None:
             rem = deadline - time.monotonic()
             if rem <= 0:
-                return set()
+                return []
             eff_to = max(0.05, min(4.0, rem))
             if hasattr(c, "_req_with_deadline"):
                 r = c._req_with_deadline("GET", path, timeout=eff_to, deadline=deadline)
@@ -4080,25 +4081,40 @@ class Flow:
         else:
             r = c.req("GET", path, timeout=4)
         if isinstance(r, dict) and not r.get("error") and isinstance(r.get("value"), list):
-            return {_clean_text(s) for s in r["value"] if isinstance(s, str) and _clean_text(s)}
-        return set()
+            return [_clean_text(s) for s in r["value"] if isinstance(s, str) and _clean_text(s)]
+        return []
 
-    def _extract_alert_controls(self, ctl, client=None, deadline=None):
-        """Filter SpringBoard controls strictly to provable alert provenance:
-        either descendants of an XCUIElementTypeAlert subtree (inAlert=True) or
-        Button controls whose exact label is returned by /wda/alert/buttons.
-        Never exposes unrelated SpringBoard background controls."""
-        if not ctl:
-            return []
-        in_alert = [c for c in ctl if c.get("inAlert")]
+    def _extract_alert_controls(self, ctl, client=None, deadline=None, screen_pt=None, text=False):
+        """Return alert controls ONLY when their source proves XCUIElementTypeAlert
+        ancestry (inAlert=True). Never promotes flat /wda/fastUI coordinates by label
+        alone (which would leak same-labelled background controls). When a compact tree
+        lacks ancestry metadata, fetches the hierarchical /source tree for verified
+        Alert descendants; if still unavailable, returns [] and records coordinate-free
+        button labels from /wda/alert/buttons in self._last_alert_buttons."""
+        self._last_alert_buttons = None
+        in_alert = [c for c in (ctl or []) if c.get("inAlert")]
         if in_alert:
             return _strip_alert_meta(in_alert)
-        alert_btns = self._active_alert_buttons(client=client, deadline=deadline)
-        if alert_btns:
-            return _strip_alert_meta([
-                c for c in ctl
-                if c.get("type") == "Button" and _clean_text(c.get("label") or "") in alert_btns
-            ])
+        c = client if client is not None else self.c
+        path = f"/session/{c.sid}{SOURCE_LITE}"
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem > 0:
+                eff_to = max(0.05, rem)
+                r = c._req_with_deadline("GET", path, timeout=eff_to, deadline=deadline) if hasattr(c, "_req_with_deadline") else c.req("GET", path, timeout=eff_to)
+            else:
+                r = None
+        else:
+            r = c.req("GET", path, timeout=10)
+        if isinstance(r, dict) and not r.get("error") and isinstance(r.get("value"), dict):
+            scr = screen_pt if screen_pt is not None else self.r.pt_size()
+            src_ctl, _ = _parse_ui_controls(r["value"], screen=scr, text=text)
+            src_alert = [x for x in src_ctl if x.get("inAlert")]
+            if src_alert:
+                return _strip_alert_meta(src_alert)
+        btns = self._active_alert_buttons(client=c, deadline=deadline)
+        if btns:
+            self._last_alert_buttons = btns
         return []
 
     def controls(self, text=False, timeout=None, deadline=None, fast_only=False, allow_alert=False):
@@ -4108,6 +4124,7 @@ class Flow:
         ):
             return None
         self._last_alert_text = None
+        self._last_alert_buttons = None
         start_ts = time.monotonic()
         if deadline is None and timeout is not None:
             deadline = start_ts + max(0.05, float(timeout))
@@ -4209,7 +4226,7 @@ class Flow:
                     if had_pending:
                         self._pending_bundle = had_pending
                     if allow_alert:
-                        return self._extract_alert_controls(ctl, deadline=deadline)
+                        return self._extract_alert_controls(ctl, deadline=deadline, screen_pt=_get_screen_pt(), text=text)
                     raise _StaleAppError(
                         f"System alert active on SpringBoard ({alert_txt!r}) "
                         f"instead of expected {expected_bundle!r}"
@@ -4264,7 +4281,7 @@ class Flow:
                         if had_pending:
                             self._pending_bundle = had_pending
                         if allow_alert:
-                            return self._extract_alert_controls(ctl, deadline=deadline)
+                            return self._extract_alert_controls(ctl, deadline=deadline, screen_pt=screen_pt, text=text)
                         raise _StaleAppError(
                             f"System alert active on SpringBoard ({alert_txt!r}) "
                             f"instead of expected {expected_bundle!r}"
@@ -4280,7 +4297,7 @@ class Flow:
                 if had_pending:
                     self._pending_bundle = had_pending
                 if allow_alert:
-                    return self._extract_alert_controls(ctl, deadline=deadline)
+                    return self._extract_alert_controls(ctl, deadline=deadline, screen_pt=_get_screen_pt(), text=text)
                 raise _StaleAppError(
                     f"System alert active on SpringBoard ({alert_txt!r}) "
                     f"instead of expected {expected_bundle!r}"
@@ -4313,6 +4330,7 @@ class Flow:
         frames without redundant OCR, confirms static screens via cheap
         pixel-still grabs, and never discards a fresh completed tree."""
         self._last_alert_text = None
+        self._last_alert_buttons = None
         start_ts = time.monotonic()
         expectation = self._snapshot_ui_expectation(start_ts)
         expected_bundle = expectation[0]
@@ -4485,7 +4503,7 @@ class Flow:
                 self._invalidate_ctl_cache()
                 if had_pending_bundle:
                     self._pending_bundle = had_pending_bundle
-                ui_res = self._extract_alert_controls(ui_res or [], client=side)
+                ui_res = self._extract_alert_controls(ui_res or [], client=side, screen_pt=pt, text=True)
             elif self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                 # Never return or cache mismatched outgoing-app UI coordinates.
                 self._invalidate_ctl_cache()
@@ -5109,6 +5127,7 @@ class Flow:
             self.back()
         elif verb == "read":
             self._last_alert_text = None
+            self._last_alert_buttons = None
             ui = None
             if arg and arg != "ocr":
                 y0, y1 = (int(v) for v in arg.split("-"))
@@ -5120,14 +5139,19 @@ class Flow:
                 entry["ui"] = ui
             if self._last_alert_text:
                 entry["alert"] = self._last_alert_text
+            if self._last_alert_buttons:
+                entry["alert_buttons"] = self._last_alert_buttons
             self.reads.append(entry)
             return len(lines)
         elif verb == "ui":
             self._last_alert_text = None
+            self._last_alert_buttons = None
             ui = self.controls(allow_alert=True)
             entry = {"ui": ui}
             if self._last_alert_text:
                 entry["alert"] = self._last_alert_text
+            if self._last_alert_buttons:
+                entry["alert_buttons"] = self._last_alert_buttons
             self.reads.append(entry)
             return len(ui)
         elif verb == "readel":
