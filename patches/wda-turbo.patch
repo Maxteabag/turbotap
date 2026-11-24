@@ -1,3 +1,150 @@
+diff --git a/WebDriverAgentLib/Commands/FBCustomCommands.m b/WebDriverAgentLib/Commands/FBCustomCommands.m
+index 6dee73b..3b2e19d 100644
+--- a/WebDriverAgentLib/Commands/FBCustomCommands.m
++++ b/WebDriverAgentLib/Commands/FBCustomCommands.m
+@@ -35,6 +35,60 @@
+ #import "XCUIElement+FBIsVisible.h"
+ #import "XCUIElementQuery.h"
+ #import "FBUnattachedAppLauncher.h"
++#import <CoreFoundation/CoreFoundation.h>
++#import <stdatomic.h>
++#import "FBXCTestDaemonsProxy.h"
++#import "XCTMessagingChannel_RunnerToDaemon-Protocol.h"
++
++// wda-turbo: terminate an application via direct async testmanagerd XPC and wake
++// the current CFRunLoop immediately upon completion, with a bounded timeout so it
++// can never hang. Returns YES only when XPC completes with nil error.
++static BOOL FBTerminateAppFast(NSString *bundleId, NSTimeInterval timeoutSec)
++{
++  id<XCTMessagingChannel_RunnerToDaemon> daemonProxy = [FBXCTestDaemonsProxy testRunnerProxy];
++  if (![(NSObject *)daemonProxy respondsToSelector:@selector(_XCT_terminateApplicationWithBundleID:completion:)]) {
++    return NO;
++  }
++  __block NSError *xpcError = nil;
++  __block atomic_bool done = false;
++  __block atomic_bool timedOut = false;
++  __block atomic_bool invoked = false;
++  CFRunLoopRef rl = CFRunLoopGetCurrent();
++  CFRetain(rl);
++  @try {
++    [daemonProxy _XCT_terminateApplicationWithBundleID:bundleId
++                                            completion:^(NSError *invokeError) {
++      if (atomic_exchange_explicit(&invoked, true, memory_order_acq_rel)) {
++        return;
++      }
++      if (nil != invokeError) {
++        xpcError = invokeError;
++      }
++      atomic_store_explicit(&done, true, memory_order_release);
++      if (!atomic_load_explicit(&timedOut, memory_order_acquire)) {
++        CFRunLoopStop(rl);
++        CFRunLoopWakeUp(rl);
++      }
++      CFRelease(rl);
++    }];
++  } @catch (NSException *exception) {
++    (void)exception;
++    if (!atomic_exchange_explicit(&invoked, true, memory_order_acq_rel)) {
++      CFRelease(rl);
++    }
++    return NO;
++  }
++  NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + timeoutSec;
++  while (!atomic_load_explicit(&done, memory_order_acquire)) {
++    NSTimeInterval remaining = deadline - NSProcessInfo.processInfo.systemUptime;
++    if (remaining <= 0.0) {
++      atomic_store_explicit(&timedOut, true, memory_order_release);
++      return NO;
++    }
++    CFRunLoopRunInMode(kCFRunLoopDefaultMode, MIN(0.02, remaining), (Boolean)true);
++  }
++  return (nil == xpcError);
++}
+ 
+ @implementation FBCustomCommands
+ 
+@@ -75,6 +129,8 @@
+     [[FBRoute POST:@"/wda/expectNotification"] respondWithTarget:self action:@selector(handleExpectNotification:)],
+     [[FBRoute POST:@"/wda/siri/activate"] respondWithTarget:self action:@selector(handleActivateSiri:)],
+     [[FBRoute POST:@"/wda/apps/launchUnattached"].withoutSession respondWithTarget:self action:@selector(handleLaunchUnattachedApp:)],
++    [[FBRoute POST:@"/wda/fastLaunch"] respondWithTarget:self action:@selector(handleFastLaunch:)],
++    [[FBRoute POST:@"/wda/fastLaunch"].withoutSession respondWithTarget:self action:@selector(handleFastLaunch:)],
+     [[FBRoute GET:@"/wda/device/hingeAngle"] respondWithTarget:self action:@selector(handleGetSimulatedHingeAngle:)],
+     [[FBRoute GET:@"/wda/device/hingeAngle"].withoutSession respondWithTarget:self action:@selector(handleGetSimulatedHingeAngle:)],
+     [[FBRoute POST:@"/wda/device/hingeAngle"] respondWithTarget:self action:@selector(handleSetSimulatedHingeAngle:)],
+@@ -386,6 +442,72 @@
+   return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"LSApplicationWorkspace failed to launch app" traceback:nil]);
+ }
+ 
++// wda-turbo: fast app launch / cold-launch in one round-trip.
++// Skips termination when NotRunning, uses direct async testmanagerd XPC termination
++// (falling back to [app terminate]), briefly polls until NotRunning, then launches via
++// LSApplicationWorkspace (falling back to [app activate]).
++// Body: {"bundleId": "com.apple.Preferences", "terminate": true|false}
+++ (id<FBResponsePayload>)handleFastLaunch:(FBRouteRequest *)request
++{
++  NSDictionary *a = request.arguments ?: @{};
++  id rawBundleId = a[@"bundleId"];
++  if (![rawBundleId isKindOfClass:NSString.class] || ((NSString *)rawBundleId).length == 0U) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'bundleId' must be a non-empty string"
++                                                                       traceback:nil]);
++  }
++  NSString *bundleId = (NSString *)rawBundleId;
++  id rawTerminate = a[@"terminate"];
++  BOOL shouldTerminate = (nil != rawTerminate && [rawTerminate respondsToSelector:@selector(boolValue)])
++    ? [rawTerminate boolValue]
++    : NO;
++
++  XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:bundleId];
++  BOOL didTerminate = NO;
++  if (shouldTerminate
++      && ![bundleId isEqualToString:@"com.apple.springboard"]
++      && app.state > XCUIApplicationStateNotRunning) {
++    if (FBTerminateAppFast(bundleId, 2.0)) {
++      didTerminate = YES;
++    } else if (app.state > XCUIApplicationStateNotRunning) {
++      @try {
++        [app terminate];
++        didTerminate = YES;
++      } @catch (NSException *exception) {
++        return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:exception.reason ?: @"Failed to terminate application"
++                                                                   traceback:nil]);
++      }
++    } else {
++      didTerminate = YES;
++    }
++    NSTimeInterval pollDeadline = NSProcessInfo.processInfo.systemUptime + 0.4;
++    while (app.state > XCUIApplicationStateNotRunning
++           && NSProcessInfo.processInfo.systemUptime < pollDeadline) {
++      CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, (Boolean)true);
++    }
++  }
++
++  BOOL launched = [FBUnattachedAppLauncher launchAppWithBundleId:bundleId];
++  if (!launched) {
++    @try {
++      [app activate];
++    } @catch (NSException *exception) {
++      NSString *msg = exception.reason ?: [NSString stringWithFormat:@"Failed to launch '%@'", bundleId];
++      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:msg traceback:nil]);
++    }
++    launched = (app.state > XCUIApplicationStateNotRunning);
++    if (!launched) {
++      NSString *msg = [NSString stringWithFormat:@"Failed to launch application '%@'", bundleId];
++      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:msg traceback:nil]);
++    }
++  }
++
++  return FBResponseWithObject(@{
++    @"bundleId": bundleId,
++    @"terminated": @(didTerminate),
++    @"launched": @(launched),
++  });
++}
++
+ + (id <FBResponsePayload>)handleResetAppAuth:(FBRouteRequest *)request
+ {
+   NSNumber *resource = request.arguments[@"resource"];
 diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m b/WebDriverAgentLib/Commands/FBDebugCommands.m
 index 42ea74b..829efed 100644
 --- a/WebDriverAgentLib/Commands/FBDebugCommands.m

@@ -288,6 +288,136 @@ class WDAClientCommandsTests(unittest.TestCase):
         self.assertEqual([x["label"] for x in ctl_fb], ["About"])
         self.assertTrue(any(cli.SOURCE_LITE in p for _, p, _ in c_old.calls))
 
+    def test_fast_launch_turbo_fallbacks_and_error_handling(self):
+        # 1. Happy path on WDA Turbo v5: POST /wda/fastLaunch sets _fast_launch=True.
+        c = MockWDAClient()
+        res = c.fast_launch("com.example.notes", terminate=True)
+        self.assertTrue(c._fast_launch)
+        self.assertEqual(res["value"], {"bundleId": "com.example.notes", "terminated": True, "launched": True})
+        self.assertEqual(
+            c.calls[-1],
+            ("POST", "/wda/fastLaunch", {"bundleId": "com.example.notes", "terminate": True}),
+        )
+
+        # terminate=False passes terminate=False cleanly.
+        res2 = c.fast_launch("com.example.notes", terminate=False)
+        self.assertEqual(res2["value"]["terminated"], False)
+        self.assertEqual(
+            c.calls[-1],
+            ("POST", "/wda/fastLaunch", {"bundleId": "com.example.notes", "terminate": False}),
+        )
+
+        # _side_client propagates _fast_launch capability flag.
+        real = cli.WDAClient(TEST_WDA_URL, udid=TEST_UDID)
+        real.sid = "sid-side"
+        real._fast_launch = True
+        self.assertTrue(real._side_client()._fast_launch)
+
+        # 2. Non-404 error returns error without disabling _fast_launch and without fallback replay.
+        c500 = MockWDAClient(
+            custom_handler=lambda m, p, d: {"error": 500, "body": "launch failed"} if p == "/wda/fastLaunch" else None
+        )
+        r500 = c500.fast_launch("com.example.bad", terminate=True)
+        self.assertEqual(r500["error"], 500)
+        self.assertIsNone(c500._fast_launch)
+        self.assertEqual([p for _, p, _ in c500.calls], ["/wda/fastLaunch"])
+
+        # 3. HTTP 404 caches _fast_launch=False and falls back to terminate + launchUnattached.
+        c404 = MockWDAClient(fast_launch_404=True)
+        r404 = c404.fast_launch("com.example.calc", terminate=True)
+        self.assertNotIn("error", r404)
+        self.assertIs(c404._fast_launch, False)
+        self.assertEqual(
+            [(m, p, d) for m, p, d in c404.calls],
+            [
+                ("POST", "/wda/fastLaunch", {"bundleId": "com.example.calc", "terminate": True}),
+                ("POST", "/session/test-session-1/wda/apps/terminate", {"bundleId": "com.example.calc"}),
+                ("POST", "/wda/apps/launchUnattached", {"bundleId": "com.example.calc"}),
+            ],
+        )
+
+        # Subsequent call skips /wda/fastLaunch directly; terminate=False skips /wda/apps/terminate.
+        c404.calls.clear()
+        c404.fast_launch("com.example.calc", terminate=False)
+        self.assertEqual(
+            [(m, p, d) for m, p, d in c404.calls],
+            [("POST", "/wda/apps/launchUnattached", {"bundleId": "com.example.calc"})],
+        )
+
+        # 4. If launchUnattached returns an error (404 or 500), falls back to /wda/apps/activate.
+        c_act = MockWDAClient(fast_launch_404=True, launch_unattached_404=True)
+        r_act = c_act.fast_launch("com.example.mail", terminate=True)
+        self.assertNotIn("error", r_act)
+        self.assertEqual(
+            [p for _, p, _ in c_act.calls],
+            [
+                "/wda/fastLaunch",
+                "/session/test-session-1/wda/apps/terminate",
+                "/wda/apps/launchUnattached",
+                "/session/test-session-1/wda/apps/activate",
+            ],
+        )
+
+        c_lu500 = MockWDAClient(
+            fast_launch_404=True,
+            custom_handler=lambda m, p, d: {"error": 500, "body": "LSApplicationWorkspace failed"}
+            if p == "/wda/apps/launchUnattached"
+            else None,
+        )
+        r_lu500 = c_lu500.fast_launch("com.example.mail", terminate=False)
+        self.assertNotIn("error", r_lu500)
+        self.assertEqual(
+            [p for _, p, _ in c_lu500.calls],
+            ["/wda/fastLaunch", "/wda/apps/launchUnattached", "/session/test-session-1/wda/apps/activate"],
+        )
+
+        # 5. If fallback terminate fails, return error immediately without launching.
+        c_tfail = MockWDAClient(
+            fast_launch_404=True,
+            custom_handler=lambda m, p, d: {"error": 500, "body": "terminate failed"}
+            if p.endswith("/wda/apps/terminate")
+            else None,
+        )
+        r_tfail = c_tfail.fast_launch("com.example.app", terminate=True)
+        self.assertEqual(r_tfail["error"], 500)
+        self.assertEqual(
+            [p for _, p, _ in c_tfail.calls],
+            ["/wda/fastLaunch", "/session/test-session-1/wda/apps/terminate"],
+        )
+
+        # 6. When turbo is explicitly False, skips /wda/fastLaunch without probing.
+        c_noturbo = MockWDAClient()
+        c_noturbo.turbo = False
+        c_noturbo.fast_launch("com.example.app", terminate=True)
+        self.assertEqual(
+            [p for _, p, _ in c_noturbo.calls],
+            ["/session/test-session-1/wda/apps/terminate", "/wda/apps/launchUnattached"],
+        )
+
+    def test_fast_launch_never_retries_sent_post_on_disconnect(self):
+        def router(method, path, payload):
+            if path == "/status":
+                return 200, "application/json", b'{"sessionId":"sid-fl","value":{"ready":true}}'
+            return 200, "application/json", b'{"value":{"bundleId":"com.example.app","terminated":true,"launched":true}}'
+
+        with _LoopbackWDAServer(router) as srv:
+            client = cli.WDAClient(srv.url, udid=TEST_UDID)
+            client.sid = "sid-fl"
+            try:
+                self.assertEqual(client.req("GET", "/status")["sessionId"], "sid-fl")
+                # Drop connection right after the server receives the mutating POST /wda/fastLaunch.
+                srv.httpd.state["drop_once"] = True
+                res = client.fast_launch("com.example.app", terminate=True)
+                self.assertIn("error", res)
+                self.assertIsNone(client._fast_launch)
+                fl_reqs = [r for r in srv.httpd.state["requests"] if r[1] == "/wda/fastLaunch"]
+                self.assertEqual(len(fl_reqs), 1, "Sent POST /wda/fastLaunch must never retry or replay")
+                fallback_reqs = [r for r in srv.httpd.state["requests"] if "apps/" in r[1]]
+                self.assertEqual(fallback_reqs, [])
+            finally:
+                if client._conn is not None:
+                    client._conn.close()
+
 
 class SessionCacheAndAspectDriftTests(unittest.TestCase):
     def test_ensure_session_caches_settings_per_sid(self):
@@ -372,6 +502,136 @@ class UnlockAndPasteboardTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 c_fail.unlock_phone()
         self.assertNotIn("987654", str(ctx.exception))
+
+    def test_unlock_fast_ui_and_fast_tap_batch_happy_path(self):
+        keypad_ui = {
+            "bundleId": "com.apple.springboard",
+            "appName": "SpringBoard",
+            "screen": [430, 932],
+            "ui": [
+                {"type": "Key", "label": str(d), "x": 100 + (d % 3) * 110, "y": 400 + (d // 3) * 90}
+                for d in range(10)
+            ],
+        }
+        empty_lock_ui = {
+            "bundleId": "com.apple.springboard",
+            "appName": "SpringBoard",
+            "screen": [430, 932],
+            "ui": [{"type": "Button", "label": "Flashlight", "x": 80, "y": 820}],
+        }
+        home_presses = [0]
+        unlocked_state = [False]
+
+        def fast_ui_cb(_qs):
+            return keypad_ui if home_presses[0] >= 2 else empty_lock_ui
+
+        def on_action(kind, payload):
+            if kind == "button" and (payload or {}).get("name") == "home":
+                home_presses[0] += 1
+            elif kind == "tap_batch":
+                unlocked_state[0] = True
+
+        def custom_handler(method, path, data):
+            if path == "/wda/locked":
+                return {"value": not unlocked_state[0]}
+            return None
+
+        c = MockWDAClient(fast_ui=fast_ui_cb, on_action=on_action, custom_handler=custom_handler)
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "112340"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c.unlock_phone())
+
+        self.assertEqual(home_presses[0], 2)
+        self.assertEqual(len(c.batch_taps), 1)
+        self.assertEqual(c.batch_taps[0]["interval"], 0.12)
+        self.assertEqual(c.batch_taps[0]["duration"], 0.02)
+        expected_pts = [[100 + (int(d) % 3) * 110, 400 + (int(d) // 3) * 90] for d in "112340"]
+        self.assertEqual(c.batch_taps[0]["points"], expected_pts)
+        # Zero slow /element or /click calls on the fastUI + fastTapBatch path.
+        self.assertEqual([p for _, p, _ in c.calls if p.endswith("/element") or p.endswith("/click")], [])
+
+    def test_unlock_face_id_auto_unlock_returns_immediately(self):
+        lock_ui = {
+            "bundleId": "com.apple.springboard",
+            "appName": "SpringBoard",
+            "screen": [430, 932],
+            "ui": [{"type": "Button", "label": "Camera", "x": 350, "y": 820}],
+        }
+        c = MockWDAClient(locked=[True, False], fast_ui=lock_ui)
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "123456"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c.unlock_phone())
+        home_calls = [p for _, p, _ in c.calls if p.endswith("/wda/pressButton")]
+        self.assertEqual(len(home_calls), 1)
+        self.assertEqual(c.batch_taps, [])
+        self.assertEqual(c.tapped_points, [])
+        self.assertEqual([p for _, p, _ in c.calls if p.endswith("/click")], [])
+
+    def test_unlock_fast_ui_batch_500_redacts_secret_and_v3_404_falls_back(self):
+        keypad_ui = {
+            "bundleId": "com.apple.springboard",
+            "appName": "SpringBoard",
+            "screen": [430, 932],
+            "ui": [
+                {"type": "Key", "label": str(d), "x": 100 + d * 20, "y": 500}
+                for d in range(10)
+            ],
+        }
+        # HTTP 500 from /wda/fastTapBatch raises RuntimeError, redacts body/passcode, never falls back.
+        c500 = MockWDAClient(
+            locked=True,
+            fast_ui=keypad_ui,
+            custom_handler=lambda m, p, d: {"error": 500, "body": "leak-739152"} if p == "/wda/fastTapBatch" else None,
+        )
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "739152"}), mock.patch("turbotap.cli.time.sleep"):
+            with self.assertRaises(RuntimeError) as ctx:
+                c500.unlock_phone()
+        self.assertNotIn("739152", str(ctx.exception))
+        self.assertNotIn("leak-", str(ctx.exception))
+        self.assertEqual([p for _, p, _ in c500.calls if p == "/wda/fastTap"], [])
+
+        # Still locked after entering passcode raises without echoing digits.
+        c_still = MockWDAClient(locked=True, fast_ui=keypad_ui)
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "739152"}), mock.patch("turbotap.cli.time.sleep"):
+            with self.assertRaises(RuntimeError) as ctx_still:
+                c_still.unlock_phone()
+        self.assertIn("still locked", str(ctx_still.exception))
+        self.assertNotIn("739152", str(ctx_still.exception))
+
+        # Turbo v3 (fastUI works, fastTapBatch 404) falls back to sequential fastTap and unlocks.
+        c_v3 = MockWDAClient(locked=[True, False], fast_ui=keypad_ui, fast_tap_batch_404=True)
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "1234"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c_v3.unlock_phone())
+        self.assertEqual(len([p for _, p, _ in c_v3.calls if p == "/wda/fastTap"]), 4)
+
+    def test_unlock_fast_ui_partial_keys_falls_back_to_predicate_without_third_home(self):
+        # fastUI works but lacks digit '9', so after polling (which sends 2nd home at ~0.45s),
+        # unlock_phone falls back to XCUIElementTypeKey lookup without sending a 3rd home press.
+        partial_ui = {
+            "bundleId": "com.apple.springboard",
+            "appName": "SpringBoard",
+            "screen": [430, 932],
+            "ui": [{"type": "Key", "label": "1", "x": 100, "y": 500}],
+        }
+        key_map = {
+            f"type == 'XCUIElementTypeKey' AND name == '{d}'": {"ELEMENT": f"k-{d}"}
+            for d in "19"
+        }
+        clicked = [0]
+
+        def on_action(kind, _payload):
+            if kind == "click":
+                clicked[0] += 1
+
+        def custom_handler(method, path, data):
+            if path == "/wda/locked":
+                return {"value": clicked[0] < 2}
+            return None
+
+        c = MockWDAClient(fast_ui=partial_ui, element_map=key_map, on_action=on_action, custom_handler=custom_handler)
+        with mock.patch.dict(os.environ, {"WDA_PASSCODE": "19"}), mock.patch("turbotap.cli.time.sleep"):
+            self.assertTrue(c.unlock_phone())
+        self.assertEqual(clicked[0], 2)
+        home_calls = [p for _, p, _ in c.calls if p.endswith("/wda/pressButton")]
+        self.assertEqual(len(home_calls), 2)
 
     def test_pasteboard_roundtrip_unicode_and_errors(self):
         c = MockWDAClient()

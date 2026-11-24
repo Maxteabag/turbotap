@@ -244,6 +244,46 @@ class FrameReactedTests(unittest.TestCase):
         shifted = solid_img(236, size=(240, 480))
         self.assertTrue(cli._frame_reacted(before, shifted, x=120, y=235, scale=1.0))
 
+    def test_radio_dot_toggle_left_of_tap_triggers_on_first_frame(self):
+        # Realistic Safari HTML radio-button toggle on an iPhone-sized frame:
+        # tapping the label at x=120, y=400 fills an 8x8px radio dot 30pt to the left.
+        # Global mean diff and local _box_diff mean both stay below threshold,
+        # while the 4x4-averaged local tap-row peak catches the dot immediately.
+        before = solid_img(245, size=(390, 844))
+        after = box_img(bg=245, boxes=[((86, 396, 93, 403), 100)], size=(390, 844))
+        self.assertLess(cli._thumb_diff(before, after), 1.0)
+        self.assertLessEqual(cli._box_diff(before, after, x=120, y=400, scale=1.0, dx=45, dy=25), 2.5)
+        self.assertTrue(cli._frame_reacted(before, after, x=120, y=400, scale=1.0))
+
+        # Same check at default 1.5x OCR scale (dot 35pt left of tap point).
+        before_15 = solid_img(245, size=(585, 1266))
+        after_15 = box_img(bg=245, boxes=[((124, 594, 134, 604), 110)], size=(585, 1266))
+        self.assertLessEqual(cli._box_diff(before_15, after_15, x=120, y=400, scale=1.5, dx=45, dy=25), 2.5)
+        self.assertTrue(cli._frame_reacted(before_15, after_15, x=120, y=400, scale=1.5))
+
+    def test_random_jpeg_noise_ringing_and_status_bar_near_top_rejected(self):
+        import random
+
+        w, h = 240, 480
+        base = solid_img(200, size=(w, h))
+        rng = random.Random(42)
+        noisy_bytes = bytes(200 + rng.randint(-3, 3) for _ in range(w * h))
+        noisy = Image.frombytes("L", (w, h), noisy_bytes)
+        self.assertFalse(cli._frame_reacted(base, noisy, x=120, y=240, scale=1.0))
+
+        # 1px JPEG ringing (+-8) around a sharp edge inside the tap neighborhood stays False.
+        ring = base.copy()
+        draw = ImageDraw.Draw(ring)
+        for dx in range(-40, 40):
+            draw.point((120 + dx, 240), fill=208)
+            draw.point((120 + dx, 241), fill=192)
+        self.assertFalse(cli._frame_reacted(base, ring, x=120, y=240, scale=1.0))
+
+        # Status-bar clock tick (y < 6% = 28px) must still be ignored even when
+        # the tap point is right below the status bar (y=36, where y-18=18 < 28).
+        clock_tick = box_img(bg=200, boxes=[((100, 8, 140, 22), 20)], size=(w, h))
+        self.assertFalse(cli._frame_reacted(base, clock_tick, x=120, y=36, scale=1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

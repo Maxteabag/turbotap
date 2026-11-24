@@ -103,9 +103,12 @@ class MockWDAClient(cli.WDAClient):
         locked=False,
         pasteboard="",
         fast_tap_404=False,
+        fast_tap_batch_404=False,
         fast_keys_404=False,
         fast_drag_404=False,
         fast_ui_404=False,
+        fast_launch_404=False,
+        launch_unattached_404=False,
         elements_map=None,
         element_map=None,
         element_rects=None,
@@ -120,6 +123,8 @@ class MockWDAClient(cli.WDAClient):
         self._raw_shot = None
         self._fast_ui = None
         self._fast_keys = None
+        self._fast_launch = None
+        self._fast_tap_batch = None
         self.calls = []
         self.screen_pt = screen_pt
         self.active_app = active_app
@@ -129,9 +134,12 @@ class MockWDAClient(cli.WDAClient):
         self.locked = locked
         self.pasteboard = pasteboard
         self.fast_tap_404 = fast_tap_404
+        self.fast_tap_batch_404 = fast_tap_batch_404
         self.fast_keys_404 = fast_keys_404
         self.fast_drag_404 = fast_drag_404
         self.fast_ui_404 = fast_ui_404
+        self.fast_launch_404 = fast_launch_404
+        self.launch_unattached_404 = launch_unattached_404
         self.elements_map = dict(elements_map or {})
         self.element_map = dict(element_map or {})
         self.element_rects = dict(element_rects or {})
@@ -142,6 +150,7 @@ class MockWDAClient(cli.WDAClient):
         self.custom_handler = custom_handler
         self.typed_history = []
         self.tapped_points = []
+        self.batch_taps = []
         self.drags = []
 
     def _fire_action(self, kind, payload):
@@ -182,6 +191,14 @@ class MockWDAClient(cli.WDAClient):
                 return {"error": 404, "body": "unknown route"}
             self.tapped_points.append((data["x"], data["y"], data.get("duration")))
             self._fire_action("tap", data)
+            return {"value": None}
+        if clean_path == "/wda/fastTapBatch":
+            if self.fast_tap_batch_404:
+                return {"error": 404, "body": "unknown route"}
+            self.batch_taps.append(data)
+            for pt in (data or {}).get("points") or []:
+                self.tapped_points.append((pt[0], pt[1], data.get("duration")))
+            self._fire_action("tap_batch", data)
             return {"value": None}
         if clean_path.endswith("/wda/tap") or clean_path.endswith("/wda/touchAndHold"):
             self.tapped_points.append((data["x"], data["y"], data.get("duration")))
@@ -238,6 +255,22 @@ class MockWDAClient(cli.WDAClient):
             self.pasteboard = base64.b64decode(data["content"]).decode("utf-8")
             return {"value": None}
 
+        if clean_path == "/wda/fastLaunch":
+            if self.fast_launch_404:
+                return {"error": 404, "body": "unknown route"}
+            self._fire_action("fastLaunch", data)
+            return {
+                "value": {
+                    "bundleId": (data or {}).get("bundleId", ""),
+                    "terminated": bool((data or {}).get("terminate")),
+                    "launched": True,
+                }
+            }
+        if clean_path == "/wda/apps/launchUnattached":
+            if self.launch_unattached_404:
+                return {"error": 404, "body": "unknown route"}
+            self._fire_action("launchUnattached", data)
+            return {"value": None}
         if clean_path.endswith("/wda/apps/activate") or clean_path.endswith("/wda/apps/terminate"):
             self._fire_action("app", data)
             return {"value": None}
