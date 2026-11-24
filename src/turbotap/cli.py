@@ -390,6 +390,37 @@ class WDAClient:
             self._fast_keys = False
         return self.req("POST", f"/session/{self.sid}/wda/keys", {"value": list(text), "frequency": freq})
 
+    def long_press(self, x, y, duration=0.65):
+        """Coordinate long-press (default 0.65 s). Uses /wda/fastTap with
+        duration when wda-turbo is running, else falls back to stock
+        /session/{sid}/wda/touchAndHold."""
+        return self.fast_tap(x, y, duration=max(0.1, float(duration)))
+
+    def get_pasteboard(self, content_type="plaintext"):
+        """Read the iOS general pasteboard via /wda/getPasteboard (base64 -> UTF-8)."""
+        import base64
+        r = self.req("POST", "/wda/getPasteboard", {"contentType": content_type})
+        if not isinstance(r, dict) or r.get("error"):
+            raise RuntimeError(f"getPasteboard failed: {r}")
+        raw_b64 = r.get("value") or ""
+        if not raw_b64:
+            return ""
+        try:
+            return base64.b64decode(raw_b64).decode("utf-8", errors="replace")
+        except Exception as e:
+            raise RuntimeError(f"getPasteboard invalid base64: {e}")
+
+    def set_pasteboard(self, text, content_type="plaintext"):
+        """Write UTF-8 text to the iOS general pasteboard via /wda/setPasteboard.
+        On iOS 16+, backgrounded WDA pasteboard access is restricted unless WDA is
+        foregrounded, and pasting into another app may prompt 'Allow Paste'."""
+        import base64
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        r = self.req("POST", "/wda/setPasteboard", {"content": encoded, "contentType": content_type})
+        if not isinstance(r, dict) or r.get("error"):
+            raise RuntimeError(f"setPasteboard failed: {r}")
+        return r
+
     def wait_click(self, predicate=None, class_chain=None, timeout=8.0, poll=0.25, post_wait=0.3):
         deadline = time.time() + timeout
         using = "class chain" if class_chain else "predicate string"
@@ -1105,18 +1136,36 @@ def resolve_app(arg, udid="", base_url=""):
 
 CONTROL_TYPES = {"Button", "Key", "Tab", "SearchField", "TextField", "SecureTextField", "TextView",
                  "Cell", "Link", "Switch", "Slider", "SegmentedControl", "PickerWheel", "Stepper", "Image"}
-_VALUE_CONTROL_TYPES = ("Switch", "Slider", "TextField", "SearchField", "PickerWheel", "Stepper")
 # Skipping these attributes makes /source much cheaper: visibility and
 # nativeAccessibilityElement trigger extra AX attribute queries per node in WDA's
-# XCUIApplication+FBHelpers.m, and ui_controls() only reads type/rect/label/name/value.
+# XCUIApplication+FBHelpers.m. 'enabled' is kept because isWDEnabled reads an
+# in-memory snapshot BOOL (zero extra AX IPC) and lets us deprioritize disabled buttons.
 SOURCE_LITE = (
     "/source?format=json&excluded_attributes="
-    "visible,accessible,enabled,index,nativeAccessibilityElement,"
+    "visible,accessible,index,nativeAccessibilityElement,"
     "frame,nativeFrame,focused,traits,placeholderValue,minValue,maxValue"
 )
 _CHEVRON_LABELS = {"chevron", "chevron.right", "chevron.forward"}
 _DEV_CELL_RE = re.compile(r"[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*|\[id=", re.I)
 _TEXT_DEDUPE_TYPES = ("Button", "Tab", "Cell", "Link", "Key")
+_VALUE_CONTROL_TYPES = ("Switch", "Slider", "TextField", "SearchField", "PickerWheel", "Stepper")
+
+
+def _is_explicitly_disabled(node):
+    """True only when a WDA /source or /wda/fastUI node explicitly reports disabled."""
+    for key in ("enabled", "isEnabled"):
+        if key in node and node[key] is not None:
+            v = node[key]
+            if isinstance(v, bool):
+                return not v
+            if isinstance(v, (int, float)):
+                return v == 0
+            s = str(v).strip().casefold()
+            if s in ("0", "false", "no"):
+                return True
+            if s in ("1", "true", "yes"):
+                return False
+    return False
 
 
 def _is_internal_cell(t, lab):
@@ -1132,7 +1181,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
     Filters off-screen recycled cells, soft-keyboard typing keys (while keeping
     app keypad keys such as Calculator/dialer), internal CamelCase/asset Images,
     edge-clamped overlays, decorative row chevrons, and stacked (Cell, Button)
-    duplicates on the same row.
+    duplicates on the same row. Preserves 'enabled': False only when explicitly disabled.
     """
     out, seen = [], {}
     app_name = ""
@@ -1153,7 +1202,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
         lab = _clean_text(str(raw_lab)) if raw_lab else ""
         if t == "Other" and not lab and n.get("value"):
             lab, t = _clean_text(str(n["value"])), "Value"  # unlabelled value text (OTP digits, counters)
-        elif t == "PickerWheel" and not lab and n.get("value"):
+        elif t == "PickerWheel" and not lab and n.get("value") not in (None, ""):
             lab = _clean_text(str(n["value"]))
         elif t == "StaticText" and text:
             t = "Text"
@@ -1176,17 +1225,19 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
                 val = n.get("value")
                 if t in _VALUE_CONTROL_TYPES and val not in (None, ""):
                     cval = _clean_text(str(val))
-                    if cval and cval != lab:
+                    if cval and (t == "PickerWheel" or cval != lab):
                         item["value"] = cval
-                raw_en = n.get("enabled") if "enabled" in n else n.get("isEnabled")
-                if raw_en in (False, 0, "0", "false", "False"):
+                if _is_explicitly_disabled(n):
                     item["enabled"] = False
                 if key not in seen:
                     seen[key] = len(out)
                     out.append(item)
+                elif (out[seen[key]].get("enabled") is False and item.get("enabled") is not False):
+                    out[seen[key]] = item
                 elif (out[seen[key]]["type"] == "Cell"
                       and t in ("Button", "TextField", "SearchField", "SecureTextField", "TextView")
-                      and not out[seen[key]].get("value")):
+                      and not out[seen[key]].get("value")
+                      and not (out[seen[key]].get("enabled") is not False and item.get("enabled") is False)):
                     out[seen[key]] = item
         for ch in n.get("children") or []:
             walk(ch, kb)
@@ -1199,7 +1250,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
 def _dedupe_ui_controls(out):
     """Drop decorative disclosure 'chevron' buttons sitting on a list row, and
     stacked (Cell, Button) pairs on the same row with the exact same normalized
-    label (prefer Button; keep Cell if it carries extra info)."""
+    label (prefer Button; keep Cell if it carries extra info or Button is disabled)."""
     buttons = [c for c in out if c["type"] == "Button"]
     row_anchors = [c for c in out if c["type"] in ("Cell", "Button")
                    and c["label"].casefold() not in _CHEVRON_LABELS]
@@ -1210,11 +1261,9 @@ def _dedupe_ui_controls(out):
                 continue
         if c["type"] == "Cell" and not c.get("value"):
             cn = _norm(c["label"])
-            if any(
-                _norm(b["label"]) == cn and abs(c["y"] - b["y"]) <= 8
-                and (b.get("enabled") is not False or c.get("enabled") is False)
-                for b in buttons
-            ):
+            c_dis = c.get("enabled") is False
+            if any(_norm(b["label"]) == cn and abs(c["y"] - b["y"]) <= 8
+                   and (c_dis or b.get("enabled") is not False) for b in buttons):
                 continue
         deduped.append(c)
     return deduped
@@ -1235,6 +1284,9 @@ def _parse_fast_ui(data, screen=(430, 932)):
             continue
         t = raw.get("type") or ""
         lab = _clean_text(str(raw.get("label") or ""))
+        val = raw.get("value")
+        if t == "PickerWheel" and not lab and val not in (None, ""):
+            lab = _clean_text(str(val))
         if not t or not lab:
             continue
         try:
@@ -1248,20 +1300,22 @@ def _parse_fast_ui(data, screen=(430, 932)):
         if not (0 < x < eff_screen[0] and 0 < y < eff_screen[1]) or is_internal_img or _is_internal_cell(t, lab):
             continue
         item = {"type": t, "label": lab, "x": x, "y": y}
-        val = raw.get("value")
         if t in _VALUE_CONTROL_TYPES and val not in (None, ""):
             cval = _clean_text(str(val))
-            if cval and cval != lab:
+            if cval and (t == "PickerWheel" or cval != lab):
                 item["value"] = cval
-        if raw.get("enabled") is False:
+        if _is_explicitly_disabled(raw):
             item["enabled"] = False
         key = (lab, x // 4, y // 4)
         if key not in seen:
             seen[key] = len(out)
             out.append(item)
+        elif out[seen[key]].get("enabled") is False and item.get("enabled") is not False:
+            out[seen[key]] = item
         elif (out[seen[key]]["type"] == "Cell"
               and t in ("Button", "TextField", "SearchField", "SecureTextField", "TextView")
-              and not out[seen[key]].get("value")):
+              and not out[seen[key]].get("value")
+              and not (out[seen[key]].get("enabled") is not False and item.get("enabled") is False)):
             out[seen[key]] = item
     return _dedupe_ui_controls(out), app_name
 
@@ -1449,8 +1503,11 @@ FLOW_HELP = """steps (one argument each, run in order):
   tapif:TEXT            optional tap (~1 s max): tap TEXT (OCR + exact UI control
                         fallback, respects --deny and @region) or return 'skipped'
                         cleanly without failing the flow
-  TEXT@below:HEADER     (tap/tapif/wait/waitany/scrollto) only match under HEADER, e.g.
-  TEXT@above:T TEXT@y>N   tap:Alice@below:Chats skips the stories carousel
+  TEXT@below:HEADER     (tap/tapif/longpress/swipe:left|right/wait/waitany/scrollto) only match under HEADER,
+  TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
+  longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
+                        @region, OCR + UI fallback, respects --deny)
+  longpressxy:X,Y[,MS]  long-press points (default 650 ms; optional MS or Ns, e.g. 800 or 0.8s)
   search:QUERY          tap the app's search field/Search button, type QUERY, settle
   readel:TEXT           labels of controls containing TEXT (accessibility tree)
   ui                    all labelled on-screen controls with (x, y)
@@ -1461,23 +1518,29 @@ FLOW_HELP = """steps (one argument each, run in order):
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects
+  picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
+  clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
+  setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
   alert:accept|dismiss  accept or dismiss an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
   scrollto:TEXT         scroll down (max 8x) until TEXT is visible
+  swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
+  swipe:left|right:TEXT horizontal row swipe on TEXT's row (damped 80%->30% / 20%->70% to reveal
+                        row actions without triggering full-width destructive delete)
   back                  iOS edge-swipe back gesture
   read                  OCR text once it holds still + labelled controls with (x, y)
   read:ocr / read:Y0-Y1 OCR only (whole screen / a band)
   settle                wait until two frames in a row are identical
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
-taps on text matching --deny are refused unless --no-deny is passed."""
+taps and long-presses on text matching --deny are refused unless --no-deny is passed."""
 
 
 _TYPING_FREQ = 240  # verified 27/27 exact on iPhone 17 (-43% to -56% vs WDA's 60 keys/s default)
 _IMAGE_STEP_VERBS = frozenset({
-    "wait", "expect", "waitany", "gone", "tap", "tapif",
-    "scroll", "scrollto", "back", "read", "search", "settle", "shot",
+    "wait", "expect", "waitany", "gone", "tap", "tapif", "longpress",
+    "scroll", "scrollto", "swipe", "back", "read", "search", "settle", "shot",
 })
 _STALE_UI_BACKOFF = (0.05, 0.08, 0.12)
 
@@ -1613,9 +1676,9 @@ class Flow:
                 return False
             time.sleep(poll)
 
-    def guard(self, x, y, text=""):
+    def guard(self, x, y, text="", action="tap"):
         if self.deny and text and self.deny.search(text):
-            raise FlowError(f"refusing to tap {text!r}: matches --deny")
+            raise FlowError(f"refusing to {action} {text!r}: matches --deny")
 
     def lines(self):
         return self.r.read()
@@ -2188,13 +2251,14 @@ class Flow:
         lines = self.lines()
         want = _norm(label)
         region = (_region(lines, where) or []) if where else lines
-        cands = [(l.y, l.x, l.text) for l in region if _norm(l.text) == want]
-        cands += [(c["y"], c["x"], c["label"]) for c in _controls_in_region(self.controls(), lines, where)
+        cands = [(False, l.y, l.x, l.text) for l in region if _norm(l.text) == want]
+        cands += [(c.get("enabled") is False, c["y"], c["x"], c["label"])
+                  for c in _controls_in_region(self.controls(), lines, where)
                   if c["type"] in ("Button", "Link") and c["label"].casefold() == label.casefold()
                   and c.get("enabled") is not False]
         if not cands:
             return None
-        y, x, text = min(cands)
+        _, y, x, text = min(cands)
         self.tap_point(x, y, text)
         self.settle(timeout=1.5)
         return Match(x, y, text, None)
@@ -2202,7 +2266,12 @@ class Flow:
     def tap_el(self, label, timeout=None):
         self._wait_active_app()
         q = json.dumps(label)
-        preds = [f"label == {q} OR name == {q}", f"label CONTAINS[c] {q} OR name CONTAINS[c] {q}"]
+        preds = [
+            f"(label == {q} OR name == {q}) AND enabled == 1",
+            f"label == {q} OR name == {q}",
+            f"(label CONTAINS[c] {q} OR name CONTAINS[c] {q}) AND enabled == 1",
+            f"label CONTAINS[c] {q} OR name CONTAINS[c] {q}",
+        ]
         end = time.time() + (timeout or self.timeout)
         while time.time() < end:
             for pred in preds:
@@ -2217,6 +2286,73 @@ class Flow:
                         self.tap_point(int(x), int(y), label)
                         return int(x), int(y)
         raise FlowError(f"no element labelled {label!r}")
+
+    def _find_target(self, label, timeout=None):
+        """Resolve TEXT (with optional @region or re:REGEX) to an on-screen Match
+        using OCR first, then accessibility controls and targeted Sauvola OCR."""
+        self._wait_active_app()
+        base, where = split_where(label)
+        m0 = None
+        cached_lines = self._fresh_lines()
+        if cached_lines is not None:
+            m0 = find_text(cached_lines, base, where=where)
+        if m0 is None:
+            lines = self.lines()
+            m0 = find_text(lines, base, where=where)
+        else:
+            lines = cached_lines
+        if not where and m0 is None and not base.startswith("re:"):
+            ctl = self.controls()
+            c = exact_control(ctl, base, TAP_FORM_TYPES + ("Image", "Slider", "Value"))
+            if c:
+                return Match(c["x"], c["y"], c["label"], None, 0)
+        try:
+            m = self.wait(label, timeout=min(2.2, timeout or self.timeout), stable=True, initial=m0)
+        except FlowError:
+            last_lines = getattr(self.r, "last_lines", None)
+            cur_lines = last_lines if last_lines is not None else lines
+            ctl = _controls_in_region(self.controls(), cur_lines, where)
+            if base.startswith("re:"):
+                cm = find_control_match(ctl, base)
+                if cm:
+                    return cm
+            else:
+                c = find_control(ctl, base)
+                if c:
+                    return Match(c["x"], c["y"], c["label"], None, 0)
+            slines = self._read_sauvola(self.r.last)
+            if slines:
+                sm = find_text(slines, base, where=where)
+                if sm:
+                    return sm
+            raise
+        if m.line is not None and m.rank and not base.startswith("re:"):
+            last_lines = getattr(self.r, "last_lines", None)
+            cur_lines = last_lines if last_lines is not None else (
+                self.r.read(img=self.r.last) if self.r.last is not None else [])
+            ctl = _controls_in_region(self.controls(), cur_lines, where)
+            c = exact_control(ctl, base, TAP_FORM_TYPES)
+            if c:
+                return Match(c["x"], c["y"], c["label"], None, 0)
+        return m
+
+    def long_press_point(self, x, y, text="", duration=0.65):
+        self.guard(x, y, text, action="long-press")
+        self._mark_action()
+        self.c.long_press(x, y, duration=duration)
+        now = time.monotonic()
+        self._last_action_ts = now
+        self._last_tap_type = None
+        self._last_tap_ts = now
+
+    def long_press_text(self, label, duration=0.65):
+        base, _ = split_where(label)
+        if not base.startswith("re:"):
+            self.guard(0, 0, base, action="long-press")
+        m = self._find_target(label)
+        self.long_press_point(m.x, m.y, m.text, duration=duration)
+        self.settle(timeout=1.2)
+        return m
 
     def drag(self, x0, y0, x1, y1, duration=0.12, release=0.02):
         self._mark_action()
@@ -2239,6 +2375,85 @@ class Flow:
             self.drag(w // 2, b, w // 2, a, duration=0.08, release=0.08)
         else:
             raise FlowError(f"scroll:{direction}? use down|up")
+
+    def swipe_gesture(self, spec):
+        """Directional mid-screen swipe (swipe:left|right|up|down) or horizontal
+        row swipe (swipe:left:TEXT / swipe:right:TEXT, supports @region).
+        Row swipes drag 80%->30% (left) or 20%->70% (right) with release=0.06
+        damping to reveal swipe action buttons without triggering full-width
+        destructive delete or the left-edge back gesture."""
+        direction, _, target = spec.partition(":")
+        direction = direction.strip().lower()
+        target = target.strip()
+        if direction not in ("left", "right", "up", "down"):
+            raise FlowError(f"swipe:{spec!r}? use swipe:left|right|up|down or swipe:left|right:TEXT")
+        if target:
+            if direction not in ("left", "right"):
+                raise FlowError(f"swipe:{direction}:TEXT not supported; row target requires swipe:left:TEXT or swipe:right:TEXT")
+            m = self._find_target(target)
+            w, _ = self.r.pt_size()
+            if direction == "left":
+                self.drag(int(w * 0.80), m.y, int(w * 0.30), m.y, duration=0.18, release=0.06)
+            else:
+                self.drag(int(w * 0.20), m.y, int(w * 0.70), m.y, duration=0.18, release=0.06)
+            self.settle(timeout=1.5)
+            return m.text
+        w, h = self.r.pt_size()
+        if direction == "left":
+            self.drag(int(w * 0.82), h // 2, int(w * 0.22), h // 2, duration=0.14, release=0.02)
+        elif direction == "right":
+            self.drag(int(w * 0.18), h // 2, int(w * 0.78), h // 2, duration=0.14, release=0.02)
+        elif direction == "up":
+            self.drag(w // 2, int(h * 0.75), w // 2, int(h * 0.25), duration=0.14, release=0.02)
+        else:
+            self.drag(w // 2, int(h * 0.25), w // 2, int(h * 0.75), duration=0.14, release=0.02)
+        self.settle(timeout=1.5)
+        return direction
+
+    def set_picker(self, spec):
+        """Set a XCUIElementTypePickerWheel via POST /session/{sid}/element/{eid}/value.
+        Accepts VALUE (wheel 0) or INDEX:VALUE (0-based wheel index)."""
+        self._wait_active_app()
+        if not spec:
+            raise FlowError("picker requires VALUE or INDEX:VALUE (e.g. picker:2026 or picker:1:30)")
+        els = self.c.req("POST", f"/session/{self.c.sid}/elements",
+                         {"using": "class name", "value": "XCUIElementTypePickerWheel"}).get("value") or []
+        if not els:
+            raise FlowError("no PickerWheel on screen")
+        m = re.match(r"^(\d+):(.*)$", spec)
+        if m:
+            idx, val = int(m.group(1)), m.group(2)
+        else:
+            idx, val = 0, spec
+        if not val:
+            raise FlowError("picker value cannot be empty")
+        if idx < 0 or idx >= len(els):
+            raise FlowError(f"picker wheel index {idx} out of range ({len(els)} wheel(s) on screen)")
+        el_obj = els[idx]
+        eid = el_obj.get("ELEMENT") or next(iter(el_obj.values()))
+        self._mark_action()
+        r = self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/value", {"value": [val]})
+        if isinstance(r, dict) and r.get("error"):
+            raise FlowError(f"picker wheel {idx} failed to set {val!r}: {r.get('body') or r.get('error')}")
+        return f"wheel[{idx}]={val}"
+
+    def clipboard(self, content_type="plaintext"):
+        """Read iOS pasteboard text via /wda/getPasteboard and record it in reads."""
+        try:
+            text = self.c.get_pasteboard(content_type=content_type)
+        except RuntimeError as e:
+            raise FlowError(str(e))
+        self.reads.append({"clipboard": text})
+        return text
+
+    def set_clipboard(self, arg, content_type="plaintext"):
+        """Write text (or env:VAR / cmd:CMD secret) to the iOS pasteboard via /wda/setPasteboard."""
+        val = _secret_arg("setclip", arg)
+        try:
+            self.c.set_pasteboard(val, content_type=content_type)
+        except RuntimeError as e:
+            raise FlowError(str(e))
+        return f"len={len(val)}"
 
     def scroll(self, direction="down"):
         before = self.r.last
@@ -2567,6 +2782,26 @@ class Flow:
         elif verb == "tapxy":
             x, y = (int(float(v)) for v in arg.split(","))
             self.tap_point(x, y)
+        elif verb == "longpress":
+            return self.long_press_text(arg).text
+        elif verb == "longpressxy":
+            parts = [p.strip() for p in arg.split(",")]
+            if len(parts) not in (2, 3):
+                raise FlowError("longpressxy expects X,Y or X,Y,MS (e.g. longpressxy:200,400 or longpressxy:200,400,800)")
+            try:
+                x, y = int(float(parts[0])), int(float(parts[1]))
+                if len(parts) == 3:
+                    ds = parts[2].lower()
+                    dur = float(ds[:-1]) if ds.endswith("s") else float(ds) / 1000.0
+                else:
+                    dur = 0.65
+            except ValueError:
+                raise FlowError(f"invalid longpressxy coordinates/duration: {arg!r}")
+            if dur <= 0:
+                raise FlowError(f"longpressxy duration must be > 0, got {arg!r}")
+            self.long_press_point(x, y, duration=dur)
+            self.settle(timeout=1.2)
+            return f"{x},{y} ({int(round(dur * 1000))}ms)"
         elif verb == "type":
             arg = _secret_arg(verb, arg)
             if self._last_tap_type in INPUT_TYPES:
@@ -2660,7 +2895,7 @@ class Flow:
                     pass
                 time.sleep(0.25)
                 for d in digits:
-                    self.c.fast_keys(d)
+                    self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": [d]})
                     time.sleep(0.08)
                 time.sleep(0.4)
                 val = re.sub(r"\D", "", self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/value").get("value") or "")
@@ -2709,6 +2944,14 @@ class Flow:
             self.scroll(arg or "down")
         elif verb == "scrollto":
             return self.scroll_to(*split_where(arg)).text
+        elif verb == "swipe":
+            return self.swipe_gesture(arg)
+        elif verb == "picker":
+            return self.set_picker(arg)
+        elif verb in ("clipboard", "copy"):
+            return self.clipboard(content_type=arg.strip().lower() or "plaintext")
+        elif verb == "setclip":
+            return self.set_clipboard(arg)
         elif verb == "back":
             self.back()
         elif verb == "read":
