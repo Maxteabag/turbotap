@@ -238,18 +238,25 @@ class WDAClient:
 
     def req_raw(self, method, path, data=None, timeout=25):
         """Raw HTTP request on the same persistent keep-alive connection.
-        Returns (status_code, content_type, raw_bytes)."""
+        Returns (status_code, content_type, raw_bytes).
+        Retries reconnects only for idempotent reads (GET/HEAD) or provably
+        unsent writes (connection failed before transmitting the request)."""
         hc = _http_client()
         body = json.dumps(data).encode() if data is not None else None
         headers = {"Content-Type": "application/json"} if data is not None else {}
         u = _urlsplit(self.base_url)
+        idempotent = method.upper() in ("GET", "HEAD")
         for attempt in (0, 1):
+            sent = False
             try:
                 if self._conn is None:
                     self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
                 self._conn.timeout = timeout
+                if self._conn.sock is None:
+                    self._conn.connect()
                 if self._conn.sock is not None:
                     self._conn.sock.settimeout(timeout)
+                sent = True
                 self._conn.request(method, path, body=body, headers=headers)
                 resp = self._conn.getresponse()
                 raw = resp.read()
@@ -257,7 +264,7 @@ class WDAClient:
                 return resp.status, ct, raw
             except (hc.HTTPException, OSError) as e:
                 self._conn = None
-                if attempt:
+                if attempt or (sent and not idempotent):
                     return 0, "", str(e).encode()
 
     def req(self, method, path, data=None, timeout=25):
@@ -265,18 +272,25 @@ class WDAClient:
 
         Measured on Wi-Fi: /status 5.8 ms keep-alive vs 14.6 ms with a new
         urllib socket per call; /screenshot 123 ms vs 150 ms.
+        Retries reconnects only for idempotent reads (GET/HEAD) or provably
+        unsent writes (connect failed before transmitting a mutating POST/DELETE).
         """
         hc = _http_client()
         body = json.dumps(data).encode() if data is not None else None
         headers = {"Content-Type": "application/json"} if data is not None else {}
         u = _urlsplit(self.base_url)
+        idempotent = method.upper() in ("GET", "HEAD")
         for attempt in (0, 1):
+            sent = False
             try:
                 if self._conn is None:
                     self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
                 self._conn.timeout = timeout
+                if self._conn.sock is None:
+                    self._conn.connect()
                 if self._conn.sock is not None:
                     self._conn.sock.settimeout(timeout)
+                sent = True
                 self._conn.request(method, path, body=body, headers=headers)
                 resp = self._conn.getresponse()
                 raw = resp.read()
@@ -286,7 +300,7 @@ class WDAClient:
                 return json.loads(raw.decode())
             except (hc.HTTPException, OSError, ValueError) as e:
                 self._conn = None
-                if attempt:
+                if attempt or (sent and not idempotent):
                     return {"error": str(e)}
 
     def ensure_session(self, bundle_id=None, apply_fast_settings=True):
@@ -462,23 +476,31 @@ class WDAClient:
         return last
 
     def fast_keys(self, text, frequency=None):
-        """Type text into the focused element. With wda-turbo v3, POST /wda/fastKeys
+        """Type text into the focused element. With wda-turbo v3+, POST /wda/fastKeys
         synthesizes key events via FBSynthesizeEventFast (skipping FBRunLoopSpinner's
-        100 ms polling sleep) at high frequency; falls back to /session/{sid}/wda/keys
-        with frequency on 404 (stock WDA / wda-turbo v2)."""
+        100 ms polling sleep); preserves WDA's default typing pace unless frequency
+        or TURBOTAP_TYPING_FREQ is explicitly set. Falls back to /session/{sid}/wda/keys
+        only on a definitive 404 route miss (never replays an already-accepted 200)."""
         text = str(text)
         freq = int(frequency) if frequency else _typing_freq()
         if self.turbo is not False and self._fast_keys is not False:
-            r = self.req("POST", "/wda/fastKeys", {"value": text, "frequency": freq})
+            body = {"value": text}
+            if freq:
+                body["frequency"] = freq
+            r = self.req("POST", "/wda/fastKeys", body)
             if isinstance(r, dict):
-                val = r.get("value")
-                if not r.get("error") and isinstance(val, dict) and val.get("fastKeys"):
+                if not r.get("error"):
                     self._fast_keys = True
                     return r
-                if r.get("error") and r.get("error") != 404:
+                if r.get("error") != 404:
                     return r
-            self._fast_keys = False
-        return self.req("POST", f"/session/{self.sid}/wda/keys", {"value": list(text), "frequency": freq})
+                self._fast_keys = False
+            else:
+                return {"error": "invalid response from /wda/fastKeys"}
+        legacy_body = {"value": list(text)}
+        if freq:
+            legacy_body["frequency"] = freq
+        return self.req("POST", f"/session/{self.sid}/wda/keys", legacy_body)
 
     def long_press(self, x, y, duration=0.65):
         """Coordinate long-press (default 0.65 s). Uses /wda/fastTap with
@@ -1073,7 +1095,10 @@ class ScreenReader:
     def _ocr_raw(self, raw, w, h, sauvola=False):
         sample = raw[::19]
         if sample:
-            if max(sample) - min(sample) < 16:
+            # Skip only genuinely uniform flat strips; preserve low-contrast text
+            # (e.g. ~12 grayscale levels) for both Otsu and Sauvola binarization.
+            min_contrast = 1 if sauvola else 4
+            if max(sample) - min(sample) < min_contrast:
                 return []  # uniform blank strip
             if (sum(sample) / len(sample)) < 120:
                 # Pre-invert dark-mode strips so LSTM succeeds on pass 1 instead of
@@ -1302,7 +1327,10 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
             if x0 >= screen[0] or x0 + rc["width"] <= 0 or y0 >= screen[1] or y0 + rc["height"] <= 0:
                 return  # off-screen recycled table cells can carry stale on-screen child rects
         kb = in_keyboard or t == "Keyboard"
-        raw_lab = n.get("label") or n.get("name") or ""
+        raw_label = n.get("label") or ""
+        raw_name = n.get("name") or ""
+        label_from_id = (not bool(raw_label)) and bool(raw_name)
+        raw_lab = raw_label or raw_name
         lab = _clean_text(str(raw_lab)) if raw_lab else ""
         if t == "Other" and not lab and n.get("value"):
             lab, t = _clean_text(str(n["value"])), "Value"  # unlabelled value text (OTP digits, counters)
@@ -1324,7 +1352,10 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
             )
             key = (lab, x // 4, y // 4)
             # Strict bounds skip edge-clamped overlays at y == 0 or y == screen[1].
-            if 0 < x < screen[0] and 0 < y < screen[1] and not is_internal_img and not _is_internal_cell(t, lab):
+            # Only filter dotted/bracketed internal IDs on Cells when the text came
+            # from an identifier fallback (preserving explicit labels like docs.example.com).
+            if (0 < x < screen[0] and 0 < y < screen[1] and not is_internal_img
+                    and not (label_from_id and _is_internal_cell(t, lab))):
                 item = {"type": t, "label": lab, "x": x, "y": y}
                 val = n.get("value")
                 if t in _VALUE_CONTROL_TYPES and val not in (None, ""):
@@ -1401,7 +1432,10 @@ def _parse_fast_ui(data, screen=(430, 932)):
             t == "Image" and " " not in lab
             and bool(re.search(r"[._-]", lab) or re.search(r"[a-z][A-Z]", lab))
         )
-        if not (0 < x < eff_screen[0] and 0 < y < eff_screen[1]) or is_internal_img or _is_internal_cell(t, lab):
+        label_from_id = bool(raw.get("fromId"))
+        if (not (0 < x < eff_screen[0] and 0 < y < eff_screen[1])
+                or is_internal_img
+                or (label_from_id and _is_internal_cell(t, lab))):
             continue
         item = {"type": t, "label": lab, "x": x, "y": y}
         if t in _VALUE_CONTROL_TYPES and val not in (None, ""):
@@ -1646,7 +1680,7 @@ FLOW_HELP = """steps (one argument each, run in order):
 taps, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed."""
 
 
-_TYPING_FREQ = 240  # verified 27/27 exact on iPhone 17 (-43% to -56% vs WDA's 60 keys/s default)
+_TYPING_FREQ = None  # None = keep legacy WDA default pace; override via TURBOTAP_TYPING_FREQ (e.g. 240)
 _IMAGE_STEP_VERBS = frozenset({
     "wait", "expect", "waitany", "gone", "tap", "tapif", "longpress", "doubletap",
     "scroll", "scrollto", "swipe", "back", "read", "search", "settle", "shot",
@@ -1655,7 +1689,7 @@ _STALE_UI_BACKOFF = (0.05, 0.08, 0.12)
 
 
 def _typing_freq():
-    """Keys/sec frequency passed to /wda/keys (default 240, overridable via TURBOTAP_TYPING_FREQ)."""
+    """Optional keys/sec override from TURBOTAP_TYPING_FREQ (None preserves WDA's default pace)."""
     raw = os.environ.get("TURBOTAP_TYPING_FREQ", "").strip()
     if raw:
         try:
@@ -1665,6 +1699,18 @@ def _typing_freq():
         except ValueError:
             pass
     return _TYPING_FREQ
+
+
+def _check_wda_ok(res, action, redact=False):
+    """Raise FlowError if a mutating WDA call returned an HTTP/transport error.
+    When redact=True, omit response body details that might echo secret input."""
+    if isinstance(res, dict) and res.get("error"):
+        err = res.get("error")
+        if redact:
+            raise FlowError(f"{action} failed (error {err})")
+        detail = res.get("body") or err
+        raise FlowError(f"{action} failed: {detail}")
+    return res
 
 
 def _secret_arg(verb, arg):
@@ -2014,17 +2060,54 @@ class Flow:
     def tap_point(self, x, y, text=""):
         self.guard(x, y, text)
         self._mark_action(keep_ctl_cache=True)
-        self.c.fast_tap(x, y)
+        _check_wda_ok(self.c.fast_tap(x, y), "tap")
         now = time.monotonic()
         self._last_action_ts = now
         self._last_tap_type = None
         self._last_tap_ts = now
 
+    def _is_disabled_ocr_match(self, m, base, lines, where, controls=None):
+        """Reconcile an OCR match against known accessibility controls to detect
+        explicitly disabled buttons/targets (e.g. dimmed 'New Note' button).
+        Uses supplied controls or a fresh cached control list for the current bundle."""
+        ctl = controls
+        if ctl is None and self._ctl_cache is not None:
+            c_list, c_bundle, c_ts, _ = self._ctl_cache
+            if c_bundle == self.bundle and (time.monotonic() - c_ts) <= _CTL_CACHE_TTL:
+                ctl = c_list
+        if not ctl:
+            return False
+        scoped = _controls_in_region(ctl, lines, where) if where else ctl
+        want = _clean_text(base).casefold()
+        near_disabled = [
+            c for c in scoped
+            if c.get("enabled") is False
+            and abs(c["x"] - m.x) <= 45 and abs(c["y"] - m.y) <= 24
+            and (c["label"].casefold() == want or want in c["label"].casefold() or c["label"].casefold() in _norm(m.text))
+        ]
+        if near_disabled:
+            # Only treat as disabled if no enabled control sits at the same spot.
+            has_enabled_here = any(
+                c.get("enabled") is not False
+                and abs(c["x"] - m.x) <= 45 and abs(c["y"] - m.y) <= 24
+                and (c["label"].casefold() == want or want in c["label"].casefold())
+                for c in scoped
+            )
+            if not has_enabled_here:
+                return True
+        if not base.startswith("re:"):
+            en_exact = exact_control(scoped, base, TAP_FORM_TYPES, allow_disabled=False)
+            dis_exact = exact_control(scoped, base, TAP_FORM_TYPES, allow_disabled=True)
+            if en_exact is None and dis_exact is not None and dis_exact.get("enabled") is False:
+                if abs(dis_exact["x"] - m.x) <= 60 and abs(dis_exact["y"] - m.y) <= 30:
+                    return True
+        return False
+
     def _try_cached_tap(self, base):
         """Fast path for repeated taps on static keypads/layouts (e.g. Calculator):
         if a recent control cache matches base and the screen has only changed
-        locally (_thumb_diff < _CTL_CACHE_MAX_DIFF), tap directly and verify
-        reaction; on any layout shift or non-reaction, invalidate and fall back."""
+        locally (_thumb_diff < _CTL_CACHE_MAX_DIFF), tap once and use pixel diff
+        solely to keep or invalidate the cache (never replays an acknowledged tap)."""
         if self._ctl_cache is None or base.startswith("re:"):
             return None
         ctl, cache_bundle, cache_ts, cache_img = self._ctl_cache
@@ -2060,10 +2143,11 @@ class Flow:
                     self._invalidate_ctl_cache()
                 else:
                     self._ctl_cache = (ctl, cache_bundle, time.monotonic(), self.r.last)
-            return m
-        # Safety net: cached tap produced no UI reaction -> drop cache and fall through.
-        self._invalidate_ctl_cache()
-        return None
+        else:
+            # Pixels stayed still after an acknowledged tap: drop cached coordinates
+            # for future steps, but NEVER replay the tap.
+            self._invalidate_ctl_cache()
+        return m
 
     def tap_text(self, label):
         app_confirmed = self._wait_active_app()
@@ -2152,12 +2236,7 @@ class Flow:
                     if c:
                         break
             if c:
-                just_opened = bool(self._pending_bundle_ts and (time.monotonic() - self._pending_bundle_ts) < 1.5)
-                before = self.r.grab() if just_opened else None
-                m_ctl = self.tap_control(c)
-                if just_opened and before is not None and not self.changed_since(before, x=c["x"], y=c["y"]):
-                    m_ctl = self.tap_control(c)
-                return m_ctl
+                return self.tap_control(c)
         if m0 is not None and m0_pixel_stable:
             self._wait_settled_ts = time.monotonic()
             m = m0
@@ -2176,6 +2255,8 @@ class Flow:
                 if slines:
                     sm = find_text(slines, base, where=where)
                     if sm:
+                        if self._is_disabled_ocr_match(sm, base, slines, where, controls=ctl_fb):
+                            raise FlowError(f"{base!r} is disabled")
                         self.tap_point(sm.x, sm.y, sm.text)
                         return sm
                 if ctl_fb is not None and find_control(ctl_fb, base, allow_disabled=True):
@@ -2185,6 +2266,7 @@ class Flow:
         _, h = self.r.pt_size()
         near_bottom_tab = m.line is not None and m.y > h - 55
         is_form_label = base.rstrip().endswith(":")
+        resolved_ctl = None
         if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
             # 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
             #    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
@@ -2198,7 +2280,8 @@ class Flow:
             last_lines = getattr(self.r, "last_lines", None)
             cur_lines = last_lines if last_lines is not None else (
                 self.r.read(img=self.r.last) if self.r.last is not None else [])
-            ctl = _controls_in_region(self.controls(), cur_lines, where)
+            resolved_ctl = self.controls()
+            ctl = _controls_in_region(resolved_ctl, cur_lines, where)
             c = exact_control(ctl, base, TAP_FORM_TYPES) if (m.rank or is_form_label) else None
             if not c and is_form_label:
                 c = self.input_near(base, m, controls=ctl)
@@ -2210,47 +2293,47 @@ class Flow:
                     c = find_control(near, base, types={"Tab", "Button"})
             if c:
                 return self.tap_control(c)
-        # When m came from wait()'s accessibility fallback (m.line is None), self.r.last
-        # was captured before /source finished (often a splash or outgoing screen): take
-        # a fresh pre-tap baseline so changed_since() measures the tap, not the launch.
+        if m.line is not None:
+            cur_lines = getattr(self.r, "last_lines", None) or []
+            if self._is_disabled_ocr_match(m, base, cur_lines, where, controls=resolved_ctl):
+                raise FlowError(f"{base!r} is disabled")
+        # Take a fresh pre-tap baseline when m came from wait()'s UI fallback so
+        # changed_since() measures the tap cleanly (used for switch/input companion
+        # resolution and cache invalidation; never replays an acknowledged tap).
         before = self.r.grab() if m.line is None else self.r.last
         self.tap_point(m.x, m.y, m.text)
         if not self.changed_since(before, x=m.x, y=m.y):
-            # Tapping a switch row's label does nothing: tap the toggle itself, unless
-            # the toggle changed already (too small a change to count as a reaction).
-            ctl = self.controls()
+            self._invalidate_ctl_cache()
+            # Tapping a switch row's label does nothing: tap the distinct toggle
+            # control on that row, unless the toggle itself already flipped.
+            ctl = resolved_ctl if resolved_ctl is not None else self.controls()
             sw = self.switch_near(base, m, controls=ctl)
-            if sw:
+            if sw and (abs(sw["x"] - m.x) > 12 or abs(sw["y"] - m.y) > 12):
                 if _box_diff(before, self.r.grab(), sw["x"], sw["y"], self.r.scale) < 4:
                     return self.tap_control(sw)
                 return m
-            # Tapping a form field's static label may not focus its input: tap an
-            # exact or row-aligned TextField/TextView/SearchField/SecureTextField.
+            # Tapping a form field's static label may not focus its input: tap a
+            # distinct row-aligned TextField/TextView/SearchField/SecureTextField.
             inp = self.input_near(base, m, controls=ctl)
-            if inp:
+            if inp and (abs(inp["x"] - m.x) > 12 or abs(inp["y"] - m.y) > 12):
                 return self.tap_control(inp)
-            # Nothing moved: the tap was probably eaten by an animation. Retry once
-            # if the target is still there (accessibility control for icon buttons, else OCR).
-            if m.line is None:
-                c2 = exact_control(ctl, base, TAP_FORM_TYPES + ("Image", "Slider", "Value"))
-                if c2:
-                    return self.tap_control(c2)
-            m2 = find_text(self.lines(), base, where=where)
-            if m2:
-                self.tap_point(m2.x, m2.y, m2.text)
         elif self._ctl_cache is not None and self.r.last is not None:
             if _thumb_diff(self._ctl_cache[3], self.r.last) >= _CTL_CACHE_MAX_DIFF:
                 self._invalidate_ctl_cache()
         return m
 
-    def _tap_if_ocr_match(self, m, base, where, lines):
+    def _tap_if_ocr_match(self, m, base, where, lines, controls=None):
         """Tap an OCR match found by tap_if, preferring an exact control on
-        substring/bottom-tab/form-label hits and respecting --deny."""
+        substring/bottom-tab/form-label hits, skipping explicitly disabled
+        controls, and respecting --deny."""
         _, h = self.r.pt_size()
         near_bottom_tab = m.line is not None and m.y > h - 55
         is_form_label = base.rstrip().endswith(":")
+        resolved_ctl = controls
         if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
-            ctl = _controls_in_region(self.controls(), lines, where)
+            if resolved_ctl is None:
+                resolved_ctl = self.controls()
+            ctl = _controls_in_region(resolved_ctl, lines, where)
             c = exact_control(ctl, base, TAP_FORM_TYPES) if (m.rank or is_form_label) else None
             if not c and is_form_label:
                 c = self.input_near(base, m, controls=ctl)
@@ -2262,28 +2345,38 @@ class Flow:
                     c = find_control(near, base, types={"Tab", "Button"})
             if c:
                 return self.tap_control(c).text
+        if self._is_disabled_ocr_match(m, base, lines, where, controls=resolved_ctl):
+            return "skipped"
         self.tap_point(m.x, m.y, m.text)
         return m.text
 
     def tap_if(self, label, timeout=1.0):
-        """Optional tap with a short bounded timeout (~1.0 s max, never 8 s).
-        Checks OCR + exact accessibility control fallback (+ targeted Sauvola
-        if both miss), supporting @region filters and enforcing --deny. Returns
-        the matched text/control if tapped, or 'skipped' if not present."""
-        self._wait_active_app()
+        """Optional tap with a unified monotonic deadline (~1.0 s max, never 8 s).
+        Shares one budget across app confirmation, screenshots, and UI lookups;
+        rechecks accessibility controls if a prompt arrives mid-window, skips
+        explicitly disabled targets consistently, supports @region, and enforces
+        --deny. Returns the matched text/control if tapped, or 'skipped'."""
+        eff_timeout = min(timeout, self.timeout)
+        deadline = time.monotonic() + eff_timeout
+        rem = deadline - time.monotonic()
+        if rem > 0:
+            self._wait_active_app(max_wait=min(1.5, rem))
+        if time.monotonic() >= deadline:
+            return "skipped"
         base, where = split_where(label)
         low_base = base.casefold()
-        eff_timeout = min(timeout, self.timeout)
-        start = time.time()
-        end = start + eff_timeout
         ext_types = TAP_FORM_TYPES + ("Image", "Slider", "Value")
-        checked_ui = False
+        last_ui_check = 0.0
+        last_ui_img = None
+        last_ctl = None
         last_sauvola_id = None
         prev_texts = None
         prev_img = None
         frames = 0
         while True:
             t_frame = time.monotonic()
+            if frames > 0 and t_frame >= deadline:
+                return "skipped"
             if frames == 0:
                 lines = self._fresh_lines()
                 if lines is None:
@@ -2294,12 +2387,32 @@ class Flow:
             cur_img = self.r.last
             m = find_text(lines, base, where=where)
             if m:
-                return self._tap_if_ocr_match(m, base, where, lines)
-            if not checked_ui:
-                checked_ui = True
-                ctl = _controls_in_region(self.controls(), lines, where)
+                ctl_for_check = last_ctl
+                if ctl_for_check is None and time.monotonic() < deadline:
+                    try:
+                        ctl_for_check = self.controls()
+                        last_ctl = ctl_for_check
+                        last_ui_check = time.monotonic()
+                        last_ui_img = cur_img
+                    except FlowError:
+                        ctl_for_check = None
+                return self._tap_if_ocr_match(m, base, where, lines, controls=ctl_for_check)
+            now = time.monotonic()
+            screen_changed_since_ui = (
+                last_ui_img is not None and cur_img is not None
+                and cur_img is not last_ui_img and _thumb_diff(last_ui_img, cur_img) >= 0.8
+            )
+            if now < deadline and (last_ui_check == 0.0 or screen_changed_since_ui or (now - last_ui_check) >= 0.35):
+                last_ui_check = now
+                last_ui_img = cur_img
+                try:
+                    raw_ctl = self.controls()
+                except FlowError:
+                    raw_ctl = []
+                last_ctl = raw_ctl
+                ctl = _controls_in_region(raw_ctl, lines, where)
                 if base.startswith("re:"):
-                    cm = find_control_match(ctl, base, types=set(ext_types))
+                    cm = find_control_match(ctl, base, types=set(ext_types), allow_disabled=False)
                     if cm:
                         self.tap_point(cm.x, cm.y, cm.text)
                         return cm.text
@@ -2312,12 +2425,14 @@ class Flow:
                                 break
                     if c:
                         return self.tap_control(c).text
-                if cur_img is not None and id(cur_img) != last_sauvola_id:
+                if time.monotonic() < deadline and cur_img is not None and id(cur_img) != last_sauvola_id:
                     last_sauvola_id = id(cur_img)
                     slines = self._read_sauvola(cur_img)
                     if slines:
                         sm = find_text(slines, base, where=where)
                         if sm:
+                            if self._is_disabled_ocr_match(sm, base, slines, where, controls=raw_ctl):
+                                return "skipped"
                             self.tap_point(sm.x, sm.y, sm.text)
                             return sm.text
             cur_texts = [l.text for l in lines]
@@ -2328,10 +2443,11 @@ class Flow:
                     return "skipped"
             prev_texts = cur_texts
             prev_img = cur_img
-            if time.time() >= end:
+            rem_after = deadline - time.monotonic()
+            if rem_after <= 0:
                 return "skipped"
             if (time.monotonic() - t_frame) < 0.02:
-                time.sleep(min(0.05, max(0.0, end - time.time())))
+                time.sleep(min(0.05, rem_after))
 
     def tap_control(self, c):
         self.tap_point(c["x"], c["y"], c["label"])
@@ -2464,7 +2580,7 @@ class Flow:
     def long_press_point(self, x, y, text="", duration=0.65):
         self.guard(x, y, text, action="long-press")
         self._mark_action()
-        self.c.long_press(x, y, duration=duration)
+        _check_wda_ok(self.c.long_press(x, y, duration=duration), "long-press")
         now = time.monotonic()
         self._last_action_ts = now
         self._last_tap_type = None
@@ -2482,7 +2598,7 @@ class Flow:
     def double_tap_point(self, x, y, text="", interval=None, duration=None):
         self.guard(x, y, text, action="double-tap")
         self._mark_action()
-        r = self.c.fast_double_tap(x, y, interval=interval, duration=duration)
+        r = _check_wda_ok(self.c.fast_double_tap(x, y, interval=interval, duration=duration), "double-tap")
         now = time.monotonic()
         self._last_action_ts = now
         self._last_tap_type = None
@@ -2541,10 +2657,15 @@ class Flow:
         body = {"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration, "release": release}
         if self.c.turbo is not False:
             r = self.c.req("POST", "/wda/fastDrag", body)
-            if not r.get("error"):
+            if isinstance(r, dict) and not r.get("error"):
                 return
-        self.c.req("POST", f"/session/{self.c.sid}/wda/dragfromtoforduration",
-                   {"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": max(0.2, duration)})
+            if isinstance(r, dict) and r.get("error") != 404:
+                _check_wda_ok(r, "drag")
+        _check_wda_ok(
+            self.c.req("POST", f"/session/{self.c.sid}/wda/dragfromtoforduration",
+                       {"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": max(0.2, duration)}),
+            "drag",
+        )
 
     def swipe(self, direction="down"):
         """Scroll 40% of the screen without momentum (wda-turbo fastDrag crawls
@@ -2717,9 +2838,24 @@ class Flow:
             # use short adaptive backoff until iOS publishes the new app's tree.
             for delay in _STALE_UI_BACKOFF:
                 time.sleep(delay)
-                ctl, app_name, bundle_id = _fetch_ui_controls_full(self.c, self.r.pt_size(), text=text)
+                ctl, app_name, bundle_id = _fetch_ui_controls_full(
+                    self.c, self.r.pt_size(), text=text,
+                    wait_bundle=self.bundle if self.bundle else None,
+                    wait_ms=400 if self.bundle else 0,
+                )
                 if not self._is_stale_ui(app_name, bundle_id):
                     break
+        if self._is_stale_ui(app_name, bundle_id):
+            # Never return or cache mismatched outgoing-app coordinates under the target bundle.
+            self._invalidate_ctl_cache()
+            if self.bundle:
+                self._pending_bundle = self.bundle
+            raise FlowError(
+                f"UI tree still shows outgoing app ({bundle_id or app_name!r}) "
+                f"instead of expected {self.bundle!r}"
+            )
+        if bundle_id and self.bundle and bundle_id == self.bundle:
+            self._pending_bundle = None
         if app_name:
             self._last_app_name = app_name
             self._last_app_bundle = bundle_id or self.bundle
@@ -2863,15 +2999,28 @@ class Flow:
             if self._is_stale_ui(app_name, bundle_id):
                 for delay in _STALE_UI_BACKOFF:
                     time.sleep(delay)
-                    ui_res, app_name, bundle_id = _fetch_ui_controls_meta(side, pt, True)
+                    ui_res, app_name, bundle_id = _fetch_ui_controls_meta(
+                        side, pt, True,
+                        self.bundle if self.bundle else None,
+                        400 if self.bundle else 0,
+                    )
                     if not self._is_stale_ui(app_name, bundle_id):
                         break
-            if app_name:
-                self._last_app_name = app_name
-                self._last_app_bundle = bundle_id or self.bundle
-                if app_name != self._switched_from_app_name:
-                    self._switched_from_app_name = None
-            self._store_ctl_cache(ui_res, img=self.r.last)
+            if self._is_stale_ui(app_name, bundle_id):
+                # Never return or cache mismatched outgoing-app UI coordinates.
+                self._invalidate_ctl_cache()
+                if self.bundle:
+                    self._pending_bundle = self.bundle
+                ui_res = None
+            else:
+                if bundle_id and self.bundle and bundle_id == self.bundle:
+                    self._pending_bundle = None
+                if app_name:
+                    self._last_app_name = app_name
+                    self._last_app_bundle = bundle_id or self.bundle
+                    if app_name != self._switched_from_app_name:
+                        self._switched_from_app_name = None
+                self._store_ctl_cache(ui_res, img=self.r.last)
         else:
             ui_res = None
         if ui_res:
@@ -2928,18 +3077,19 @@ class Flow:
                     self.tap_point(f["x"], f["y"], f["label"])
         time.sleep(0.18)  # brief keyboard focus beat after fast_tap
         self._mark_action()
-        self.c.fast_keys(query)
+        _check_wda_ok(self.c.fast_keys(query), "search")
         self.settle(timeout=2.0, still=0.5)
         return c["label"]
 
     def back(self):
         self._wait_active_app()
-        was = {l.text for l in self.lines() if len(l.text) > 3}
+        lines0 = self._fresh_lines() or self.lines()
+        was = {l.text for l in lines0 if len(l.text) > 3}
         before = self.r.last
         w, h = self.r.pt_size()
         self.drag(2, h // 2, int(w * 0.8), h // 2, duration=0.22, release=0.02)
         self.changed_since(before, timeout=0.6)
-        self.settle()
+        self.settle(timeout=1.5, still=0.4)
         now = {l.text for l in self.lines() if len(l.text) > 3}
         if was and len(was & now) >= 0.7 * len(was):
             # The swipe moved the page but it sprang back (Spotify playlists) or never
@@ -3033,6 +3183,7 @@ class Flow:
         elif verb == "zoom":
             return self.zoom(arg)
         elif verb == "type":
+            is_secret = arg.startswith(("env:", "cmd:"))
             arg = _secret_arg(verb, arg)
             if self._last_tap_type in INPUT_TYPES:
                 rem = self._INPUT_FOCUS_SETTLE - (time.monotonic() - self._last_tap_ts)
@@ -3040,7 +3191,7 @@ class Flow:
                     time.sleep(rem)
             self._last_tap_type = None
             self._mark_action(typing=True)
-            self.c.fast_keys(arg)
+            _check_wda_ok(self.c.fast_keys(arg), "type", redact=is_secret)
         elif verb == "key":
             kname = arg.strip().lower()
             ch = KEY_MAP.get(kname)
@@ -3053,9 +3204,10 @@ class Flow:
                     time.sleep(rem)
             self._last_tap_type = None
             self._mark_action(typing=True)
-            self.c.fast_keys(ch)
+            _check_wda_ok(self.c.fast_keys(ch), f"key:{kname}")
             return kname
         elif verb == "cleartype":
+            is_secret = arg.startswith(("env:", "cmd:"))
             arg = _secret_arg(verb, arg)
             self._mark_action(typing=True)
             els = []
@@ -3074,11 +3226,11 @@ class Flow:
             if not els:
                 raise FlowError("no TextField, SecureTextField, SearchField, or TextView on screen")
             eid = list(els[0].values())[0]
-            self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/clear", {})
+            _check_wda_ok(self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/clear", {}), "cleartype clear", redact=is_secret or secure)
             time.sleep(0.15)
-            self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {})
+            _check_wda_ok(self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/click", {}), "cleartype click", redact=is_secret or secure)
             time.sleep(0.15)
-            self.c.fast_keys(arg)
+            _check_wda_ok(self.c.fast_keys(arg), "cleartype", redact=is_secret or secure)
             time.sleep(0.20)
             if not secure:
                 val = self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/value").get("value") or ""
@@ -3125,7 +3277,11 @@ class Flow:
                     pass
                 time.sleep(0.25)
                 for d in digits:
-                    self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": [d]})
+                    _check_wda_ok(
+                        self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": [d]}),
+                        "typedigits",
+                        redact=True,
+                    )
                     time.sleep(0.08)
                 time.sleep(0.4)
                 val = re.sub(r"\D", "", self.c.req("GET", f"/session/{self.c.sid}/element/{eid}/attribute/value").get("value") or "")
@@ -3158,7 +3314,11 @@ class Flow:
                 raise FlowError(f"pintap found no key rects for {len(set(missing))} of the PIN's digits")  # never echo PIN digits
             # Conservative 150 ms inter-key spacing via /wda/fastTapBatch (one testmanagerd
             # XPC call; falls back automatically to sequential fast_tap() on stock/v3 WDA).
-            self.c.fast_tap_batch([coords[d] for d in digits], interval=0.15, duration=0.02)
+            _check_wda_ok(
+                self.c.fast_tap_batch([coords[d] for d in digits], interval=0.15, duration=0.02),
+                "pintap",
+                redact=True,
+            )
             return f"tapped {len(digits)} digits"
         elif verb == "alert":
             action = arg.strip().lower() or "accept"
@@ -3442,12 +3602,16 @@ def cmd_deploy(client, args):
     """Clone/patch/build (unless --no-build) and start WDA on the Mac host."""
     # If an existing WDA instance is reachable and the device is locked, unlock it
     # first: once the old runner stops, Xcode cannot launch WDA on a locked iPhone.
+    # If a reachable device is known locked and unlock fails, abort before stopping
+    # the existing runner instead of leaving the phone unreachable.
     try:
         st = client.req("GET", "/status", timeout=3)
-        if not st.get("error"):
-            client.unlock_phone()
     except Exception:
-        pass
+        st = {"error": "unreachable"}
+    if isinstance(st, dict) and not st.get("error"):
+        locked_resp = client.req("GET", "/wda/locked", timeout=4)
+        if isinstance(locked_resp, dict) and locked_resp.get("value") is True:
+            client.unlock_phone()
     client.start_wda_on_mac(build=not args.no_build)
 
 
@@ -3503,7 +3667,9 @@ def cmd_otp_type(client, args):
         client.req("POST", f"/session/{client.sid}/element/{tfs[0]['ELEMENT']}/click", {})
         time.sleep(0.25)
     for d in code:
-        client.fast_keys(d)
+        r = client.fast_keys(d)
+        if isinstance(r, dict) and r.get("error"):
+            raise RuntimeError(f"otp-type failed (error {r.get('error')})")
         time.sleep(0.35)
     print(json.dumps({"ok": True, "digits_typed": len(code)}))
 

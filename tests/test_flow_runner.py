@@ -192,14 +192,19 @@ class TapTextAndCacheTests(unittest.TestCase):
             self.assertIsNone(flow._try_cached_tap("7"))
             self.assertIsNone(flow._ctl_cache)
 
-            # Safety net: non-reaction after cached tap invalidates cache and returns None.
+            # Safety net: non-reaction after an acknowledged cached tap invalidates
+            # cache for future steps, returns the Match, and NEVER replays the tap.
             still = solid_img(30, size=(240, 480))
             r.set_frames([(still, [])])
             r.set_last(still)
             c.on_action = None
             flow._store_ctl_cache(ctl, img=still)
+            taps_before = len([p for _, p, _ in c.calls if p == "/wda/fastTap"])
             with mock.patch.object(flow, "changed_since", return_value=False):
-                self.assertIsNone(flow._try_cached_tap("7"))
+                m_still = flow._try_cached_tap("7")
+                self.assertIsNotNone(m_still)
+                self.assertEqual(m_still.text, "[Key:7]")
+            self.assertEqual(len([p for _, p, _ in c.calls if p == "/wda/fastTap"]) - taps_before, 1)
             self.assertIsNone(flow._ctl_cache)
         finally:
             flow.close()

@@ -1,8 +1,8 @@
-diff --git i/WebDriverAgentLib/Commands/FBDebugCommands.m w/WebDriverAgentLib/Commands/FBDebugCommands.m
-index 42ea74b..8af5009 100644
---- i/WebDriverAgentLib/Commands/FBDebugCommands.m
-+++ w/WebDriverAgentLib/Commands/FBDebugCommands.m
-@@ -8,13 +8,156 @@
+diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m b/WebDriverAgentLib/Commands/FBDebugCommands.m
+index 42ea74b..829efed 100644
+--- a/WebDriverAgentLib/Commands/FBDebugCommands.m
++++ b/WebDriverAgentLib/Commands/FBDebugCommands.m
+@@ -8,13 +8,165 @@
  
  #import "FBDebugCommands.h"
  
@@ -67,9 +67,15 @@ index 42ea74b..8af5009 100644
 +  }
 +  BOOL kb = inKeyboard || (type == XCUIElementTypeKeyboard);
 +  NSString *label = snapshot.label;
++  BOOL labelFromId = NO;
 +  if (label.length == 0) {
 +    NSString *ident = snapshot.identifier;
-+    label = ident.length > 0 ? ident : nil;
++    if (ident.length > 0) {
++      label = ident;
++      labelFromId = YES;
++    } else {
++      label = nil;
++    }
 +  }
 +  NSString *typeName = FBFastUIControlTypeName(type);
 +  if (nil == typeName) {
@@ -145,6 +151,9 @@ index 42ea74b..8af5009 100644
 +      if (!snapshot.enabled) {
 +        item[@"enabled"] = @NO;
 +      }
++      if (labelFromId && type == XCUIElementTypeCell) {
++        item[@"fromId"] = @YES;
++      }
 +      [out addObject:item];
 +    }
 +  }
@@ -159,7 +168,7 @@ index 42ea74b..8af5009 100644
  @implementation FBDebugCommands
  
  #pragma mark - <FBCommandHandler>
-@@ -27,6 +170,8 @@
+@@ -27,6 +179,8 @@
      [[FBRoute GET:@"/source"].withoutSession respondWithTarget:self action:@selector(handleGetSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"] respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
      [[FBRoute GET:@"/wda/accessibleSource"].withoutSession respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
@@ -168,7 +177,7 @@ index 42ea74b..8af5009 100644
    ];
  }
  
-@@ -78,4 +223,84 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
+@@ -78,4 +232,84 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
    return FBResponseWithObject(application.fb_accessibilityTree ?: @{});
  }
  
@@ -253,10 +262,10 @@ index 42ea74b..8af5009 100644
 +}
 +
  @end
-diff --git i/WebDriverAgentLib/Commands/FBElementCommands.m w/WebDriverAgentLib/Commands/FBElementCommands.m
-index 97afb7b..98578dd 100644
---- i/WebDriverAgentLib/Commands/FBElementCommands.m
-+++ w/WebDriverAgentLib/Commands/FBElementCommands.m
+diff --git a/WebDriverAgentLib/Commands/FBElementCommands.m b/WebDriverAgentLib/Commands/FBElementCommands.m
+index 97afb7b..c43e621 100644
+--- a/WebDriverAgentLib/Commands/FBElementCommands.m
++++ b/WebDriverAgentLib/Commands/FBElementCommands.m
 @@ -40,6 +40,14 @@
  #import "XCUIElement.h"
  #import "XCUIElementQuery.h"
@@ -291,7 +300,7 @@ index 97afb7b..98578dd 100644
  
      [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
  #endif
-@@ -509,6 +529,365 @@
+@@ -509,6 +529,368 @@
    return FBResponseWithOK();
  }
  
@@ -613,8 +622,8 @@ index 97afb7b..98578dd 100644
 +}
 +
 +// wda-turbo: synthesize text input via FBSynthesizeEventFast (bypasses FBRunLoopSpinner's
-+// 100 ms sleep in FBTypeText) with a fast default typing frequency (240 keys/s).
-+// Body: {"value": "text" | ["t","e","x","t"], "frequency": 240 (optional)}
++// 100 ms sleep in FBTypeText), preserving WDA's default maxTypingFrequency unless overridden.
++// Body: {"value": "text" | ["t","e","x","t"], "frequency": N (optional)}
 ++ (id<FBResponsePayload>)handleFastKeys:(FBRouteRequest *)request
 +{
 +  NSDictionary *a = request.arguments ?: @{};
@@ -631,7 +640,10 @@ index 97afb7b..98578dd 100644
 +  if (textToType.length == 0) {
 +    return FBResponseWithObject(@{@"fastKeys": @YES});
 +  }
-+  unsigned long long frequency = 240ULL;
++  unsigned long long frequency = (unsigned long long)FBConfiguration.sharedInstance.maxTypingFrequency;
++  if (frequency == 0ULL) {
++    frequency = 60ULL;
++  }
 +  id freqArg = a[@"frequency"];
 +  if (nil != freqArg && [freqArg respondsToSelector:@selector(longLongValue)]) {
 +    long long parsed = [freqArg longLongValue];
@@ -657,10 +669,10 @@ index 97afb7b..98578dd 100644
  + (id<FBResponsePayload>)handlePinch:(FBRouteRequest *)request
  {
    XCUIElement *element = [self targetFromRequest:request];
-diff --git i/WebDriverAgentLib/Commands/FBScreenshotCommands.m w/WebDriverAgentLib/Commands/FBScreenshotCommands.m
+diff --git a/WebDriverAgentLib/Commands/FBScreenshotCommands.m b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
 index 9586a19..f647625 100644
---- i/WebDriverAgentLib/Commands/FBScreenshotCommands.m
-+++ w/WebDriverAgentLib/Commands/FBScreenshotCommands.m
+--- a/WebDriverAgentLib/Commands/FBScreenshotCommands.m
++++ b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
 @@ -9,6 +9,57 @@
  #import "FBScreenshotCommands.h"
  
@@ -766,10 +778,10 @@ index 9586a19..f647625 100644
 +}
 +
  @end
-diff --git i/WebDriverAgentLib/Routing/FBResponsePayload.h w/WebDriverAgentLib/Routing/FBResponsePayload.h
+diff --git a/WebDriverAgentLib/Routing/FBResponsePayload.h b/WebDriverAgentLib/Routing/FBResponsePayload.h
 index b29b8f9..404ef61 100644
---- i/WebDriverAgentLib/Routing/FBResponsePayload.h
-+++ w/WebDriverAgentLib/Routing/FBResponsePayload.h
+--- a/WebDriverAgentLib/Routing/FBResponsePayload.h
++++ b/WebDriverAgentLib/Routing/FBResponsePayload.h
 @@ -52,6 +52,11 @@ id<FBResponsePayload> FBResponseWithUnknownErrorFormat(NSString *errorFormat, ..
   */
  id<FBResponsePayload> FBResponseWithStatus(FBCommandStatus *status);
@@ -782,10 +794,10 @@ index b29b8f9..404ef61 100644
  /**
   Returns a response payload as a NSDictionary for given element.
   Set compact=NO to include further attributes (defined by FBConfiguration.elementResponseAttributes)
-diff --git i/WebDriverAgentLib/Routing/FBResponsePayload.m w/WebDriverAgentLib/Routing/FBResponsePayload.m
+diff --git a/WebDriverAgentLib/Routing/FBResponsePayload.m b/WebDriverAgentLib/Routing/FBResponsePayload.m
 index 5d0098a..d1cf182 100644
---- i/WebDriverAgentLib/Routing/FBResponsePayload.m
-+++ w/WebDriverAgentLib/Routing/FBResponsePayload.m
+--- a/WebDriverAgentLib/Routing/FBResponsePayload.m
++++ b/WebDriverAgentLib/Routing/FBResponsePayload.m
 @@ -10,6 +10,7 @@
  
  #import "FBElementCache.h"
@@ -833,10 +845,10 @@ index 5d0098a..d1cf182 100644
  id<FBResponsePayload> FBResponseWithStatus(FBCommandStatus *status)
  {
    NSMutableDictionary* response = [NSMutableDictionary dictionary];
-diff --git i/WebDriverAgentLib/Utilities/FBScreenshot.h w/WebDriverAgentLib/Utilities/FBScreenshot.h
+diff --git a/WebDriverAgentLib/Utilities/FBScreenshot.h b/WebDriverAgentLib/Utilities/FBScreenshot.h
 index 3604ba2..3beb05e 100644
---- i/WebDriverAgentLib/Utilities/FBScreenshot.h
-+++ w/WebDriverAgentLib/Utilities/FBScreenshot.h
+--- a/WebDriverAgentLib/Utilities/FBScreenshot.h
++++ b/WebDriverAgentLib/Utilities/FBScreenshot.h
 @@ -39,6 +39,15 @@ NS_ASSUME_NONNULL_BEGIN
                                                    timeout:(NSTimeInterval)timeout
                                                      error:(NSError **)error;
@@ -853,10 +865,10 @@ index 3604ba2..3beb05e 100644
  @end
  
  NS_ASSUME_NONNULL_END
-diff --git i/WebDriverAgentLib/Utilities/FBScreenshot.m w/WebDriverAgentLib/Utilities/FBScreenshot.m
+diff --git a/WebDriverAgentLib/Utilities/FBScreenshot.m b/WebDriverAgentLib/Utilities/FBScreenshot.m
 index ee37fa3..7ced618 100644
---- i/WebDriverAgentLib/Utilities/FBScreenshot.m
-+++ w/WebDriverAgentLib/Utilities/FBScreenshot.m
+--- a/WebDriverAgentLib/Utilities/FBScreenshot.m
++++ b/WebDriverAgentLib/Utilities/FBScreenshot.m
 @@ -93,18 +93,50 @@ NSString *formatTimeInterval(NSTimeInterval interval) {
                                                          error:error];
  }

@@ -70,9 +70,11 @@ class UiParsingTests(unittest.TestCase):
                 _node("Image", "nav.badge", x=130, y=100, w=24, h=24),
                 # Human-readable spaced Image -> kept
                 _node("Image", "Profile photo", x=180, y=100, w=48, h=48),
-                # Internal developer-ID Cells -> dropped
-                _node("Cell", "settings.section.account", x=0, y=200, w=430, h=44),
-                _node("Cell", "shelf.header[id=0,row=1]", x=0, y=260, w=430, h=44),
+                # Internal developer-ID Cells (identifier fallback, no explicit label) -> dropped
+                _node("Cell", "", name="settings.section.account", x=0, y=200, w=430, h=44),
+                _node("Cell", "", name="shelf.header[id=0,row=1]", x=0, y=260, w=430, h=44),
+                # Explicitly labelled dotted Cell (e.g. domain name) -> KEPT
+                _node("Cell", "docs.example.com", x=0, y=290, w=430, h=44),
                 # Spaced Cell -> kept
                 _node("Cell", "Account settings", x=0, y=320, w=430, h=44),
                 # Dotted URLs/emails in Link/TextField -> NOT dropped
@@ -85,27 +87,33 @@ class UiParsingTests(unittest.TestCase):
             [(c["type"], c["label"]) for c in ctl],
             [
                 ("Image", "Profile photo"),
+                ("Cell", "docs.example.com"),
                 ("Cell", "Account settings"),
                 ("Link", "https://docs.example.org"),
                 ("TextField", "alice@mail.example.org"),
             ],
         )
 
-        # Same filtering applies in _parse_fast_ui.
+        # Same provenance-aware filtering applies in _parse_fast_ui.
         fast_payload = {
             "appName": "App",
             "screen": [430, 932],
             "ui": [
                 {"type": "Image", "label": "iconChevronRight", "x": 20, "y": 100},
                 {"type": "Image", "label": "Profile photo", "x": 180, "y": 100},
-                {"type": "Cell", "label": "settings.section.account", "x": 215, "y": 220},
+                {"type": "Cell", "label": "settings.section.account", "fromId": True, "x": 215, "y": 220},
+                {"type": "Cell", "label": "docs.example.com", "x": 215, "y": 280},
                 {"type": "Link", "label": "https://docs.example.org", "x": 140, "y": 395},
             ],
         }
         fctl, _ = cli._parse_fast_ui(fast_payload)
         self.assertEqual(
             [(c["type"], c["label"]) for c in fctl],
-            [("Image", "Profile photo"), ("Link", "https://docs.example.org")],
+            [
+                ("Image", "Profile photo"),
+                ("Cell", "docs.example.com"),
+                ("Link", "https://docs.example.org"),
+            ],
         )
 
     def test_switch_toggle_offset_edge_bounds_and_invisible_char_cleaning(self):

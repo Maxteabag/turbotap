@@ -216,7 +216,8 @@ class WDAClientCommandsTests(unittest.TestCase):
             os.environ.pop("TURBOTAP_TYPING_FREQ", None)
             c.fast_keys("Hello")
             self.assertTrue(c._fast_keys)
-            self.assertEqual(c.calls[-1], ("POST", "/wda/fastKeys", {"value": "Hello", "frequency": cli._TYPING_FREQ}))
+            # Legacy default typing pace preserved (no frequency override sent unless configured).
+            self.assertEqual(c.calls[-1], ("POST", "/wda/fastKeys", {"value": "Hello"}))
 
             c.fast_keys("Hi", frequency=120)
             self.assertEqual(c.calls[-1], ("POST", "/wda/fastKeys", {"value": "Hi", "frequency": 120}))
@@ -225,10 +226,10 @@ class WDAClientCommandsTests(unittest.TestCase):
             c.fast_keys("Env")
             self.assertEqual(c.calls[-1], ("POST", "/wda/fastKeys", {"value": "Env", "frequency": 180}))
 
-        # Invalid env value falls back to default _TYPING_FREQ.
+        # Invalid env value preserves default pace (omits frequency).
         with mock.patch.dict(os.environ, {"TURBOTAP_TYPING_FREQ": "not-a-number"}):
             c.fast_keys("Bad")
-            self.assertEqual(c.calls[-1][2]["frequency"], cli._TYPING_FREQ)
+            self.assertNotIn("frequency", c.calls[-1][2])
 
         # 404 on /wda/fastKeys remembers _fast_keys=False and falls back to /session/{sid}/wda/keys.
         c404 = MockWDAClient(fast_keys_404=True)
