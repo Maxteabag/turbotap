@@ -396,6 +396,67 @@ class PR3ReviewFixesTests(unittest.TestCase):
         finally:
             flow.close()
 
+    # Re-review 5: stale outgoing-app tree followed by failed retry (HTTP 500) must NOT revalidate/cache/tap
+    def test_stale_ui_followed_by_failed_retry_never_caches_or_taps(self):
+        img = solid_img(220, size=(430, 932))
+        calls = [0]
+
+        def stale_then_500(qs):
+            calls[0] += 1
+            if calls[0] == 1:
+                return {
+                    "bundleId": "com.apple.oldapp",
+                    "appName": "OldApp",
+                    "screen": [430, 932],
+                    "ui": [{"type": "Button", "label": "Continue", "x": 200, "y": 500}],
+                }
+            return {"error": 500, "body": "internal error"}
+
+        c = MockWDAClient(active_app="com.apple.target", fast_ui=stale_then_500)
+        r = FakeReader(frames=[(img, []), (img, [])])
+        flow = cli.Flow(c, reader=r)
+        try:
+            flow.bundle = "com.apple.target"
+            flow._pending_bundle = None
+            flow._pending_bundle_ts = time.monotonic()
+            flow._switched_from_app_name = "OldApp"
+            flow._switched_at = time.monotonic()
+            with mock.patch.object(cli, "_STALE_UI_BACKOFF", (0.01,)):
+                res = flow.tap_if("Continue", timeout=0.5)
+            self.assertEqual(res, "skipped")
+            self.assertIsNone(flow._ctl_cache)
+            post_calls = [(m, p) for m, p, _ in c.calls if m == "POST"]
+            self.assertEqual(post_calls, [])
+        finally:
+            flow.close()
+
+    # Re-review 6: delayed /wda/fastTap 404 past tapif deadline must NOT dispatch legacy /wda/tap
+    def test_tapif_delayed_fasttap_404_past_deadline_skips_legacy_fallback(self):
+        img = solid_img(220, size=(430, 932))
+        lines = [make_line("Continue", 180, 480, 260, 505)]
+
+        def delayed_fasttap_404(method, path, data):
+            if path == "/wda/fastTap":
+                time.sleep(0.25)
+                return {"error": 404, "body": "unknown route"}
+            if path.endswith("/wda/tap"):
+                return {"value": None}
+            return None
+
+        c = MockWDAClient(
+            fast_ui={"bundleId": "com.test.app", "appName": "Test", "screen": [430, 932], "ui": []},
+            custom_handler=delayed_fasttap_404,
+        )
+        r = FakeReader(frames=[(img, lines)])
+        flow = cli.Flow(c, reader=r)
+        try:
+            res = flow.tap_if("Continue", timeout=0.15)
+            self.assertEqual(res, "skipped")
+            legacy_taps = [p for _, p, _ in c.calls if p.endswith("/wda/tap")]
+            self.assertEqual(legacy_taps, [])
+        finally:
+            flow.close()
+
 
 if __name__ == "__main__":
     unittest.main()

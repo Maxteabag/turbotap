@@ -236,7 +236,7 @@ class WDAClient:
         cls = type(self)
         return cls.req_raw is not WDAClient.req_raw or cls.req is WDAClient.req
 
-    def req_raw(self, method, path, data=None, timeout=25):
+    def req_raw(self, method, path, data=None, timeout=25, deadline=None):
         """Raw HTTP request on the same persistent keep-alive connection.
         Returns (status_code, content_type, raw_bytes).
         Retries reconnects only for idempotent reads (GET/HEAD) or provably
@@ -247,15 +247,23 @@ class WDAClient:
         u = _urlsplit(self.base_url)
         idempotent = method.upper() in ("GET", "HEAD")
         for attempt in (0, 1):
+            eff_timeout = timeout
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    return 0, "", b"deadline exceeded"
+                eff_timeout = max(0.05, min(float(timeout), rem))
             sent = False
             try:
                 if self._conn is None:
-                    self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
-                self._conn.timeout = timeout
+                    self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=eff_timeout)
+                self._conn.timeout = eff_timeout
                 if self._conn.sock is None:
                     self._conn.connect()
                 if self._conn.sock is not None:
-                    self._conn.sock.settimeout(timeout)
+                    self._conn.sock.settimeout(eff_timeout)
+                if deadline is not None and time.monotonic() >= deadline:
+                    return 0, "", b"deadline exceeded"
                 sent = True
                 self._conn.request(method, path, body=body, headers=headers)
                 resp = self._conn.getresponse()
@@ -267,7 +275,7 @@ class WDAClient:
                 if attempt or (sent and not idempotent):
                     return 0, "", str(e).encode()
 
-    def req(self, method, path, data=None, timeout=25):
+    def req(self, method, path, data=None, timeout=25, deadline=None):
         """One persistent keep-alive HTTP connection (re-opened on failure).
 
         Measured on Wi-Fi: /status 5.8 ms keep-alive vs 14.6 ms with a new
@@ -281,15 +289,23 @@ class WDAClient:
         u = _urlsplit(self.base_url)
         idempotent = method.upper() in ("GET", "HEAD")
         for attempt in (0, 1):
+            eff_timeout = timeout
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    return {"error": "deadline exceeded", "deadline_exceeded": True}
+                eff_timeout = max(0.05, min(float(timeout), rem))
             sent = False
             try:
                 if self._conn is None:
-                    self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
-                self._conn.timeout = timeout
+                    self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=eff_timeout)
+                self._conn.timeout = eff_timeout
                 if self._conn.sock is None:
                     self._conn.connect()
                 if self._conn.sock is not None:
-                    self._conn.sock.settimeout(timeout)
+                    self._conn.sock.settimeout(eff_timeout)
+                if deadline is not None and time.monotonic() >= deadline:
+                    return {"error": "deadline exceeded", "deadline_exceeded": True}
                 sent = True
                 self._conn.request(method, path, body=body, headers=headers)
                 resp = self._conn.getresponse()
@@ -302,6 +318,22 @@ class WDAClient:
                 self._conn = None
                 if attempt or (sent and not idempotent):
                     return {"error": str(e)}
+
+    def _req_with_deadline(self, method, path, data=None, timeout=25, deadline=None):
+        """Invoke req() honoring an absolute monotonic deadline while remaining
+        compatible with test doubles that override req() without a deadline kwarg."""
+        if deadline is None:
+            return self.req(method, path, data, timeout=timeout)
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            return {"error": "deadline exceeded", "deadline_exceeded": True}
+        eff = max(0.05, min(float(timeout), rem))
+        if type(self).req is WDAClient.req:
+            return self.req(method, path, data, timeout=eff, deadline=deadline)
+        try:
+            return self.req(method, path, data, timeout=eff, deadline=deadline)
+        except TypeError:
+            return self.req(method, path, data, timeout=eff)
 
     def ensure_session(self, bundle_id=None, apply_fast_settings=True):
         st = self.req("GET", "/status", timeout=4)
@@ -371,25 +403,31 @@ class WDAClient:
     _fast_pinch = None       # None = not probed; True = /wda/fastPinch; False = fallback to /wda/pinch
     _fast_tap_batch = None   # None = not probed; True = /wda/fastTapBatch; False = sequential fast_tap
 
-    def fast_tap(self, x, y, duration=None):
+    def fast_tap(self, x, y, duration=None, deadline=None):
         """Coordinate tap (or long-press when duration is given, e.g. 0.65 s).
         With patches/wda-turbo.patch, /wda/fastTap sends one synthesized touch
         and skips XCUICoordinate's quiescence wait; stock WDA falls back to
-        /wda/touchAndHold (when duration is set) or legacy /wda/tap."""
+        /wda/touchAndHold (when duration is set) or legacy /wda/tap. When an
+        absolute monotonic deadline is supplied, caps the fast probe and never
+        dispatches a fallback POST once the deadline has expired."""
         body = {"x": int(x), "y": int(y)}
         if duration is not None:
             body["duration"] = float(duration)
         if self.turbo is not False:
-            r = self.req("POST", "/wda/fastTap", body)
+            if deadline is not None and time.monotonic() >= deadline:
+                return {"error": "deadline exceeded", "deadline_exceeded": True}
+            r = self._req_with_deadline("POST", "/wda/fastTap", body, deadline=deadline)
             if not r.get("error"):
                 self.turbo = True
                 return r
             if r.get("error") != 404:
                 return r
             self.turbo = False
+        if deadline is not None and time.monotonic() >= deadline:
+            return {"error": "deadline exceeded", "deadline_exceeded": True}
         if duration is not None:
-            return self.req("POST", f"/session/{self.sid}/wda/touchAndHold", body)
-        return self.req("POST", f"/session/{self.sid}/wda/tap", body)
+            return self._req_with_deadline("POST", f"/session/{self.sid}/wda/touchAndHold", body, deadline=deadline)
+        return self._req_with_deadline("POST", f"/session/{self.sid}/wda/tap", body, deadline=deadline)
 
     def fast_double_tap(self, x, y, interval=None, duration=None):
         """Coordinate double-tap. With wda-turbo v4, POST /wda/fastDoubleTap
@@ -976,12 +1014,24 @@ class ScreenReader:
             self.c._save_session_cache({"screen_pt": [w, h]})
         return self._pt
 
-    def grab(self, y0=0, y1=None, timeout=None):
+    def grab(self, y0=0, y1=None, timeout=None, deadline=None):
         import base64
         import io
         Image, _, _ = _pil()
         full = (y0 == 0 and y1 is None)
-        req_timeout = max(0.05, float(timeout)) if timeout is not None else None
+        eff_deadline = (
+            deadline if deadline is not None
+            else ((time.monotonic() + max(0.05, float(timeout))) if timeout is not None else None)
+        )
+
+        def _rem():
+            if eff_deadline is None:
+                return None
+            r_sec = eff_deadline - time.monotonic()
+            if r_sec <= 0:
+                raise TimeoutError("screenshot deadline exceeded")
+            return max(0.05, r_sec)
+
         for attempt in (0, 1):
             w, h = self.pt_size()
             y1_eff = h if y1 is None else y1
@@ -998,10 +1048,14 @@ class ScreenReader:
                 )
                 raw_bytes = None
                 r = None
+                req_timeout = _rem()
                 if use_raw:
                     payload["raw"] = True
-                    if req_timeout is not None:
-                        status, ct, body = self.c.req_raw("POST", "/wda/fastScreenshot", payload, timeout=req_timeout)
+                    if eff_deadline is not None:
+                        try:
+                            status, ct, body = self.c.req_raw("POST", "/wda/fastScreenshot", payload, timeout=req_timeout, deadline=eff_deadline)
+                        except TypeError:
+                            status, ct, body = self.c.req_raw("POST", "/wda/fastScreenshot", payload, timeout=req_timeout)
                     else:
                         status, ct, body = self.c.req_raw("POST", "/wda/fastScreenshot", payload)
                     if status == 200 and ct.lower().startswith("image/") and body:
@@ -1020,8 +1074,8 @@ class ScreenReader:
                     else:
                         r = {"error": status or "connection failed"}
                 else:
-                    if req_timeout is not None:
-                        r = self.c.req("POST", "/wda/fastScreenshot", payload, timeout=req_timeout)
+                    if eff_deadline is not None:
+                        r = self.c._req_with_deadline("POST", "/wda/fastScreenshot", payload, timeout=req_timeout, deadline=eff_deadline)
                     else:
                         r = self.c.req("POST", "/wda/fastScreenshot", payload)
                 if raw_bytes is None and isinstance(r, dict):
@@ -1032,6 +1086,8 @@ class ScreenReader:
                     elif r.get("error") == 404:
                         self.c.turbo = False
                     elif r.get("error") and self._pt_from_cache and attempt == 0:
+                        if eff_deadline is not None and time.monotonic() >= eff_deadline:
+                            raise TimeoutError("screenshot deadline exceeded")
                         if hasattr(self.c, "_invalidate_session_cache"):
                             self.c._invalidate_session_cache("screen_pt")
                         self.pt_size(force_refresh=True)
@@ -1052,8 +1108,9 @@ class ScreenReader:
                         if abs(img.size[0] - out[0]) > 2:
                             self._dev *= out[0] / img.size[0]
             if img is None:
-                if req_timeout is not None:
-                    b64 = self.c.req("GET", "/screenshot", timeout=req_timeout).get("value")
+                req_timeout = _rem()
+                if eff_deadline is not None:
+                    b64 = self.c._req_with_deadline("GET", "/screenshot", timeout=req_timeout, deadline=eff_deadline).get("value")
                 else:
                     b64 = self.c.req("GET", "/screenshot").get("value")
                 if not b64:
@@ -1505,7 +1562,7 @@ def _fetch_ui_controls_full(client, screen=(430, 932), text=False,
             path = f"/wda/fastUI?{urlencode(params)}"
         else:
             path = "/wda/fastUI"
-        r = client.req("GET", path, timeout=max(0.05, rem))
+        r = client._req_with_deadline("GET", path, timeout=max(0.05, rem), deadline=deadline) if hasattr(client, "_req_with_deadline") else client.req("GET", path, timeout=max(0.05, rem))
         if isinstance(r, dict) and isinstance(r.get("ui"), list):
             client._fast_ui = True
             ctl, app_name = _parse_fast_ui(r, screen=screen)
@@ -1522,7 +1579,7 @@ def _fetch_ui_controls_full(client, screen=(430, 932), text=False,
     rem = deadline - time.monotonic()
     if rem <= 0:
         return None, "", ""
-    r = client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=max(0.05, rem))
+    r = client._req_with_deadline("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=max(0.05, rem), deadline=deadline) if hasattr(client, "_req_with_deadline") else client.req("GET", f"/session/{client.sid}{SOURCE_LITE}", timeout=max(0.05, rem))
     if isinstance(r, dict) and r.get("error") and timeout is not None and timeout < 30:
         return None, "", ""
     ctl, app_name = _parse_ui_controls(r.get("value") or {}, screen=screen, text=text)
@@ -1784,6 +1841,10 @@ def _secret_arg(verb, arg):
 
 
 class FlowError(RuntimeError):
+    pass
+
+
+class _DeadlineExceeded(FlowError):
     pass
 
 
@@ -2122,10 +2183,15 @@ class Flow:
             self.r.last = prev
         return None, prev
 
-    def tap_point(self, x, y, text=""):
+    def tap_point(self, x, y, text="", deadline=None):
         self.guard(x, y, text)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _DeadlineExceeded("tap deadline exceeded")
         self._mark_action(keep_ctl_cache=True)
-        _check_wda_ok(self.c.fast_tap(x, y), "tap")
+        res = self.c.fast_tap(x, y, deadline=deadline) if deadline is not None else self.c.fast_tap(x, y)
+        if isinstance(res, dict) and res.get("deadline_exceeded"):
+            raise _DeadlineExceeded("tap deadline exceeded")
+        _check_wda_ok(res, "tap")
         now = time.monotonic()
         self._last_action_ts = now
         self._last_tap_type = None
@@ -2422,21 +2488,27 @@ class Flow:
             if c:
                 if deadline is not None and time.monotonic() >= deadline:
                     return "skipped"
-                return self.tap_control(c).text
+                return self.tap_control(c, deadline=deadline).text
         if self._is_disabled_ocr_match(m, base, lines, where, controls=resolved_ctl):
             return "skipped"
         if deadline is not None and time.monotonic() >= deadline:
             return "skipped"
-        self.tap_point(m.x, m.y, m.text)
+        self.tap_point(m.x, m.y, m.text, deadline=deadline)
         return m.text
 
     def tap_if(self, label, timeout=1.0):
         """Optional tap with a unified monotonic deadline (~1.0 s max, never 8 s).
-        Shares one budget across app confirmation, screenshots, and UI lookups;
-        rechecks accessibility controls if a prompt arrives mid-window, never
-        dispatches a tap after the deadline, skips explicitly disabled targets
-        consistently, supports @region, and enforces --deny. Returns the matched
-        text/control if tapped, or 'skipped'."""
+        Shares one budget across app confirmation, screenshots, UI lookups, and
+        tap transport (including 404 fallback); rechecks accessibility controls
+        if a prompt arrives mid-window, never dispatches a tap after the deadline,
+        skips explicitly disabled targets consistently, supports @region, and
+        enforces --deny. Returns the matched text/control if tapped, or 'skipped'."""
+        try:
+            return self._tap_if_impl(label, timeout=timeout)
+        except _DeadlineExceeded:
+            return "skipped"
+
+    def _tap_if_impl(self, label, timeout=1.0):
         eff_timeout = min(timeout, self.timeout)
         deadline = time.monotonic() + eff_timeout
         rem = deadline - time.monotonic()
@@ -2514,7 +2586,7 @@ class Flow:
                     if cm:
                         if time.monotonic() >= deadline:
                             return "skipped"
-                        self.tap_point(cm.x, cm.y, cm.text)
+                        self.tap_point(cm.x, cm.y, cm.text, deadline=deadline)
                         return cm.text
                 else:
                     c = exact_control(ctl, base, ext_types)
@@ -2526,7 +2598,7 @@ class Flow:
                     if c:
                         if time.monotonic() >= deadline:
                             return "skipped"
-                        return self.tap_control(c).text
+                        return self.tap_control(c, deadline=deadline).text
                 if time.monotonic() < deadline and cur_img is not None and id(cur_img) != last_sauvola_id:
                     last_sauvola_id = id(cur_img)
                     slines = self._read_sauvola(cur_img)
@@ -2539,7 +2611,7 @@ class Flow:
                                 return "skipped"
                             if time.monotonic() >= deadline:
                                 return "skipped"
-                            self.tap_point(sm.x, sm.y, sm.text)
+                            self.tap_point(sm.x, sm.y, sm.text, deadline=deadline)
                             return sm.text
             cur_texts = [l.text for l in lines]
             in_transition = bool(self._last_action_ts) and (time.monotonic() - self._last_action_ts) < 0.5
@@ -2555,8 +2627,8 @@ class Flow:
             if (time.monotonic() - t_frame) < 0.02:
                 time.sleep(min(0.05, rem_after))
 
-    def tap_control(self, c):
-        self.tap_point(c["x"], c["y"], c["label"])
+    def tap_control(self, c, deadline=None):
+        self.tap_point(c["x"], c["y"], c["label"], deadline=deadline)
         self._last_tap_type = c["type"]
         self._last_tap_ts = time.monotonic()
         if c["type"] in INPUT_TYPES:
@@ -2985,6 +3057,8 @@ class Flow:
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
             # /source or /wda/fastUI occasionally lags behind activeAppInfo right after open:;
             # use short adaptive backoff until iOS publishes the new app's tree.
+            # Keep controls and provenance together: never overwrite (app_name, bundle_id)
+            # when a retry fails and returns None, or the final stale check would be bypassed.
             for delay in _STALE_UI_BACKOFF:
                 if deadline is not None:
                     rem = deadline - time.monotonic()
@@ -2994,7 +3068,7 @@ class Flow:
                     rem = deadline - time.monotonic()
                     if rem <= 0:
                         break
-                    ctl_try, app_name, bundle_id = _fetch_ui_controls_full(
+                    ctl_try, try_app_name, try_bundle_id = _fetch_ui_controls_full(
                         self.c, self.r.pt_size(), text=text,
                         wait_bundle=expected_bundle if expected_bundle else None,
                         wait_ms=min(400, int(rem * 1000)) if expected_bundle else 0,
@@ -3002,14 +3076,17 @@ class Flow:
                     )
                     if ctl_try is None:
                         break
-                    ctl = ctl_try
+                    ctl, app_name, bundle_id = ctl_try, try_app_name, try_bundle_id
                 else:
                     time.sleep(delay)
-                    ctl, app_name, bundle_id = _fetch_ui_controls_full(
+                    ctl_try, try_app_name, try_bundle_id = _fetch_ui_controls_full(
                         self.c, self.r.pt_size(), text=text,
                         wait_bundle=expected_bundle if expected_bundle else None,
                         wait_ms=400 if expected_bundle else 0,
                     )
+                    if ctl_try is None:
+                        break
+                    ctl, app_name, bundle_id = ctl_try, try_app_name, try_bundle_id
                 if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                     break
         if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
@@ -3171,11 +3248,14 @@ class Flow:
             if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                 for delay in _STALE_UI_BACKOFF:
                     time.sleep(delay)
-                    ui_res, app_name, bundle_id = _fetch_ui_controls_meta(
+                    ui_try, try_app_name, try_bundle_id = _fetch_ui_controls_meta(
                         side, pt, True,
                         expected_bundle if expected_bundle else None,
                         400 if expected_bundle else 0,
                     )
+                    if ui_try is None:
+                        break
+                    ui_res, app_name, bundle_id = ui_try, try_app_name, try_bundle_id
                     if not self._is_stale_ui(app_name, bundle_id, expectation=expectation):
                         break
             if self._is_stale_ui(app_name, bundle_id, expectation=expectation):
