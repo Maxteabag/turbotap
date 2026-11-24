@@ -958,54 +958,37 @@ class FlowVerbsAndGuardsTests(unittest.TestCase):
         finally:
             flow.close()
 
-    def test_bottom_tab_skips_fast_ui_above_home_indicator_and_refines_inside_home_zone(self):
+    def test_bottom_tab_cold_cache_disabled_guard_and_center_refinement(self):
         img1 = solid_img(240, size=(402, 874))
         img2 = solid_img(180, size=(402, 874))
+        tab_lines = [make_line("Stopwatch", 200, 828, 280, 844)]  # y = 836 (> 874 - 55 = 819)
 
-        # 1. Exact OCR match on a normal bottom tab bar (y = 836, i.e. h - 38, above h - 28):
-        # taps directly with ZERO /wda/fastUI calls in both tap: and tapif:.
-        tab_lines = [make_line("Stopwatch", 200, 828, 280, 844)]  # y = 836
-        c_fast = MockWDAClient(fast_ui=_fast_ui([{"type": "Button", "label": "Stopwatch", "x": 240, "y": 822}]))
-        r_fast = FakeReader(frames=[(img1, tab_lines), (img1.copy(), tab_lines), (img2, tab_lines)], pt=(402, 874), scale=1.0)
-        flow_fast = cli.Flow(c_fast, reader=r_fast, timeout=0.5)
+        # 1. Cold cache + disabled accessibility tab at (240, 822) under exact OCR at (240, 836):
+        # MUST fetch controls, report disabled, and dispatch ZERO tap POSTs.
+        c_dis = MockWDAClient(
+            fast_ui=_fast_ui([{"type": "Tab", "label": "Stopwatch", "x": 240, "y": 822, "enabled": False}])
+        )
+        r_dis = FakeReader(frames=[(img1, tab_lines), (img1.copy(), tab_lines)], pt=(402, 874), scale=1.0)
+        flow_dis = cli.Flow(c_dis, reader=r_dis, timeout=0.5)
         try:
-            flow_fast.tap_text("Stopwatch")
-            self.assertEqual([(x, y) for x, y, _ in c_fast.tapped_points], [(240, 836)])
-            self.assertEqual([p for _, p, _ in c_fast.calls if p.startswith("/wda/fastUI")], [])
-
-            c_fast.tapped_points.clear()
-            c_fast.calls.clear()
-            r_fast2 = FakeReader(frames=[(img1, tab_lines), (img2, tab_lines)], pt=(402, 874), scale=1.0)
-            flow_if = cli.Flow(c_fast, reader=r_fast2, timeout=0.5)
-            try:
-                self.assertEqual(flow_if.tap_if("Stopwatch", timeout=0.5), "Stopwatch")
-                # Above Home-indicator zone: keeps direct OCR tap (240, 836) instead of snapping to Tab centre.
-                self.assertEqual([(x, y) for x, y, _ in c_fast.tapped_points], [(240, 836)])
-            finally:
-                flow_if.close()
+            with self.assertRaises(cli.FlowError) as ctx:
+                flow_dis.tap_text("Stopwatch")
+            self.assertIn("disabled", str(ctx.exception).lower())
+            self.assertEqual(c_dis.tapped_points, [])
         finally:
-            flow_fast.close()
+            flow_dis.close()
 
-        # 2. OCR match inside the true Home-indicator zone (y = 856 > 874 - 28 = 846):
-        # STILL calls controls() and snaps to the Tab/Button centre (240, 822) in both tap: and tapif:.
-        edge_lines = [make_line("Stopwatch", 200, 850, 280, 862)]  # y = 856
-        c_edge = MockWDAClient(fast_ui=_fast_ui([{"type": "Tab", "label": "Stopwatch", "x": 240, "y": 822}]))
-        r_edge = FakeReader(frames=[(img1, edge_lines), (img1.copy(), edge_lines), (img2, edge_lines)], pt=(402, 874), scale=1.0)
-        flow_edge = cli.Flow(c_edge, reader=r_edge, timeout=0.5)
+        # 2. Enabled accessibility tab in the bottom band refines to the Tab centre (240, 822).
+        c_en = MockWDAClient(
+            fast_ui=_fast_ui([{"type": "Tab", "label": "Stopwatch", "x": 240, "y": 822, "enabled": True}])
+        )
+        r_en = FakeReader(frames=[(img1, tab_lines), (img1.copy(), tab_lines), (img2, tab_lines)], pt=(402, 874), scale=1.0)
+        flow_en = cli.Flow(c_en, reader=r_en, timeout=0.5)
         try:
-            flow_edge.tap_text("Stopwatch")
-            self.assertEqual([(x, y) for x, y, _ in c_edge.tapped_points], [(240, 822)])
-            self.assertEqual(len([p for _, p, _ in c_edge.calls if p.startswith("/wda/fastUI")]), 1)
-            c_edge.tapped_points.clear()
-            r_edge2 = FakeReader(frames=[(img1, edge_lines), (img2, edge_lines)], pt=(402, 874), scale=1.0)
-            flow_if_edge = cli.Flow(c_edge, reader=r_edge2, timeout=0.5)
-            try:
-                self.assertEqual(flow_if_edge.tap_if("Stopwatch", timeout=0.5), "[Tab:Stopwatch]")
-                self.assertEqual([(x, y) for x, y, _ in c_edge.tapped_points], [(240, 822)])
-            finally:
-                flow_if_edge.close()
+            flow_en.tap_text("Stopwatch")
+            self.assertEqual([(x, y) for x, y, _ in c_en.tapped_points], [(240, 822)])
         finally:
-            flow_edge.close()
+            flow_en.close()
 
     def test_picker_key_cleartype_typedigits_and_clipboard(self):
         c = MockWDAClient(
