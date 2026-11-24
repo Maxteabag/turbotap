@@ -71,13 +71,33 @@ set -euo pipefail
 [[ -x "$XB" ]] || XB=xcodebuild
 KCDIR="${KCDIR:-$HOME/.local/share/iphone-use/signing}"
 KC="$KCDIR/wda.keychain-db"
-SIGN=(-allowProvisioningUpdates DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic
-      CODE_SIGN_IDENTITY="Apple Development" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE")
+PROV="$KCDIR/wda.mobileprovision"
+SIGN=(DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_IDENTITY="Apple Development" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE")
 if [[ -f "$KC" && -f "$KCDIR/kcpass" ]]; then
   # Over ssh the keychain is locked and codesign fails with errSecInternalComponent.
   security unlock-keychain -p "$(cat "$KCDIR/kcpass")" "$KC"
   security set-keychain-settings -t 3600 "$KC"
+  # Ensure Xcode's provisioning matcher can see the signing identity in $KC.
+  if ! security list-keychains -d user | grep -Fq "$KC"; then
+    EXISTING_KCS=()
+    while IFS= read -r line; do
+      line="${line#*\"}"; line="${line%\"*}"
+      [[ -n "$line" ]] && EXISTING_KCS+=("$line")
+    done < <(security list-keychains -d user)
+    security list-keychains -d user -s "$KC" "${EXISTING_KCS[@]}"
+  fi
   SIGN+=(OTHER_CODE_SIGN_FLAGS="--keychain $KC")
+fi
+if [[ -f "$PROV" ]]; then
+  UUID="$(security cms -D -i "$PROV" 2>/dev/null | plutil -extract UUID raw -o - - 2>/dev/null || true)"
+  if [[ -n "$UUID" ]]; then
+    for pdir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+      mkdir -p "$pdir"
+      [[ -f "$pdir/$UUID.mobileprovision" ]] || cp "$PROV" "$pdir/$UUID.mobileprovision"
+    done
+  fi
+else
+  SIGN+=(-allowProvisioningUpdates CODE_SIGN_STYLE=Automatic)
 fi
 if [[ "$BUILD" == 1 ]]; then
   if [[ ! -d "$SRC/.git" ]]; then
@@ -92,9 +112,31 @@ if [[ "$BUILD" == 1 ]]; then
     git apply /var/tmp/wda-turbo.patch
     echo "wda-turbo patch applied on $REF"
   fi
+  git checkout -q -- WebDriverAgent.xcodeproj/project.pbxproj
+  if [[ -n "${UUID:-}" ]]; then
+    # Scope manual provisioning profile strictly to WebDriverAgentRunner (never WebDriverAgentLib framework).
+    python3 - "$UUID" <<'PYEOF'
+import re, sys
+uuid = sys.argv[1]
+p = "WebDriverAgent.xcodeproj/project.pbxproj"
+txt = open(p).read()
+def patch_runner(m):
+    blk = m.group(0)
+    blk = re.sub(r"CODE_SIGN_STYLE\s*=\s*[^;]+;", "CODE_SIGN_STYLE = Manual;", blk)
+    if "CODE_SIGN_STYLE" not in blk:
+        blk = blk.replace("INFOPLIST_FILE = WebDriverAgentRunner/Info.plist;",
+                          f'CODE_SIGN_STYLE = Manual;\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "{uuid}";\n\t\t\t\tINFOPLIST_FILE = WebDriverAgentRunner/Info.plist;')
+    elif "PROVISIONING_PROFILE_SPECIFIER" not in blk:
+        blk = blk.replace("CODE_SIGN_STYLE = Manual;",
+                          f'CODE_SIGN_STYLE = Manual;\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "{uuid}";')
+    return blk
+txt2 = re.sub(r"buildSettings = \{[^{}]*INFOPLIST_FILE = WebDriverAgentRunner/Info\.plist;[^{}]*\};", patch_runner, txt)
+open(p, "w").write(txt2)
+PYEOF
+  fi
   "$XB" build-for-testing -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
     -destination generic/platform=iOS -derivedDataPath "$DD" "${SIGN[@]}" >/var/tmp/wda-turbo-build.log 2>&1 \
-    || { tail -20 /var/tmp/wda-turbo-build.log; exit 1; }
+    || { tail -25 /var/tmp/wda-turbo-build.log; exit 1; }
   echo "build ok"
 fi
 # Stop any WebDriverAgentRunner test session for this device (no pkill -f).

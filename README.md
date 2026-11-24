@@ -34,7 +34,7 @@ turbotap flow open:Weather read
 turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" tap:Get
 ```
 
-Run `turbotap flow --help` to see all available verbs.
+Run `turbotap flow --help` to see all available verbs (including `gone:`, `key:`, `re:` regexes, and `read:Y0-Y1` band OCR).
 
 ## Requirements
 
@@ -98,18 +98,19 @@ Full walkthrough and troubleshooting (finding your Team ID, trusting the dev cer
 
 ## Benchmarks
 
-Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full-res screenshots over HTTP, and runs visibility checks on hidden UI nodes. [`wda-turbo.patch`](patches/wda-turbo.patch) skips most of that overhead, and `turbotap` keeps one HTTP connection open while running OCR locally in parallel with caching on unchanged regions.
+Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full-res screenshots over HTTP, and runs expensive per-node AX queries on hidden UI nodes. [`wda-turbo.patch`](patches/wda-turbo.patch) skips most of that overhead, while `turbotap` keeps one HTTP connection open, caches session settings and screen dimensions per device, trims `/source` attributes, and runs strip-parallel LSTM OCR locally with dark-mode pre-inversion and strip hash caching.
 
 | Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
-| Tap | 740-1200ms | ~320ms | Skips waiting for background animations |
-| Grab frame | 123-244ms | 41-62ms | Crops and shrinks the image on the phone first |
-| Read screen (OCR) | ~1470ms | 180-250ms | Parallel local Tesseract + region caching |
-| Scroll | ~2000ms | 150-370ms | Clean drag stop with no fling momentum |
-| UI tree | ~2600ms | 300-700ms | Skips visibility checks on hidden elements |
-| Multi-step flow | 14.4-15.7s | 3.8-6.5s | Single process, persistent connection |
+| Session startup | ~88ms (uncached) | ~14ms | Caches fast settings & screen size per device |
+| Tap | 740-1200ms | ~260ms | Instant-wake `CFRunLoopStop` touch synthesis (`0.02s`) |
+| Grab frame | 123-244ms | ~34ms | On-device ImageIO thumbnail + raw binary JPEG |
+| Read screen (OCR) | ~1470ms | 100-180ms | Parallel LSTM OCR + dark-strip pre-invert + caching (~50ms cached) |
+| Scroll | ~2000ms | 150-350ms | Clean drag stop with no fling momentum |
+| UI tree | ~2600ms | 158-198ms | On-device `/wda/fastUI` (falls back to trimmed `/source` ~297ms) |
+| Multi-step flow | 14.4-15.7s | 1.2-6.4s | Single process, persistent connection, safe keypad/tab cache |
 
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) explains each trick behind these numbers: in-process strip-parallel OCR, the zero-momentum drag, the cheap UI tree, and a few iOS quirks.
+[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) explains each trick behind these numbers: session caching, strip-parallel OCR, zero-momentum drag, trimmed UI trees, app-switch freshness, and iOS quirks.
 
 If you don't want to patch WDA, `turbotap` still works against stock WDA and falls back to the standard endpoints automatically.
 
@@ -117,11 +118,11 @@ If you don't want to patch WDA, `turbotap` still works against stock WDA and fal
 
 By default, `turbotap` blocks taps on buttons matching `Send`, `Pay`, `Buy`, `Delete`, `Cancel booking`, or `Start call` (`--deny`). Pass `--no-deny` when you actually want it to press one of those.
 
-`tap:TEXT` prefers a button labelled exactly `TEXT` over a longer line that only contains it (`tap:"Sign In"` won't hit `Sign in with another account`). Tapping a switch row's label flips the switch itself, and `Next`/`Previous` pick the form's button over the keyboard toolbar's copy. When a step fails, the JSON lists the visible text and the tappable controls with their exact labels.
+`tap:TEXT` prefers a button, app keypad `Key`, or link labelled exactly `TEXT` over a longer OCR line (`tap:"Sign In"` won't hit `Sign in with another account`), and deprioritizes iOS status-bar matches (`y < 54`) behind in-app text unless targeted explicitly. `wait:TEXT` is OCR-first and falls back to the accessibility tree for low-contrast or colored buttons, while `gone:TEXT` polls until a spinner or sheet disappears. Tapping a switch row's label flips the switch itself, and `Next`/`Previous` pick the form's button over the keyboard toolbar's copy. When a step fails, the JSON lists the visible text and the top 30 interactive controls with their exact labels.
 
-You can narrow down tap targets relative to other text on screen. `tap:"Alice@below:Chats"`, for example, skips stories or carousels above the list.
+You can narrow down targets relative to other text on screen (`tap:"Alice@below:Chats"`, `tap:"Alice@y>300"`) or match dynamic text with `re:REGEX` in `wait:`, `tap:`, and `scrollto:`.
 
-Formatted iOS text fields (phone numbers, OTPs, IDs) tend to drop characters when pasted all at once. `cleartype:TEXT` clears the field first and checks what landed in it, and `typedigits:env:CODE` types one digit at a time. For banking or MDM PIN pads that iOS blacks out in screenshots, `pintap:env:APP_PIN` taps the keypad directly.
+Formatted iOS text fields (phone numbers, OTPs, IDs) tend to drop characters when pasted all at once. `type:` waits for brief keyboard focus after tapping an input, `key:return|backspace|tab|space|escape` sends control keys cleanly, `cleartype:TEXT` clears (`TextField`, `SecureTextField`, `SearchField`, `TextView`) and checks what landed, `dismisskb` closes the keyboard across localized labels in one lookup, and `typedigits:env:CODE` types one digit at a time. For banking or MDM PIN pads that iOS blacks out in screenshots, `pintap:env:APP_PIN` taps the keypad directly.
 
 ## Using with AI agents
 
@@ -159,9 +160,9 @@ App PINs work the same way. `pintap:cmd:"security find-generic-password -w -s ba
 
 ### How does it read the screen, accessibility tree or screenshots?
 
-Both. `read` grabs a cropped, downscaled screenshot from the phone and OCRs it locally with `libtesseract`, split into strips that run in parallel in one process (180-250ms). OCR sees everything that's drawn, including web views and apps with poor accessibility labels. It also pulls a trimmed accessibility tree (`/source` with `excluded_attributes=visible,accessible,enabled,index`, 300-700ms) to catch what OCR misses: icon-only buttons, unlabeled controls, switch states and exact field values. The agent gets the merged result as JSON text and tap targets, not images.
+Both. `read` grabs a cropped, downscaled screenshot from the phone and OCRs it locally with `libtesseract` (`OEM_LSTM_ONLY`), split into strips that run in parallel in one process with dark-mode pre-inversion and strip caching (180-250ms cold, ~50-65ms cached). OCR sees everything that's drawn, including web views and apps with poor accessibility labels. It also pulls a trimmed accessibility tree (`/source` excluding visibility and other expensive per-node attributes, 250-450ms) to catch what OCR misses: icon-only buttons, app keypad keys, unlabeled controls, switch states and exact field values. The agent gets the merged result as JSON text and tap targets, not images.
 
-`read:ocr` skips the tree when you only need text, and `ui` or `readel:TEXT` give you just the tree.
+`read:ocr` skips the tree when you only need text, `read:Y0-Y1` OCRs a single vertical band 3-4x faster, and `ui` or `readel:TEXT` give you just the tree.
 
 ### Can it unlock the phone? Does it have to stay awake?
 
