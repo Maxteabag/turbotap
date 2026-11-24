@@ -1739,7 +1739,11 @@ class Flow:
             if inp:
                 return self.tap_control(inp)
             # Nothing moved: the tap was probably eaten by an animation. Retry once
-            # if the target is still there.
+            # if the target is still there (accessibility control for icon buttons, else OCR).
+            if m.line is None:
+                c2 = exact_control(ctl, base, TAP_FORM_TYPES + ("Image", "Slider", "Value"))
+                if c2:
+                    return self.tap_control(c2)
             m2 = find_text(self.lines(), base, where=where)
             if m2:
                 self.tap_point(m2.x, m2.y, m2.text)
