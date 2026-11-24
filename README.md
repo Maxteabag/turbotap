@@ -6,6 +6,14 @@
 
 CLI for driving a real iPhone over Wi-Fi from your terminal or an AI agent (Claude Code, Codex, etc.).
 
+<p align="center">
+  <a href="https://github.com/Maxteabag/turbotap/releases/download/v0.2.0/turbotap-live-demo.mp4">
+    <img src="assets/demo-thumb.jpg" alt="turbotap demo: an agent drives a real iPhone 17 over Wi-Fi through Settings, Spotify, Weather and the App Store" width="720" />
+  </a>
+  <br />
+  <sub>Click to watch the 39 second demo on a real iPhone 17 over Wi-Fi.</sub>
+</p>
+
 I put this together because controlling an iPhone one screenshot at a time through an LLM is painfully slow. Grabbing a frame, waiting on the model to pick coordinates, and waiting another second per tap on stock WebDriverAgent turns a 5-tap task into a minute of waiting. `turbotap` takes a whole sequence of steps in one command, runs them locally against a patched WebDriverAgent on the phone, and returns JSON with the text and buttons on screen.
 
 A multi-step flow usually finishes in 3.8-6.5s end to end, compared to 14.4-15.7s on stock WDA.
@@ -21,6 +29,9 @@ turbotap flow open:Spotify tap:"Your Library" tap:"Liked Songs@y>150" wait:songs
 
 # Open Weather and read the forecast (~2.9s)
 turbotap flow open:Weather read
+
+# Search the App Store for Angry Birds and install it
+turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" tap:Get
 ```
 
 Run `turbotap flow --help` to see all available verbs.
