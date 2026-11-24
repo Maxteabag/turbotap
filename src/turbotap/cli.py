@@ -975,7 +975,9 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
                 if key not in seen:
                     seen[key] = len(out)
                     out.append(item)
-                elif out[seen[key]]["type"] == "Cell" and t == "Button" and not out[seen[key]].get("value"):
+                elif (out[seen[key]]["type"] == "Cell"
+                      and t in ("Button", "TextField", "SearchField", "SecureTextField", "TextView")
+                      and not out[seen[key]].get("value")):
                     out[seen[key]] = item
         for ch in n.get("children") or []:
             walk(ch, kb)
@@ -1017,6 +1019,24 @@ def ui_controls(client, screen=(430, 932), text=False):
 
 # Controls a tap:TEXT may land on instead of the OCR text, best type first.
 TAP_TYPES = ("Button", "Key", "Link", "Switch", "Tab", "SegmentedControl", "Cell")
+# Extended tap types including form inputs (preferred over Cell for form labels).
+TAP_FORM_TYPES = ("Button", "Key", "Link", "Switch", "Tab", "SegmentedControl",
+                  "TextField", "SearchField", "SecureTextField", "TextView", "Cell")
+# Control types eligible for the safe local-delta control cache in Flow.tap_text().
+_CTL_CACHE_TYPES = ("Key", "Button", "Tab", "SegmentedControl")
+_CTL_CACHE_TTL = 5.0
+_CTL_CACHE_MAX_DIFF = 1.5
+# Named special keys for the `key:NAME` flow step (sent via /wda/keys).
+KEY_MAP = {
+    "return": "\n",
+    "enter": "\n",
+    "backspace": "\b",
+    "delete": "\b",
+    "tab": "\t",
+    "space": " ",
+    "escape": "\x1b",
+    "esc": "\x1b",
+}
 # Shown with 'visible' when a flow step fails, so the next try uses exact labels.
 INTERACTIVE_TYPES = {"Button", "Key", "Tab", "Cell", "Link", "Switch", "Slider", "SegmentedControl",
                      "SearchField", "TextField", "SecureTextField", "TextView"}
@@ -1115,7 +1135,8 @@ FLOW_HELP = """steps (one argument each, run in order):
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
   tapxy:X,Y             tap points
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
-  cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField, type, verify read-back
+  key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys
+  cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
@@ -1169,6 +1190,9 @@ class Flow:
         self._side = None
         self._ui_pool = None
         self._last_action_ts = 0.0
+        self._wait_settled_ts = 0.0
+        self._ctl_cache = None  # (controls, bundle, ts, img)
+        self._last_tap_small_delta = False
 
     def _get_ui_worker(self):
         if self._side is None:
@@ -1190,35 +1214,49 @@ class Flow:
                 pass
             self._side._conn = None
 
-    def _mark_action(self):
+    def _invalidate_ctl_cache(self):
+        self._ctl_cache = None
+        self._last_tap_small_delta = False
+
+    def _store_ctl_cache(self, ctl, img=None):
+        ref = img if img is not None else self.r.last
+        if ref is not None and ctl:
+            self._ctl_cache = (ctl, self.bundle, time.monotonic(), ref)
+        else:
+            self._ctl_cache = None
+
+    def _mark_action(self, keep_ctl_cache=False):
         self._last_action_ts = time.monotonic()
         if hasattr(self.r, "invalidate_last"):
             self.r.invalidate_last()
+        if not keep_ctl_cache:
+            self._invalidate_ctl_cache()
 
     # -- primitives ---------------------------------------------------------
     def _wait_active_app(self, max_wait=1.5, poll=0.04):
         """After open:/launch:, confirm iOS finished foregrounding the target app
         before reading /source or interacting. Already-active apps clear on one
-        ~10 ms GET /wda/activeAppInfo."""
+        ~10 ms GET /wda/activeAppInfo. Returns True when a pending switch was
+        confirmed active."""
         target = self._pending_bundle
         if not target:
-            return
+            return False
         if time.monotonic() - self._pending_bundle_ts > 2.5:
             self._pending_bundle = None
-            return
+            return False
         deadline = time.monotonic() + max_wait
         while True:
             info = self.c.req("GET", "/wda/activeAppInfo", timeout=4)
             val = info.get("value") if isinstance(info, dict) else None
             if not isinstance(info, dict) or info.get("error") or not isinstance(val, dict) or "bundleId" not in val:
                 self._pending_bundle = None
-                return
+                return False
             if val.get("bundleId") == target:
                 self._pending_bundle = None
-                return
+                return True
             if time.monotonic() >= deadline:
                 self._pending_bundle = None
-                return
+                return False
             time.sleep(poll)
 
     def guard(self, x, y, text=""):
@@ -1255,6 +1293,7 @@ class Flow:
             frames += 1
             m = find_text(lines, label, where=where)
             if m and (not stable or (prev and abs(m.x - prev.x) <= 3 and abs(m.y - prev.y) <= 3)):
+                self._wait_settled_ts = time.monotonic()
                 return m
             prev = m
             now = time.time()
@@ -1263,6 +1302,7 @@ class Flow:
                 last_ui = time.time()
                 cm = find_control_match(ctl, label, types=WAIT_UI_TYPES)
                 if cm:
+                    self._wait_settled_ts = time.monotonic()
                     return cm
             if time.time() >= end:
                 break
@@ -1315,10 +1355,53 @@ class Flow:
 
     def tap_point(self, x, y, text=""):
         self.guard(x, y, text)
-        self._mark_action()
+        self._mark_action(keep_ctl_cache=True)
         self.c.fast_tap(x, y)
+        now = time.monotonic()
+        self._last_action_ts = now
         self._last_tap_type = None
-        self._last_tap_ts = time.monotonic()
+        self._last_tap_ts = now
+
+    def _try_cached_tap(self, base):
+        """Fast path for repeated taps on static keypads/layouts (e.g. Calculator):
+        if a recent control cache matches base and the screen has only changed
+        locally (_thumb_diff < _CTL_CACHE_MAX_DIFF), tap directly and verify
+        reaction; on any layout shift or non-reaction, invalidate and fall back."""
+        if self._ctl_cache is None or base.startswith("re:"):
+            return None
+        ctl, cache_bundle, cache_ts, cache_img = self._ctl_cache
+        now = time.monotonic()
+        if cache_bundle != self.bundle or (now - cache_ts) > _CTL_CACHE_TTL:
+            self._invalidate_ctl_cache()
+            return None
+        c = exact_control(ctl, base, _CTL_CACHE_TYPES)
+        if not c:
+            return None
+        # Reuse a frame already grabbed after the previous action if very fresh;
+        # otherwise take one cheap grab to confirm layout stability and serve as
+        # the pre-tap reaction baseline.
+        last_ts = getattr(self.r, "last_ts", 0.0)
+        if self.r.last is not None and last_ts >= self._last_action_ts and (now - last_ts) < 0.25:
+            cur_img = self.r.last
+        else:
+            cur_img = self.r.grab()
+            if hasattr(self.r, "set_last"):
+                self.r.set_last(cur_img)
+            else:
+                self.r.last = cur_img
+        if _thumb_diff(cache_img, cur_img) >= _CTL_CACHE_MAX_DIFF:
+            self._invalidate_ctl_cache()
+            return None
+        self._last_tap_small_delta = True
+        before = cur_img
+        m = self.tap_control(c)
+        if self.changed_since(before, x=c["x"], y=c["y"]):
+            if self.r.last is not None and _thumb_diff(cache_img, self.r.last) >= _CTL_CACHE_MAX_DIFF:
+                self._invalidate_ctl_cache()
+            return m
+        # Safety net: cached tap produced no UI reaction -> drop cache and fall through.
+        self._invalidate_ctl_cache()
+        return None
 
     def tap_text(self, label):
         self._wait_active_app()
@@ -1339,6 +1422,10 @@ class Flow:
             m = self.tap_form_button(base, where)
             if m:
                 return m
+        if not where and self._ctl_cache is not None:
+            m_cached = self._try_cached_tap(base)
+            if m_cached is not None:
+                return m_cached
         # Reuse a very recent frame (< 0.15 s) from the preceding step as Frame #1 if it
         # already contains the target; otherwise grab a fresh Frame #1 and feed its match
         # into wait(stable=True) so static screens only need one confirming frame.
@@ -1348,13 +1435,17 @@ class Flow:
             m0 = find_text(cached_lines, base, where=where)
         if m0 is None:
             m0 = find_text(self.lines(), base, where=where)
+        if m0 is None and self._last_action_ts and (time.monotonic() - self._last_action_ts) < 0.7:
+            # Inside a short post-action transition window (e.g. iOS nav push right
+            # after a previous tap): grab one more OCR frame before paying for a
+            # /source fetch on the outgoing screen.
+            m0 = find_text(self.lines(), base, where=where)
         if not where and m0 is None:
             # Not in the first fresh OCR frame: an exact accessibility label (icon-only
             # Back/Close/Search/tab or keypad Key) is tapped at once instead of after
             # the 2.2 s OCR wait (Messenger Back: 2,979 -> ~800 ms).
             ctl = self.controls()
-            ext_types = TAP_TYPES + (
-                "Image", "SearchField", "TextField", "SecureTextField", "TextView", "Slider", "Value")
+            ext_types = TAP_FORM_TYPES + ("Image", "Slider", "Value")
             c = exact_control(ctl, base, ext_types)
             if not c and low_base in BACK_LABELS:
                 for alt in BACK_LABELS:
@@ -1376,17 +1467,24 @@ class Flow:
             return Match(x, y, f"[el:{label}]", None)
         _, h = self.r.pt_size()
         near_bottom_tab = m.line is not None and m.y > h - 55
-        if m.line is not None and (m.rank or near_bottom_tab):
+        is_form_label = base.rstrip().endswith(":")
+        if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
             # 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
             #    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
             #    labelled exactly TEXT wins over the substring.
             # 2. near_bottom_tab: OCR matched a tab label near the bottom edge
             #    (y > h - 55, close to the home indicator): prefer the Tab/Button centre.
+            # 3. is_form_label: classic form label ('To:', 'Subject:', 'Til:', 'Emne:')
+            #    where OCR matches the left-aligned label text, but the focusable input
+            #    (TextField/TextView/SearchField) spans the row and should be tapped at
+            #    its centre.
             last_lines = getattr(self.r, "last_lines", None)
             cur_lines = last_lines if last_lines is not None else (
                 self.r.read(img=self.r.last) if self.r.last is not None else [])
             ctl = _controls_in_region(self.controls(), cur_lines, where)
-            c = exact_control(ctl, base) if m.rank else None
+            c = exact_control(ctl, base, TAP_FORM_TYPES) if (m.rank or is_form_label) else None
+            if not c and is_form_label:
+                c = self.input_near(base, m, controls=ctl)
             if not c and near_bottom_tab:
                 c = exact_control(ctl, base, ("Tab", "Button"))
                 if not c:
@@ -1400,30 +1498,63 @@ class Flow:
         if not self.changed_since(before, x=m.x, y=m.y):
             # Tapping a switch row's label does nothing: tap the toggle itself, unless
             # the toggle changed already (too small a change to count as a reaction).
-            sw = self.switch_near(base, m)
+            ctl = self.controls()
+            sw = self.switch_near(base, m, controls=ctl)
             if sw:
                 if _box_diff(before, self.r.grab(), sw["x"], sw["y"], self.r.scale) < 4:
                     return self.tap_control(sw)
                 return m
+            # Tapping a form field's static label may not focus its input: tap an
+            # exact or row-aligned TextField/TextView/SearchField/SecureTextField.
+            inp = self.input_near(base, m, controls=ctl)
+            if inp:
+                return self.tap_control(inp)
             # Nothing moved: the tap was probably eaten by an animation. Retry once
             # if the target is still there.
             m2 = find_text(self.lines(), base, where=where)
             if m2:
                 self.tap_point(m2.x, m2.y, m2.text)
+        elif self._ctl_cache is not None and self.r.last is not None:
+            if _thumb_diff(self._ctl_cache[3], self.r.last) >= _CTL_CACHE_MAX_DIFF:
+                self._invalidate_ctl_cache()
         return m
 
     def tap_control(self, c):
         self.tap_point(c["x"], c["y"], c["label"])
         self._last_tap_type = c["type"]
         self._last_tap_ts = time.monotonic()
+        if c["type"] in INPUT_TYPES:
+            self._invalidate_ctl_cache()
         return Match(c["x"], c["y"], f"[{c['type']}:{c['label']}]", None)
 
-    def switch_near(self, label, m):
+    def switch_near(self, label, m, controls=None):
         """The Switch on the matched text's row whose label contains label."""
+        ctl = controls if controls is not None else self.controls()
         want = _clean_text(label).casefold()
-        hits = [c for c in self.controls() if c["type"] == "Switch" and abs(c["y"] - m.y) <= 30
+        hits = [c for c in ctl if c["type"] == "Switch" and abs(c["y"] - m.y) <= 30
                 and (want in c["label"].casefold() or c["label"].casefold() in _norm(m.text))]
         return min(hits, key=lambda c: abs(c["y"] - m.y)) if hits else None
+
+    def input_near(self, label, m, controls=None):
+        """Exact or row-aligned TextField/SearchField/SecureTextField/TextView for a form label."""
+        ctl = controls if controls is not None else self.controls()
+        inputs = [c for c in ctl if c["type"] in INPUT_TYPES]
+        if not inputs:
+            return None
+        want = _clean_text(label).rstrip(":").casefold()
+        exact_row = [c for c in inputs if abs(c["y"] - m.y) <= 35
+                     and c["label"].rstrip(":").casefold() == want]
+        if exact_row:
+            return min(exact_row, key=lambda c: abs(c["y"] - m.y))
+        norm_m = _norm(m.text).rstrip(":")
+        named_row = [c for c in inputs if abs(c["y"] - m.y) <= 35
+                     and (want in c["label"].casefold() or c["label"].rstrip(":").casefold() in norm_m)]
+        if named_row:
+            return min(named_row, key=lambda c: abs(c["y"] - m.y))
+        same_row = [c for c in inputs if abs(c["y"] - m.y) <= 25 and c["x"] >= m.x - 20]
+        if same_row:
+            return min(same_row, key=lambda c: (abs(c["y"] - m.y), abs(c["x"] - m.x)))
+        return None
 
     def tap_form_button(self, label, where=None):
         """Next/Previous also sit on the keyboard toolbar: tap the topmost exact
@@ -1526,6 +1657,7 @@ class Flow:
             self._last_app_bundle = self.bundle
             if app_name != self._switched_from_app_name:
                 self._switched_from_app_name = None
+        self._store_ctl_cache(ctl)
         return ctl
 
     def read_full(self, ui=True, timeout=2.5):
@@ -1534,13 +1666,18 @@ class Flow:
         coordinates. Reuses one persistent side connection/worker so /source
         overlaps with OCR, checks active-app freshness, and never discards a
         fresh completed tree."""
-        self._wait_active_app()
+        app_confirmed = self._wait_active_app()
         side, pool = self._get_ui_worker() if ui else (None, None)
         pt = self.r.pt_size()
         status_y = int(pt[1] * 0.06)
         t0 = time.monotonic()
         end = t0 + timeout
-        may_be_transitioning = (t0 - self._last_action_ts) < 1.5
+        settled_by_wait = self._wait_settled_ts > self._last_action_ts
+        # Start /source in parallel with Frame 1 whenever the screen is steady,
+        # _wait_active_app() already confirmed the target app after open:/launch:,
+        # or wait: already confirmed destination text; stale/splash trees are still
+        # caught by app_name and _text_overlap(fut_texts, texts) < 0.5 below.
+        may_be_transitioning = (not app_confirmed) and (not settled_by_wait) and (t0 - self._last_action_ts) < 1.5
         fut = None
         fut_texts = None
         if side and not may_be_transitioning:
@@ -1599,6 +1736,7 @@ class Flow:
                 self._last_app_bundle = self.bundle
                 if app_name != self._switched_from_app_name:
                     self._switched_from_app_name = None
+            self._store_ctl_cache(ui_res, img=self.r.last)
         else:
             ui_res = None
         if ui_res:
@@ -1662,7 +1800,7 @@ class Flow:
     def step(self, spec):
         verb, _, arg = spec.partition(":")
         verb = verb.strip().lower()
-        if verb != "type":
+        if verb not in ("type", "key"):
             self._last_tap_type = None
         if verb == "unlock":
             self._mark_action()
@@ -1711,18 +1849,38 @@ class Flow:
             self._last_tap_type = None
             self._mark_action()
             self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": list(arg)})
+        elif verb == "key":
+            kname = arg.strip().lower()
+            ch = KEY_MAP.get(kname)
+            if ch is None:
+                valid = "|".join(("return", "enter", "backspace", "delete", "tab", "space", "escape"))
+                raise FlowError(f"unknown key {arg!r}; use {valid}")
+            if self._last_tap_type in INPUT_TYPES:
+                rem = self._INPUT_FOCUS_SETTLE - (time.monotonic() - self._last_tap_ts)
+                if rem > 0:
+                    time.sleep(rem)
+            self._last_tap_type = None
+            self._mark_action()
+            self.c.req("POST", f"/session/{self.c.sid}/wda/keys", {"value": [ch]})
+            return kname
         elif verb == "cleartype":
             arg = _secret_arg(verb, arg)
             self._mark_action()
-            els = self.c.req("POST", f"/session/{self.c.sid}/elements",
-                             {"using": "class name", "value": "XCUIElementTypeTextField"}).get("value") or []
+            els = []
             secure = False
-            if not els:
+            for cls, is_sec in (
+                ("XCUIElementTypeTextField", False),
+                ("XCUIElementTypeSecureTextField", True),
+                ("XCUIElementTypeSearchField", False),
+                ("XCUIElementTypeTextView", False),
+            ):
                 els = self.c.req("POST", f"/session/{self.c.sid}/elements",
-                                 {"using": "class name", "value": "XCUIElementTypeSecureTextField"}).get("value") or []
-                secure = True
+                                 {"using": "class name", "value": cls}).get("value") or []
+                if els:
+                    secure = is_sec
+                    break
             if not els:
-                raise FlowError("no TextField or SecureTextField on screen")
+                raise FlowError("no TextField, SecureTextField, SearchField, or TextView on screen")
             eid = list(els[0].values())[0]
             self.c.req("POST", f"/session/{self.c.sid}/element/{eid}/clear", {})
             time.sleep(0.25)
