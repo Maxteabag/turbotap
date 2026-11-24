@@ -109,6 +109,188 @@ class TapTextAndCacheTests(unittest.TestCase):
         finally:
             flow.close()
 
+    def test_wait_drains_active_slide_transition_before_ocr(self):
+        f0 = solid_img(100, size=(430, 932))
+        f_mid = solid_img(160, size=(430, 932))
+        f_done1 = solid_img(230, size=(430, 932))
+        f_done2 = solid_img(230, size=(430, 932))
+        lines = [make_line("iOS-versjon", 40, 200, 180, 220)]
+
+        # 1. wait(stable=False) drains blurry mid-slide frame with grab() and returns on 1 OCR pass.
+        r = FakeReader(frames=[(f_mid, []), (f_done1, lines), (f_done2, lines)], pt=(430, 932), scale=1.0)
+        r.last = f0
+        r.last_lines = None
+        flow = cli.Flow(MockWDAClient(), reader=r, timeout=1.0)
+        flow._last_action_ts = time.monotonic()
+        flow._last_reaction_diff = 12.0
+        try:
+            m = flow.wait("iOS-versjon")
+            self.assertEqual(m.text, "iOS-versjon")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 3)
+            self.assertGreaterEqual(flow._wait_settled_ts, flow._last_action_ts)
+        finally:
+            flow.close()
+
+        # 2. wait(stable=True) also returns immediately in 1 OCR pass when settled_prev and settled_img are still.
+        r2 = FakeReader(frames=[(f_mid, []), (f_done1, lines), (f_done2, lines)], pt=(430, 932), scale=1.0)
+        r2.last = f0
+        r2.last_lines = None
+        flow2 = cli.Flow(MockWDAClient(), reader=r2, timeout=1.0)
+        flow2._last_action_ts = time.monotonic()
+        flow2._last_reaction_diff = 12.0
+        try:
+            m2 = flow2.wait("iOS-versjon", stable=True)
+            self.assertEqual(m2.text, "iOS-versjon")
+            self.assertEqual(r2.read_calls, 1)
+            self.assertEqual(r2.grab_calls, 3)
+        finally:
+            flow2.close()
+
+        # 3. When target is absent on the settled OCR frame, wait() cleanly falls back to UI controls.
+        c_ui = MockWDAClient(fast_ui=_fast_ui([{"type": "Button", "label": "IconOnly", "x": 380, "y": 90}]))
+        r3 = FakeReader(frames=[(f_mid, []), (f_done1, []), (f_done2, []), (solid_img(230, size=(430, 932)), [])],
+                        pt=(430, 932), scale=1.0)
+        r3.last = f0
+        r3.last_lines = None
+        flow3 = cli.Flow(c_ui, reader=r3, timeout=1.0)
+        flow3._last_action_ts = time.monotonic()
+        flow3._last_reaction_diff = 12.0
+        try:
+            m3 = flow3.wait("IconOnly")
+            self.assertEqual(m3.text, "IconOnly")
+            self.assertEqual((m3.x, m3.y), (380, 90))
+        finally:
+            flow3.close()
+
+    def test_wait_reuses_fresh_lines_only_when_settled_after_last_action(self):
+        img1 = solid_img(240, size=(430, 932))
+        img2 = solid_img(240, size=(430, 932))
+        img_new = solid_img(180, size=(430, 932))
+        lines1 = [make_line("General", 40, 150, 140, 170), make_line("About", 40, 220, 120, 240)]
+        lines_new = [make_line("About", 40, 300, 120, 320)]
+
+        r = FakeReader(frames=[(img1, lines1), (img2, lines1), (img_new, lines_new)], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(MockWDAClient(), reader=r, timeout=1.0)
+        try:
+            m1 = flow.wait("General")
+            self.assertEqual(m1.text, "General")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 1)
+
+            # Immediate wait("About") reuses fresh settled lines with 0 grabs and 0 OCR calls.
+            m2 = flow.wait("About")
+            self.assertEqual(m2.text, "About")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 1)
+
+            # wait("About", stable=True) reuses fresh settled lines as prev and confirms with 1 grab, 0 OCR.
+            m3 = flow.wait("About", stable=True)
+            self.assertEqual(m3.text, "About")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 2)
+
+            # After a new action (_last_action_ts > _wait_settled_ts), NEVER reuse pre-action lines.
+            flow._last_action_ts = time.monotonic() + 1.0
+            m4 = flow.wait("About")
+            self.assertEqual(m4.y, 310)
+            self.assertEqual(r.read_calls, 2)
+        finally:
+            flow.close()
+
+    def test_waitany_drains_transition_and_reuses_fresh_lines(self):
+        f0 = solid_img(100, size=(430, 932))
+        f_mid = solid_img(160, size=(430, 932))
+        f_done1 = solid_img(230, size=(430, 932))
+        f_done2 = solid_img(230, size=(430, 932))
+        lines = [make_line("Alarmer", 40, 180, 140, 200), make_line("Start", 40, 300, 110, 320)]
+
+        r = FakeReader(frames=[(f_mid, []), (f_done1, lines), (f_done2, lines)], pt=(430, 932), scale=1.0)
+        r.last = f0
+        r.last_lines = None
+        flow = cli.Flow(MockWDAClient(), reader=r, timeout=1.0)
+        flow._last_action_ts = time.monotonic()
+        flow._last_reaction_diff = 10.0
+        try:
+            m1 = flow.wait_any("Alarmer|Missing")
+            self.assertEqual(m1.text, "Alarmer")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 3)
+
+            # Follow-up wait_any on the same settled frame reuses fresh lines with 0 extra OCR.
+            m2 = flow.wait_any("Missing|Start")
+            self.assertEqual(m2.text, "Start")
+            self.assertEqual(r.read_calls, 1)
+            self.assertEqual(r.grab_calls, 3)
+        finally:
+            flow.close()
+
+    def test_gone_skips_ocr_while_pixel_still_and_detects_change_immediately(self):
+        f_busy1 = box_img(bg=240, boxes=[((100, 300, 300, 360), 40)], size=(430, 932))
+        f_busy2 = box_img(bg=240, boxes=[((100, 300, 300, 360), 40)], size=(430, 932))
+        f_busy3 = box_img(bg=240, boxes=[((100, 300, 300, 360), 40)], size=(430, 932))
+        f_busy4 = box_img(bg=240, boxes=[((100, 300, 300, 360), 40)], size=(430, 932))
+        f_done = solid_img(240, size=(430, 932))
+        busy_lines = [make_line("Loading...", 120, 320, 260, 340)]
+
+        # 1. Still frames skip redundant OCR; pixel change triggers 1 confirming OCR pass.
+        r = FakeReader(frames=[
+            (f_busy1, busy_lines),
+            (f_busy2, busy_lines),
+            (f_busy3, busy_lines),
+            (f_busy4, busy_lines),
+            (f_done, []),
+        ], pt=(430, 932), scale=1.0)
+        flow = cli.Flow(MockWDAClient(), reader=r, timeout=1.0)
+        try:
+            self.assertTrue(flow.gone("Loading...", timeout=1.0))
+            self.assertEqual(r.read_calls, 2)
+            self.assertEqual(r.grab_calls, 5)
+        finally:
+            flow.close()
+
+        # 2. gone() right after wait() reuses wait()'s settled frame on Frame 0 (only 1 OCR total).
+        r2 = FakeReader(frames=[
+            (f_busy1, busy_lines),
+            (f_busy2, busy_lines),
+            (f_busy3, busy_lines),
+            (f_done, []),
+        ], pt=(430, 932), scale=1.0)
+        flow2 = cli.Flow(MockWDAClient(), reader=r2, timeout=1.0)
+        try:
+            self.assertEqual(flow2.wait("Loading...").text, "Loading...")
+            self.assertEqual(r2.read_calls, 1)
+            self.assertTrue(flow2.gone("Loading...", timeout=1.0))
+            self.assertEqual(r2.read_calls, 2)  # 1 in wait + 1 in gone when pixels changed
+            self.assertEqual(r2.grab_calls, 4)
+        finally:
+            flow2.close()
+
+        # 3. Still screen until timeout raises FlowError with only 1 OCR call (Frame 0).
+        r3 = FakeReader(frames=[(f_busy1, busy_lines), (f_busy2, busy_lines)], pt=(430, 932), scale=1.0)
+        flow3 = cli.Flow(MockWDAClient(), reader=r3, timeout=0.05)
+        try:
+            with self.assertRaises(cli.FlowError):
+                flow3.gone("Loading...", timeout=0.05)
+            self.assertEqual(r3.read_calls, 1)
+        finally:
+            flow3.close()
+
+        # 4. Status-bar target (@y<54) does not get masked by _content_pixel_still ignoring top 6%.
+        f_sb1 = box_img(bg=240, boxes=[((40, 10, 100, 30), 20)], size=(430, 932))
+        f_sb2 = solid_img(240, size=(430, 932))
+        self.assertTrue(cli._content_pixel_still(f_sb1, f_sb2))
+        r4 = FakeReader(frames=[
+            (f_sb1, [make_line("VPN", 40, 10, 100, 30)]),
+            (f_sb2, []),
+        ], pt=(430, 932), scale=1.0)
+        flow4 = cli.Flow(MockWDAClient(), reader=r4, timeout=0.5)
+        try:
+            self.assertTrue(flow4.gone("VPN@y<54", timeout=0.5))
+            self.assertEqual(r4.read_calls, 2)
+        finally:
+            flow4.close()
+
     def test_tap_text_drains_transition_before_ocr(self):
         # Simulate an active iOS slide transition right after a prior tap with large reaction diff.
         f0 = solid_img(100, size=(430, 932))

@@ -856,6 +856,8 @@ _INVERT_LUT = bytes(255 - i for i in range(256))
 def _tesseract_tsv_raw(raw, w, h, api):
     lib = _tess_lib()
     ctypes_mod = _TESS["ctypes"]
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
     lib.TessBaseAPISetImage(api, raw, w, h, 1, w)
     ptr = lib.TessBaseAPIGetTsvText(api, 0)
     try:
@@ -1033,9 +1035,10 @@ def _thumb_diff(a, b):
     """Mean absolute grey difference of two frames (0-255) on a tiny thumbnail."""
     if a is None or b is None or a.size != b.size:
         return 255.0
-    _, ImageChops, ImageStat = _pil()
+    Image, ImageChops, ImageStat = _pil()
     size = (max(1, a.size[0] // 8), max(1, a.size[1] // 8))
-    d = ImageChops.difference(a.resize(size), b.resize(size))
+    box_resample = getattr(Image, "Resampling", Image).BOX
+    d = ImageChops.difference(a.resize(size, box_resample), b.resize(size, box_resample))
     return ImageStat.Stat(d).mean[0]
 
 
@@ -1333,22 +1336,28 @@ class ScreenReader:
     def _cuts(self, img, data=None):
         """Strip boundaries at the most uniform row near each 1/n of the height."""
         w, h = img.size
+        if h < 180 or self.n <= 1:
+            return [0, h]
+        n = min(self.n, max(1, h // 90))
+        if n <= 1:
+            return [0, h]
         data = data if data is not None else img.tobytes()
-        n = self.n
+        step = 4 if w >= 240 else 2
         cuts = [0]
         for i in range(1, n):
             t = h * i // n
-            lo, hi = max(cuts[-1] + 24, t - h // (2 * n)), min(h - 24, t + h // (2 * n))
+            half = min(48, h // (2 * n))
+            lo, hi = max(cuts[-1] + 24, t - half), min(h - 24, t + half)
             if lo >= hi:
                 continue
-            # Search outward from target row t with stride-2 sampling and early exit on
+            # Search outward from target row t with strided sampling and early exit on
             # blank/uniform rows (range <= 2), avoiding scanning every pixel of every row.
             best_y, best_score = t, (256, 0)
             max_off = max(t - lo, hi - 1 - t)
             for off in range(max_off + 1):
                 for y in ((t,) if off == 0 else (t - off, t + off)):
                     if lo <= y < hi:
-                        row = data[y * w:(y + 1) * w:2]
+                        row = data[y * w:(y + 1) * w:step]
                         rng = max(row) - min(row)
                         sc = (rng, off)
                         if sc < best_score:
@@ -1365,21 +1374,38 @@ class ScreenReader:
         return self._ocr_raw(strip.tobytes(), strip.size[0], strip.size[1], sauvola=sauvola)
 
     def _ocr_raw(self, raw, w, h, sauvola=False):
-        sample = raw[::19]
-        if sample:
+        sample = raw[::19].tobytes() if isinstance(raw, memoryview) else raw[::19]
+        n_samp = len(sample)
+        if n_samp:
             # Skip only genuinely uniform flat strips; preserve low-contrast text
             # (e.g. ~12 grayscale levels) for both Otsu and Sauvola binarization.
             min_contrast = 1 if sauvola else 4
-            if max(sample) - min(sample) < min_contrast:
-                return []  # uniform blank strip
-            if (sum(sample) / len(sample)) < 120:
+            if n_samp >= 256:
+                Image, _, _ = _pil()
+                hist = Image.frombuffer("L", (n_samp, 1), sample, "raw", "L", 0, 1).histogram()
+                lo = 0
+                while not hist[lo]:
+                    lo += 1
+                hi = 255
+                while not hist[hi]:
+                    hi -= 1
+                if hi - lo < min_contrast:
+                    return []  # uniform blank strip
+                mean = sum(i * c for i, c in enumerate(hist) if c) / n_samp
+            else:
+                if max(sample) - min(sample) < min_contrast:
+                    return []  # uniform blank strip
+                mean = sum(sample) / n_samp
+            if mean < 120:
                 # Pre-invert dark-mode strips so LSTM succeeds on pass 1 instead of
                 # retrying via tessedit_do_invert (kept enabled for mixed-polarity UI).
-                raw = raw.translate(_INVERT_LUT)
+                raw_bytes = raw.tobytes() if isinstance(raw, memoryview) else raw
+                raw = raw_bytes.translate(_INVERT_LUT)
         lib = _tess_lib()
         if lib is None:
             Image, _, _ = _pil()
-            tsv = tesseract_tsv(Image.frombytes("L", (w, h), raw), self.psm, sauvola=sauvola)
+            raw_bytes = raw.tobytes() if isinstance(raw, memoryview) else raw
+            tsv = tesseract_tsv(Image.frombytes("L", (w, h), raw_bytes), self.psm, sauvola=sauvola)
         else:
             self._ensure_ocr()
             api = self.apis.get()
@@ -1395,10 +1421,14 @@ class ScreenReader:
                 self.apis.put(api)
         lines = {}
         for row in tsv.splitlines():
+            if not row.startswith("5\t"):
+                continue
             p = row.split("\t")
-            if len(p) == 12 and p[0] == "5" and p[11].strip() and float(p[10]) > 30:
-                x0, y0, ww, hh = int(p[6]), int(p[7]), int(p[8]), int(p[9])
-                lines.setdefault((p[2], p[3], p[4]), []).append((p[11].strip(), x0, y0, x0 + ww, y0 + hh))
+            if len(p) == 12:
+                txt = p[11].strip()
+                if txt and float(p[10]) > 30:
+                    x0, y0, ww, hh = int(p[6]), int(p[7]), int(p[8]), int(p[9])
+                    lines.setdefault((p[2], p[3], p[4]), []).append((txt, x0, y0, x0 + ww, y0 + hh))
         return list(lines.values())
 
     def read(self, y0=0, y1=None, img=None, sauvola=False, timeout=None, deadline=None, **_ignored):
@@ -1422,18 +1452,21 @@ class ScreenReader:
                 img = self.grab(y0, y1, timeout=timeout)
             else:
                 img = self.grab(y0, y1)
-        w, _ = img.size
+        w, h = img.size
         data = img.tobytes()
         mv = memoryview(data)
         cuts = self._cuts(img, data=data)
         jobs = []
         for a, b in zip(cuts, cuts[1:]):
-            digest = hashlib.blake2b(mv[a * w:b * w], digest_size=16).digest()
+            digest = hashlib.sha256(mv[a * w:b * w]).digest()
             k = (b"S" + digest) if sauvola else digest
             jobs.append((a, b, k))
         if len(self.cache) > 512:
             self.cache.clear()  # before `todo`, or strips counted as cached vanish (KeyError)
-        todo = [(k, data[a * w:b * w], b - a) for a, b, k in jobs if k not in self.cache]
+        todo = [
+            (k, data if (a == 0 and b == h) else data[a * w:b * w], b - a)
+            for a, b, k in jobs if k not in self.cache
+        ]
         if todo:
             uniq = {}
             for k, raw, sh in todo:
@@ -2285,14 +2318,72 @@ class Flow:
         frames = 0
         last_ui = 0.0
         last_sauvola_id = None
+        settled_lines = None
+
+        # Reuse very recent already-OCR'd lines when no action has happened since
+        # the screen settled (e.g. wait:TEXT right after read or another wait).
+        if (initial is None
+                and self._wait_settled_ts >= self._last_action_ts
+                and getattr(self.r, "last_lines", None) is not None):
+            cached_lines = self._fresh_lines()
+            if cached_lines is not None:
+                m0 = find_text(cached_lines, label, where=where)
+                if m0 is not None:
+                    if not stable:
+                        self._wait_settled_ts = time.monotonic()
+                        return m0
+                    prev = m0
+                    prev_img = self.r.last
+                    prev_lines = cached_lines
+
+        # Right after a tap that triggered a full-screen slide/push
+        # (_last_reaction_diff >= 2.0), drain the animation with cheap ~34 ms raw
+        # grabs before spending ~250 ms OCRing a blurry mid-transition frame.
+        if (initial is None
+                and prev is None
+                and self._last_action_ts
+                and (time.monotonic() - self._last_action_ts) < 0.7
+                and self._wait_settled_ts < self._last_action_ts
+                and self._last_reaction_diff >= 2.0
+                and getattr(self.r, "last_lines", None) is None
+                and self.r.last is not None):
+            rem_wait = max(0.0, end - time.time())
+            settled_prev, settled_img = self._settle_transition(max_wait=min(0.28, rem_wait), still=1.2)
+            if settled_img is not None:
+                settled_lines = self.r.read(img=settled_img)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(settled_img, lines=settled_lines)
+                m0 = find_text(settled_lines, label, where=where)
+                if m0 is not None:
+                    if (not stable or (
+                        settled_prev is not None
+                        and settled_prev is not settled_img
+                        and (_content_pixel_still(settled_prev, settled_img)
+                             or _thumb_diff(settled_prev, settled_img) < 0.8)
+                        and _box_diff(settled_prev, settled_img, m0.x, m0.y, self.r.scale) < 2.0
+                    )):
+                        self._wait_settled_ts = time.monotonic()
+                        return m0
+                    prev = m0
+                    prev_img = settled_img
+                    prev_lines = settled_lines
+                    frames = 1
+                    settled_lines = None
+
         while True:
-            if stable and prev is not None and prev.line is not None and prev_img is not None:
+            if settled_lines is not None:
+                lines = settled_lines
+                settled_lines = None
+                frames += 1
+                m = None
+            elif stable and prev is not None and prev.line is not None and prev_img is not None:
                 # Confirm stability with one cheap raw screenshot (~34 ms): if the entire
                 # screen and the target box are pixel-still between two distinct grabs,
                 # skip a redundant second full OCR pass (200-700 ms).
                 cur_img = self.r.grab()
                 if (cur_img is not prev_img
-                        and _thumb_diff(prev_img, cur_img) < 0.8
+                        and (_content_pixel_still(prev_img, cur_img)
+                             or _thumb_diff(prev_img, cur_img) < 0.8)
                         and _box_diff(prev_img, cur_img, prev.x, prev.y, self.r.scale) < 2.0):
                     if hasattr(self.r, "set_last"):
                         self.r.set_last(cur_img, lines=prev_lines)
@@ -2303,10 +2394,12 @@ class Flow:
                 lines = self.r.read(img=cur_img)
                 if hasattr(self.r, "set_last"):
                     self.r.set_last(cur_img, lines=lines)
+                frames += 1
+                m = find_text(lines, label, where=where)
             else:
                 lines = self.lines()
-            frames += 1
-            m = find_text(lines, label, where=where)
+                frames += 1
+                m = find_text(lines, label, where=where)
             if m and (not stable or (prev and abs(m.x - prev.x) <= 3 and abs(m.y - prev.y) <= 3)):
                 self._wait_settled_ts = time.monotonic()
                 return m
@@ -2353,14 +2446,49 @@ class Flow:
         frames = 0
         last_ui = 0.0
         last_sauvola_id = None
+        settled_lines = None
+
+        if (self._wait_settled_ts >= self._last_action_ts
+                and getattr(self.r, "last_lines", None) is not None):
+            cached_lines = self._fresh_lines()
+            if cached_lines is not None:
+                for label, where in cands:
+                    m = find_text(cached_lines, label, where=where)
+                    if m:
+                        self._wait_settled_ts = time.monotonic()
+                        return m
+
+        if (self._last_action_ts
+                and (time.monotonic() - self._last_action_ts) < 0.7
+                and self._wait_settled_ts < self._last_action_ts
+                and self._last_reaction_diff >= 2.0
+                and getattr(self.r, "last_lines", None) is None
+                and self.r.last is not None):
+            rem_wait = max(0.0, end - time.time())
+            _, settled_img = self._settle_transition(max_wait=min(0.28, rem_wait), still=1.2)
+            if settled_img is not None:
+                settled_lines = self.r.read(img=settled_img)
+                if hasattr(self.r, "set_last"):
+                    self.r.set_last(settled_img, lines=settled_lines)
+                for label, where in cands:
+                    m = find_text(settled_lines, label, where=where)
+                    if m:
+                        self._wait_settled_ts = time.monotonic()
+                        return m
+
         while True:
-            lines = self.lines()
-            frames += 1
-            for label, where in cands:
-                m = find_text(lines, label, where=where)
-                if m:
-                    self._wait_settled_ts = time.monotonic()
-                    return m
+            if settled_lines is not None:
+                lines = settled_lines
+                settled_lines = None
+                frames += 1
+            else:
+                lines = self.lines()
+                frames += 1
+                for label, where in cands:
+                    m = find_text(lines, label, where=where)
+                    if m:
+                        self._wait_settled_ts = time.monotonic()
+                        return m
             now = time.time()
             if (frames >= 2 or now - start >= 0.4) and (last_ui == 0.0 or now - last_ui >= 0.8):
                 raw_ctl = self.controls(text=True)
@@ -2389,11 +2517,47 @@ class Flow:
         self._wait_active_app()
         label, where = split_where(label)
         end = time.time() + (timeout or self.timeout)
-        while True:
-            if not find_text(self.lines(), label, where=where):
+        prev_img = None
+        m = None
+        if (self._wait_settled_ts >= self._last_action_ts
+                and getattr(self.r, "last_lines", None) is not None):
+            cached_lines = self._fresh_lines()
+            if cached_lines is not None:
+                m = find_text(cached_lines, label, where=where)
+                if m is not None:
+                    prev_img = self.r.last
+        if prev_img is None:
+            lines = self.lines()
+            m = find_text(lines, label, where=where)
+            if not m:
+                self._wait_settled_ts = time.monotonic()
                 return True
-            if time.time() >= end:
-                break
+            prev_img = self.r.last
+        match_in_status = bool(
+            m is not None and prev_img is not None
+            and (m.y * self.r.scale) < int(prev_img.size[1] * 0.06)
+        )
+        while time.time() < end:
+            cur_img = self.r.grab()
+            if prev_img is not None and not match_in_status and _content_pixel_still(prev_img, cur_img):
+                if cur_img is not prev_img:
+                    if hasattr(self.r, "set_last"):
+                        self.r.set_last(cur_img, lines=getattr(self.r, "last_lines", None))
+                    else:
+                        self.r.last = cur_img
+                continue
+            lines = self.r.read(img=cur_img)
+            if hasattr(self.r, "set_last"):
+                self.r.set_last(cur_img, lines=lines)
+            m = find_text(lines, label, where=where)
+            if not m:
+                self._wait_settled_ts = time.monotonic()
+                return True
+            prev_img = cur_img
+            match_in_status = bool(
+                prev_img is not None
+                and (m.y * self.r.scale) < int(prev_img.size[1] * 0.06)
+            )
         raise FlowError(f"{label!r} still on screen")
 
     def settle(self, timeout=2.0, start=None, still=0.6):
@@ -2445,7 +2609,7 @@ class Flow:
         cur = self.r.grab()
         if cur is prev:
             return None, cur
-        if _thumb_diff(prev, cur) < still or _content_pixel_still(prev, cur):
+        if _content_pixel_still(prev, cur) or _thumb_diff(prev, cur) < still:
             if hasattr(self.r, "set_last"):
                 self.r.set_last(cur)
             else:
@@ -2456,7 +2620,7 @@ class Flow:
         prev = cur
         while time.monotonic() < end:
             cur = self.r.grab()
-            if cur is not prev and (_thumb_diff(prev, cur) < still or _content_pixel_still(prev, cur)):
+            if cur is not prev and (_content_pixel_still(prev, cur) or _thumb_diff(prev, cur) < still):
                 if hasattr(self.r, "set_last"):
                     self.r.set_last(cur)
                 else:
@@ -3922,6 +4086,7 @@ class Flow:
         populated_frames = 0
         lines, texts = [], []
         already_stable = False
+        stable = False
         pending_img = None
         if settled_by_wait:
             last_ts = getattr(self.r, "last_ts", 0.0)
@@ -3968,6 +4133,7 @@ class Flow:
                         self.r.set_last(cur_img, lines=lines)
                     else:
                         self.r.last = cur_img
+                    stable = True
                     break
                 lines = self.r.read(img=cur_img)
                 if hasattr(self.r, "set_last"):
@@ -4067,6 +4233,8 @@ class Flow:
                         continue
                 filtered_ui.append(c)
             ui_res = filtered_ui
+        if already_stable or stable:
+            self._wait_settled_ts = time.monotonic()
         return lines, ui_res
 
     def search(self, query):
