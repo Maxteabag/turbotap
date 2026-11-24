@@ -434,15 +434,17 @@ def _tesseract_tsv_raw(raw, w, h, api):
         lib.TessDeleteText(ptr)
 
 
-def tesseract_tsv(img, psm=11, api=None):
+def tesseract_tsv(img, psm=11, api=None, sauvola=False):
     """Tesseract TSV for an 8-bit grayscale PIL image (in-process when api is given)."""
     if api is not None:
         return _tesseract_tsv_raw(img.tobytes(), img.size[0], img.size[1], api)
     buf = io.BytesIO()
     img.save(buf, format="BMP")
-    return subprocess.check_output(
-        ["tesseract", "stdin", "stdout", "--oem", "1", "--psm", str(psm), "tsv"],
-        input=buf.getvalue(), stderr=subprocess.DEVNULL).decode()
+    cmd = ["tesseract", "stdin", "stdout", "--oem", "1", "--psm", str(psm)]
+    if sauvola:
+        cmd += ["-c", "thresholding_method=2", "-c", "thresholding_kfactor=0.15", "-c", "thresholding_window_size=0.80"]
+    cmd.append("tsv")
+    return subprocess.check_output(cmd, input=buf.getvalue(), stderr=subprocess.DEVNULL).decode()
 
 
 class Line:
@@ -827,10 +829,10 @@ class ScreenReader:
         cuts.append(h)
         return cuts
 
-    def _ocr(self, strip):
-        return self._ocr_raw(strip.tobytes(), strip.size[0], strip.size[1])
+    def _ocr(self, strip, sauvola=False):
+        return self._ocr_raw(strip.tobytes(), strip.size[0], strip.size[1], sauvola=sauvola)
 
-    def _ocr_raw(self, raw, w, h):
+    def _ocr_raw(self, raw, w, h, sauvola=False):
         sample = raw[::19]
         if sample:
             if max(sample) - min(sample) < 16:
@@ -841,12 +843,18 @@ class ScreenReader:
                 raw = raw.translate(_INVERT_LUT)
         lib = _tess_lib()
         if lib is None:
-            tsv = tesseract_tsv(Image.frombytes("L", (w, h), raw), self.psm)
+            tsv = tesseract_tsv(Image.frombytes("L", (w, h), raw), self.psm, sauvola=sauvola)
         else:
             api = self.apis.get()
             try:
+                if sauvola:
+                    lib.TessBaseAPISetVariable(api, b"thresholding_method", b"2")
+                    lib.TessBaseAPISetVariable(api, b"thresholding_kfactor", b"0.15")
+                    lib.TessBaseAPISetVariable(api, b"thresholding_window_size", b"0.80")
                 tsv = _tesseract_tsv_raw(raw, w, h, api)
             finally:
+                if sauvola:
+                    lib.TessBaseAPISetVariable(api, b"thresholding_method", b"0")
                 self.apis.put(api)
         lines = {}
         for row in tsv.splitlines():
@@ -856,8 +864,13 @@ class ScreenReader:
                 lines.setdefault((p[2], p[3], p[4]), []).append((p[11].strip(), x0, y0, x0 + ww, y0 + hh))
         return list(lines.values())
 
-    def read(self, y0=0, y1=None, img=None, **_ignored):
-        """[Line] for the screen (or band y0..y1 in points)."""
+    def read(self, y0=0, y1=None, img=None, sauvola=False, **_ignored):
+        """[Line] for the screen (or band y0..y1 in points).
+
+        sauvola=True uses Tesseract Sauvola binarization (k=0.15, win=0.80) under
+        a separate cache key prefix b'S' so targeted colored-button fallbacks
+        never collide with or slow down default Otsu OCR.
+        """
         full = (y0 == 0 and y1 is None)
         fresh_grab = img is None
         img = img if img is not None else self.grab(y0, y1)
@@ -867,7 +880,8 @@ class ScreenReader:
         cuts = self._cuts(img, data=data)
         jobs = []
         for a, b in zip(cuts, cuts[1:]):
-            k = hashlib.blake2b(mv[a * w:b * w], digest_size=16).digest()
+            digest = hashlib.blake2b(mv[a * w:b * w], digest_size=16).digest()
+            k = (b"S" + digest) if sauvola else digest
             jobs.append((a, b, k))
         if len(self.cache) > 512:
             self.cache.clear()  # before `todo`, or strips counted as cached vanish (KeyError)
@@ -879,9 +893,12 @@ class ScreenReader:
             items = list(uniq.items())
             if len(items) == 1:
                 k, (raw, sh) = items[0]
-                self.cache[k] = self._ocr_raw(raw, w, sh)
+                self.cache[k] = self._ocr_raw(raw, w, sh, sauvola=sauvola)
             else:
-                for (k, _), res in zip(items, self.pool.map(lambda it: self._ocr_raw(it[1][0], w, it[1][1]), items)):
+                for (k, _), res in zip(
+                    items,
+                    self.pool.map(lambda it: self._ocr_raw(it[1][0], w, it[1][1], sauvola=sauvola), items),
+                ):
                     self.cache[k] = res
         s = self.scale
         out = []
@@ -890,12 +907,17 @@ class ScreenReader:
                 out.append(Line([(t, x0 / s, (ya + a) / s + y0, x1 / s, (yb + a) / s + y0)
                                  for t, x0, ya, x1, yb in words]))
         out.sort(key=lambda l: (l.y0, l.x0))
-        if full:
-            self.last = img
-            self.last_lines = out
-            if fresh_grab:
-                self.last_ts = time.monotonic()
-        else:
+        if not sauvola:
+            if full:
+                self.last = img
+                self.last_lines = out
+                if fresh_grab:
+                    self.last_ts = time.monotonic()
+            else:
+                self.last = img
+                self.last_lines = None
+                self.last_ts = 0.0
+        elif fresh_grab:
             self.last = img
             self.last_lines = None
             self.last_ts = 0.0
@@ -982,6 +1004,15 @@ SOURCE_LITE = (
     "frame,nativeFrame,focused,traits,placeholderValue,minValue,maxValue"
 )
 _CHEVRON_LABELS = {"chevron", "chevron.right", "chevron.forward"}
+_DEV_CELL_RE = re.compile(r"[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*|\[id=", re.I)
+_TEXT_DEDUPE_TYPES = ("Button", "Tab", "Cell", "Link", "Key")
+
+
+def _is_internal_cell(t, lab):
+    """True for unlabelled Cell nodes exposing internal developer accessibility IDs
+    (e.g. 'podcasts.shelf.header[id=0,...]' or 'com.app.foo.bar_cell'). Only
+    applied to Cell so URLs/emails in Link/TextField/Text are never dropped."""
+    return t == "Cell" and " " not in lab and bool(_DEV_CELL_RE.search(lab))
 
 
 def _parse_ui_controls(root, screen=(430, 932), text=False):
@@ -1027,7 +1058,7 @@ def _parse_ui_controls(root, screen=(430, 932), text=False):
             )
             key = (lab, x // 4, y // 4)
             # Strict bounds skip edge-clamped overlays at y == 0 or y == screen[1].
-            if 0 < x < screen[0] and 0 < y < screen[1] and not is_internal_img:
+            if 0 < x < screen[0] and 0 < y < screen[1] and not is_internal_img and not _is_internal_cell(t, lab):
                 item = {"type": t, "label": lab, "x": x, "y": y}
                 val = n.get("value")
                 if t in ("Switch", "Slider", "TextField", "SearchField") and val not in (None, ""):
@@ -1094,7 +1125,7 @@ def _parse_fast_ui(data, screen=(430, 932)):
             t == "Image" and " " not in lab
             and bool(re.search(r"[._-]", lab) or re.search(r"[a-z][A-Z]", lab))
         )
-        if not (0 < x < eff_screen[0] and 0 < y < eff_screen[1]) or is_internal_img:
+        if not (0 < x < eff_screen[0] and 0 < y < eff_screen[1]) or is_internal_img or _is_internal_cell(t, lab):
             continue
         item = {"type": t, "label": lab, "x": x, "y": y}
         val = raw.get("value")
@@ -1235,7 +1266,10 @@ FLOW_HELP = """steps (one argument each, run in order):
                         devicectl cache (~1 ms; refreshed once on an unknown name)
   launch:APP            terminate + activate (fresh start)
   wait:TEXT             poll until TEXT is on screen (OCR-first, falls back to
-                        UI controls for colored/icon labels; 're:REGEX' for regex)
+                        UI controls + Sauvola OCR for colored/icon labels; 're:REGEX' for regex)
+  waitany:A|B|C         poll until ANY '|'-separated target appears (OCR-first, then
+                        UI controls + Sauvola fallback; per-target @region supported);
+                        returns the matched text
   gone:TEXT             poll until TEXT is no longer on screen
   tap:TEXT              wait until TEXT is on screen at the same spot twice, tap its
                         centre, and re-tap once if the screen did not react; text
@@ -1243,7 +1277,10 @@ FLOW_HELP = """steps (one argument each, run in order):
                         A Button labelled exactly TEXT beats a longer OCR line that
                         only contains it; a switch row's label taps the toggle;
                         Next/Previous prefer the form button over the keyboard bar
-  TEXT@below:HEADER     (tap/wait/scrollto) only match under HEADER, e.g.
+  tapif:TEXT            optional tap (~1 s max): tap TEXT (OCR + exact UI control
+                        fallback, respects --deny and @region) or return 'skipped'
+                        cleanly without failing the flow
+  TEXT@below:HEADER     (tap/tapif/wait/waitany/scrollto) only match under HEADER, e.g.
   TEXT@above:T TEXT@y>N   tap:Alice@below:Chats skips the stories carousel
   search:QUERY          tap the app's search field/Search button, type QUERY, settle
   readel:TEXT           labels of controls containing TEXT (accessibility tree)
@@ -1392,11 +1429,21 @@ class Flow:
             return self.r.read(img=self.r.last)
         return None
 
+    def _read_sauvola(self, img):
+        """Targeted Sauvola OCR pass on an already-grabbed frame (returns None
+        for test doubles whose read() does not accept sauvola=True)."""
+        if img is None:
+            return None
+        try:
+            return self.r.read(img=img, sauvola=True)
+        except TypeError:
+            return None
+
     def wait(self, label, timeout=None, stable=False, initial=None):
         """Poll until label is visible (and, if stable, at the same spot twice).
         label may carry a region: 'Alice@below:Chats', 'Alice@y>300'.
         OCR-first for zero /source overhead on the fast path; falls back to the
-        accessibility tree if OCR misses colored/low-contrast/icon controls."""
+        accessibility tree, then targeted Sauvola OCR if both miss colored/WebView buttons."""
         self._wait_active_app()
         label, where = split_where(label)
         start = time.time()
@@ -1404,6 +1451,7 @@ class Flow:
         prev = initial
         frames = 0
         last_ui = 0.0
+        last_sauvola_id = None
         while True:
             lines = self.lines()
             frames += 1
@@ -1420,9 +1468,64 @@ class Flow:
                 if cm:
                     self._wait_settled_ts = time.monotonic()
                     return cm
+                cur_img = self.r.last
+                if cur_img is not None and id(cur_img) != last_sauvola_id:
+                    last_sauvola_id = id(cur_img)
+                    slines = self._read_sauvola(cur_img)
+                    if slines:
+                        sm = find_text(slines, label, where=where)
+                        if sm:
+                            self._wait_settled_ts = time.monotonic()
+                            return sm
             if time.time() >= end:
                 break
         raise FlowError(f"{label!r}{'@' + where if where else ''} not on screen after {timeout or self.timeout:.0f} s")
+
+    def wait_any(self, spec, timeout=None):
+        """Poll until ANY '|'-separated candidate appears (per-candidate @region
+        supported). OCR-first, then accessibility controls after 2 frames / 0.4 s,
+        then targeted Sauvola OCR if both miss. Returns the winning Match."""
+        self._wait_active_app()
+        parts = [p.replace(r"\|", "|").strip() for p in re.split(r"(?<!\\)\|", spec) if p.strip()]
+        if not parts:
+            raise FlowError("waitany requires at least one candidate (e.g. waitany:A|B)")
+        cands = [split_where(p) for p in parts]
+        start = time.time()
+        end = start + (timeout or self.timeout)
+        frames = 0
+        last_ui = 0.0
+        last_sauvola_id = None
+        while True:
+            lines = self.lines()
+            frames += 1
+            for label, where in cands:
+                m = find_text(lines, label, where=where)
+                if m:
+                    self._wait_settled_ts = time.monotonic()
+                    return m
+            now = time.time()
+            if (frames >= 2 or now - start >= 0.4) and (last_ui == 0.0 or now - last_ui >= 0.8):
+                raw_ctl = self.controls(text=True)
+                last_ui = time.time()
+                for label, where in cands:
+                    ctl = _controls_in_region(raw_ctl, lines, where)
+                    cm = find_control_match(ctl, label, types=WAIT_UI_TYPES)
+                    if cm:
+                        self._wait_settled_ts = time.monotonic()
+                        return cm
+                cur_img = self.r.last
+                if cur_img is not None and id(cur_img) != last_sauvola_id:
+                    last_sauvola_id = id(cur_img)
+                    slines = self._read_sauvola(cur_img)
+                    if slines:
+                        for label, where in cands:
+                            sm = find_text(slines, label, where=where)
+                            if sm:
+                                self._wait_settled_ts = time.monotonic()
+                                return sm
+            if time.time() >= end:
+                break
+        raise FlowError(f"none of {spec!r} on screen after {timeout or self.timeout:.0f} s")
 
     def gone(self, label, timeout=None):
         self._wait_active_app()
@@ -1579,10 +1682,16 @@ class Flow:
         except FlowError:
             # Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct messages)
             # have no visible text for OCR: one /source lookup with coordinates, then
-            # the slower element-predicate poll.
+            # targeted Sauvola fallback, then the slower element-predicate poll.
             c = None if where else find_control(self.controls(), base)
             if c:
                 return self.tap_control(c)
+            slines = self._read_sauvola(self.r.last)
+            if slines:
+                sm = find_text(slines, base, where=where)
+                if sm:
+                    self.tap_point(sm.x, sm.y, sm.text)
+                    return sm
             x, y = self.tap_el(base, timeout=max(2.0, self.timeout - 2.2))
             return Match(x, y, f"[el:{label}]", None)
         _, h = self.r.pt_size()
@@ -1638,6 +1747,96 @@ class Flow:
             if _thumb_diff(self._ctl_cache[3], self.r.last) >= _CTL_CACHE_MAX_DIFF:
                 self._invalidate_ctl_cache()
         return m
+
+    def _tap_if_ocr_match(self, m, base, where, lines):
+        """Tap an OCR match found by tap_if, preferring an exact control on
+        substring/bottom-tab/form-label hits and respecting --deny."""
+        _, h = self.r.pt_size()
+        near_bottom_tab = m.line is not None and m.y > h - 55
+        is_form_label = base.rstrip().endswith(":")
+        if m.line is not None and (m.rank or near_bottom_tab or is_form_label):
+            ctl = _controls_in_region(self.controls(), lines, where)
+            c = exact_control(ctl, base, TAP_FORM_TYPES) if (m.rank or is_form_label) else None
+            if not c and is_form_label:
+                c = self.input_near(base, m, controls=ctl)
+            if not c and near_bottom_tab:
+                c = exact_control(ctl, base, ("Tab", "Button"))
+                if not c:
+                    near = [x for x in ctl if x["type"] in ("Tab", "Button")
+                            and abs(x["y"] - m.y) <= 35 and abs(x["x"] - m.x) <= 60]
+                    c = find_control(near, base, types={"Tab", "Button"})
+            if c:
+                return self.tap_control(c).text
+        self.tap_point(m.x, m.y, m.text)
+        return m.text
+
+    def tap_if(self, label, timeout=1.0):
+        """Optional tap with a short bounded timeout (~1.0 s max, never 8 s).
+        Checks OCR + exact accessibility control fallback (+ targeted Sauvola
+        if both miss), supporting @region filters and enforcing --deny. Returns
+        the matched text/control if tapped, or 'skipped' if not present."""
+        self._wait_active_app()
+        base, where = split_where(label)
+        low_base = base.casefold()
+        eff_timeout = min(timeout, self.timeout)
+        start = time.time()
+        end = start + eff_timeout
+        ext_types = TAP_FORM_TYPES + ("Image", "Slider", "Value")
+        checked_ui = False
+        last_sauvola_id = None
+        prev_texts = None
+        prev_img = None
+        frames = 0
+        while True:
+            t_frame = time.monotonic()
+            if frames == 0:
+                lines = self._fresh_lines()
+                if lines is None:
+                    lines = self.lines()
+            else:
+                lines = self.lines()
+            frames += 1
+            cur_img = self.r.last
+            m = find_text(lines, base, where=where)
+            if m:
+                return self._tap_if_ocr_match(m, base, where, lines)
+            if not checked_ui:
+                checked_ui = True
+                ctl = _controls_in_region(self.controls(), lines, where)
+                if base.startswith("re:"):
+                    cm = find_control_match(ctl, base, types=set(ext_types))
+                    if cm:
+                        self.tap_point(cm.x, cm.y, cm.text)
+                        return cm.text
+                else:
+                    c = exact_control(ctl, base, ext_types)
+                    if not c and low_base in BACK_LABELS:
+                        for alt in BACK_LABELS:
+                            c = exact_control(ctl, alt, ("Button", "Link"))
+                            if c:
+                                break
+                    if c:
+                        return self.tap_control(c).text
+                if cur_img is not None and id(cur_img) != last_sauvola_id:
+                    last_sauvola_id = id(cur_img)
+                    slines = self._read_sauvola(cur_img)
+                    if slines:
+                        sm = find_text(slines, base, where=where)
+                        if sm:
+                            self.tap_point(sm.x, sm.y, sm.text)
+                            return sm.text
+            cur_texts = [l.text for l in lines]
+            in_transition = bool(self._last_action_ts) and (time.monotonic() - self._last_action_ts) < 0.5
+            if prev_texts is not None and not in_transition and cur_texts == prev_texts:
+                img_still = (prev_img is None or cur_img is None or _thumb_diff(prev_img, cur_img) < 0.8)
+                if img_still:
+                    return "skipped"
+            prev_texts = cur_texts
+            prev_img = cur_img
+            if time.time() >= end:
+                return "skipped"
+            if (time.monotonic() - t_frame) < 0.02:
+                time.sleep(min(0.05, max(0.0, end - time.time())))
 
     def tap_control(self, c):
         self.tap_point(c["x"], c["y"], c["label"])
@@ -1861,8 +2060,26 @@ class Flow:
             ui_res = None
         if ui_res:
             # StaticText only where OCR missed it (white text on photos, huge
-            # digits, odd fonts): Weather's city and current temperature.
-            ui_res = [c for c in ui_res if c["type"] != "Text" or not find_text(lines, c["label"][:40])]
+            # digits, odd fonts: Weather's city and current temperature) and where
+            # no co-located interactive control already carries the same text.
+            anchors = [
+                (c["x"], c["y"], _norm(c["label"]))
+                for c in ui_res
+                if c["type"] in _TEXT_DEDUPE_TYPES
+            ]
+            filtered_ui = []
+            for c in ui_res:
+                if c["type"] == "Text":
+                    if find_text(lines, c["label"][:40]):
+                        continue
+                    tn = _norm(c["label"])
+                    if tn and any(
+                        abs(c["x"] - cx) <= 12 and abs(c["y"] - cy) <= 12 and tn in clab
+                        for cx, cy, clab in anchors
+                    ):
+                        continue
+                filtered_ui.append(c)
+            ui_res = filtered_ui
         return lines, ui_res
 
     def search(self, query):
@@ -1951,10 +2168,14 @@ class Flow:
             return arg
         elif verb in ("wait", "expect"):
             return self.wait(arg).text
+        elif verb == "waitany":
+            return self.wait_any(arg).text
         elif verb == "gone":
             self.gone(arg)
         elif verb == "tap":
             return self.tap_text(arg).text
+        elif verb == "tapif":
+            return self.tap_if(arg)
         elif verb == "tapel":
             return self.tap_el(arg)
         elif verb == "tapxy":
