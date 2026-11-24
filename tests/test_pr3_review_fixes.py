@@ -270,6 +270,132 @@ class PR3ReviewFixesTests(unittest.TestCase):
         finally:
             flow.close()
 
+    # Re-review 1: tap_if never dispatches a tap if a slow probe returns past deadline
+    def test_tapif_late_response_past_deadline_sends_zero_taps(self):
+        img = solid_img(220, size=(430, 932))
+        seen_timeouts = []
+
+        def slow_fast_ui(qs):
+            time.sleep(0.25)
+            return {
+                "bundleId": "com.test.app",
+                "appName": "Test",
+                "screen": [430, 932],
+                "ui": [{"type": "Button", "label": "Allow", "x": 200, "y": 500}],
+            }
+
+        c = MockWDAClient(fast_ui=slow_fast_ui)
+        orig_req = c.req
+
+        def tracking_req(method, path, data=None, timeout=30):
+            if path.startswith("/wda/fastUI"):
+                seen_timeouts.append(timeout)
+            return orig_req(method, path, data, timeout=timeout)
+
+        c.req = tracking_req
+        r = FakeReader(frames=[(img, [])])
+        flow = cli.Flow(c, reader=r)
+        try:
+            res = flow.tap_if("Allow", timeout=0.15)
+            self.assertEqual(res, "skipped")
+            post_calls = [(m, p) for m, p, _ in c.calls if m == "POST"]
+            self.assertEqual(post_calls, [])
+            self.assertTrue(seen_timeouts)
+            self.assertLessEqual(seen_timeouts[0], 0.2)
+        finally:
+            flow.close()
+
+    # Re-review 2: delayed outgoing-app UI reply crossing the 3s age window is still rejected
+    def test_controls_and_read_full_reject_delayed_reply_crossing_3s_window(self):
+        img = solid_img(220, size=(430, 932))
+        lines = [make_line("Target Content", 120, 260, 280, 285)]
+
+        def delayed_wrong_ui(qs):
+            time.sleep(0.25)
+            return {
+                "bundleId": "com.apple.oldapp",
+                "appName": "OldApp",
+                "screen": [430, 932],
+                "ui": [{"type": "Button", "label": "StaleBtn", "x": 50, "y": 100}],
+            }
+
+        c = MockWDAClient(active_app="com.apple.target", fast_ui=delayed_wrong_ui)
+        r = FakeReader(frames=[(img, lines), (img, lines)])
+        flow = cli.Flow(c, reader=r)
+        try:
+            # Request starts at t=2.90s after open: (inside 3s window); reply arrives at ~3.15s.
+            flow.bundle = "com.apple.target"
+            flow._pending_bundle = None
+            flow._pending_bundle_ts = time.monotonic() - 2.90
+            flow._switched_from_app_name = "OldApp"
+            flow._switched_at = time.monotonic() - 2.90
+            with mock.patch.object(cli, "_STALE_UI_BACKOFF", ()):
+                with self.assertRaises(cli.FlowError):
+                    flow.controls()
+                self.assertIsNone(flow._ctl_cache)
+                # Reset to 2.90s and verify read_full also rejects + does not cache.
+                flow._pending_bundle = None
+                flow._pending_bundle_ts = time.monotonic() - 2.90
+                flow._switched_at = time.monotonic() - 2.90
+                _, ui_res = flow.read_full(ui=True, timeout=0.5)
+                self.assertIsNone(ui_res)
+                self.assertIsNone(flow._ctl_cache)
+        finally:
+            flow.close()
+
+    # Re-review 3: read_full catches tiny local counter update ('1' -> '2') on a still background
+    def test_read_full_detects_small_counter_update_on_still_background(self):
+        from PIL import ImageDraw
+
+        img1 = solid_img(240, size=(430, 932))
+        img2 = solid_img(240, size=(430, 932))
+        ImageDraw.Draw(img1).text((200, 450), "1", fill=20)
+        ImageDraw.Draw(img2).text((200, 450), "2", fill=20)
+        # Confirm whole-screen _thumb_diff would have been fooled (< 0.8), while
+        # _content_pixel_still detects the local counter change cleanly.
+        self.assertLess(cli._thumb_diff(img1, img2), 0.1)
+        self.assertFalse(cli._content_pixel_still(img1, img2))
+
+        l1 = [make_line("1", 198, 448, 212, 468)]
+        l2 = [make_line("2", 198, 448, 212, 468)]
+        c = MockWDAClient()
+        r = FakeReader(frames=[(img1, l1), (img2, l2), (img2, l2)])
+        flow = cli.Flow(c, reader=r)
+        try:
+            lines, ui_res = flow.read_full(ui=False, timeout=1.0)
+            self.assertIsNone(ui_res)
+            self.assertEqual([l.text for l in lines], ["2"])
+        finally:
+            flow.close()
+
+    # Re-review 4: coordinate zoom:@X,Y fails honestly on older WDA without sending centered pinch
+    def test_zoom_explicit_coords_errors_without_centered_fallback_on_404(self):
+        def pinch_404(method, path, data):
+            if path == "/wda/fastPinch":
+                return {"error": 404, "body": "unknown route"}
+            if path.endswith("/wda/pinch"):
+                return {"value": None}
+            return None
+
+        c = MockWDAClient(custom_handler=pinch_404)
+        img = solid_img(220, size=(430, 932))
+        r = FakeReader(frames=[(img, []), (img, [])])
+        flow = cli.Flow(c, reader=r)
+        try:
+            with self.assertRaises(cli.FlowError) as ctx:
+                flow.step("zoom:in@20,30")
+            self.assertIn("fastPinch", str(ctx.exception))
+            stock_pinches = [p for _, p, _ in c.calls if p.endswith("/wda/pinch")]
+            self.assertEqual(stock_pinches, [])
+
+            # Centered zoom:in (no @X,Y) still keeps the stock /wda/pinch fallback.
+            res = flow.step("zoom:in")
+            self.assertEqual(res, "2x@215,466")
+            stock_pinches = [p for _, p, _ in c.calls if p.endswith("/wda/pinch")]
+            self.assertEqual(len(stock_pinches), 1)
+        finally:
+            flow.close()
+
 
 if __name__ == "__main__":
     unittest.main()
