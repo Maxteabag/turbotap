@@ -129,6 +129,54 @@ Formatted iOS text fields (phone numbers, OTPs, IDs) tend to drop characters whe
 
 [skills/turbotap-retro/SKILL.md](skills/turbotap-retro/SKILL.md) is an optional companion: after each non-trivial task the agent reviews what slowed it down and fixes it once in `turbotap` itself, using generic primitives only.
 
+## FAQ
+
+### Where does the iPhone passcode live, and does Claude ever see it?
+
+It stays on your machine and never enters the model's context. When `turbotap unlock` (or the `unlock` step in a flow) runs, the Python process runs your `passcode_cmd` itself, taps the digits on the phone over your local Wi-Fi, and prints `{"ok": true, "unlocked_now": true, "locked": false}`. The agent only ever sees that result, not the digits, and error messages never include them either.
+
+`passcode_cmd` is whatever command prints your passcode, so you can use the secret store you already have. On macOS the Keychain works well and nothing gets written to disk:
+
+```bash
+# store it once (prompts for the passcode)
+security add-generic-password -a "$USER" -s turbotap-passcode -w
+```
+
+```json
+"passcode_cmd": "security find-generic-password -w -s turbotap-passcode"
+```
+
+Other options:
+
+- Bitwarden: `"bw get password iphone-passcode"` or `"rbw get iphone-passcode"`
+- 1Password: `"op read op://Private/iPhone/passcode"`
+- pass: `"pass show iphone/passcode"`
+- `WDA_PASSCODE_CMD` in the environment overrides the config value, and `WDA_PASSCODE` holds the passcode itself (simple, but it then sits in your environment)
+
+The command runs without a shell, so wrap it in `sh -c '...'` if you need a pipe.
+
+App PINs work the same way. `pintap:cmd:"security find-generic-password -w -s bank-pin"` or `pintap:env:APP_PIN` fetches the PIN locally and the step reports only `tapped 4 digits`. `type:`, `cleartype:` and `typedigits:` take `env:` (and `type:`/`cleartype:` also `cmd:`) for the same reason. Avoid writing the digits straight into a step like `pintap:1234`, since the agent then has them.
+
+### How does it read the screen, accessibility tree or screenshots?
+
+Both. `read` grabs a cropped, downscaled screenshot from the phone and OCRs it locally with `libtesseract`, split into strips that run in parallel in one process (180-250ms). OCR sees everything that's drawn, including web views and apps with poor accessibility labels. It also pulls a trimmed accessibility tree (`/source` with `excluded_attributes=visible,accessible,enabled,index`, 300-700ms) to catch what OCR misses: icon-only buttons, unlabeled controls, switch states and exact field values. The agent gets the merged result as JSON text and tap targets, not images.
+
+`read:ocr` skips the tree when you only need text, and `ui` or `readel:TEXT` give you just the tree.
+
+### Can it unlock the phone? Does it have to stay awake?
+
+Yes, `turbotap unlock` or the `unlock` step in a flow. It does nothing if the phone is already unlocked. It finds the keypad keys by their `XCUIElementTypeKey` names instead of screen coordinates, so it works on any iPhone screen size.
+
+The phone can auto-lock and sleep between tasks. WebDriverAgent keeps running, and when iOS has put Wi-Fi to sleep `turbotap` sends one ping to wake it before giving up, so start a task with `unlock` and carry on.
+
+### Do I need a Mac, or does it talk to the iPhone directly?
+
+Both, sort of. `turbotap` talks straight to WebDriverAgent on the iPhone over HTTP on your Wi-Fi, and none of your commands go through the Mac. But Apple only lets Xcode sign and launch WebDriverAgent, so you need a Mac once to install it, and the runner lives in an `xcodebuild` session on that Mac. Leave the Mac on and on the same network, and keep it reachable over SSH so `turbotap deploy --no-build` can restart the runner after the phone reboots. The machine running `turbotap` can be that Mac or any Linux box on the same network.
+
+### Why a real iPhone and not the Simulator?
+
+The Simulator can't install App Store apps or use your real accounts, and it skips the things that break real tasks: permission prompts, push notifications, the real lock screen, and real-device speed. Driving the actual phone covers all of it.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -232,7 +232,7 @@ class WDAClient:
             v = el.get("value")
             eid = v.get("ELEMENT") if isinstance(v, dict) else None
             if not eid:
-                raise RuntimeError(f"Passcode keypad key {d!r} not found")
+                raise RuntimeError("Passcode keypad not found on screen")  # never echo passcode digits
             self.req("POST", f"/session/{self.sid}/element/{eid}/click", {})
             time.sleep(0.1)
         time.sleep(0.8)
@@ -1211,7 +1211,7 @@ class Flow:
                 coords[d] = (x + w // 2, y + h // 2)
             missing = [d for d in digits if d not in coords]
             if missing:
-                raise FlowError(f"pintap missing key rects for digits: {''.join(sorted(set(missing)))}")
+                raise FlowError(f"pintap found no key rects for {len(set(missing))} of the PIN's digits")  # never echo PIN digits
             for d in digits:
                 self.c.fast_tap(*coords[d])
                 time.sleep(0.25)
