@@ -103,12 +103,12 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 | Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
 | Session startup | ~88ms (uncached) | ~14ms | Caches fast settings & screen size per device |
-| Tap | 740-1200ms | ~320ms | Skips waiting for background animations |
-| Grab frame | 123-244ms | 41-62ms | Crops and shrinks the image on the phone first |
-| Read screen (OCR) | ~1470ms | 180-250ms | Parallel LSTM OCR + dark-strip pre-invert + caching (~50-65ms cached) |
-| Scroll | ~2000ms | 150-370ms | Clean drag stop with no fling momentum |
-| UI tree | ~2600ms | 250-450ms | Trimmed `excluded_attributes` + client-side pruning |
-| Multi-step flow | 14.4-15.7s | 3.8-6.5s | Single process, persistent connection |
+| Tap | 740-1200ms | ~260ms | Instant-wake `CFRunLoopStop` touch synthesis (`0.02s`) |
+| Grab frame | 123-244ms | ~34ms | On-device ImageIO thumbnail + raw binary JPEG |
+| Read screen (OCR) | ~1470ms | 100-180ms | Parallel LSTM OCR + dark-strip pre-invert + caching (~50ms cached) |
+| Scroll | ~2000ms | 150-350ms | Clean drag stop with no fling momentum |
+| UI tree | ~2600ms | 158-198ms | On-device `/wda/fastUI` (falls back to trimmed `/source` ~297ms) |
+| Multi-step flow | 14.4-15.7s | 1.2-6.4s | Single process, persistent connection, safe keypad/tab cache |
 
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) explains each trick behind these numbers: session caching, strip-parallel OCR, zero-momentum drag, trimmed UI trees, app-switch freshness, and iOS quirks.
 
