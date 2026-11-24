@@ -1676,8 +1676,8 @@ class Flow:
                     if c:
                         break
             if c:
-                before = self.r.last
                 just_opened = bool(self._pending_bundle_ts and (time.monotonic() - self._pending_bundle_ts) < 1.5)
+                before = self.r.grab() if just_opened else None
                 m_ctl = self.tap_control(c)
                 if just_opened and before is not None and not self.changed_since(before, x=c["x"], y=c["y"]):
                     m_ctl = self.tap_control(c)
@@ -1727,7 +1727,10 @@ class Flow:
                     c = find_control(near, base, types={"Tab", "Button"})
             if c:
                 return self.tap_control(c)
-        before = self.r.last
+        # When m came from wait()'s accessibility fallback (m.line is None), self.r.last
+        # was captured before /source finished (often a splash or outgoing screen): take
+        # a fresh pre-tap baseline so changed_since() measures the tap, not the launch.
+        before = self.r.grab() if m.line is None else self.r.last
         self.tap_point(m.x, m.y, m.text)
         if not self.changed_since(before, x=m.x, y=m.y):
             # Tapping a switch row's label does nothing: tap the toggle itself, unless
