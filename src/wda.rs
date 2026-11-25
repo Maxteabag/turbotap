@@ -38,12 +38,23 @@ pub struct HttpResponse {
 pub struct Conn {
     pub host: String,
     pub port: u16,
+    host_hdr: String,
     reader: Option<BufReader<TcpStream>>,
+    req_buf: Vec<u8>,
+    line_buf: Vec<u8>,
 }
 
 impl Conn {
     pub fn new(host: &str, port: u16) -> Conn {
-        Conn { host: host.to_string(), port, reader: None }
+        let host_hdr = if port == 80 { host.to_string() } else { format!("{host}:{port}") };
+        Conn {
+            host: host.to_string(),
+            port,
+            host_hdr,
+            reader: None,
+            req_buf: Vec::with_capacity(512),
+            line_buf: Vec::with_capacity(256),
+        }
     }
 
     pub fn is_connected(&self) -> bool {
@@ -100,32 +111,59 @@ impl Conn {
         body: Option<&[u8]>,
         headers: &[(String, String)],
     ) -> std::io::Result<HttpResponse> {
-        let host_hdr = if self.port == 80 { self.host.clone() } else { format!("{}:{}", self.host, self.port) };
+        if headers.is_empty() {
+            return self.request_inner(method, path, body, &[], true);
+        }
+        let slices: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        self.request_inner(method, path, body, &slices, true)
+    }
+
+    fn request_inner(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+        collect_headers: bool,
+    ) -> std::io::Result<HttpResponse> {
         let r = self
             .reader
             .as_mut()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected"))?;
-        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept-Encoding: identity\r\n");
+        self.req_buf.clear();
+        self.req_buf.extend_from_slice(method.as_bytes());
+        self.req_buf.push(b' ');
+        self.req_buf.extend_from_slice(path.as_bytes());
+        self.req_buf.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+        self.req_buf.extend_from_slice(self.host_hdr.as_bytes());
+        self.req_buf.extend_from_slice(b"\r\nAccept-Encoding: identity\r\n");
         if let Some(b) = body {
-            head.push_str(&format!("Content-Length: {}\r\n", b.len()));
-        } else if ["POST", "PUT", "PATCH"].iter().any(|m| method.eq_ignore_ascii_case(m)) {
+            self.req_buf.extend_from_slice(b"Content-Length: ");
+            push_usize_bytes(&mut self.req_buf, b.len());
+            self.req_buf.extend_from_slice(b"\r\n");
+        } else if method.eq_ignore_ascii_case("POST")
+            || method.eq_ignore_ascii_case("PUT")
+            || method.eq_ignore_ascii_case("PATCH")
+        {
             // http.client sends an explicit zero length for body-carrying methods.
-            head.push_str("Content-Length: 0\r\n");
+            self.req_buf.extend_from_slice(b"Content-Length: 0\r\n");
         }
         for (k, v) in headers {
-            head.push_str(k);
-            head.push_str(": ");
-            head.push_str(v);
-            head.push_str("\r\n");
+            self.req_buf.extend_from_slice(k.as_bytes());
+            self.req_buf.extend_from_slice(b": ");
+            self.req_buf.extend_from_slice(v.as_bytes());
+            self.req_buf.extend_from_slice(b"\r\n");
         }
-        head.push_str("\r\n");
-        let mut msg = head.into_bytes();
-        if let Some(b) = body {
-            msg.extend_from_slice(b);
+        self.req_buf.extend_from_slice(b"\r\n");
+        match body {
+            None => r.get_mut().write_all(&self.req_buf)?,
+            Some(b) if b.len() <= 16_384 => {
+                self.req_buf.extend_from_slice(b);
+                r.get_mut().write_all(&self.req_buf)?;
+            }
+            Some(b) => write_all_pair(r.get_mut(), &self.req_buf, b)?,
         }
-        r.get_mut().write_all(&msg)?;
-        let resp = read_response(r, method)?;
-        let close = resp.headers.get("connection").map(|v| v.eq_ignore_ascii_case("close")).unwrap_or(false);
+        let (resp, close) = read_response_into(r, method, &mut self.line_buf, collect_headers)?;
         if close {
             self.reader = None;
         }
@@ -133,48 +171,197 @@ impl Conn {
     }
 }
 
+#[inline]
+fn push_usize_bytes(buf: &mut Vec<u8>, mut n: usize) {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+fn write_all_pair(w: &mut TcpStream, a: &[u8], b: &[u8]) -> std::io::Result<()> {
+    let mut a_off = 0;
+    let mut b_off = 0;
+    while a_off < a.len() || b_off < b.len() {
+        let slices = [std::io::IoSlice::new(&a[a_off..]), std::io::IoSlice::new(&b[b_off..])];
+        let written = match w.write_vectored(&slices) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write request")),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let a_rem = a.len() - a_off;
+        if written < a_rem {
+            a_off += written;
+        } else {
+            a_off = a.len();
+            b_off += written - a_rem;
+        }
+    }
+    Ok(())
+}
+
 fn bad(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
 }
 
-fn read_line(r: &mut BufReader<TcpStream>) -> std::io::Result<String> {
-    let mut line = Vec::new();
-    let n = r.read_until(b'\n', &mut line)?;
+#[inline]
+fn trim_ascii_bytes(mut b: &[u8]) -> &[u8] {
+    while let Some(&first) = b.first() {
+        if first.is_ascii_whitespace() {
+            b = &b[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&last) = b.last() {
+        if last.is_ascii_whitespace() {
+            b = &b[..b.len() - 1];
+        } else {
+            break;
+        }
+    }
+    b
+}
+
+#[inline]
+fn parse_u16_ascii(b: &[u8]) -> Option<u16> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut v: u16 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((c - b'0') as u16)?;
+    }
+    Some(v)
+}
+
+#[inline]
+fn parse_usize_ascii(b: &[u8]) -> Option<usize> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut v: usize = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((c - b'0') as usize)?;
+    }
+    Some(v)
+}
+
+#[inline]
+fn parse_hex_usize(b: &[u8]) -> Option<usize> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut v: usize = 0;
+    for &c in b {
+        let d = match c {
+            b'0'..=b'9' => (c - b'0') as usize,
+            b'a'..=b'f' => (c - b'a' + 10) as usize,
+            b'A'..=b'F' => (c - b'A' + 10) as usize,
+            _ => return None,
+        };
+        v = v.checked_mul(16)?.checked_add(d)?;
+    }
+    Some(v)
+}
+
+#[inline]
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn read_line_into<'a>(r: &mut BufReader<TcpStream>, buf: &'a mut Vec<u8>) -> std::io::Result<&'a [u8]> {
+    buf.clear();
+    let n = r.read_until(b'\n', buf)?;
     if n == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Remote end closed connection without response",
         ));
     }
-    while matches!(line.last(), Some(b'\n' | b'\r')) {
-        line.pop();
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
     }
-    Ok(String::from_utf8_lossy(&line).into_owned())
+    Ok(buf.as_slice())
 }
 
-fn read_response(r: &mut BufReader<TcpStream>, method: &str) -> std::io::Result<HttpResponse> {
-    let mut status_line = read_line(r)?;
+fn parse_status_line(line: &[u8]) -> std::io::Result<u16> {
+    if !line.starts_with(b"HTTP/") {
+        let s = String::from_utf8_lossy(line);
+        return Err(bad(&format!("bad status line: {s:?}")));
+    }
+    let Some(sp1) = line.iter().position(|&b| b == b' ') else {
+        return Err(bad("bad status code"));
+    };
+    let rest = &line[sp1 + 1..];
+    let sp2 = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
+    parse_u16_ascii(&rest[..sp2]).ok_or_else(|| bad("bad status code"))
+}
+
+fn read_response_into(
+    r: &mut BufReader<TcpStream>,
+    method: &str,
+    line_buf: &mut Vec<u8>,
+    collect_headers: bool,
+) -> std::io::Result<(HttpResponse, bool)> {
     let mut status: u16;
     let mut headers: HashMap<String, String>;
+    let mut chunked: bool;
+    let mut content_length: Option<usize>;
+    let mut conn_close: bool;
     loop {
-        let mut parts = status_line.splitn(3, ' ');
-        let proto = parts.next().unwrap_or("");
-        if !proto.starts_with("HTTP/") {
-            return Err(bad(&format!("bad status line: {status_line:?}")));
-        }
-        status = parts.next().and_then(|s| s.parse().ok()).ok_or_else(|| bad("bad status code"))?;
-        headers = HashMap::new();
+        let status_line = read_line_into(r, line_buf)?;
+        status = parse_status_line(status_line)?;
+        headers = if collect_headers { HashMap::with_capacity(8) } else { HashMap::new() };
+        chunked = false;
+        content_length = None;
+        conn_close = false;
         loop {
-            let line = read_line(r)?;
+            let line = read_line_into(r, line_buf)?;
             if line.is_empty() {
                 break;
             }
-            if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                let k = trim_ascii_bytes(&line[..colon]);
+                let v = trim_ascii_bytes(&line[colon + 1..]);
+                if k.eq_ignore_ascii_case(b"content-length") {
+                    content_length = parse_usize_ascii(v);
+                } else if k.eq_ignore_ascii_case(b"transfer-encoding") {
+                    chunked = contains_ignore_ascii_case(v, b"chunked");
+                } else if k.eq_ignore_ascii_case(b"connection") {
+                    conn_close = v.eq_ignore_ascii_case(b"close");
+                }
+                if collect_headers {
+                    let ks = match std::str::from_utf8(k) {
+                        Ok(s) => s.to_ascii_lowercase(),
+                        Err(_) => String::from_utf8_lossy(k).to_ascii_lowercase(),
+                    };
+                    let vs = match std::str::from_utf8(v) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => String::from_utf8_lossy(v).into_owned(),
+                    };
+                    headers.insert(ks, vs);
+                }
             }
         }
         if status == 100 {
-            status_line = read_line(r)?;
             continue;
         }
         break;
@@ -182,15 +369,15 @@ fn read_response(r: &mut BufReader<TcpStream>, method: &str) -> std::io::Result<
     let no_body = method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 || (100..200).contains(&status);
     let mut body = Vec::new();
     if !no_body {
-        let chunked = headers.get("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
         if chunked {
             loop {
-                let size_line = read_line(r)?;
-                let size_hex = size_line.split(';').next().unwrap_or("").trim();
-                let size = usize::from_str_radix(size_hex, 16).map_err(|_| bad("bad chunk size"))?;
+                let size_line = read_line_into(r, line_buf)?;
+                let semi = size_line.iter().position(|&b| b == b';').unwrap_or(size_line.len());
+                let size_hex = trim_ascii_bytes(&size_line[..semi]);
+                let size = parse_hex_usize(size_hex).ok_or_else(|| bad("bad chunk size"))?;
                 if size == 0 {
                     loop {
-                        if read_line(r)?.is_empty() {
+                        if read_line_into(r, line_buf)?.is_empty() {
                             break;
                         }
                     }
@@ -199,17 +386,20 @@ fn read_response(r: &mut BufReader<TcpStream>, method: &str) -> std::io::Result<
                 let start = body.len();
                 body.resize(start + size, 0);
                 r.read_exact(&mut body[start..])?;
-                let _ = read_line(r)?;
+                let _ = read_line_into(r, line_buf)?;
             }
-        } else if let Some(len) = headers.get("content-length").and_then(|v| v.parse::<usize>().ok()) {
-            body.resize(len, 0);
+        } else if let Some(len) = content_length {
+            body = vec![0u8; len];
             r.read_exact(&mut body)?;
         } else {
             r.read_to_end(&mut body)?;
-            headers.insert("connection".into(), "close".into());
+            conn_close = true;
+            if collect_headers {
+                headers.insert("connection".into(), "close".into());
+            }
         }
     }
-    Ok(HttpResponse { status, headers, body })
+    Ok((HttpResponse { status, headers, body }, conn_close))
 }
 
 /// `(host, port)` from a base URL such as `http://10.0.0.5:8100` or `http://[::1]:8100/`.
@@ -526,20 +716,25 @@ impl WdaClient {
         Ok(())
     }
 
-    /// One attempt-pair of an HTTP exchange shared by [`req`](Self::req) and
+    /// One attempt-pair of an HTTP exchange shared by [`req`](Self::req),
+    /// [`req_typed_with_deadline`](Self::req_typed_with_deadline), and
     /// [`req_raw`](Self::req_raw). Returns `Err(message)` for transport failures
     /// after the Python retry policy (reconnect once for GET/HEAD or provably unsent
     /// writes), or `Ok(None)` when the deadline expired before sending.
-    fn exchange(
+    fn exchange_with<T, F>(
         &mut self,
         method: &str,
         path: &str,
         body: Option<&[u8]>,
-        headers: &[(String, String)],
+        headers: &[(&str, &str)],
         timeout: f64,
         deadline: Option<f64>,
-        parse_json: bool,
-    ) -> std::result::Result<Option<(HttpResponse, Option<Value>)>, String> {
+        collect_headers: bool,
+        mut parser: F,
+    ) -> std::result::Result<Option<(HttpResponse, Option<T>)>, String>
+    where
+        F: FnMut(&[u8]) -> std::result::Result<Option<T>, String>,
+    {
         let idempotent = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
         for attempt in 0..2 {
             let mut eff_timeout = timeout;
@@ -551,7 +746,7 @@ impl WdaClient {
                 eff_timeout = timeout.min(rem).max(0.05);
             }
             let mut sent = false;
-            let res: std::io::Result<(HttpResponse, Option<Value>)> = (|| {
+            let res: std::io::Result<(HttpResponse, Option<T>)> = (|| {
                 self.ensure_conn(eff_timeout)?;
                 if let Some(d) = deadline {
                     if clock::now() >= d {
@@ -559,12 +754,9 @@ impl WdaClient {
                     }
                 }
                 sent = true;
-                let resp = self.conn.as_mut().unwrap().request(method, path, body, headers)?;
-                let parsed = if parse_json && resp.status < 400 {
-                    Some(
-                        serde_json::from_slice::<Value>(&resp.body)
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
-                    )
+                let resp = self.conn.as_mut().unwrap().request_inner(method, path, body, headers, collect_headers)?;
+                let parsed = if resp.status < 400 {
+                    parser(&resp.body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
                 } else {
                     None
                 };
@@ -595,9 +787,10 @@ impl WdaClient {
     /// [`json::deadline_value`].
     pub fn req(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>) -> Value {
         let body = data.map(|d| serde_json::to_vec(d).unwrap_or_default());
-        let headers: Vec<(String, String)> =
-            if data.is_some() { vec![("Content-Type".into(), "application/json".into())] } else { vec![] };
-        match self.exchange(method, path, body.as_deref(), &headers, timeout, deadline, true) {
+        let headers: &[(&str, &str)] = if data.is_some() { &[("Content-Type", "application/json")] } else { &[] };
+        match self.exchange_with(method, path, body.as_deref(), headers, timeout, deadline, false, |b| {
+            serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
+        }) {
             Ok(None) => json::deadline_value(),
             Ok(Some((resp, parsed))) => {
                 if resp.status >= 400 {
@@ -609,6 +802,43 @@ impl WdaClient {
                 }
             }
             Err(msg) => json::error_value(msg),
+        }
+    }
+
+    /// Typed GET request bypassing intermediate `serde_json::Value` (IndexMap) trees.
+    pub(crate) fn req_typed_with_deadline<T, F>(
+        &mut self,
+        method: &str,
+        path: &str,
+        timeout: f64,
+        deadline: Option<f64>,
+        mut parser: F,
+    ) -> TypedHttpResult<T>
+    where
+        F: FnMut(&[u8]) -> std::result::Result<T, serde_json::Error>,
+    {
+        let eff = match deadline {
+            None => timeout,
+            Some(d) => {
+                let rem = d - clock::now();
+                if rem <= 0.0 {
+                    return TypedHttpResult::DeadlineExceeded;
+                }
+                timeout.min(rem).max(0.05)
+            }
+        };
+        match self.exchange_with(method, path, None, &[], eff, deadline, false, |b| {
+            parser(b).map(Some).map_err(|e| e.to_string())
+        }) {
+            Ok(None) => TypedHttpResult::DeadlineExceeded,
+            Ok(Some((resp, parsed))) => {
+                if resp.status >= 400 {
+                    TypedHttpResult::HttpError { status: resp.status }
+                } else {
+                    TypedHttpResult::Ok(parsed.expect("parser returns Some on < 400"))
+                }
+            }
+            Err(msg) => TypedHttpResult::TransportError(msg),
         }
     }
 
@@ -655,16 +885,16 @@ impl WdaClient {
         extra_headers: Option<&[(String, String)]>,
     ) -> (u16, String, Vec<u8>) {
         let body = data.map(|d| serde_json::to_vec(d).unwrap_or_default());
-        let mut headers: Vec<(String, String)> =
-            if data.is_some() { vec![("Content-Type".into(), "application/json".into())] } else { vec![] };
+        let mut headers: Vec<(&str, &str)> =
+            if data.is_some() { vec![("Content-Type", "application/json")] } else { Vec::new() };
         if let Some(extra) = extra_headers {
             for (k, v) in extra {
                 headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(k));
-                headers.push((k.clone(), v.clone()));
+                headers.push((k.as_str(), v.as_str()));
             }
         }
         self.last_response_headers = None;
-        match self.exchange(method, path, body.as_deref(), &headers, timeout, deadline, false) {
+        match self.exchange_with(method, path, body.as_deref(), &headers, timeout, deadline, true, |_| Ok(Some(()))) {
             Ok(None) => (0, String::new(), b"deadline exceeded".to_vec()),
             Ok(Some((resp, _))) => {
                 let ct = resp.headers.get("content-type").cloned().unwrap_or_default();
@@ -674,6 +904,14 @@ impl WdaClient {
             Err(msg) => (0, String::new(), msg.into_bytes()),
         }
     }
+}
+
+/// Result of [`WdaClient::req_typed_with_deadline`].
+pub(crate) enum TypedHttpResult<T> {
+    Ok(T),
+    HttpError { status: u16 },
+    TransportError(#[allow(dead_code)] String),
+    DeadlineExceeded,
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,5 +1701,80 @@ impl WdaClient {
     /// to make one connect() fail before the request was sent).
     pub(crate) fn test_preset_conn(&mut self, host: &str, port: u16) {
         self.conn = Some(Conn::new(host, port));
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn conn_handles_100_continue_chunked_and_large_vectored_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            // Request 1: large POST body (> 16 KiB) exercising write_all_pair
+            let mut clen = 0usize;
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            loop {
+                line.clear();
+                r.read_line(&mut line).unwrap();
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        clen = v.trim().parse().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0u8; clen];
+            r.read_exact(&mut body).unwrap();
+            assert_eq!(body.len(), 20_000);
+            assert!(body.iter().all(|&b| b == b'A'));
+            // Respond with 100 Continue followed by chunked 200 OK
+            s.write_all(
+                b"HTTP/1.1 100 Continue\r\n\r\n\
+                  HTTP/1.1 200 OK\r\n\
+                  Transfer-Encoding: chunked\r\n\
+                  X-Test: val1\r\n\
+                  X-Test: val2\r\n\
+                  \r\n\
+                  5;ext=1\r\nhello\r\n\
+                  6\r\n world\r\n\
+                  0\r\nX-Trailer: ok\r\n\r\n",
+            )
+            .unwrap();
+            // Request 2 on same keep-alive socket: Connection: close
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            loop {
+                line.clear();
+                r.read_line(&mut line).unwrap();
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+        });
+
+        let mut conn = Conn::new("127.0.0.1", port);
+        conn.connect(5.0).unwrap();
+        let big = vec![b'A'; 20_000];
+        let r1 = conn.request("POST", "/big", Some(&big), &[]).unwrap();
+        assert_eq!(r1.status, 200);
+        assert_eq!(r1.body, b"hello world");
+        assert_eq!(r1.headers.get("x-test").map(String::as_str), Some("val2"));
+        assert!(conn.is_connected());
+
+        let r2 = conn.request("GET", "/close", None, &[]).unwrap();
+        assert_eq!(r2.status, 200);
+        assert_eq!(r2.body, b"ok");
+        assert!(!conn.is_connected());
+        srv.join().unwrap();
     }
 }
