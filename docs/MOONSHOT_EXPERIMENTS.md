@@ -129,6 +129,8 @@ A 320 × 480 grayscale fixture isolated fresh-process overhead. Each command ran
 | diff | 8.95 | 32.73 |
 | ocr | 133.17 | 149.84 |
 
+The helper also measured the minimal build before adding live HTTP and optional OCR linkage. Its median cold run was 1.13 ms vs 32.71 ms for its Python comparator, and its six-step flow was 2.46 ms vs 97.22 ms. The table uses a later release build with optional native OCR linked and the installed TurboTap Python environment. Startup numbers depend on binary features and interpreter environment. Both measurements used a warm filesystem cache.
+
 ## Display-change latency
 
 Sixteen randomized trials cleared the entry, verified zero, tapped 7 and verified the final Calculator readout. A changed display region required ten differing pixels above the luminance threshold. Streaming observed independently while the tap request was in flight. The pull arm requested its first frame after acknowledgement.
