@@ -534,14 +534,36 @@ impl crate::out::Sink for StreamSink {
     }
 }
 
+fn open_cwd_dir() -> std::io::Result<std::fs::File> {
+    // SAFETY: "." is NUL-terminated; O_CLOEXEC prevents leaking the handle to child processes.
+    let fd = unsafe { libc::open(c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a freshly opened, owned directory descriptor.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn restore_cwd_dir(dir: &std::fs::File) -> std::io::Result<()> {
+    // SAFETY: `dir` is an open directory descriptor held for the daemon's lifetime.
+    let rc = unsafe { libc::fchdir(dir.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 struct BaselineState {
     env: HashMap<OsString, OsString>,
-    cwd: Option<PathBuf>,
+    /// Owned handle to the daemon's startup working directory (restored via `fchdir`,
+    /// preserving directory identity even if the directory is renamed or its old path is reused).
+    cwd_dir: Option<std::fs::File>,
 }
 
 impl BaselineState {
     fn capture() -> BaselineState {
-        BaselineState { env: std::env::vars_os().collect(), cwd: std::env::current_dir().ok() }
+        BaselineState { env: std::env::vars_os().collect(), cwd_dir: open_cwd_dir().ok() }
     }
 }
 
@@ -1098,7 +1120,7 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, req: ServerReq) -> 
         conn.set_read_timeout(None)?;
         conn.set_write_timeout(None)?;
         let baseline = exec_guard.get_or_insert_with(BaselineState::capture);
-        let code = execute(conn, &argv, &env, &cwd, baseline);
+        let code = execute(conn, &argv, &env, &cwd, baseline, &inner.stopping);
         inner.state.lock().unwrap_or_else(|e| e.into_inner()).requests += 1;
         let _ = send_bytes(conn, format!("{{\"exit\":{code}}}\n").as_bytes());
         Ok(())
@@ -1142,6 +1164,7 @@ fn is_config_env_key(k: &OsStr) -> bool {
 /// `baseline.env` so any unexpected mutation is still completely reverted.
 struct RequestStateGuard<'a> {
     baseline: &'a BaselineState,
+    stopping: &'a AtomicBool,
     deltas: Vec<(OsString, Option<OsString>)>,
     cwd_changed: bool,
     config_env_changed: bool,
@@ -1149,9 +1172,10 @@ struct RequestStateGuard<'a> {
 }
 
 impl<'a> RequestStateGuard<'a> {
-    fn new(baseline: &'a BaselineState) -> RequestStateGuard<'a> {
+    fn new(baseline: &'a BaselineState, stopping: &'a AtomicBool) -> RequestStateGuard<'a> {
         RequestStateGuard {
             baseline,
+            stopping,
             deltas: Vec::new(),
             cwd_changed: false,
             config_env_changed: false,
@@ -1162,14 +1186,11 @@ impl<'a> RequestStateGuard<'a> {
 
 impl Drop for RequestStateGuard<'_> {
     fn drop(&mut self) {
-        crate::out::set_sink(None);
         let mut reload_cfg = self.config_env_changed;
-        if self.panicked || std::thread::panicking() {
+        let panicking = self.panicked || std::thread::panicking();
+        if panicking {
             if restore_env_diff(&self.baseline.env) {
                 reload_cfg = true;
-            }
-            if let Some(d) = self.baseline.cwd.as_ref() {
-                let _ = std::env::set_current_dir(d);
             }
         } else {
             for (k, prev) in self.deltas.drain(..).rev() {
@@ -1179,12 +1200,24 @@ impl Drop for RequestStateGuard<'_> {
                     _ => {}
                 }
             }
-            if self.cwd_changed {
-                if let Some(d) = self.baseline.cwd.as_ref() {
-                    let _ = std::env::set_current_dir(d);
+        }
+        if self.cwd_changed || panicking {
+            match self.baseline.cwd_dir.as_ref() {
+                Some(dir) => {
+                    if let Err(e) = restore_cwd_dir(dir) {
+                        self.stopping.store(true, Ordering::SeqCst);
+                        crate::errln!("turbotap: daemon failed to restore working directory ({e}); retiring");
+                        eprintln!("turbotap daemon: failed to restore working directory ({e}); retiring");
+                    }
+                }
+                None => {
+                    self.stopping.store(true, Ordering::SeqCst);
+                    crate::errln!("turbotap: daemon baseline working directory handle unavailable; retiring");
+                    eprintln!("turbotap daemon: baseline working directory handle unavailable; retiring");
                 }
             }
         }
+        crate::out::set_sink(None);
         if reload_cfg {
             let _ = std::panic::catch_unwind(crate::config::reload);
         }
@@ -1198,6 +1231,7 @@ fn execute(
     env: &HashMap<String, String>,
     cwd: &str,
     baseline: &BaselineState,
+    stopping: &AtomicBool,
 ) -> i32 {
     let sink = match conn.try_clone() {
         Ok(c) => Arc::new(StreamSink {
@@ -1208,10 +1242,9 @@ fn execute(
         Err(_) => return 1,
     };
     // Installed before any process state changes; restores it on every exit path.
-    let mut restore = RequestStateGuard::new(baseline);
+    let mut restore = RequestStateGuard::new(baseline, stopping);
     crate::out::set_sink(Some(sink.clone()));
     restore.config_env_changed = apply_request_env(&baseline.env, env, &mut restore.deltas);
-    let same_cwd = baseline.cwd.as_deref() == Some(Path::new(cwd));
     let code = match std::env::set_current_dir(cwd) {
         Err(e) => {
             let err = crate::cli::py_os_error(&e, cwd);
@@ -1219,7 +1252,7 @@ fn execute(
             1
         }
         Ok(()) => {
-            restore.cwd_changed = !same_cwd;
+            restore.cwd_changed = true;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::cli::run_cli(argv))) {
                 Ok(code) => code,
                 Err(p) => {
@@ -1476,31 +1509,42 @@ mod unit {
             target.insert("TT_DIFF_ADD".to_string(), "added".to_string());
             target
         };
+        let stopping = AtomicBool::new(false);
         // Normal delta-replay restoration path (zero vars_os() scan).
         {
-            let mut guard = RequestStateGuard::new(&baseline);
+            let mut guard = RequestStateGuard::new(&baseline, &stopping);
             let target = make_target();
             apply_request_env(&baseline.env, &target, &mut guard.deltas);
             assert_eq!(std::env::var("TT_DIFF_KEEP").ok(), None);
             assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("new"));
             assert_eq!(std::env::var("TT_DIFF_ADD").ok().as_deref(), Some("added"));
         }
+        assert!(!stopping.load(Ordering::SeqCst));
         assert_eq!(std::env::var("TT_DIFF_KEEP").ok().as_deref(), Some("same"));
         assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("old"));
         assert_eq!(std::env::var("TT_DIFF_ADD").ok(), None);
 
         // Panic fallback path reverts unexpected mid-request mutations too.
         {
-            let mut guard = RequestStateGuard::new(&baseline);
+            let mut guard = RequestStateGuard::new(&baseline, &stopping);
             let target = make_target();
             apply_request_env(&baseline.env, &target, &mut guard.deltas);
             std::env::set_var("TT_DIFF_EXTRA", "mutated");
             guard.panicked = true;
         }
+        assert!(!stopping.load(Ordering::SeqCst));
         assert_eq!(std::env::var("TT_DIFF_KEEP").ok().as_deref(), Some("same"));
         assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("old"));
         assert_eq!(std::env::var("TT_DIFF_ADD").ok(), None);
         assert_eq!(std::env::var("TT_DIFF_EXTRA").ok(), None);
+
+        // Failed cwd restoration retires the daemon before accepting another request.
+        let broken_baseline = BaselineState { env: baseline.env.clone(), cwd_dir: None };
+        {
+            let mut guard = RequestStateGuard::new(&broken_baseline, &stopping);
+            guard.cwd_changed = true;
+        }
+        assert!(stopping.load(Ordering::SeqCst));
     }
 
     #[test]
