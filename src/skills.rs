@@ -152,7 +152,7 @@ fn load_skill_state() -> Map<String, Value> {
 static VERIFIED_SKILL_STATE: RwLock<Option<FileStamp>> = RwLock::new(None);
 
 /// `json.dump(st, f, indent=1)`.
-fn save_skill_state_to(path: &Path, st: &Map<String, Value>) -> Result<usize> {
+fn save_skill_state_to(path: &Path, st: &Map<String, Value>) -> Result<()> {
     use serde::Serialize;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| os_err(parent, e))?;
@@ -161,14 +161,11 @@ fn save_skill_state_to(path: &Path, st: &Map<String, Value>) -> Result<usize> {
     let fmt = serde_json::ser::PrettyFormatter::with_indent(b" ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
     Value::Object(st.clone()).serialize(&mut ser).map_err(|e| Error::Value(e.to_string()))?;
-    let len = buf.len();
-    std::fs::write(path, buf).map_err(|e| os_err(path, e))?;
-    Ok(len)
+    std::fs::write(path, buf).map_err(|e| os_err(path, e))
 }
 
 fn save_skill_state(st: &Map<String, Value>) -> Result<()> {
-    save_skill_state_to(&skill_state_path(), st)?;
-    Ok(())
+    save_skill_state_to(&skill_state_path(), st)
 }
 
 fn targets_of(st: &Map<String, Value>) -> Vec<String> {
@@ -228,19 +225,12 @@ pub fn sync_skills_if_stale() {
     st.insert("stamp".into(), Value::String(stamp.to_string()));
     // Python lets a failed state write propagate; a stale stamp only means the next
     // run refreshes again, so a read-only state dir must not break every command.
-    match save_skill_state_to(&path, &st) {
-        Ok(written_len) => {
-            let new_stamp = std::fs::metadata(&path)
-                .ok()
-                .filter(|m| m.len() == written_len as u64)
-                .map(|m| FileStamp::from_meta(&path, &m));
-            *VERIFIED_SKILL_STATE.write().unwrap_or_else(|e| e.into_inner()) = new_stamp;
-        }
-        Err(e) => {
-            *VERIFIED_SKILL_STATE.write().unwrap_or_else(|e| e.into_inner()) = None;
-            crate::errln!("turbotap: could not save {}: {e}", path.display());
-        }
+    // Always invalidate the in-memory verification stamp after writing so another
+    // writer's concurrent replacement is never marked verified without reading it.
+    if let Err(e) = save_skill_state_to(&path, &st) {
+        crate::errln!("turbotap: could not save {}: {e}", path.display());
     }
+    *VERIFIED_SKILL_STATE.write().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// `os.path.abspath`: absolute and lexically normalised (no symlink resolution).
@@ -402,5 +392,23 @@ mod unit {
         crate::config::overwrite_preserving_inode_and_mtime(&state_b_file, &stale_e);
         sync_skills_if_stale();
         assert!(root_e.join("turbotap/SKILL.md").is_file(), "corrupt state file must not be cached as verified");
+
+        // Post-write refresh must leave VERIFIED_SKILL_STATE invalidated so a concurrent
+        // same-length atomic replacement cannot be marked verified without inspecting its contents.
+        assert!(
+            VERIFIED_SKILL_STATE.read().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "post-write sync must not pin VERIFIED_SKILL_STATE under an unverified post-write stat"
+        );
+        let root_f = tmp.path().join("skills-f");
+        let written_e = std::fs::read_to_string(&state_b_file).unwrap();
+        let replaced_f = written_e
+            .replace(root_e.to_str().unwrap(), root_f.to_str().unwrap())
+            .replace(s1.as_str(), stale_stamp.as_str());
+        assert_eq!(written_e.len(), replaced_f.len());
+        let tmp_f = tmp.path().join("skills-f.tmp");
+        std::fs::write(&tmp_f, &replaced_f).unwrap();
+        std::fs::rename(&tmp_f, &state_b_file).unwrap();
+        sync_skills_if_stale();
+        assert!(root_f.join("turbotap/SKILL.md").is_file(), "concurrent same-length state replacement must trigger sync");
     }
 }

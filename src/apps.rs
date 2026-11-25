@@ -216,16 +216,11 @@ fn load_apps_indexed(refresh: bool, udid: &str, base_url: &str, cache_dir: &Path
     std::fs::create_dir_all(cache_dir).map_err(|e| Error::Os(format!("{}: {e}", cache_dir.display())))?;
     let body = serde_json::to_string(&apps).unwrap_or_else(|_| "[]".to_string());
     std::fs::write(&cache_path, &body).map_err(|e| Error::Os(format!("{}: {e}", cache_path.display())))?;
+    // Invalidate rather than caching under a post-write stat: a concurrent writer
+    // could atomically replace the file between write() and stat(). The next stable
+    // read populates the cache from verified on-disk bytes.
+    remove_app_cache(&cache_key);
     let indexed: Arc<Vec<IndexedApp>> = Arc::new(apps.into_iter().map(IndexedApp::from_app).collect());
-    if let Ok(meta) = std::fs::metadata(&cache_path) {
-        if meta.len() == body.len() as u64 {
-            store_app_cache(cache_key, FileStamp::from_meta(&cache_path, &meta), indexed.clone());
-        } else {
-            remove_app_cache(&cache_key);
-        }
-    } else {
-        remove_app_cache(&cache_key);
-    }
     Ok(indexed)
 }
 
@@ -338,5 +333,50 @@ mod unit {
         std::fs::write(&path, "{not-valid-json").unwrap();
         let empty = load_apps_indexed(false, "", "http://127.0.0.1:8100", tmp.path()).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn refresh_write_invalidates_cache_so_concurrent_same_length_replacement_is_observed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("tt-apps-race-");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let ssh_shim = bin_dir.join("ssh");
+        std::fs::write(
+            &ssh_shim,
+            "#!/bin/sh\nprintf '%s' '{\"result\":{\"apps\":[{\"name\":\"Fixture\",\"bundleIdentifier\":\"com.example.app-a\"}]}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{old_path}", bin_dir.display());
+        let _env = crate::testutil::set_env(&[
+            ("PATH", Some(new_path.as_str())),
+            ("TURBOTAP_TEST_ALLOW_REMOTE", Some("1")),
+        ]);
+
+        let udid = "udid-race-test";
+        let url = "http://127.0.0.1:8100";
+        let cache_path = app_cache_path(tmp.path(), udid, url);
+        let cache_key = crate::skills::abspath(&cache_path);
+
+        // Refresh writes mapping A and must invalidate (not pin) the in-memory cache.
+        let refreshed = load_apps_indexed(true, udid, url, tmp.path()).unwrap();
+        assert_eq!(refreshed[0].app.bundle_identifier, "com.example.app-a");
+        assert!(
+            !app_cache().read().unwrap_or_else(|e| e.into_inner()).contains_key(&cache_key),
+            "post-write refresh must not pin in-memory cache under an unverified post-write stat"
+        );
+
+        // Simulate a concurrent same-length atomic replacement with mapping B right after write.
+        let written_a = std::fs::read_to_string(&cache_path).unwrap();
+        let replaced_b = written_a.replace("com.example.app-a", "com.example.app-b");
+        assert_eq!(written_a.len(), replaced_b.len());
+        let tmp_b = tmp.path().join("apps-b.tmp");
+        std::fs::write(&tmp_b, &replaced_b).unwrap();
+        std::fs::rename(&tmp_b, &cache_path).unwrap();
+
+        // Next lookup must observe B, never stale A.
+        assert_eq!(resolve_app("Fixture", udid, url, tmp.path()).unwrap(), "com.example.app-b");
     }
 }
