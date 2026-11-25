@@ -1511,41 +1511,51 @@ fn test_unresolved_configured_host_is_never_treated_as_a_different_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
-// v1.4.1: plain Send allowed by the default --deny in a confirmed allowlisted app
+// v1.4.1: exactly "Send" / "Send message" allowed by the default --deny in a
+// confirmed allowlisted app
 // ---------------------------------------------------------------------------
 
-/// A mock whose accessibility tree has one element per label (for `tapel:`).
+/// A mock whose accessibility tree has one element per label (for `tapel:`), found by
+/// the exact predicate, with its label (and name, when given) as attributes.
 fn mock_with_elements(app: &str, labels: &[&str]) -> MockWda {
     let mut st = state_with_app(json!(app));
     for (i, l) in labels.iter().enumerate() {
         let q = serde_json::to_string(l).unwrap();
         let eid = format!("el-{i}");
         st.element_map.insert(format!("(label == {q} OR name == {q}) AND enabled == 1"), Dyn::one(json!({"ELEMENT": eid})));
-        st.element_rects.insert(eid, json!({"x": 10 + i as i64 * 40, "y": 700, "width": 30, "height": 20}));
+        st.element_rects.insert(eid.clone(), json!({"x": 10 + i as i64 * 40, "y": 700, "width": 30, "height": 20}));
+        st.element_labels.insert(eid, json!(l));
     }
     MockWda::start(st)
 }
 
-const SEND_LABELS: [&str; 3] = ["Send", "Send message", "Submit"];
-const STILL_DENIED: [&str; 8] =
-    ["Delete", "Pay", "Buy now", "Cancel booking", "Start video call", "Send money", "Unsend", "Confirm purchase"];
+const SEND_LABELS: [&str; 4] = ["Send", "Send message", "  send   MESSAGE ", "Submit"];
+const STILL_DENIED: [&str; 14] = [
+    "Delete",
+    "Pay",
+    "Buy now",
+    "Cancel booking",
+    "Start video call",
+    "Unsend",
+    "Confirm purchase",
+    "Send money",
+    "Send the payment",
+    "Send all funds",
+    "Send payment now",
+    "Send $50",
+    "Send attachment",
+    "Send to everyone",
+];
 
 #[test]
-fn test_relaxed_default_deny_only_drops_plain_send() {
-    use crate::flow::{DENY_DEFAULT, DENY_DEFAULT_IN_ALLOWED_APP};
-    assert_eq!(
-        DENY_DEFAULT_IN_ALLOWED_APP,
-        DENY_DEFAULT.replace(r"|\bsend\b|", r"|\bsend\s+(?:money|payment|funds|cash)\b|")
-    );
-    let full = crate::text::compile_icase(DENY_DEFAULT).unwrap();
-    let relaxed = crate::text::compile_icase(DENY_DEFAULT_IN_ALLOWED_APP).unwrap();
-    for t in ["Send", "Send message", "SEND"] {
-        assert!(full.is_match(t).unwrap() && !relaxed.is_match(t).unwrap(), "{t}");
+fn test_plain_send_is_a_whole_label_match() {
+    use crate::flow::is_plain_send;
+    for t in ["Send", "send", "Send message", "  SEND\tmessage  "] {
+        assert!(is_plain_send(t), "{t}");
     }
-    for t in STILL_DENIED {
-        assert!(relaxed.is_match(t).unwrap(), "{t} must stay denied in allowlisted apps");
+    for t in STILL_DENIED.iter().chain(["Send!", "Sending", "Send message to all", "Resend", "Send Message Now", ""].iter()) {
+        assert!(!is_plain_send(t), "{t}");
     }
-    assert!(!full.is_match("Submit").unwrap(), "Submit was never in the default list");
 }
 
 #[test]
@@ -1565,9 +1575,65 @@ fn test_allowlisted_foreground_allows_send_but_not_pay_or_delete_without_no_deny
             Err(Error::Flow(m)) => assert!(m.contains("matches --deny"), "{l}: {m}"),
             other => panic!("{l}: expected --deny refusal, got {other:?}"),
         }
+        // The same rule for OCR / control taps, which pass the matched text.
+        assert!(flow.guard(l, "tap").is_err(), "{l}");
     }
     assert_eq!(mock.tapped_points().len(), SEND_LABELS.len(), "a denied label was tapped");
     flow.close();
+}
+
+#[test]
+fn test_tapel_checks_the_selected_elements_own_label() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // Each case: the only element a `tapel:Send` query can select, found by the
+    // substring/name fallback predicate, and its actual label / name.
+    let q = serde_json::to_string("Send").unwrap();
+    let fallback = format!("(label CONTAINS[c] {q} OR name CONTAINS[c] {q}) AND enabled == 1");
+    let refused: [(Option<&str>, Option<&str>); 6] = [
+        (Some("Send payment"), None),
+        (Some("Send all funds"), Some("Send all funds")),
+        (None, Some("sendPaymentButton")), // name only, not a plain Send
+        (Some("Send"), Some("sendPaymentButton")), // label and name disagree
+        (None, None),                     // cannot be verified
+        (Some("Send attachment"), Some("Send")),
+    ];
+    for (label, name) in refused {
+        let mut st = state_with_app(json!(ALLOWED));
+        st.element_map.insert(fallback.clone(), Dyn::one(json!({"ELEMENT": "fin-1"})));
+        st.element_rects.insert("fin-1".into(), json!({"x": 100, "y": 700, "width": 40, "height": 20}));
+        if let Some(l) = label {
+            st.element_labels.insert("fin-1".into(), json!(l));
+        }
+        if let Some(n) = name {
+            st.element_names.insert("fin-1".into(), json!(n));
+        }
+        let mock = MockWda::start(st);
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+        match flow.step("tapel:Send") {
+            Err(Error::Flow(m)) => assert!(m.contains("matches --deny"), "{label:?}/{name:?}: {m}"),
+            other => panic!("{label:?}/{name:?}: expected --deny refusal, got {other:?}"),
+        }
+        assert!(input_posts(&mock).is_empty(), "{label:?}/{name:?}: {:?}", input_posts(&mock));
+        flow.close();
+    }
+    // The same fallback selecting an element whose own label is exactly Send is allowed.
+    for (label, name) in [(Some("Send"), None), (Some("Send"), Some("send")), (None, Some("Send message"))] {
+        let mut st = state_with_app(json!(ALLOWED));
+        st.element_map.insert(fallback.clone(), Dyn::one(json!({"ELEMENT": "ok-1"})));
+        st.element_rects.insert("ok-1".into(), json!({"x": 100, "y": 700, "width": 40, "height": 20}));
+        if let Some(l) = label {
+            st.element_labels.insert("ok-1".into(), json!(l));
+        }
+        if let Some(n) = name {
+            st.element_names.insert("ok-1".into(), json!(n));
+        }
+        let mock = MockWda::start(st);
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+        flow.step("tapel:Send").unwrap_or_else(|e| panic!("{label:?}/{name:?}: {e:?}"));
+        assert_eq!(mock.tapped_points().len(), 1, "{label:?}/{name:?}");
+        flow.close();
+    }
 }
 
 #[test]

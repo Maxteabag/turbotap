@@ -145,7 +145,13 @@ impl<R: Reader> Flow<R> {
 
     /// L3134.
     pub fn tap_point(&mut self, x: i64, y: i64, text: &str, deadline: Option<f64>) -> Result<()> {
-        self.guard(text, "tap")?;
+        self.tap_point_with(x, y, text, deadline, true)
+    }
+
+    /// [`Flow::tap_point`]; `may_relax` false when `text` is not verified to be the
+    /// target's own label (see [`Flow::guard_with`]).
+    pub fn tap_point_with(&mut self, x: i64, y: i64, text: &str, deadline: Option<f64>, may_relax: bool) -> Result<()> {
+        self.guard_with(text, "tap", may_relax)?;
         if let Some(d) = deadline {
             if clock::now() >= d {
                 return Err(Error::DeadlineExceeded("tap deadline exceeded".into()));
@@ -1034,7 +1040,32 @@ impl<R: Reader> Flow<R> {
                         let f = |k: &str| json::get(rect, k).as_f64().unwrap_or(0.0);
                         let x = (f("x") + f("width") / 2.0).trunc() as i64;
                         let y = (f("y") + f("height") / 2.0).trunc() as i64;
-                        self.tap_point(x, y, label, None)?;
+                        if self.deny.is_none() {
+                            self.tap_point(x, y, label, None)?;
+                            return Ok((x, y));
+                        }
+                        // The element may have been found by a substring or by its name:
+                        // check what it actually is, not only the query.
+                        let attr = |c: &mut crate::wda::WdaClient, a: &str| {
+                            let p = c.spath(&format!("/element/{eid}/attribute/{a}"));
+                            let r = c.get(&p);
+                            json::get(&r, "value").as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+                        };
+                        let (el_label, el_name) = (attr(&mut self.c, "label"), attr(&mut self.c, "name"));
+                        let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                        // The label the exception may rely on: unambiguous (label and name
+                        // agree, or only one is set). Unknown or disagreeing: no exception.
+                        let own: Option<String> = match (&el_label, &el_name) {
+                            (Some(l), Some(n)) if fold(l) == fold(n) => Some(l.clone()),
+                            (Some(l), None) => Some(l.clone()),
+                            (None, Some(n)) => Some(n.clone()),
+                            _ => None,
+                        };
+                        let may_relax = own.as_deref().is_some_and(super::is_plain_send);
+                        for t in [Some(label), el_label.as_deref(), el_name.as_deref()].into_iter().flatten() {
+                            self.guard_with(t, "tap", may_relax)?;
+                        }
+                        self.tap_point_with(x, y, own.as_deref().unwrap_or(label), None, may_relax)?;
                         return Ok((x, y));
                     }
                 }
