@@ -22,11 +22,14 @@
 //! environment.
 use crate::error::{Error, Result};
 use crate::json;
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json as j, Map, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -34,7 +37,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 pub const PROTOCOL: u32 = 1;
@@ -103,7 +106,7 @@ impl<'a> Lines<'a> {
         Lines { reader: BufReader::with_capacity(8192, sock), scratch: Vec::new() }
     }
 
-    fn read(&mut self) -> std::io::Result<Map<String, Value>> {
+    fn with_line<T>(&mut self, f: impl FnOnce(&[u8]) -> std::io::Result<T>) -> std::io::Result<T> {
         self.scratch.clear();
         loop {
             let avail = self.reader.fill_buf()?;
@@ -112,12 +115,12 @@ impl<'a> Lines<'a> {
             }
             if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
                 let res = if self.scratch.is_empty() {
-                    parse_json_obj(&avail[..pos])
+                    f(&avail[..pos])
                 } else if self.scratch.len() + pos > MAX_LINE {
                     Err(proto_err("message too large"))
                 } else {
                     self.scratch.extend_from_slice(&avail[..pos]);
-                    parse_json_obj(&self.scratch)
+                    f(&self.scratch)
                 };
                 self.reader.consume(pos + 1);
                 return res;
@@ -130,6 +133,20 @@ impl<'a> Lines<'a> {
             self.scratch.extend_from_slice(avail);
             self.reader.consume(len);
         }
+    }
+
+    fn read(&mut self) -> std::io::Result<Map<String, Value>> {
+        self.with_line(parse_json_obj)
+    }
+
+    fn read_go(&mut self) -> std::io::Result<bool> {
+        self.with_line(|line| {
+            if line == b"{\"go\":true}" {
+                return Ok(true);
+            }
+            let m = parse_json_obj(line)?;
+            Ok(json::truthy(m.get("go").unwrap_or(&Value::Null)))
+        })
     }
 }
 
@@ -247,6 +264,7 @@ pub fn ping() -> Option<Map<String, Value>> {
 }
 
 /// One request handed to the daemon (what Python read from `os.environ`/`os.getcwd()`).
+#[cfg(test)]
 pub(crate) struct ForwardRequest {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -267,17 +285,43 @@ extern "C" fn on_sigint(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
+fn encode_live_run_payload(argv: &[String]) -> Option<Vec<u8>> {
+    let cwd = std::env::current_dir().ok()?.into_os_string().into_string().ok()?;
+    let fp = code_fingerprint();
+    let mut payload = Vec::with_capacity(4096);
+    let mut ser = serde_json::Serializer::new(&mut payload);
+    let mut top = ser.serialize_map(Some(6)).ok()?;
+    top.serialize_entry("v", &PROTOCOL).ok()?;
+    top.serialize_entry("op", "run").ok()?;
+    top.serialize_entry("argv", argv).ok()?;
+    struct LiveEnv;
+    impl Serialize for LiveEnv {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(None)?;
+            for (k, v) in std::env::vars_os() {
+                let ks = k.to_str().ok_or_else(|| serde::ser::Error::custom("non-utf8 env key"))?;
+                let vs = v.to_str().ok_or_else(|| serde::ser::Error::custom("non-utf8 env value"))?;
+                map.serialize_entry(ks, vs)?;
+            }
+            map.end()
+        }
+    }
+    top.serialize_entry("env", &LiveEnv).ok()?;
+    top.serialize_entry("cwd", &cwd).ok()?;
+    top.serialize_entry("fingerprint", &fp).ok()?;
+    top.end().ok()?;
+    payload.push(b'\n');
+    Some(payload)
+}
+
 /// Hand `argv` to a running daemon. `Some(exit code)` once the daemon accepted the
 /// request; `None` to run locally (absent, stale, refused, not confirmed).
 pub fn forward(argv: &[String]) -> Option<i32> {
+    // Check socket before reading env/cwd/exe metadata so absent daemon falls back in 1 lstat.
+    let sock = connect(FIRST_REPLY_TIMEOUT)?;
     // Non-UTF-8 environment, arguments or cwd cannot travel as JSON: run locally
     // (Python failed to encode them before sending and fell back the same way).
-    let mut env = Vec::new();
-    for (k, v) in std::env::vars_os() {
-        env.push((k.into_string().ok()?, v.into_string().ok()?));
-    }
-    let cwd = std::env::current_dir().ok()?.into_os_string().into_string().ok()?;
-    let req = ForwardRequest { argv: argv.to_vec(), env, cwd, fingerprint: code_fingerprint() };
+    let payload = encode_live_run_payload(argv)?;
     // Ctrl-C: Python raised KeyboardInterrupt out of the blocking read. Catch SIGINT
     // without SA_RESTART so the read returns EINTR and we can say what happened.
     // SAFETY: plain sigaction install/restore with a handler that only stores an atomic.
@@ -289,7 +333,7 @@ pub fn forward(argv: &[String]) -> Option<i32> {
         sa.sa_flags = 0;
         libc::sigaction(libc::SIGINT, &sa, &mut old);
     }
-    let code = forward_request(&req, &mut |stream, s| match stream {
+    let code = forward_payload(sock, &payload, &mut |stream, s| match stream {
         Stream::Out => crate::out::print_out(s),
         Stream::Err => crate::out::print_err(s),
     });
@@ -300,8 +344,10 @@ pub fn forward(argv: &[String]) -> Option<i32> {
     code
 }
 
+#[cfg(test)]
 struct EnvPairs<'a>(&'a [(String, String)]);
 
+#[cfg(test)]
 impl Serialize for EnvPairs<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(self.0.len()))?;
@@ -312,6 +358,7 @@ impl Serialize for EnvPairs<'_> {
     }
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct RunMsg<'a> {
     v: u32,
@@ -322,10 +369,19 @@ struct RunMsg<'a> {
     fingerprint: &'a str,
 }
 
+#[derive(Deserialize)]
+struct ClientMsg<'a> {
+    #[serde(borrow)]
+    out: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    err: Option<Cow<'a, str>>,
+    exit: Option<Value>,
+}
+
 /// [`forward`] with an explicit request and output sink (tests call this directly).
+#[cfg(test)]
 pub(crate) fn forward_request(req: &ForwardRequest, sink: &mut dyn FnMut(Stream, &str)) -> Option<i32> {
-    let sock = connect(CONNECT_TIMEOUT)?;
-    let mut committed = false;
+    let sock = connect(FIRST_REPLY_TIMEOUT)?;
     let msg = RunMsg {
         v: PROTOCOL,
         op: "run",
@@ -336,17 +392,34 @@ pub(crate) fn forward_request(req: &ForwardRequest, sink: &mut dyn FnMut(Stream,
     };
     let mut payload = serde_json::to_vec(&msg).ok()?;
     payload.push(b'\n');
+    forward_payload(sock, &payload, sink)
+}
+
+fn parse_ready_or_queued(line: &[u8]) -> std::io::Result<(bool, bool)> {
+    if line == b"{\"ready\":true}" {
+        return Ok((true, false));
+    }
+    if line == b"{\"queued\":true}" {
+        return Ok((false, true));
+    }
+    let m = parse_json_obj(line)?;
+    Ok((
+        json::truthy(m.get("ready").unwrap_or(&Value::Null)),
+        json::truthy(m.get("queued").unwrap_or(&Value::Null)),
+    ))
+}
+
+fn forward_payload(sock: UnixStream, payload: &[u8], sink: &mut dyn FnMut(Stream, &str)) -> Option<i32> {
+    let mut committed = false;
     let res: std::io::Result<i32> = (|| {
-        sock.set_read_timeout(secs(FIRST_REPLY_TIMEOUT))?;
-        sock.set_write_timeout(secs(FIRST_REPLY_TIMEOUT))?;
-        send_bytes(&sock, &payload)?;
+        send_bytes(&sock, payload)?;
         let mut reader = Lines::new(&sock);
-        let mut m = reader.read()?;
-        if json::truthy(m.get("queued").unwrap_or(&Value::Null)) {
+        let (mut ready, queued) = reader.with_line(parse_ready_or_queued)?;
+        if queued {
             sock.set_read_timeout(None)?; // the daemon is alive and busy with another request
-            m = reader.read()?;
+            ready = reader.with_line(parse_ready_or_queued)?.0;
         }
-        if !json::truthy(m.get("ready").unwrap_or(&Value::Null)) {
+        if !ready {
             return Err(proto_err("not ready"));
         }
         sock.set_read_timeout(None)?;
@@ -354,23 +427,49 @@ pub(crate) fn forward_request(req: &ForwardRequest, sink: &mut dyn FnMut(Stream,
         send_bytes(&sock, b"{\"go\":true}\n")?;
         committed = true;
         loop {
-            let m = reader.read()?;
-            if let Some(v) = m.get("out") {
-                match v {
-                    Value::String(s) => sink(Stream::Out, s),
-                    other => sink(Stream::Out, &json::py_str(other)),
+            let done = reader.with_line(|line| {
+                if let Some(rest) = line.strip_prefix(b"{\"exit\":") {
+                    if let Some(num) = rest.strip_suffix(b"}") {
+                        if let Ok(code) = std::str::from_utf8(num).ok().and_then(|s| s.parse::<i32>().ok()).ok_or(()) {
+                            return Ok(Some(code));
+                        }
+                    }
                 }
-            } else if let Some(v) = m.get("err") {
-                match v {
-                    Value::String(s) => sink(Stream::Err, s),
-                    other => sink(Stream::Err, &json::py_str(other)),
+                if let Ok(cm) = serde_json::from_slice::<ClientMsg>(line) {
+                    if let Some(s) = cm.out {
+                        sink(Stream::Out, &s);
+                        return Ok(None);
+                    }
+                    if let Some(s) = cm.err {
+                        sink(Stream::Err, &s);
+                        return Ok(None);
+                    }
+                    if let Some(code) = cm.exit {
+                        return Ok(Some(match code {
+                            Value::Number(n) if n.is_i64() => n.as_i64().unwrap_or(1) as i32,
+                            Value::Bool(b) => b as i32,
+                            _ => 1,
+                        }));
+                    }
+                    return Ok(None);
                 }
-            } else if let Some(code) = m.get("exit") {
-                return Ok(match code {
-                    Value::Number(n) if n.is_i64() => n.as_i64().unwrap_or(1) as i32,
-                    Value::Bool(b) => *b as i32,
-                    _ => 1,
-                });
+                // Fallback for non-string out/err values
+                let m = parse_json_obj(line)?;
+                if let Some(v) = m.get("out") {
+                    sink(Stream::Out, &json::py_str(v));
+                } else if let Some(v) = m.get("err") {
+                    sink(Stream::Err, &json::py_str(v));
+                } else if let Some(code) = m.get("exit") {
+                    return Ok(Some(match code {
+                        Value::Number(n) if n.is_i64() => n.as_i64().unwrap_or(1) as i32,
+                        Value::Bool(b) => *b as i32,
+                        _ => 1,
+                    }));
+                }
+                Ok(None)
+            })?;
+            if let Some(code) = done {
+                return Ok(code);
             }
         }
     })();
@@ -435,6 +534,17 @@ impl crate::out::Sink for StreamSink {
     }
 }
 
+struct BaselineState {
+    env: HashMap<OsString, OsString>,
+    cwd: Option<PathBuf>,
+}
+
+impl BaselineState {
+    fn capture() -> BaselineState {
+        BaselineState { env: std::env::vars_os().collect(), cwd: std::env::current_dir().ok() }
+    }
+}
+
 struct State {
     last_activity: f64,
     requests: u64,
@@ -447,7 +557,7 @@ struct Inner {
     started: f64,
     fingerprint: String,
     stopping: AtomicBool,
-    exec_lock: Mutex<()>,
+    exec_lock: Mutex<Option<BaselineState>>,
     state: Mutex<State>,
 }
 
@@ -469,7 +579,7 @@ impl Server {
                 started: crate::clock::wall(),
                 fingerprint: code_fingerprint(),
                 stopping: AtomicBool::new(false),
-                exec_lock: Mutex::new(()),
+                exec_lock: Mutex::new(None),
                 state: Mutex::new(State { last_activity: crate::clock::now(), requests: 0, busy: 0 }),
             }),
             listener: None,
@@ -557,6 +667,34 @@ impl Server {
 
     pub fn serve_forever(&mut self) {
         let Some(listener) = self.listener.as_ref() else { return };
+        // Keep one warm standby worker thread so sequential requests skip per-connection
+        // thread::spawn + stack mmap/munmap overhead; concurrent arrivals spill to spawn.
+        struct PrimarySlot {
+            conn: Option<UnixStream>,
+            shutdown: bool,
+        }
+        let primary_slot = Arc::new((Mutex::new(PrimarySlot { conn: None, shutdown: false }), Condvar::new()));
+        let primary_busy = Arc::new(AtomicBool::new(false));
+        let primary_worker = {
+            let inner = self.inner.clone();
+            let slot = primary_slot.clone();
+            let busy = primary_busy.clone();
+            crate::clock::spawn(move || loop {
+                let conn = {
+                    let (lk, cv) = &*slot;
+                    let mut g = lk.lock().unwrap_or_else(|e| e.into_inner());
+                    while g.conn.is_none() && !g.shutdown {
+                        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
+                    match g.conn.take() {
+                        Some(c) => c,
+                        None => break,
+                    }
+                };
+                handle(&inner, conn);
+                busy.store(false, Ordering::Release);
+            })
+        };
         let mut threads: Vec<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = Vec::new();
         while !self.inner.stopping.load(Ordering::SeqCst) {
             let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
@@ -583,6 +721,13 @@ impl Server {
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => continue,
                 Err(_) => break,
             };
+            if !primary_busy.swap(true, Ordering::AcqRel) {
+                let (lk, cv) = &*primary_slot;
+                let mut g = lk.lock().unwrap_or_else(|e| e.into_inner());
+                g.conn = Some(conn);
+                cv.notify_one();
+                continue;
+            }
             let inner = self.inner.clone();
             let done = Arc::new(AtomicBool::new(false));
             let d2 = done.clone();
@@ -593,8 +738,20 @@ impl Server {
             threads.retain(|(_, d)| !d.load(Ordering::SeqCst));
             threads.push((t, done));
         }
-        // Let a running command finish before tearing down shared resources.
+        // Signal standby worker to exit once idle and let any running command finish first.
+        {
+            let (lk, cv) = &*primary_slot;
+            lk.lock().unwrap_or_else(|e| e.into_inner()).shutdown = true;
+            cv.notify_one();
+        }
         drop(self.inner.exec_lock.lock().unwrap_or_else(|e| e.into_inner()));
+        let deadline = crate::clock::now() + GO_TIMEOUT + 1.0;
+        while primary_busy.load(Ordering::Acquire) && crate::clock::now() < deadline {
+            crate::clock::sleep(0.01);
+        }
+        if !primary_busy.load(Ordering::Acquire) {
+            let _ = primary_worker.join();
+        }
         for (t, done) in threads {
             let deadline = crate::clock::now() + GO_TIMEOUT + 1.0;
             while !done.load(Ordering::SeqCst) && crate::clock::now() < deadline {
@@ -686,6 +843,190 @@ fn status_of(inner: &Inner) -> Value {
     })
 }
 
+/// Deserializes an optional JSON string without failing on wrong types (preserving
+/// `"malformed request"` responses).
+#[derive(Default)]
+struct MaybeStr(Option<String>);
+
+impl<'de> Deserialize<'de> for MaybeStr {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeStr;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(Some(v.to_string())))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(Some(v)))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+                Ok(MaybeStr(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                while map.next_entry::<de::IgnoredAny, de::IgnoredAny>()?.is_some() {}
+                Ok(MaybeStr(None))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// Deserializes an array of strings directly into `Option<Vec<String>>` without `Value`.
+#[derive(Default)]
+struct MaybeArgv(Option<Vec<String>>);
+
+impl<'de> Deserialize<'de> for MaybeArgv {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeArgv;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(4));
+                let mut valid = true;
+                while let Some(item) = seq.next_element::<MaybeStr>()? {
+                    match item.0 {
+                        Some(s) if valid => out.push(s),
+                        _ => valid = false,
+                    }
+                }
+                Ok(MaybeArgv(valid.then_some(out)))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeArgv(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeArgv(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeArgv(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeArgv(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeArgv(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeArgv(None))
+            }
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeArgv(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                while map.next_entry::<de::IgnoredAny, de::IgnoredAny>()?.is_some() {}
+                Ok(MaybeArgv(None))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// Deserializes a JSON object of string values directly into `Option<HashMap<String, String>>`
+/// without allocating intermediate `IndexMap`/`Value`/`Vec` containers.
+#[derive(Default)]
+struct MaybeEnv(Option<HashMap<String, String>>);
+
+impl<'de> Deserialize<'de> for MaybeEnv {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeEnv;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(64));
+                let mut valid = true;
+                while let Some((k, v)) = map.next_entry::<String, MaybeStr>()? {
+                    match v.0 {
+                        Some(s) if valid => {
+                            out.insert(k, s);
+                        }
+                        _ => valid = false,
+                    }
+                }
+                Ok(MaybeEnv(valid.then_some(out)))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeEnv(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeEnv(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeEnv(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeEnv(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeEnv(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeEnv(None))
+            }
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeEnv(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+                Ok(MaybeEnv(None))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Deserialize)]
+struct ServerReq {
+    #[serde(default)]
+    v: Value,
+    #[serde(default)]
+    op: MaybeStr,
+    #[serde(default)]
+    argv: MaybeArgv,
+    #[serde(default)]
+    env: MaybeEnv,
+    #[serde(default)]
+    cwd: MaybeStr,
+    #[serde(default)]
+    fingerprint: MaybeStr,
+}
+
+fn parse_server_req(line: &[u8]) -> std::io::Result<ServerReq> {
+    // Reject non-object top-level JSON values just like parse_json_obj.
+    let trimmed = line.iter().copied().find(|b| !b.is_ascii_whitespace());
+    if trimmed != Some(b'{') {
+        return Err(proto_err("expected a JSON object"));
+    }
+    serde_json::from_slice(line).map_err(|e| proto_err(&e.to_string()))
+}
+
 fn handle(inner: &Inner, conn: UnixStream) {
     if let Some(u) = peer_uid(&conn) {
         if u != uid() {
@@ -696,9 +1037,9 @@ fn handle(inner: &Inner, conn: UnixStream) {
         conn.set_read_timeout(secs(FIRST_REPLY_TIMEOUT))?;
         conn.set_write_timeout(secs(FIRST_REPLY_TIMEOUT))?;
         let mut reader = Lines::new(&conn);
-        let msg = reader.read()?;
-        let op = msg.get("op").and_then(Value::as_str).unwrap_or("");
-        if msg.get("v") != Some(&j!(PROTOCOL)) {
+        let req = reader.with_line(parse_server_req)?;
+        let op = req.op.0.as_deref().unwrap_or("");
+        if req.v != j!(PROTOCOL) {
             send(&conn, &j!({"error": "protocol mismatch"}))
         } else if op == "ping" {
             send(&conn, &status_of(inner))
@@ -706,39 +1047,15 @@ fn handle(inner: &Inner, conn: UnixStream) {
             inner.stopping.store(true, Ordering::SeqCst);
             send(&conn, &j!({"ok": true, "stopping": true, "pid": std::process::id()}))
         } else if op == "run" {
-            run(inner, &conn, &mut reader, msg)
+            run(inner, &conn, &mut reader, req)
         } else {
             send(&conn, &j!({"error": "unknown op"}))
         }
     })();
 }
 
-fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, mut msg: Map<String, Value>) -> std::io::Result<()> {
-    let argv: Option<Vec<String>> = match msg.remove("argv") {
-        Some(Value::Array(a)) => a
-            .into_iter()
-            .map(|x| match x {
-                Value::String(s) => Some(s),
-                _ => None,
-            })
-            .collect(),
-        _ => None,
-    };
-    let env: Option<Vec<(String, String)>> = match msg.remove("env") {
-        Some(Value::Object(m)) => m
-            .into_iter()
-            .map(|(k, v)| match v {
-                Value::String(s) => Some((k, s)),
-                _ => None,
-            })
-            .collect(),
-        _ => None,
-    };
-    let cwd = match msg.remove("cwd") {
-        Some(Value::String(s)) => Some(s),
-        _ => None,
-    };
-    let (Some(argv), Some(env), Some(cwd)) = (argv, env, cwd) else {
+fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, req: ServerReq) -> std::io::Result<()> {
+    let (Some(argv), Some(env), Some(cwd)) = (req.argv.0, req.env.0, req.cwd.0) else {
         return send(conn, &j!({"error": "malformed request"}));
     };
     // Reject before accepting anything `set_var` / `set_current_dir` cannot represent,
@@ -751,7 +1068,7 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, mut msg: Map<String
             return send(conn, &j!({"error": "runs in the calling process"}));
         }
     }
-    if msg.get("fingerprint").and_then(Value::as_str) != Some(inner.fingerprint.as_str()) {
+    if req.fingerprint.0.as_deref() != Some(inner.fingerprint.as_str()) {
         // Installed code changed under us: let the client run it and retire.
         send(conn, &j!({"error": "stale daemon"}))?;
         inner.stopping.store(true, Ordering::SeqCst);
@@ -762,7 +1079,7 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, mut msg: Map<String
     }
     touch(inner, 1);
     let res = (|| -> std::io::Result<()> {
-        let _guard = match inner.exec_lock.try_lock() {
+        let mut exec_guard = match inner.exec_lock.try_lock() {
             Ok(g) => g,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -775,12 +1092,13 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, mut msg: Map<String
         }
         send_bytes(conn, b"{\"ready\":true}\n")?;
         conn.set_read_timeout(secs(GO_TIMEOUT))?;
-        if !json::truthy(reader.read()?.get("go").unwrap_or(&Value::Null)) {
+        if !reader.read_go()? {
             return Ok(());
         }
         conn.set_read_timeout(None)?;
         conn.set_write_timeout(None)?;
-        let code = execute(conn, &argv, &env, &cwd);
+        let baseline = exec_guard.get_or_insert_with(BaselineState::capture);
+        let code = execute(conn, &argv, &env, &cwd, baseline);
         inner.state.lock().unwrap_or_else(|e| e.into_inner()).requests += 1;
         let _ = send_bytes(conn, format!("{{\"exit\":{code}}}\n").as_bytes());
         Ok(())
@@ -817,37 +1135,70 @@ fn is_config_env_key(k: &OsStr) -> bool {
 /// Restores the daemon's own environment, working directory and output sink when
 /// dropped, so a panic anywhere in request setup, execution or cleanup can never
 /// leave the next request with this caller's process state.
-struct RequestStateGuard {
-    saved_env: HashMap<OsString, OsString>,
-    saved_cwd: Option<std::path::PathBuf>,
+///
+/// Normal requests record only the small delta list (`deltas`) against the cached
+/// [`BaselineState`] and replay those deltas on drop with zero `std::env::vars_os()`
+/// calls. If a panic occurs, drop falls back to a full live `vars_os()` diff against
+/// `baseline.env` so any unexpected mutation is still completely reverted.
+struct RequestStateGuard<'a> {
+    baseline: &'a BaselineState,
+    deltas: Vec<(OsString, Option<OsString>)>,
+    cwd_changed: bool,
     config_env_changed: bool,
+    panicked: bool,
 }
 
-impl RequestStateGuard {
-    fn capture() -> RequestStateGuard {
+impl<'a> RequestStateGuard<'a> {
+    fn new(baseline: &'a BaselineState) -> RequestStateGuard<'a> {
         RequestStateGuard {
-            saved_env: std::env::vars_os().collect(),
-            saved_cwd: std::env::current_dir().ok(),
+            baseline,
+            deltas: Vec::new(),
+            cwd_changed: false,
             config_env_changed: false,
+            panicked: false,
         }
     }
 }
 
-impl Drop for RequestStateGuard {
+impl Drop for RequestStateGuard<'_> {
     fn drop(&mut self) {
         crate::out::set_sink(None);
-        let restored_config_env = restore_env_diff(std::mem::take(&mut self.saved_env));
-        if let Some(d) = self.saved_cwd.take() {
-            let _ = std::env::set_current_dir(d);
+        let mut reload_cfg = self.config_env_changed;
+        if self.panicked || std::thread::panicking() {
+            if restore_env_diff(&self.baseline.env) {
+                reload_cfg = true;
+            }
+            if let Some(d) = self.baseline.cwd.as_ref() {
+                let _ = std::env::set_current_dir(d);
+            }
+        } else {
+            for (k, prev) in self.deltas.drain(..).rev() {
+                match prev {
+                    Some(v) if valid_os_env_entry(&k, &v) => std::env::set_var(&k, &v),
+                    None => std::env::remove_var(&k),
+                    _ => {}
+                }
+            }
+            if self.cwd_changed {
+                if let Some(d) = self.baseline.cwd.as_ref() {
+                    let _ = std::env::set_current_dir(d);
+                }
+            }
         }
-        if self.config_env_changed || restored_config_env {
+        if reload_cfg {
             let _ = std::panic::catch_unwind(crate::config::reload);
         }
     }
 }
 
 /// Run one CLI invocation with the caller's environment, cwd and streams.
-fn execute(conn: &UnixStream, argv: &[String], env: &[(String, String)], cwd: &str) -> i32 {
+fn execute(
+    conn: &UnixStream,
+    argv: &[String],
+    env: &HashMap<String, String>,
+    cwd: &str,
+    baseline: &BaselineState,
+) -> i32 {
     let sink = match conn.try_clone() {
         Ok(c) => Arc::new(StreamSink {
             conn: c,
@@ -857,29 +1208,35 @@ fn execute(conn: &UnixStream, argv: &[String], env: &[(String, String)], cwd: &s
         Err(_) => return 1,
     };
     // Installed before any process state changes; restores it on every exit path.
-    let mut restore = RequestStateGuard::capture();
+    let mut restore = RequestStateGuard::new(baseline);
     crate::out::set_sink(Some(sink.clone()));
-    restore.config_env_changed = apply_request_env(&restore.saved_env, env);
+    restore.config_env_changed = apply_request_env(&baseline.env, env, &mut restore.deltas);
+    let same_cwd = baseline.cwd.as_deref() == Some(Path::new(cwd));
     let code = match std::env::set_current_dir(cwd) {
         Err(e) => {
             let err = crate::cli::py_os_error(&e, cwd);
             crate::errln!("turbotap: cannot use working directory {}: {err}", json::py_repr_str(cwd));
             1
         }
-        Ok(()) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::cli::run_cli(argv))) {
-            Ok(code) => code,
-            Err(p) => {
-                let msg = p
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "panic".to_string());
-                crate::errln!("turbotap: internal error: {msg}");
-                1
+        Ok(()) => {
+            restore.cwd_changed = !same_cwd;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::cli::run_cli(argv))) {
+                Ok(code) => code,
+                Err(p) => {
+                    restore.panicked = true;
+                    let msg = p
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "panic".to_string());
+                    crate::errln!("turbotap: internal error: {msg}");
+                    1
+                }
             }
-        },
+        }
     };
     if std::panic::catch_unwind(drain_request_work).is_err() {
+        restore.panicked = true;
         crate::errln!("turbotap: internal error while draining request work");
     }
     code
@@ -887,19 +1244,20 @@ fn execute(conn: &UnixStream, argv: &[String], env: &[(String, String)], cwd: &s
 
 /// Diff-apply the request's environment onto the process environment (only removing keys
 /// absent from `target` and only setting keys whose value changed, plus ensuring
-/// `OMP_THREAD_LIMIT=1` when absent). Returns true when any config-affecting key changed.
-fn apply_request_env(saved: &HashMap<OsString, OsString>, target: &[(String, String)]) -> bool {
+/// `OMP_THREAD_LIMIT=1` when absent). Records every change in `deltas` for O(deltas)
+/// restoration on drop. Returns true when any config-affecting key changed.
+fn apply_request_env(
+    saved: &HashMap<OsString, OsString>,
+    target: &HashMap<String, String>,
+    deltas: &mut Vec<(OsString, Option<OsString>)>,
+) -> bool {
     let omp_key = OsStr::new("OMP_THREAD_LIMIT");
     let omp_default = OsStr::new("1");
-    let mut target_map: HashMap<&OsStr, &OsStr> = HashMap::with_capacity(target.len());
-    for (k, v) in target {
-        target_map.insert(OsStr::new(k), OsStr::new(v));
-    }
     let mut config_changed = false;
-    let omp_in_target = target_map.contains_key(omp_key);
+    let omp_in_target = target.contains_key("OMP_THREAD_LIMIT");
     for (k, cur_v) in saved {
         let ks = k.as_os_str();
-        if target_map.contains_key(ks) {
+        if ks.to_str().is_some_and(|s| target.contains_key(s)) {
             continue;
         }
         if !omp_in_target && ks == omp_key && cur_v.as_os_str() == omp_default {
@@ -908,26 +1266,35 @@ fn apply_request_env(saved: &HashMap<OsString, OsString>, target: &[(String, Str
         if is_config_env_key(ks) {
             config_changed = true;
         }
+        deltas.push((k.clone(), Some(cur_v.clone())));
         std::env::remove_var(ks);
     }
-    for (&k, &new_v) in &target_map {
-        if saved.get(k).map(OsString::as_os_str) != Some(new_v) && valid_os_env_entry(k, new_v) {
-            if is_config_env_key(k) {
+    for (k, new_v) in target {
+        let ks = OsStr::new(k);
+        let vs = OsStr::new(new_v);
+        let prev = saved.get(ks);
+        if prev.map(OsString::as_os_str) != Some(vs) && valid_os_env_entry(ks, vs) {
+            if is_config_env_key(ks) {
                 config_changed = true;
             }
-            std::env::set_var(k, new_v);
+            deltas.push((OsString::from(k), prev.cloned()));
+            std::env::set_var(ks, vs);
         }
     }
-    if !omp_in_target && saved.get(omp_key).map(OsString::as_os_str) != Some(omp_default) {
-        std::env::set_var(omp_key, omp_default);
+    if !omp_in_target {
+        let prev = saved.get(omp_key);
+        if prev.map(OsString::as_os_str) != Some(omp_default) {
+            deltas.push((omp_key.to_os_string(), prev.cloned()));
+            std::env::set_var(omp_key, omp_default);
+        }
     }
     config_changed
 }
 
-/// Diff-restore the process environment back to `saved`, inspecting the live environment
-/// so any mutations or panics during the request are completely reverted. Returns true
-/// when any config-affecting key was modified.
-fn restore_env_diff(mut remaining: HashMap<OsString, OsString>) -> bool {
+/// Panic-fallback full diff restore against `saved`, inspecting the live environment
+/// so any unexpected mutations during a panic are completely reverted.
+fn restore_env_diff(saved: &HashMap<OsString, OsString>) -> bool {
+    let mut remaining = saved.clone();
     let mut config_changed = false;
     for (k, cur_v) in std::env::vars_os() {
         match remaining.remove(&k) {
@@ -1097,28 +1464,39 @@ mod unit {
     #[test]
     fn diff_env_apply_and_restore_is_exact_and_panic_safe() {
         let _lock = set_env(&[("TT_DIFF_KEEP", Some("same")), ("TT_DIFF_MOD", Some("old")), ("TT_DIFF_ADD", None)]);
-        {
-            let guard = RequestStateGuard::capture();
-            let mut target: Vec<(String, String)> = guard
-                .saved_env
+        let baseline = BaselineState::capture();
+        let make_target = || -> HashMap<String, String> {
+            let mut target: HashMap<String, String> = baseline
+                .env
                 .iter()
                 .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
                 .filter(|(k, _)| k != "TT_DIFF_KEEP")
                 .collect();
-            for (k, v) in &mut target {
-                if k == "TT_DIFF_MOD" {
-                    *v = "new".to_string();
-                }
-            }
-            target.push(("TT_DIFF_ADD".to_string(), "added".to_string()));
-            apply_request_env(&guard.saved_env, &target);
+            target.insert("TT_DIFF_MOD".to_string(), "new".to_string());
+            target.insert("TT_DIFF_ADD".to_string(), "added".to_string());
+            target
+        };
+        // Normal delta-replay restoration path (zero vars_os() scan).
+        {
+            let mut guard = RequestStateGuard::new(&baseline);
+            let target = make_target();
+            apply_request_env(&baseline.env, &target, &mut guard.deltas);
             assert_eq!(std::env::var("TT_DIFF_KEEP").ok(), None);
             assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("new"));
             assert_eq!(std::env::var("TT_DIFF_ADD").ok().as_deref(), Some("added"));
-            // Also simulate a mid-request mutation not in `target`.
-            std::env::set_var("TT_DIFF_EXTRA", "mutated");
         }
-        // Guard dropped: every change must be reverted exactly.
+        assert_eq!(std::env::var("TT_DIFF_KEEP").ok().as_deref(), Some("same"));
+        assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("old"));
+        assert_eq!(std::env::var("TT_DIFF_ADD").ok(), None);
+
+        // Panic fallback path reverts unexpected mid-request mutations too.
+        {
+            let mut guard = RequestStateGuard::new(&baseline);
+            let target = make_target();
+            apply_request_env(&baseline.env, &target, &mut guard.deltas);
+            std::env::set_var("TT_DIFF_EXTRA", "mutated");
+            guard.panicked = true;
+        }
         assert_eq!(std::env::var("TT_DIFF_KEEP").ok().as_deref(), Some("same"));
         assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("old"));
         assert_eq!(std::env::var("TT_DIFF_ADD").ok(), None);

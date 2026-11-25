@@ -368,6 +368,15 @@ impl<R: Reader> Flow<R> {
         Ok(None)
     }
 
+    /// Already-OCR'd lines from a very recent frame (never runs OCR or clones twice).
+    fn fresh_cached_lines(&self, max_age: f64) -> Option<Vec<Line>> {
+        let last_ts = self.r.last_ts();
+        if last_ts != 0.0 && (clock::now() - last_ts) < max_age && self.r.last().is_some() {
+            return self.r.last_lines();
+        }
+        None
+    }
+
     /// L2756.
     pub fn read_sauvola(&mut self, img: Option<Frame>) -> Result<Option<Vec<Line>>> {
         let Some(img) = img else { return Ok(None) };
@@ -404,8 +413,8 @@ impl<R: Reader> Flow<R> {
 
         // Reuse very recent already-OCR'd lines when no action has happened since
         // the screen settled (e.g. wait:TEXT right after read or another wait).
-        if !has_initial && self.wait_settled_ts >= self.last_action_ts && self.r.last_lines().is_some() {
-            if let Some(cached_lines) = self.fresh_lines(0.15)? {
+        if !has_initial && self.wait_settled_ts >= self.last_action_ts {
+            if let Some(cached_lines) = self.fresh_cached_lines(0.15) {
                 if let Some(m0) = find(&cached_lines, &label, where_) {
                     if !stable {
                         self.wait_settled_ts = clock::now();
@@ -561,8 +570,8 @@ impl<R: Reader> Flow<R> {
         let mut last_sauvola_id: Option<usize> = None;
         let mut settled_lines: Option<Vec<Line>> = None;
 
-        if self.wait_settled_ts >= self.last_action_ts && self.r.last_lines().is_some() {
-            if let Some(cached_lines) = self.fresh_lines(0.15)? {
+        if self.wait_settled_ts >= self.last_action_ts {
+            if let Some(cached_lines) = self.fresh_cached_lines(0.15) {
                 if let Some(m) = first_hit(&cached_lines) {
                     self.wait_settled_ts = clock::now();
                     return Ok(m);
@@ -642,8 +651,8 @@ impl<R: Reader> Flow<R> {
         let end = clock::wall() + self.eff_timeout(timeout);
         let mut prev_img: Option<Frame> = None;
         let mut m: Option<Match> = None;
-        if self.wait_settled_ts >= self.last_action_ts && self.r.last_lines().is_some() {
-            if let Some(cached_lines) = self.fresh_lines(0.15)? {
+        if self.wait_settled_ts >= self.last_action_ts {
+            if let Some(cached_lines) = self.fresh_cached_lines(0.15) {
                 m = find(&cached_lines, &label, where_);
                 if m.is_some() {
                     prev_img = self.r.last();
@@ -1166,19 +1175,19 @@ impl<R: Reader> Flow<R> {
             (None, 0)
         };
         let mut fut: Option<Pending<UiFetch>> = None;
-        let mut fut_texts: Option<Vec<String>> = None;
+        let mut fut_texts: Option<Arc<Vec<String>>> = None;
         if let Some(p) = probes.as_ref() {
             if !may_be_transitioning {
                 fut = Some(self.submit_ui_fetch(p, pt, wb.clone(), wb_ms));
             }
         }
         let has_content_of = |lines: &[Line]| lines.iter().any(|l| l.y() >= status_y);
-        let mut prev_texts: Option<Vec<String>> = None;
+        let mut prev_texts: Option<Arc<Vec<String>>> = None;
         let mut prev_img: Option<Frame> = None;
         let mut prev_has_content = false;
         let mut populated_frames = 0u32;
         let mut lines: Vec<Line> = Vec::new();
-        let mut texts: Vec<String> = Vec::new();
+        let mut texts: Arc<Vec<String>> = Arc::new(Vec::new());
         let mut already_stable = false;
         let mut stable = false;
         let mut pending_img: Option<Frame> = None;
@@ -1187,13 +1196,13 @@ impl<R: Reader> Flow<R> {
             if let (Some(last), Some(cached_lines)) = (self.r.last(), self.r.last_lines()) {
                 if last_ts != 0.0 && (t0 - last_ts) < 0.25 && has_content_of(&cached_lines) {
                     prev_img = Some(last.clone());
-                    texts = texts_of(&cached_lines);
+                    texts = Arc::new(texts_of(&cached_lines));
                     prev_texts = Some(texts.clone());
                     prev_has_content = true;
                     lines = cached_lines.clone();
                     populated_frames = 1;
                     if fut.is_some() {
-                        fut_texts = prev_texts.clone();
+                        fut_texts = Some(texts.clone());
                     }
                     // Confirm with one cheap raw grab (~34 ms): if content pixels below the
                     // status bar are locally unchanged (no small counter/text updates), skip
@@ -1211,70 +1220,70 @@ impl<R: Reader> Flow<R> {
             }
         }
         if !already_stable {
-          loop {
-            let cur_img: Option<Frame>;
-            if let Some(pimg) = pending_img.take() {
-                lines = self.read_img(&pimg)?;
-                self.r.set_last(Some(pimg.clone()), Some(lines.clone()), None);
-                cur_img = Some(pimg);
-            } else if prev_img.is_some() && prev_has_content {
-                // Confirm stability with one cheap raw grab (~34 ms) before paying
-                // for a second full OCR pass (300-600 ms) on truly still screens;
-                // any local pixel change (e.g. '1' -> '2') falls through to OCR.
-                let g = self.grab()?;
-                if !same(Some(&g), prev_img.as_ref()) && still(prev_img.as_ref(), Some(&g)) {
-                    self.r.set_last(Some(g), Some(lines.clone()), None);
-                    stable = true;
+            loop {
+                let cur_img: Option<Frame>;
+                if let Some(pimg) = pending_img.take() {
+                    lines = self.read_img(&pimg)?;
+                    self.r.set_last(Some(pimg.clone()), Some(lines.clone()), None);
+                    cur_img = Some(pimg);
+                } else if prev_img.is_some() && prev_has_content {
+                    // Confirm stability with one cheap raw grab (~34 ms) before paying
+                    // for a second full OCR pass (300-600 ms) on truly still screens;
+                    // any local pixel change (e.g. '1' -> '2') falls through to OCR.
+                    let g = self.grab()?;
+                    if !same(Some(&g), prev_img.as_ref()) && still(prev_img.as_ref(), Some(&g)) {
+                        self.r.set_last(Some(g), Some(lines.clone()), None);
+                        stable = true;
+                        break;
+                    }
+                    lines = self.read_img(&g)?;
+                    self.r.set_last(Some(g.clone()), Some(lines.clone()), None);
+                    cur_img = Some(g);
+                } else {
+                    lines = self.lines(None, None)?;
+                    cur_img = self.r.last();
+                }
+                texts = Arc::new(texts_of(&lines));
+                let has_content = has_content_of(&lines);
+                if has_content {
+                    populated_frames += 1;
+                }
+                if fut.is_some() && fut_texts.is_none() {
+                    fut_texts = Some(if has_content { texts.clone() } else { Arc::new(Vec::new()) });
+                }
+                let elapsed = clock::now() - t0;
+                stable = false;
+                if let Some(pt_texts) = prev_texts.as_ref() {
+                    let overlap = text_overlap(&texts, pt_texts);
+                    let img_still = prev_img.is_some() && still(prev_img.as_ref(), cur_img.as_ref());
+                    if has_content {
+                        stable = *texts == **pt_texts
+                            || overlap >= 0.72
+                            || img_still
+                            || (populated_frames >= 3 && overlap >= 0.5);
+                    } else if elapsed >= 0.8 && img_still {
+                        stable = true;
+                    }
+                }
+                if stable || clock::now() >= end {
                     break;
                 }
-                lines = self.read_img(&g)?;
-                self.r.set_last(Some(g.clone()), Some(lines.clone()), None);
-                cur_img = Some(g);
-            } else {
-                lines = self.lines(None, None)?;
-                cur_img = self.r.last();
-            }
-            texts = texts_of(&lines);
-            let has_content = has_content_of(&lines);
-            if has_content {
-                populated_frames += 1;
-            }
-            if fut.is_some() && fut_texts.is_none() {
-                fut_texts = Some(if has_content { texts.clone() } else { Vec::new() });
-            }
-            let elapsed = clock::now() - t0;
-            stable = false;
-            if let Some(pt_texts) = prev_texts.as_ref() {
-                let overlap = text_overlap(&texts, pt_texts);
-                let img_still = prev_img.is_some() && still(prev_img.as_ref(), cur_img.as_ref());
-                if has_content {
-                    stable = &texts == pt_texts
-                        || overlap >= 0.72
-                        || img_still
-                        || (populated_frames >= 3 && overlap >= 0.5);
-                } else if elapsed >= 0.8 && img_still {
-                    stable = true;
-                }
-            }
-            if stable || clock::now() >= end {
-                break;
-            }
-            prev_texts = Some(texts.clone());
-            prev_img = cur_img;
-            prev_has_content = has_content;
-            if let Some(p) = probes.as_ref() {
-                if has_content {
-                    let refetch = match fut.as_mut() {
-                        None => true,
-                        Some(f) => f.done() && fut_texts.as_ref().is_some_and(|ft| text_overlap(ft, &texts) < 0.5),
-                    };
-                    if refetch {
-                        fut_texts = Some(texts.clone());
-                        fut = Some(self.submit_ui_fetch(p, pt, wb.clone(), wb_ms));
+                prev_texts = Some(texts.clone());
+                prev_img = cur_img;
+                prev_has_content = has_content;
+                if let Some(p) = probes.as_ref() {
+                    if has_content {
+                        let refetch = match fut.as_mut() {
+                            None => true,
+                            Some(f) => f.done() && fut_texts.as_ref().is_some_and(|ft| text_overlap(ft, &texts) < 0.5),
+                        };
+                        if refetch {
+                            fut_texts = Some(texts.clone());
+                            fut = Some(self.submit_ui_fetch(p, pt, wb.clone(), wb_ms));
+                        }
                     }
                 }
             }
-          }
         }
         if let Some(p) = probes.as_ref() {
             let fut_fresh = fut.is_some()

@@ -394,8 +394,8 @@ impl<R: Reader> Flow<R> {
             // Back/Close/Search/tab or keypad Key) is tapped at once instead of after the
             // 2.2 s OCR wait (Messenger Back: 2,979 -> ~800 ms), honoring @region.
             let ctl = self.tap_ctl(None)?;
-            let fl = first_lines.clone().unwrap_or_default();
-            let scoped = scope(&ctl, &fl, wh);
+            let fl = first_lines.as_deref().unwrap_or(&[]);
+            let scoped = scope(&ctl, fl, wh);
             let ext = ext_types();
             let mut c = exact_control(&scoped, &base, ext, false).cloned();
             if c.is_none() && BACK_LABELS.contains(&low_base.as_str()) {
@@ -425,9 +425,13 @@ impl<R: Reader> Flow<R> {
                     // messages) have no visible text for OCR: one /source lookup with
                     // coordinates, then targeted Sauvola fallback, then the slower
                     // element-predicate poll.
-                    let cur_lines = match self.r.last_lines() {
-                        Some(l) => l,
-                        None => first_lines.clone().unwrap_or_default(),
+                    let cur_lines = if is_header_where(wh) {
+                        match self.r.last_lines() {
+                            Some(l) => l,
+                            None => first_lines.unwrap_or_default(),
+                        }
+                    } else {
+                        Vec::new()
                     };
                     let raw_ctl_fb = self.tap_ctl(None)?;
                     let ctl_fb = scope(&raw_ctl_fb, &cur_lines, wh);
@@ -479,7 +483,7 @@ impl<R: Reader> Flow<R> {
             //    where OCR matches the left-aligned label text, but the focusable input
             //    (TextField/TextView/SearchField) spans the row and should be tapped at
             //    its centre.
-            let cur_lines = self.tap_current_lines()?;
+            let cur_lines = if is_header_where(wh) { self.tap_current_lines()? } else { Vec::new() };
             let rc = self.tap_ctl(None)?;
             let ctl = scope(&rc, &cur_lines, wh);
             let c = self.resolve_ocr_control(&m, &base, &ctl, near_bottom_tab, is_form_label)?;
@@ -489,8 +493,8 @@ impl<R: Reader> Flow<R> {
                 return self.tap_control(&c, None);
             }
         }
-        if m.line.is_some() {
-            let cur_lines = self.r.last_lines().unwrap_or_default();
+        if m.line.is_some() && (resolved_ctl.is_some() || self.ctl_cache.is_some()) {
+            let cur_lines = if is_header_where(wh) { self.r.last_lines().unwrap_or_default() } else { Vec::new() };
             if self.is_disabled_ocr_match(&m, &base, &cur_lines, wh, resolved_ctl.as_deref()) {
                 return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
             }
@@ -1106,7 +1110,7 @@ impl<R: Reader> Flow<R> {
             Err(e) => return Err(e),
         };
         if m.line.is_some() && m.rank != 0 && !base.starts_with("re:") {
-            let cur_lines = self.tap_current_lines()?;
+            let cur_lines = if is_header_where(wh) { self.tap_current_lines()? } else { Vec::new() };
             let rc = self.tap_ctl(None)?;
             let ctl = scope(&rc, &cur_lines, wh);
             if let Some(c) = exact_control(&ctl, &base, TAP_FORM_TYPES, false) {

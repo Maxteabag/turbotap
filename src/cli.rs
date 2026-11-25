@@ -234,9 +234,16 @@ fn b(m: &ArgMatches, k: &str) -> bool {
     m.get_flag(k)
 }
 
+fn parse_cli(argv: &[String]) -> std::result::Result<ArgMatches, clap::Error> {
+    static CMD: std::sync::Mutex<Option<Command>> = std::sync::Mutex::new(None);
+    let mut guard = CMD.lock().unwrap_or_else(|e| e.into_inner());
+    let cmd = guard.get_or_insert_with(build_command);
+    cmd.try_get_matches_from_mut(std::iter::once("turbotap").chain(argv.iter().map(String::as_str)))
+}
+
 /// Python `_main` (L5998): parse, then dispatch. Returns the exit code.
 fn main_inner(argv: &[String]) -> Result<i32> {
-    let m = match build_command().try_get_matches_from(std::iter::once("turbotap").chain(argv.iter().map(String::as_str))) {
+    let m = match parse_cli(argv) {
         Ok(m) => m,
         Err(e) => {
             let text = e.render().to_string();
@@ -458,4 +465,25 @@ pub fn cmd_otp_type(
     }
     crate::outln!("{}", json::dumps(&j!({"ok": true, "digits_typed": code.chars().count()})));
     Ok(())
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    #[test]
+    fn reused_cli_parser_matches_across_subcommands_help_and_errors() {
+        let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let m1 = parse_cli(&s(&["--url", "http://127.0.0.1:8100", "preflight", "--stock"])).unwrap();
+        assert_eq!(m1.subcommand_name(), Some("preflight"));
+        assert!(parse_cli(&s(&["--help"])).is_err());
+        assert!(parse_cli(&s(&["flow"])).is_err());
+        let m2 = parse_cli(&s(&["flow", "--no-deny", "--scale", "2.0", "ui", "tap:Settings"])).unwrap();
+        let (cmd, sm) = m2.subcommand().unwrap();
+        assert_eq!(cmd, "flow");
+        assert!(sm.get_flag("no-deny"));
+        assert_eq!(sm.get_one::<f64>("scale").copied(), Some(2.0));
+        let m3 = parse_cli(&s(&["ocr", "--y0", "100", "--y1", "400"])).unwrap();
+        assert_eq!(m3.subcommand_name(), Some("ocr"));
+    }
 }
