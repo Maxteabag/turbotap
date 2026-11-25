@@ -99,3 +99,16 @@ Eight captures of Calculator were passed to both engines with the same grayscale
 | calculator | rapidocr | 48/80 | 761.57 |
 
 RapidOCR improved exact coverage on both inputs. On Calculator its median added about 706 ms over Tesseract. The two device series used different frames and display state from the earlier scale sweep, so compare engines within the same series.
+
+## Native raw JPEG and frame differencing
+
+Eight alternating-order pairs per operation. Wall time includes process startup, foreground and lock checks. Each capture is a fresh POST to fastScreenshot. OCR uses one full frame with PSM 6; the Rust binary initializes libtesseract in process, and the Python comparator starts the tesseract executable. The production strip reader has separate measurements.
+
+| Operation | Client | Median wall ms | Phase medians in ms |
+|---|---|---:|---|
+| turbo | python | 306.17 | capture 76.40, decode 15.54 |
+| turbo | rust | 240.78 | capture 71.10, decode 4.58 |
+| turbo-diff | python | 509.16 | capture 76.56, decode 15.23, diff 1.25 |
+| turbo-diff | rust | 451.12 | capture 72.80, decode 4.19, diff 0.24 |
+| turbo-ocr | python | 430.25 | capture 76.54, decode 15.21 |
+| turbo-ocr | rust | 344.92 | capture 73.54, decode 3.52 |
