@@ -269,3 +269,18 @@ For each Clock and Settings snapshot, the benchmark matched recognized lines to 
 | settings | host | 6/6 | 36/138 | 98.4 |
 | settings | fast | 6/6 | 60/138 | 147.6 |
 | settings | accurate | 6/6 | 72/138 | 265.5 |
+
+## Overnight JPEG and connection study
+
+The iPhone completed 25 blocks from 01:18 to 06:06 CET, with 48 captures per block and eight randomized trials in each quality and connection condition. The first worker was interrupted between blocks and resumed at the next scheduled slot. All 1,200 captures are accounted for. Each capture was scored against ten stable Calculator key centers. The table gives pooled medians and total anchor hits. The same phone and layout were sampled repeatedly.
+
+| JPEG quality | Connection | Captures | Median body bytes | Median HTTP ms | Median host decode + OCR ms | Anchor hits / 2,000 |
+|---|---|---:|---:|---:|---:|---:|
+| 0.25 | reused | 200 | 31,968 | 65.0 | 23.2 | 600 |
+| 0.25 | new | 200 | 31,968 | 76.7 | 23.3 | 603 |
+| 0.6 | reused | 200 | 61,757 | 67.6 | 25.3 | 1,000 |
+| 0.6 | new | 200 | 61,757 | 84.1 | 25.3 | 1,000 |
+| 0.9 | reused | 200 | 96,185 | 72.0 | 20.1 | 1,196 |
+| 0.9 | new | 200 | 96,185 | 90.3 | 19.9 | 1,200 |
+
+Across the 25 blocks, reusing the connection reduced median HTTP time in every block at each quality. Median within-block savings were 12.1 ms (quality 0.25), 16.7 ms (0.6) and 17.9 ms (0.9). Lower JPEG quality reduced bandwidth but also reduced digit localization on this screen. The repeated static layout limits how far these accuracy results generalize.
