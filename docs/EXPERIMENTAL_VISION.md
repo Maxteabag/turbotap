@@ -1,10 +1,14 @@
 # Experimental WDA text recognition
 
-Apply `patches/wda-vision.patch` **after** the bundled turbo patch on Appium WebDriverAgent 16.14.0. It adds two aliases, `POST /wda/fastOCR` and `POST /wda/fastRead`, both with and without a session. The Python reader still uses its existing OCR path.
+Apply `patches/wda-vision.patch` **after** the bundled turbo patch on Appium WebDriverAgent 16.14.0. It adds `POST /wda/fastOCR` for OCR alone and `POST /wda/fastRead` for OCR plus fastUI in one request. Both support session and sessionless URLs. The Python reader still uses its existing OCR path.
 
 Send `{}` or `{"mode":"fast"}` for Vision's fast recognizer with language correction disabled. Use `{"mode":"accurate"}` for the accurate recognizer with language correction enabled. Other modes and keys return a WDA invalid argument error. Both routes capture the full main screen once through XCTest's public `XCUIScreen.screenshot.PNGRepresentation` and run one public `VNRecognizeTextRequest` locally. The screenshot stays in the runner. The caller receives recognized text, which may be sensitive.
 
-The WDA response wraps `{"mode":"fast","lines":[]}` in its normal `value` field. A successful blank screen returns an empty array. Each observation contributes its best candidate with `text`, Vision `confidence`, and `x`, `y`, `width`, `height`. The bounding box uses normalized fractions of the oriented screenshot from its **top left**. Multiply horizontal values by the displayed screenshot width and vertical values by its height to convert to the corresponding pixels or points. Lines follow Vision's observation order. Capture and recognition failures return WDA errors.
+Both responses include `value.mode`, `value.lines`, and `value.timing`. A successful blank screen returns an empty array. Each observation contributes its best candidate with `text`, Vision `confidence`, and `x`, `y`, `width`, `height`. The bounding box uses normalized fractions of the oriented screenshot from its **top left**. Multiply horizontal values by the displayed screenshot width and vertical values by its height to convert to the corresponding pixels or points. Lines follow Vision's observation order. Capture and recognition failures return WDA errors.
+
+On a fused read, the runner captures the screenshot, collects the same AX payload as `GET /wda/fastUI`, then recognizes the captured image. The object at `value.fastUI` includes `ui`, `screen`, app metadata and keyboard state in the original fastUI schema and point coordinate system. The fused route accepts the existing fastUI query parameters. For example, `POST /wda/fastRead?text=1` with body `{"mode":"accurate"}` includes AX static text. A failed AX snapshot fails the fused request. Capture and AX collection are sequential, so an app transition can yield different screen states between them. An optional fastUI bundle wait occurs after screenshot capture.
+
+`value.timing` reports monotonic elapsed milliseconds. `captureMs` includes screenshot capture and PNG creation, `axMs` includes the fastUI collection and optional wait (zero for fastOCR), and `recognitionMs` includes Vision setup, recognition and extraction of the line results. `totalMs` spans those operations up to result assembly. The caller measures HTTP round-trip time separately.
 
 ## Build without signing or running
 

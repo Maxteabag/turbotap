@@ -1,31 +1,78 @@
+--- a/WebDriverAgentLib/Commands/FBDebugCommands.h
++++ b/WebDriverAgentLib/Commands/FBDebugCommands.h
+@@ -14,6 +14,8 @@
+ 
+ @interface FBDebugCommands : NSObject <FBCommandHandler>
+ 
+++ (nullable NSDictionary *)fastUIPayloadForRequest:(FBRouteRequest *)request;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+--- a/WebDriverAgentLib/Commands/FBDebugCommands.m
++++ b/WebDriverAgentLib/Commands/FBDebugCommands.m
+@@ -263,7 +263,7 @@
+ // wda-turbo: single-snapshot on-device UI control walk (zero per-node customActions /
+ // accessibility IPC, prunes off-screen cells, skips soft-keyboard keys, compact JSON).
+ // Optional query params: ?text=1&waitBundle=<bundleId>&waitMs=<ms> (capped at 2000 ms).
+-+ (id<FBResponsePayload>)handleFastUI:(FBRouteRequest *)request
+++ (nullable NSDictionary *)fastUIPayloadForRequest:(FBRouteRequest *)request
+ {
+   XCUIApplication *application = XCUIApplication.fb_activeApplication;
+   NSString *waitBundle = request.parameters[@"waitBundle"];
+@@ -292,7 +292,7 @@
+     snapshot = [application fb_standardSnapshot];
+   }
+   if (nil == snapshot) {
+-    return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
++    return nil;
+   }
+   CGRect rootFrame = snapshot.frame;
+   BOOL rootValid = isfinite(rootFrame.size.width) && isfinite(rootFrame.size.height)
+@@ -352,6 +352,15 @@
+       @"height": @((NSInteger)llround(kbRect.size.height)),
+     };
+   }
++  return payload;
++}
++
+++ (id<FBResponsePayload>)handleFastUI:(FBRouteRequest *)request
++{
++  NSDictionary *payload = [self fastUIPayloadForRequest:request];
++  if (nil == payload) {
++    return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
++  }
+   NSError *jsonError = nil;
+   NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload
+                                                      options:(NSJSONWritingOptions)0
 --- a/WebDriverAgentLib/Commands/FBScreenshotCommands.m
 +++ b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
-@@ -15,6 +15,7 @@
+@@ -15,6 +15,8 @@
  #import "FBCommandStatus.h"
  #import "FBRouteRequest.h"
  @import UniformTypeIdentifiers;
++#import "FBDebugCommands.h"
 +@import Vision;
  
  // wda-turbo: downscale JPEG/PNG via ImageIO thumbnail subsampling (avoids full RGBA
  // UIGraphicsImageRenderer redraw and per-call FBImageProcessor dispatch queue alloc).
-@@ -73,6 +74,10 @@
+@@ -73,6 +75,10 @@
      [[FBRoute GET:@"/screenshot"].standalone respondWithTarget:self action:@selector(handleGetScreenshot:)],
      [[FBRoute POST:@"/wda/fastScreenshot"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastScreenshot:)],
      [[FBRoute POST:@"/wda/fastScreenshot"].standalone respondWithTarget:self action:@selector(handleFastScreenshot:)],
 +    [[FBRoute POST:@"/wda/fastOCR"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastOCR:)],
 +    [[FBRoute POST:@"/wda/fastOCR"].standalone respondWithTarget:self action:@selector(handleFastOCR:)],
-+    [[FBRoute POST:@"/wda/fastRead"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastOCR:)],
-+    [[FBRoute POST:@"/wda/fastRead"].standalone respondWithTarget:self action:@selector(handleFastOCR:)],
++    [[FBRoute POST:@"/wda/fastRead"].withoutSession respondWithTarget:self action:@selector(handleFastRead:)],
++    [[FBRoute POST:@"/wda/fastRead"] respondWithTarget:self action:@selector(handleFastRead:)],
    ];
  }
  
-@@ -123,4 +128,54 @@
+@@ -123,4 +129,84 @@
    return FBResponseWithObject([data base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0]);
  }
  
-+// Both route names expose the same line-level result. Coordinates are fractions
-+// of the oriented screenshot, with an origin at the top left.
-++ (id<FBResponsePayload>)handleFastOCR:(FBRouteRequest *)request
++// The fused read takes the AX snapshot immediately after screenshot capture.
+++ (id<FBResponsePayload>)handleVisionRead:(FBRouteRequest *)request includeUI:(BOOL)includeUI
 +{
 +  NSDictionary *args = request.arguments;
 +  id mode = args[@"mode"] ?: @"fast";
@@ -39,10 +86,21 @@
 +  }
 +
 +  @autoreleasepool {
++    NSProcessInfo *clock = NSProcessInfo.processInfo;
++    NSTimeInterval start = clock.systemUptime;
 +    NSData *png = XCUIScreen.mainScreen.screenshot.PNGRepresentation;
++    NSTimeInterval captured = clock.systemUptime;
 +    if (png.length == 0) {
 +      return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:@"No screenshot available" traceback:nil]);
 +    }
++    NSDictionary *ui = nil;
++    if (includeUI) {
++      ui = [FBDebugCommands fastUIPayloadForRequest:request];
++      if (nil == ui) {
++        return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
++      }
++    }
++    NSTimeInterval recognitionStart = clock.systemUptime;
 +    VNRecognizeTextRequest *ocr = [[VNRecognizeTextRequest alloc] init];
 +    BOOL accurate = [@"accurate" isEqual:mode];
 +    ocr.recognitionLevel = accurate ? VNRequestTextRecognitionLevelAccurate : VNRequestTextRecognitionLevelFast;
@@ -69,8 +127,28 @@
 +        @"height": @(CGRectGetHeight(box)),
 +      }];
 +    }
-+    return FBResponseWithObject(@{@"mode": mode, @"lines": lines});
++    NSTimeInterval end = clock.systemUptime;
++    NSMutableDictionary *result = [@{@"mode": mode, @"lines": lines, @"timing": @{
++      @"captureMs": @((captured - start) * 1000.0),
++      @"axMs": @(includeUI ? (recognitionStart - captured) * 1000.0 : 0.0),
++      @"recognitionMs": @((end - recognitionStart) * 1000.0),
++      @"totalMs": @((end - start) * 1000.0),
++    }} mutableCopy];
++    if (nil != ui) {
++      result[@"fastUI"] = ui;
++    }
++    return FBResponseWithObject(result);
 +  }
++}
++
+++ (id<FBResponsePayload>)handleFastOCR:(FBRouteRequest *)request
++{
++  return [self handleVisionRead:request includeUI:NO];
++}
++
+++ (id<FBResponsePayload>)handleFastRead:(FBRouteRequest *)request
++{
++  return [self handleVisionRead:request includeUI:YES];
 +}
 +
  @end
