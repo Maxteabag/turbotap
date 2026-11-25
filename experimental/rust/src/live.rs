@@ -33,7 +33,7 @@ impl Wda {
 
     fn guard(&self) -> Result<()> {
         if self.get("/wda/locked")?["value"] != false
-            || self.get("/wda/activeAppInfo")?["value"]["bundleId"] != CALCULATOR
+            || !self.get("/wda/activeAppInfo")?["value"]["bundleId"].as_str().unwrap_or("").eq_ignore_ascii_case(CALCULATOR)
         {
             return Err("guard failed".into());
         }
@@ -66,7 +66,7 @@ impl Wda {
             "screenshot" => json!({"bytes":screenshot_bytes(&self.get("/screenshot")?)?.len()}),
             "fastUI" => {
                 let ui = self.get("/wda/fastUI")?;
-                if ui["bundleId"] != CALCULATOR {
+                if !ui["bundleId"].as_str().unwrap_or("").eq_ignore_ascii_case(CALCULATOR) {
                     return Err("snapshot provenance".into());
                 }
                 control_count(&ui)?

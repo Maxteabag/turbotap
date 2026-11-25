@@ -25,7 +25,7 @@ class CaptureSource:
 
     def require_calculator(self, deadline):
         reply = self.transport.req("GET", "/wda/activeAppInfo", deadline=deadline)
-        if (reply.get("value") or {}).get("bundleId") != "com.apple.calculator":
+        if (reply.get("value") or {}).get("bundleId", "").casefold() != "com.apple.calculator":
             raise RuntimeError("Calculator foreground required")
 
     def req_raw(self, method, path, data, *, timeout, deadline):

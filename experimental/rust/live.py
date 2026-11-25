@@ -37,7 +37,7 @@ def run(op):
 
     def guard():
         if (get("/wda/locked")["value"] is not False
-                or get("/wda/activeAppInfo")["value"]["bundleId"] != CALCULATOR):
+                or get("/wda/activeAppInfo")["value"]["bundleId"].casefold() != CALCULATOR):
             raise ValueError()
 
     def observe(step):
@@ -59,7 +59,7 @@ def run(op):
             result = {"bytes": len(data)}
         else:
             ui = get("/wda/fastUI")
-            if ui["bundleId"] != CALCULATOR or not isinstance(ui["ui"], list):
+            if ui["bundleId"].casefold() != CALCULATOR or not isinstance(ui["ui"], list):
                 raise ValueError()
             width, height = ui["screen"]
             controls = set()

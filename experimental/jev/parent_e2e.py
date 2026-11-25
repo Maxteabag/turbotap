@@ -5,6 +5,7 @@ import re
 import secrets
 import sys
 import time
+import unicodedata
 
 from planner import TASKS, query
 
@@ -12,13 +13,13 @@ BUNDLE = "com.apple.calculator"
 TASK, SEQUENCE = TASKS["sum"]
 ALIASES = {str(i): str(i) for i in range(10)}
 ALIASES.update({
-    "+": "+", "plus": "+", "add": "+", "pluss": "+",
+    "+": "+", "plus": "+", "add": "+", "pluss": "+", "adder": "+",
     "=": "=", "equals": "=", "equal": "=", "er lik": "=",
     "−": "−", "-": "−", "minus": "−", "subtract": "−",
     "×": "×", "multiply": "×", "times": "×",
     "÷": "÷", "divide": "÷", ".": ".", ",": ".", "decimal": ".",
 })
-CLEAR = {"ac": "AC", "all clear": "AC", "c": "C", "clear": "C"}
+CLEAR = {"ac": "AC", "all clear": "AC", "c": "C", "clear": "C", "slett alt": "AC", "slett": "backspace"}
 
 
 class RunStopped(Exception):
@@ -28,7 +29,7 @@ class RunStopped(Exception):
 def observe(client):
     raw = client.req("GET", "/wda/fastUI?text=1", timeout=4)
     snap = raw.get("value", raw)
-    if not isinstance(snap, dict) or snap.get("bundleId") != BUNDLE or snap.get("hasKeyboard"):
+    if not isinstance(snap, dict) or str(snap.get("bundleId")).casefold() != BUNDLE or snap.get("hasKeyboard"):
         raise RunStopped("Calculator must be foreground with its keypad visible")
     width, height = snap["screen"]
     buttons = {}
@@ -39,13 +40,13 @@ def observe(client):
         x, y = item.get("x"), item.get("y")
         if not (type(x) is int and type(y) is int and 0 < x < width and 0 < y < height):
             continue
-        label = str(item.get("label", "")).strip()
+        label = "".join(ch for ch in str(item.get("label", "")) if unicodedata.category(ch) != "Cf").strip()
         kind = item.get("type")
         if kind in ("Text", "Value", "StaticText", "TextField"):
             value = item.get("value", label)
             if isinstance(value, str) and re.fullmatch(r"[0-9]+(?:[.,][0-9]+)?", value):
                 readings.append((y, value))
-        if kind != "Button" or item.get("enabled", True) is not True or item.get("inKeyboard"):
+        if kind not in ("Button", "Key") or item.get("enabled", True) is not True or item.get("inKeyboard"):
             continue
         key = ALIASES.get(label.casefold()) or CLEAR.get(label.casefold())
         if key:
@@ -58,12 +59,12 @@ def observe(client):
     return buttons, [(y, value) for y, value in readings if y < keypad_top]
 
 
-def tap(client, buttons, label):
+def tap(client, buttons, label, duration=0.02):
     current, _ = observe(client)
     if current != buttons:
         raise RunStopped("Keypad changed before tap")
     x, y = current[label]
-    result = client.req("POST", "/wda/fastTap", {"x": x, "y": y}, timeout=4)
+    result = client.req("POST", "/wda/fastTap", {"x": x, "y": y, "duration": duration}, timeout=4)
     if "error" in result or isinstance(result.get("value"), dict) and "error" in result["value"]:
         raise RunStopped("Tap failed or delivery uncertain")
 
@@ -83,6 +84,9 @@ def prepare(client):
     if "AC" not in buttons and "C" in buttons:
         tap(client, buttons, "C")
         buttons, _ = observe(client)
+    if "AC" not in buttons and "backspace" in buttons:
+        tap(client, buttons, "backspace", duration=0.8)
+        return verify(client, "0")
     if "AC" not in buttons:
         raise RunStopped("All-clear key unavailable")
     tap(client, buttons, "AC")
