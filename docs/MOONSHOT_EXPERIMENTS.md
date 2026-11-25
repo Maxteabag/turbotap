@@ -232,3 +232,7 @@ The same twelve paired fresh-process calls per state compared all stable output 
 
 - rotated, stock median 239.3 ms, combined median 229.0 ms, 12/12 matching pairs.
 - locked, stock median 146.4 ms, combined median 123.7 ms, 12/12 matching pairs.
+
+### WDA overlay compatibility
+
+Two clean exports of WDA commit `d17782422d55ff1e5e0ceb74eb1fd509cc0c35b6` received the bundled v5 patch. One then received Vision followed by fastFlow, and the other received fastFlow followed by Vision. Every overlay passed `git apply --check`. A recursive comparison found identical file contents. The installed combined build also returned a fused read and completed the live fastFlow trials above.
