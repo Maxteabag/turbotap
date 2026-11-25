@@ -527,6 +527,9 @@ impl<R: Reader> Flow<R> {
     /// /wda/setPasteboard.
     pub fn set_clipboard(&mut self, arg: &str, content_type: &str) -> Result<String> {
         let val = secret_arg("setclip", arg)?;
+        if arg.starts_with("env:") || arg.starts_with("cmd:") {
+            self.note_secret(&val);
+        }
         self.c.set_pasteboard(&val, content_type).map_err(runtime_to_flow)?;
         Ok(format!("len={}", val.chars().count()))
     }

@@ -183,14 +183,19 @@ pub fn check_output(cmd: &str) -> Result<String> {
     let Some((prog, args)) = parts.split_first() else {
         return Err(Error::value("empty command"));
     };
+    // Never name the helper in errors: its path or arguments may embed the secret.
     let out = std::process::Command::new(prog)
         .args(args)
         .stderr(std::process::Stdio::null())
         .output()
-        .map_err(|e| Error::Os(format!("{prog}: {e}")))?;
+        .map_err(|e| Error::runtime(format!("credential helper could not be started ({:?})", e.kind())))?;
     if !out.status.success() {
-        let name = Path::new(prog).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        return Err(Error::Subprocess { cmd: name, code: out.status.code().unwrap_or(1) });
+        use std::os::unix::process::ExitStatusExt;
+        return Err(Error::runtime(match (out.status.code(), out.status.signal()) {
+            (Some(code), _) => format!("credential helper failed (exit {code})"),
+            (None, Some(sig)) => format!("credential helper was terminated (signal {sig})"),
+            _ => "credential helper failed".to_string(),
+        }));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

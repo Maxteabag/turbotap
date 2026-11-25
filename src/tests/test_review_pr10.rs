@@ -101,12 +101,99 @@ fn test_typing_errors_redact_wda_bodies_that_echo_the_text() {
 fn test_credential_command_errors_never_echo_the_command() {
     let e = crate::config::check_output("echo '4729").unwrap_err();
     assert!(!e.to_string().contains(PIN), "{e}");
-    // A failing command reports only its program name.
-    let e = crate::config::check_output("false 4729").unwrap_err();
-    assert!(!e.to_string().contains(PIN), "{e}");
     let _env = set_env(&[("WDA_PASSCODE", None), ("WDA_PASSCODE_CMD", Some("sh -c 'echo 4729 >&2; exit 3'"))]);
     let e = crate::config::get_passcode().unwrap_err();
-    assert!(!e.to_string().contains(PIN), "{e}");
+    assert_eq!(e.to_string(), "credential helper failed (exit 3)");
+}
+
+#[test]
+fn test_credential_helper_spawn_and_exit_failures_never_name_the_helper() {
+    let dir = crate::testutil::TempDir::new("tt-cred-");
+    // Spawn failure: the PIN is embedded in a missing helper's path.
+    let missing = dir.path().join("pin-helper-4729");
+    let e = crate::config::check_output(&missing.to_string_lossy()).unwrap_err();
+    assert_eq!(e.to_string(), "credential helper could not be started (NotFound)");
+    // Nonzero exit: the PIN is the helper's own file name.
+    let helper = dir.path().join("helper-4729");
+    std::fs::write(&helper, "#!/bin/sh\necho 4729 >&2\nexit 7\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let e = crate::config::check_output(&helper.to_string_lossy()).unwrap_err();
+    assert_eq!(e.to_string(), "credential helper failed (exit 7)");
+    // Through a flow step, the CLI-facing error is the same generic text.
+    let _cache = isolated_cache();
+    let mock = MockWda::start(MockState { source_xml: keypad_xml(PIN), ..Default::default() });
+    let cap = Capture::start();
+    let r = FakeReader::new(vec![]);
+    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), true).unwrap();
+    let e = flow.run(&[format!("pintap:cmd:{}", missing.display())]).unwrap_err();
+    flow.close();
+    for text in [e.to_string(), cap.stdout(), cap.stderr()] {
+        assert!(!text.contains(PIN), "{text}");
+    }
+    assert!(mock.tapped_points().is_empty());
+}
+
+/// Screen state showing the PIN: an OCR line and a text field value.
+fn pin_on_screen() -> (MockWda, FakeReader) {
+    let ui = json!([
+        {"type": "TextField", "label": "Passcode", "value": PIN, "x": 215, "y": 300},
+        {"type": "Button", "label": "Continue", "x": 215, "y": 700},
+    ]);
+    let mock = MockWda::start(MockState {
+        source_xml: keypad_xml("47"),
+        ..MockState::default().with_fast_ui(crate::testutil::fast_ui(ui, "Example", "com.example.app"))
+    });
+    let img = solid_img(240, (430, 932));
+    let lines = vec![make_line(&format!("Code {PIN}"), 100.0, 290.0, 330.0, 310.0), make_line("Continue", 160.0, 690.0, 270.0, 710.0)];
+    (mock, FakeReader::new(vec![(img, lines)]))
+}
+
+#[test]
+fn test_failed_credential_step_prints_no_screen_diagnostics() {
+    let _cache = isolated_cache();
+    let (mock, r) = pin_on_screen();
+    let cap = Capture::start();
+    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), true).unwrap();
+    // Keys for 4 and 7 only: pintap fails while the PIN is visible in OCR and the UI tree.
+    let res = flow.run(&["pintap:4729".to_string()]).unwrap();
+    flow.close();
+    assert_eq!(res["ok"], json!(false), "{res}");
+    assert_eq!((&res["visible"], &res["ui"]), (&json!([]), &json!([])), "{res}");
+    assert_no_pin(&res, &cap.stdout(), &cap.stderr());
+}
+
+#[test]
+fn test_later_failure_and_reads_scrub_an_earlier_credential() {
+    let _cache = isolated_cache();
+    let (mock, r) = pin_on_screen();
+    mock.state().source_xml = keypad_xml(PIN);
+    let cap = Capture::start();
+    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), true).unwrap();
+    // pintap succeeds, read sees the PIN on screen, then an unrelated tap fails.
+    let steps: Vec<String> = ["pintap:4729", "read", "tap:Nowhere"].iter().map(|s| s.to_string()).collect();
+    let res = flow.run(&steps).unwrap();
+    flow.close();
+    assert_eq!(res["ok"], json!(false), "{res}");
+    assert_eq!(res["failed_step"], json!("tap:Nowhere"));
+    // Diagnostics are still printed for a non-credential failure, with the PIN scrubbed.
+    let dump = json::dumps_utf8(&res);
+    assert!(dump.contains("Code <redacted>"), "{dump}");
+    assert!(res["ui"].as_array().unwrap().iter().any(|c| c["value"] == json!("<redacted>")), "{dump}");
+    assert_no_pin(&res, &cap.stdout(), &cap.stderr());
+}
+
+#[test]
+fn test_plain_type_text_stays_readable() {
+    let _cache = isolated_cache();
+    let mock = MockWda::start(MockState::default());
+    let img = solid_img(240, (430, 932));
+    let r = FakeReader::new(vec![(img, vec![make_line("Angry Birds", 100.0, 290.0, 330.0, 310.0)])]);
+    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let res = flow.run(&["type:Angry Birds".to_string(), "read:ocr".to_string()]).unwrap();
+    flow.close();
+    assert_eq!(res["steps"][0]["step"], json!("type:<redacted>"));
+    assert_eq!(res["reads"][0]["lines"][0]["text"], json!("Angry Birds"), "{res}");
 }
 
 #[test]

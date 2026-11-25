@@ -135,6 +135,21 @@ pub fn is_url_scheme(s: &str) -> bool {
 /// flow output; `env:VAR` names are shown.
 pub const SECRET_ARG_VERBS: &[&str] = &["pintap", "typedigits", "cleartype", "type", "setclip"];
 
+/// Verbs whose value is always a credential (PINs, passwords), in any form.
+pub const CREDENTIAL_VERBS: &[&str] = &["pintap", "typedigits", "cleartype"];
+
+/// True when the step enters a credential: `pintap`/`typedigits`/`cleartype` in any
+/// form, or `type`/`setclip` with an `env:`/`cmd:` value (the documented way to pass
+/// secrets). Its value is scrubbed from all flow output, and if it fails no screen
+/// diagnostics are printed. Plain `type:TEXT` is ordinary input (search terms) and
+/// stays readable in later `read` results.
+pub fn is_secret_step(spec: &str) -> bool {
+    let Some((verb, arg)) = spec.split_once(':') else { return false };
+    let verb = verb.trim().to_lowercase();
+    CREDENTIAL_VERBS.contains(&verb.as_str())
+        || ((verb == "type" || verb == "setclip") && (arg.starts_with("env:") || arg.starts_with("cmd:")))
+}
+
 /// The step as it may appear in flow output (success items, stderr progress and
 /// `failed_step`): secret-bearing arguments are replaced by `<redacted>`.
 pub fn safe_step(spec: &str) -> String {
@@ -199,6 +214,9 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub last_alert_text: Option<String>,
     pub last_alert_buttons: Option<Vec<String>>,
     pub last_ui_retried_stale: bool,
+    /// Secret values this flow typed, tapped or copied (inline, `env:` or `cmd:`);
+    /// scrubbed from every string the flow outputs.
+    pub secrets: Vec<String>,
     /// Test-only override for `changed_since` (Python tests'
     /// `mock.patch.object(flow, "changed_since", return_value=...)`).
     #[cfg(test)]
@@ -242,6 +260,7 @@ impl<R: Reader> Flow<R> {
             last_alert_text: None,
             last_alert_buttons: None,
             last_ui_retried_stale: false,
+            secrets: Vec::new(),
             #[cfg(test)]
             changed_since_hook: None,
         })
@@ -463,6 +482,9 @@ impl<R: Reader> Flow<R> {
             "type" => {
                 let is_secret = arg.starts_with("env:") || arg.starts_with("cmd:");
                 let text = secret_arg(&verb, &arg)?;
+                if is_secret {
+                    self.note_secret(&text);
+                }
                 self.wait_input_focus();
                 self.last_tap_type = None;
                 self.mark_action(false, true);
@@ -652,6 +674,7 @@ impl<R: Reader> Flow<R> {
     fn clear_type(&mut self, verb: &str, arg: &str) -> Result<String> {
         let is_secret = arg.starts_with("env:") || arg.starts_with("cmd:");
         let text = secret_arg(verb, arg)?;
+        self.note_secret(&text);
         self.mark_action(false, true);
         let mut els = Value::Array(vec![]);
         let mut secure = false;
@@ -712,7 +735,9 @@ impl<R: Reader> Flow<R> {
         } else {
             arg.to_string()
         };
+        self.note_secret(&raw);
         let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+        self.note_secret(&digits);
         if digits.is_empty() {
             return Err(Error::flow("typedigits got no digits"));
         }
@@ -777,6 +802,7 @@ impl<R: Reader> Flow<R> {
                 (m[2].parse().unwrap_or(0), m[3].parse().unwrap_or(0), m[4].parse().unwrap_or(0), m[5].parse().unwrap_or(0));
             coords.insert(d, (x + w / 2, y + h / 2));
         }
+        self.note_secret(&digits);
         let missing: std::collections::BTreeSet<char> = digits.chars().filter(|d| !coords.contains_key(d)).collect();
         if !missing.is_empty() {
             // never echo PIN digits
@@ -788,12 +814,76 @@ impl<R: Reader> Flow<R> {
         Ok(format!("tapped {} digits", digits.chars().count()))
     }
 
+    /// Remember a secret value so it never appears in flow output.
+    pub fn note_secret(&mut self, s: &str) {
+        let s = s.trim();
+        if !s.is_empty() && !self.secrets.iter().any(|x| x == s) {
+            self.secrets.push(s.to_string());
+            // Longest first, so a secret containing another is replaced whole.
+            self.secrets.sort_by_key(|x| std::cmp::Reverse(x.len()));
+        }
+    }
+
+    /// `s` with every remembered secret replaced by `<redacted>`.
+    pub fn scrub(&self, s: &str) -> String {
+        let mut out = s.to_string();
+        for sec in &self.secrets {
+            if out.contains(sec.as_str()) {
+                out = out.replace(sec.as_str(), "<redacted>");
+            }
+        }
+        out
+    }
+
+    /// Scrub every string (keys and values) in an output value.
+    pub fn scrub_value(&self, v: &mut Value) {
+        if self.secrets.is_empty() {
+            return;
+        }
+        match v {
+            Value::String(s) => *s = self.scrub(s),
+            Value::Array(a) => a.iter_mut().for_each(|x| self.scrub_value(x)),
+            Value::Object(m) => {
+                let old = std::mem::take(m);
+                for (k, mut x) in old {
+                    self.scrub_value(&mut x);
+                    m.insert(self.scrub(&k), x);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scrub_error(&self, e: Error) -> Error {
+        if self.secrets.is_empty() {
+            return e;
+        }
+        let f = |m: String| self.scrub(&m);
+        match e {
+            Error::Flow(m) => Error::Flow(f(m)),
+            Error::DeadlineExceeded(m) => Error::DeadlineExceeded(f(m)),
+            Error::StaleApp(m) => Error::StaleApp(f(m)),
+            Error::Runtime(m) => Error::Runtime(f(m)),
+            Error::Timeout(m) => Error::Timeout(f(m)),
+            Error::VisionUnsupported(m) => Error::VisionUnsupported(f(m)),
+            Error::Value(m) => Error::Value(f(m)),
+            Error::Os(m) => Error::Os(f(m)),
+            Error::Subprocess { cmd, code } => Error::Subprocess { cmd: f(cmd), code },
+        }
+    }
+
     /// Run every step; the result dict printed by `turbotap flow`.
     pub fn run(&mut self, steps: &[String]) -> Result<Value> {
         let t0 = clock::real_now();
         let mut done: Vec<Value> = Vec::new();
         for spec in steps {
             let s0 = clock::real_now();
+            let secret_step = is_secret_step(spec);
+            if let Some((_, arg)) = spec.split_once(':').filter(|_| secret_step) {
+                if !arg.starts_with("env:") && !arg.starts_with("cmd:") {
+                    self.note_secret(arg);
+                }
+            }
             match self.step(spec) {
                 Ok(res) => {
                     let mut item = serde_json::Map::new();
@@ -802,11 +892,27 @@ impl<R: Reader> Flow<R> {
                     if let Some(r) = res {
                         item.insert("result".into(), r);
                     }
-                    let item = Value::Object(item);
+                    let mut item = Value::Object(item);
+                    self.scrub_value(&mut item);
                     if self.log {
                         crate::errln!("{}", json::dumps(&item));
                     }
                     done.push(item);
+                }
+                Err(e) if e.is_flow() && secret_step => {
+                    // A credential step failed: the screen may show what was being
+                    // entered, so no screen diagnostics at all.
+                    let mut res = j!({
+                        "ok": false,
+                        "failed_step": safe_step(spec),
+                        "error": e.to_string(),
+                        "steps": done,
+                        "visible": [],
+                        "ui": [],
+                        "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
+                    });
+                    self.scrub_value(&mut res);
+                    return Ok(res);
                 }
                 Err(e) if e.is_flow() => {
                     let visible: Vec<String> = self
@@ -824,7 +930,7 @@ impl<R: Reader> Flow<R> {
                         }
                         Err(_) => vec![],
                     };
-                    return Ok(j!({
+                    let mut res = j!({
                         "ok": false,
                         "failed_step": safe_step(spec),
                         "error": e.to_string(),
@@ -832,17 +938,22 @@ impl<R: Reader> Flow<R> {
                         "visible": visible,
                         "ui": ui::controls_to_value(&ui),
                         "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
-                    }));
+                    });
+                    // Earlier credential steps may still be visible on screen.
+                    self.scrub_value(&mut res);
+                    return Ok(res);
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(self.scrub_error(e)),
             }
         }
-        Ok(j!({
+        let mut res = j!({
             "ok": true,
             "steps": done,
             "reads": self.reads,
             "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
-        }))
+        });
+        self.scrub_value(&mut res);
+        Ok(res)
     }
 }
 
