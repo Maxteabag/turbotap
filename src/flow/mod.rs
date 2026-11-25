@@ -384,7 +384,7 @@ impl<R: Reader> Flow<R> {
             match guard.regex().is_match(text) {
                 Ok(false) => {}
                 Ok(true) => {
-                    let relaxed_ok = guard.in_allowed_app_regex().is_some_and(|rx| rx.is_match(text) == Ok(false));
+                    let relaxed_ok = guard.in_allowed_app_regex().is_some_and(|rx| matches!(rx.is_match(text), Ok(false)));
                     if relaxed_ok && self.c.foreground_confirmed_allowed() {
                         return Ok(());
                     }

@@ -1389,7 +1389,6 @@ fn test_mixed_candidates_conflict_and_transport_uses_only_checked_addresses() {
     let phone = MockWda::start(state_with_app(json!(ALLOWED)));
     let other = MockWda::start(state_with_app(json!(ALLOWED)));
     let phone_addr = format!("127.0.0.1:{}", phone.port());
-    let other_addr = format!("127.0.0.1:{}", other.port());
     // Resolver: a name whose candidates are the configured phone plus an unrelated
     // address cannot be assigned to the phone's policy.
     let cfg = json!({"devices": {"p": {"url": phone.url, "allowed_apps": [ALLOWED]}}});
