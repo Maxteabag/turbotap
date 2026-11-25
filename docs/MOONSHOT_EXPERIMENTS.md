@@ -236,3 +236,7 @@ The same twelve paired fresh-process calls per state compared all stable output 
 ### WDA overlay compatibility
 
 Two clean exports of WDA commit `d17782422d55ff1e5e0ceb74eb1fd509cc0c35b6` received the bundled v5 patch. One then received Vision followed by fastFlow, and the other received fastFlow followed by Vision. Every overlay passed `git apply --check`. A recursive comparison found identical file contents. The installed combined build also returned a fused read and completed the live fastFlow trials above.
+
+## Jev visual grounding
+
+Eleven synthetic icon boards randomized the positions and opaque IDs of four pictograms. The image arm selected 17/22 present targets, compared with 0/22 when only the prompt and IDs were sent. Both arms abstained on all 11 missing targets. All five image misses were abstentions on the filled-square stop icon. Median full-response latency for three batched choices was 168.60 ms with the PNG and 168.01 ms with text alone. Estimated image-arm list cost was $0.00043428 for eleven requests. The boards contained no device pixels. The [grounding harness and receipts](../experimental/jev-vision/) reproduce this synthetic comparison.
