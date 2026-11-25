@@ -60,6 +60,7 @@ pub(crate) fn write_assets(dir: &Path) -> Result<(PathBuf, PathBuf)> {
 /// `bash deploy_wda_mac.sh [--no-build]` with `WDA_URL`/`WDA_UDID`/`WDA_DEVICE` and
 /// `WDA_PATCH` (unless the caller set one) in its environment.
 pub fn run_deploy_script(base_url: &str, udid: &str, device_key: Option<&str>, build: bool) -> Result<()> {
+    crate::config::guard_remote("running the WDA deploy script")?;
     let tmp = PrivateTempDir::new("turbotap-deploy-")?;
     let (script, patch) = write_assets(tmp.path())?;
     let mut cmd = std::process::Command::new("bash");
