@@ -155,6 +155,13 @@ turbotap: app guard refused tap:Message: foreground app 'com.example.other' is n
 - `--allow-app BUNDLE_ID` (repeatable, before or after `flow`/`tap-ocr`/`otp-type`) adds an app for one run; `TURBOTAP_ALLOWED_APPS=a,b` adds apps for every run in that environment. Neither can remove an app from the configured list, and with no config they turn the guard on by themselves.
 - `--no-deny` only turns off the label filter above. It never weakens the app guard.
 
+**Stop file.** Set `"stop_file": "/path/to/stop.file"` (per device under `devices.<name>`, or top-level for devices without their own) and/or `TURBOTAP_STOP_FILE=/path/to/stop.file`. While any of these paths exists on the machine running `turbotap`, `deploy`, `unlock`, `flow`, `tap-ocr` and `otp-type` stop at once with exit code 6, before any request to WDA, and nothing retries. Read-only commands (`preflight`, `ocr`, `tree`, `screenshot`, `vision-ocr`) still work. A symlink counts even if its target is missing, and if the path can't be checked (permissions, a file where a directory should be) or `config.json` can't be read, the commands are refused too. `--no-deny` and `--allow-app` don't change this, and the warm daemon checks it for every request. Create the file to freeze the phone, delete it to continue:
+
+```bash
+touch ~/turbotap.stop      # with "stop_file": "~/turbotap.stop" in config.json
+rm ~/turbotap.stop
+```
+
 `tap:TEXT` prefers a button, app keypad `Key`, or link labelled exactly `TEXT` over a longer OCR line (`tap:"Sign In"` won't hit `Sign in with another account`), and deprioritizes iOS status-bar matches (`y < 54`) behind in-app text unless targeted explicitly. `wait:TEXT` is OCR-first and falls back to the accessibility tree for low-contrast or colored buttons, while `gone:TEXT` polls until a spinner or sheet disappears. Tapping a switch row's label flips the switch itself, and `Next`/`Previous` pick the form's button over the keyboard toolbar's copy. When a step fails, the JSON lists the visible text and the top 30 interactive controls with their exact labels.
 
 You can narrow down targets relative to other text on screen (`tap:"Alice@below:Chats"`, `tap:"Alice@y>300"`) or match dynamic text with `re:REGEX` in `wait:`, `waitany:`, `assert:`, `assertnot:`, `tap:`, and `scrollto:`. OCR matching folds Unicode/Nordic diacritics (`å`↔`a`, `ø`↔`o`, `æ`↔`ae`, `é`↔`e`, etc.) as a lower-priority fallback when exact diacritics are missed by Tesseract, and `scrollto:` falls back to accessibility controls on blank-OCR or end-of-list frames. `alert:text` reads an active system alert, and `read`/`ui` surface active SpringBoard alerts immediately after `open:`/`launch:` instead of stalling on stale-app retries.

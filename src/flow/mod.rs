@@ -107,7 +107,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
 taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.
 with allowed_apps in config.json (or TURBOTAP_ALLOWED_APPS / --allow-app), every input step is refused unless
 the live foreground app is on that list; open:/launch: check the target app, url: is refused (iOS picks the receiving app).
---no-deny never disables this app guard.";
+--no-deny never disables this app guard. while a configured stop_file (or TURBOTAP_STOP_FILE) exists,
+flow/unlock/deploy/tap-ocr/otp-type exit 6 before contacting WDA.";
 
 /// Verbs that run host Tesseract OCR (the CLI warms libtesseract engines only for these).
 /// Note: `read:vision*` and directional `swipe:left|right|up|down` are filtered out in

@@ -90,6 +90,7 @@ fn cli_env(url: &str, extra_env: &[(&str, Option<&str>)]) -> CliEnv {
         ("WDA_TURBO", None),
         ("TURBOTAP_DAEMON", None),
         ("TURBOTAP_ALLOWED_APPS", None),
+        ("TURBOTAP_STOP_FILE", None),
     ];
     for (k, v) in extra_env {
         vars.retain(|(ek, _)| ek != k);
@@ -440,14 +441,20 @@ fn test_invalid_or_unreadable_config_blocks_input_but_not_reads() {
             let mut a = vec!["--no-daemon", "--url", url.as_str()];
             a.extend_from_slice(extra);
             a.extend_from_slice(&["flow", "--no-deny", "--quiet", "tapxy:1,2", "type:x"]);
+            // The config's stop_file is unknown too: refused up front, exit 6.
             let (code, _, err) = run(&a);
-            assert_eq!(code, 1, "{needle}: {err}");
-            assert!(err.contains("app guard policy unavailable"), "{needle}: {err}");
+            assert_eq!(code, crate::stop::STOP_EXIT, "{needle}: {err}");
+            assert!(err.contains("stop_file state unknown"), "{needle}: {err}");
             assert!(err.contains(needle), "{needle}: {err}");
         }
-        // Read-only work still runs.
-        let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "flow", "--quiet", "clipboard"]);
+        // Read-only commands still run.
+        let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "preflight", "--stock"]);
         assert_eq!(code, 0, "{needle}: {err}");
+        // Below the CLI, the client refuses input with a policy error as well.
+        let mut c = mock.client();
+        c.set_guard_policy_error(format!("{needle} (test)"));
+        let r = c.fast_tap(1, 2, None, None);
+        assert!(crate::json::py_str(crate::json::get(&r, "error")).contains("app guard policy unavailable"), "{r}");
     }
     assert!(input_posts(&mock).is_empty(), "{:?}", input_posts(&mock));
     // A genuinely absent config.json means no policy (guard off), as before.
@@ -879,16 +886,30 @@ fn test_daemon_applies_allowlist_per_request_without_leaking() {
     for broken in [r#"{"default_device": "d", "devices": {"d": {"url": "#, "not json", "[]"] {
         std::fs::write(&cfg, broken).unwrap();
         let (code, err) = forward(&with_url, &[]);
-        assert_eq!(code, Some(1), "{broken}: {err}");
-        assert!(err.contains("app guard policy unavailable"), "{broken}: {err}");
+        assert_eq!(code, Some(crate::stop::STOP_EXIT), "{broken}: {err}");
+        assert!(err.contains("stop_file state unknown"), "{broken}: {err}");
         let (code, err) = forward(&with_url, &[("TURBOTAP_ALLOWED_APPS", ALLOWED)]);
-        assert_eq!(code, Some(1), "{broken}: {err}");
+        assert_eq!(code, Some(crate::stop::STOP_EXIT), "{broken}: {err}");
         assert_eq!(taps(), 4, "{broken}");
     }
     write_cfg(&[ALLOWED]);
     let (code, err) = forward(&with_url, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(taps(), 5);
+
+    // Stop file, checked per request: an existing TURBOTAP_STOP_FILE refuses with exit
+    // 6 and zero WDA requests; the next request without it is not affected.
+    let stop = tmp.path().join("stop.file");
+    std::fs::write(&stop, "").unwrap();
+    let stop_s = stop.to_string_lossy().into_owned();
+    let before = srv.paths().len();
+    let (code, err) = forward(&tap, &[("TURBOTAP_STOP_FILE", stop_s.as_str())]);
+    assert_eq!(code, Some(crate::stop::STOP_EXIT), "{err}");
+    assert!(err.contains("exists; refusing flow"), "{err}");
+    assert_eq!(srv.paths().len(), before, "WDA was contacted despite the stop file");
+    let (code, err) = forward(&tap, &[]);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(taps(), 6);
 }
 
 #[test]
@@ -926,8 +947,8 @@ fn test_dangling_policy_link_fails_closed() {
     // The target disappears mid-replacement: the link still exists, so no "no config".
     std::fs::remove_file(&target).unwrap();
     let (code, _, err) = run(&tap);
-    assert_eq!(code, 1, "{err}");
-    assert!(err.contains("app guard policy unavailable"), "{err}");
+    assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
+    assert!(err.contains("stop_file state unknown"), "{err}");
     assert!(err.contains("is a link whose target cannot be read"), "{err}");
     assert!(input_posts(&mock).is_empty(), "{:?}", input_posts(&mock));
     // A dangling link for the config directory itself (default location) too.
@@ -936,7 +957,7 @@ fn test_dangling_policy_link_fails_closed() {
     std::fs::create_dir_all(home.join(".config")).unwrap();
     std::os::unix::fs::symlink(home.join("missing-config-dir"), home.join(".config/turbotap")).unwrap();
     let (code, _, err) = run(&tap);
-    assert_eq!(code, 1, "{err}");
+    assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
     assert!(err.contains("is a link whose target is missing"), "{err}");
     assert!(input_posts(&mock).is_empty(), "{:?}", input_posts(&mock));
     // Genuinely absent (no link, no file) still means no policy.
@@ -1014,4 +1035,78 @@ fn test_url_override_uses_the_addressed_devices_own_policy() {
     assert!(err.contains("is not device 'a'"), "{err}");
     assert!(input_posts(&unknown).is_empty());
     assert_eq!(a.tapped_points().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Stop file
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stop_file_refuses_acting_commands_with_exit_6_and_zero_wda_calls() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mock = MockWda::start(state_with_app(json!(ALLOWED)));
+    let e = cli_env(&mock.url, &[]);
+    let dir = e.cfg.parent().unwrap().to_path_buf();
+    let top = dir.join("top.stop");
+    let dev = dir.join("device.stop");
+    let env_stop = dir.join("env.stop");
+    let write_cfg = |device_stop: Option<&std::path::Path>| {
+        let mut d = json!({"url": mock.url, "allowed_apps": [ALLOWED]});
+        if let Some(p) = device_stop {
+            d["stop_file"] = json!(p.to_string_lossy());
+        }
+        std::fs::write(&e.cfg, json!({"default_device": "d", "stop_file": top.to_string_lossy(), "devices": {"d": d}}).to_string())
+            .unwrap();
+    };
+    let acting: [&[&str]; 6] = [
+        &["flow", "--no-deny", "tapxy:1,2"],
+        &["flow", "--no-deny", "--allow-app", OTHER, "ui"],
+        &["unlock"],
+        &["deploy", "--no-build"],
+        &["tap-ocr", "Message"],
+        &["otp-type", "--code", "123456"],
+    ];
+    let run_all = |expect_stop: bool, needle: &str| {
+        for a in acting {
+            // Without a stop file, skip the commands that would only fail slowly here
+            // (deploy is offline in tests; tap-ocr would wait for OCR text).
+            if !expect_stop && matches!(a[0], "deploy" | "tap-ocr") {
+                continue;
+            }
+            let mut v = vec!["--no-daemon"];
+            v.extend_from_slice(a);
+            let before = mock.calls().len();
+            let (code, _, err) = run(&v);
+            if expect_stop {
+                assert_eq!(code, crate::stop::STOP_EXIT, "{a:?}: {err}");
+                assert!(err.contains(needle), "{a:?}: {err}");
+                assert_eq!(mock.calls().len(), before, "{a:?}: WDA was contacted");
+            } else {
+                assert_ne!(code, crate::stop::STOP_EXIT, "{a:?}: {err}");
+            }
+        }
+    };
+    // Top-level stop file (device has none).
+    write_cfg(None);
+    std::fs::write(&top, "").unwrap();
+    run_all(true, &format!("stop file {} exists; refusing", top.display()));
+    // A device stop_file replaces the top-level one for that device.
+    write_cfg(Some(&dev));
+    let (code, _, err) = run(&["--no-daemon", "flow", "--quiet", "tapxy:1,2"]);
+    assert_eq!(code, 0, "top-level stop file must not apply to a device with its own: {err}");
+    std::fs::write(&dev, "").unwrap();
+    run_all(true, "device.stop exists");
+    std::fs::remove_file(&dev).unwrap();
+    std::fs::remove_file(&top).unwrap();
+    // TURBOTAP_STOP_FILE adds one more; a dangling symlink counts as existing.
+    std::os::unix::fs::symlink(dir.join("nowhere"), &env_stop).unwrap();
+    std::env::set_var("TURBOTAP_STOP_FILE", &env_stop);
+    run_all(true, "env.stop exists");
+    // Read-only commands are not blocked.
+    let (code, _, err) = run(&["--no-daemon", "preflight", "--stock"]);
+    assert_eq!(code, 0, "{err}");
+    std::env::remove_var("TURBOTAP_STOP_FILE");
+    // Absent stop files: the commands run (or fail for their own reasons), never exit 6.
+    run_all(false, "");
 }

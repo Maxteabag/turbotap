@@ -3,7 +3,7 @@
 //!
 //! Env vars: `WDA_CONFIG`, `WDA_URL`, `WDA_DEVICE`, `WDA_UDID` (`IPHONE_UDID`),
 //! `WDA_MAC_HOST`, `WDA_PASSCODE`, `WDA_PASSCODE_CMD`, `TURBOTAP_TYPING_FREQ`,
-//! `TURBOTAP_DAEMON`, `TURBOTAP_ALLOWED_APPS`, `WDA_OCR`, `TESSDATA_PREFIX`, `WDA_TURBO`,
+//! `TURBOTAP_DAEMON`, `TURBOTAP_ALLOWED_APPS`, `TURBOTAP_STOP_FILE`, `WDA_OCR`, `TESSDATA_PREFIX`, `WDA_TURBO`,
 //! `WDA_CONDITIONAL_SHOT`, `WDA_OCR_WORKERS`.
 //!
 //! Everything is read at call time (or per [`reload`]) so the warm daemon applies
@@ -363,6 +363,16 @@ pub fn device_overrides(url_arg: Option<&str>, device_arg: Option<&str>, udid_ar
         .or_else(|| env_nonempty("IPHONE_UDID"));
     let explicit = device_arg.is_some_and(|s| !s.is_empty()) || env_nonempty("WDA_DEVICE").is_some();
     (url, udid, explicit)
+}
+
+/// The device key named by `--device`, `WDA_DEVICE` or `default_device` (same
+/// precedence as [`resolve_device_settings`]).
+pub fn selected_device_key(device_arg: Option<&str>) -> Option<String> {
+    device_arg
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| env_nonempty("WDA_DEVICE"))
+        .or_else(|| current().get("default_device").as_str().filter(|s| !s.is_empty()).map(String::from))
 }
 
 /// `(url, udid, device_key)` from CLI args, env and config.json.

@@ -290,10 +290,27 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         }
         _ => {}
     }
-    crate::config::reload();
+    let cfg = crate::config::reload();
+    let (url_ov, udid_ov, explicit) = crate::config::device_overrides(s(&m, "url"), s(&m, "device"), s(&m, "udid"));
+    {
+        // Stop file: before anything else touches WDA, the Mac or the phone.
+        let selected = crate::config::selected_device_key(s(&m, "device"));
+        let mut keys: Vec<String> = selected.iter().cloned().collect();
+        if let Ok(Some(k)) =
+            crate::guard::policy_device(&cfg.raw, selected.as_deref(), explicit, url_ov.as_deref(), udid_ov.as_deref())
+        {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        if let Some(msg) = crate::stop::refusal(cmd, &refs) {
+            crate::errln!("turbotap: {msg}");
+            return Ok(crate::stop::STOP_EXIT);
+        }
+    }
     crate::skills::sync_skills_if_stale();
     let (url, udid, dev_key) = crate::config::resolve_device_settings(s(&m, "url"), s(&m, "device"), s(&m, "udid"))?;
-    let (url_ov, udid_ov, explicit) = crate::config::device_overrides(s(&m, "url"), s(&m, "device"), s(&m, "udid"));
     let allowed = crate::guard::resolve_allowlist(
         dev_key.as_deref(),
         explicit,
