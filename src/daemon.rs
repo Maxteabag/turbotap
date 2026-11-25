@@ -473,7 +473,9 @@ impl Server {
                 let _ = std::fs::remove_file(&self.inner.path);
             }
         }
-        if self.warmed {
+        // While unwinding (a panic during warm-up), only the socket and lock are
+        // released: calling back into OCR could panic again and abort the process.
+        if self.warmed && !std::thread::panicking() {
             drain_request_work();
             crate::ocr::set_warm_ocr(false);
             crate::wda::set_pool_enabled(false);
