@@ -315,7 +315,9 @@ mod needs_ocr_merge {
         // Python ran `_recycle_request_conns()` here; Rust strip threads are scoped to
         // the read, so the sibling already finished when read() returned.
         assert_eq!(*seen.lock().unwrap(), vec!["first".to_string()], "a binary OCR worker outlived its request");
-        std::env::set_var("TT_REQUEST", "second"); // the next caller's environment
+        // The next caller's environment (a new guard: set_env holds the env lock).
+        drop(_e);
+        let _e = set_env(&[("WDA_OCR", Some("binary")), ("TT_REQUEST", Some("second"))]);
         std::thread::sleep(Duration::from_millis(400));
         assert_eq!(*seen.lock().unwrap(), vec!["first".to_string()]);
         // The next request gets a fresh, working reader.
