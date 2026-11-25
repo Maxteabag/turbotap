@@ -14,18 +14,18 @@ name and the same personal email as the Git author email. Never use an ECIT work
 email for either a local commit or a GitHub squash merge. Verify both identities
 from the resulting commits.
 
-## XPS build slot
+## Rust build host
 
-Run Cargo builds and tests on `xps15` only. Use the shared build slot for every
-Cargo invocation there, including review and release verification:
+Run all Rust builds and Cargo tests on `ai-swarm` through `buildbox-cargo`.
+This applies to development, review and release verification:
 
 ```sh
-flock /var/tmp/clarp-build/lock nice -n 19 cargo <subcommand> [args...]
+buildbox-cargo <checkout> test
+buildbox-cargo <checkout> build --release
 ```
 
-The lock is shared with Clarp Host release builds. Run at most one build or test
-invocation at a time. If the slot is busy, let the current build finish and use
-a durable continuation instead of waiting in the foreground.
+Keep heavy work off EliteBook, laptopstudio and xps15. If the buildbox is
+unavailable, use a durable continuation or report the blocker.
 
 ## Agent instruction files
 
