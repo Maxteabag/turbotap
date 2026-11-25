@@ -784,12 +784,35 @@ class WDAClient:
         raise RuntimeError("iPhone is still locked after entering passcode")
 
 
-def cmd_preflight(client, _args):
+def _fast_preflight(client, sid):
+    from math import isfinite
+
+    response = client.req("GET", f"/session/{sid}/wda/fastPreflight")
+    if not isinstance(response, dict) or "error" in response:
+        return None
+    value = response.get("value")
+    if not isinstance(value, dict) or type(value.get("locked")) is not bool:
+        return None
+    size = value.get("size")
+    if not isinstance(value.get("bundleId"), str) or not isinstance(size, dict):
+        return None
+    for key in ("width", "height"):
+        n = size.get(key)
+        if type(n) is not int and not (type(n) is float and isfinite(n)):
+            return None
+    return value["locked"], value["bundleId"], size
+
+
+def cmd_preflight(client, args):
     t0 = time.perf_counter()
     sid = client.ensure_session(apply_fast_settings=True)
-    locked = client.req("GET", "/wda/locked").get("value")
-    app = client.req("GET", "/wda/activeAppInfo").get("value", {}).get("bundleId")
-    sz = client.req("GET", f"/session/{sid}/window/size").get("value") or {}
+    snapshot = _fast_preflight(client, sid) if sid and getattr(args, "fast", False) else None
+    if snapshot is None:
+        locked = client.req("GET", "/wda/locked").get("value")
+        app = client.req("GET", "/wda/activeAppInfo").get("value", {}).get("bundleId")
+        sz = client.req("GET", f"/session/{sid}/window/size").get("value") or {}
+    else:
+        locked, app, sz = snapshot
     if sz.get("width") and sz.get("height"):
         client._save_session_cache({"screen_pt": [int(sz["width"]), int(sz["height"])]})
     dt = (time.perf_counter() - t0) * 1000
@@ -5490,7 +5513,9 @@ def _main():
     p.add_argument("--device", default=None, help="device key from ~/.config/turbotap/config.json (or WDA_DEVICE)")
     p.add_argument("--udid", default=None, help="device UDID (or WDA_UDID / config.json)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("preflight")
+    preflight = sub.add_parser("preflight")
+    preflight.add_argument("--fast", action="store_true",
+                           help="try the optional WDA preflight overlay, falling back to stock reads")
     sub.add_parser("unlock")
     sp_skill = sub.add_parser("install-skill", help="install the turbotap agent skills (Claude Code, Codex, ...)",
                               description="Copy the turbotap and turbotap-retro skills into agent skill folders. "
