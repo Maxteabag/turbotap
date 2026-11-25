@@ -1,0 +1,115 @@
+diff --git i/WebDriverAgentLib/Commands/FBCustomCommands.m w/WebDriverAgentLib/Commands/FBCustomCommands.m
+index fbf238c..80d8c67 100644
+--- i/WebDriverAgentLib/Commands/FBCustomCommands.m
++++ w/WebDriverAgentLib/Commands/FBCustomCommands.m
+@@ -14,6 +14,7 @@
+ #import <XCTest/XCUIDevice.h>
+ #import <CoreLocation/CoreLocation.h>
+ 
++#import "FBElementCommands.h"
+ #import "FBConfiguration.h"
+ #import "FBKeyboard.h"
+ #import "FBNotificationsHelper.h"
+@@ -111,6 +112,7 @@ static FBTerminateFastResult FBTerminateAppFast(NSString *bundleId, NSTimeInterv
+     [[FBRoute POST:@"/wda/lock"] respondWithTarget:self action:@selector(handleLock:)],
+     [[FBRoute POST:@"/wda/unlock"].withoutSession respondWithTarget:self action:@selector(handleUnlock:)],
+     [[FBRoute POST:@"/wda/unlock"] respondWithTarget:self action:@selector(handleUnlock:)],
++    [[FBRoute GET:@"/wda/fastPreflight"] respondWithTarget:self action:@selector(handleFastPreflight:)],
+     [[FBRoute GET:@"/wda/locked"].withoutSession respondWithTarget:self action:@selector(handleIsLocked:)],
+     [[FBRoute GET:@"/wda/locked"] respondWithTarget:self action:@selector(handleIsLocked:)],
+     [[FBRoute GET:@"/wda/screen"] respondWithTarget:self action:@selector(handleGetScreen:)],
+@@ -270,8 +272,12 @@ static FBTerminateFastResult FBTerminateAppFast(NSString *bundleId, NSTimeInterv
+ 
+ + (id<FBResponsePayload>)handleIsLocked:(FBRouteRequest *)request
+ {
+-  BOOL isLocked = [XCUIDevice sharedDevice].fb_isScreenLocked;
+-  return FBResponseWithObject(isLocked ? @YES : @NO);
++  return FBResponseWithObject([self screenLocked]);
++}
++
+++ (NSNumber *)screenLocked
++{
++  return @([XCUIDevice sharedDevice].fb_isScreenLocked);
+ }
+ 
+ + (id<FBResponsePayload>)handleUnlock:(FBRouteRequest *)request
+@@ -285,16 +291,30 @@ static FBTerminateFastResult FBTerminateAppFast(NSString *bundleId, NSTimeInterv
+ 
+ + (id<FBResponsePayload>)handleActiveAppInfo:(FBRouteRequest *)request
+ {
+-  XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
++  return FBResponseWithObject([self activeAppInfoForSession:request.session]);
++}
++
+++ (NSDictionary *)activeAppInfoForSession:(FBSession *)session
++{
++  XCUIApplication *app = session.activeApplication ?: XCUIApplication.fb_activeApplication;
+   // .identifier can be nil if the app stopped answering accessibility requests
+   // and accessibilityDeadline aborted the underlying snapshot fetch (#1210).
+   NSString *name = app.identifier ?: @"unknown";
+-  return FBResponseWithObject(@{
++  return @{
+     @"pid": @(app.processID),
+     @"bundleId": app.bundleID,
+     @"name": name,
+     @"processArguments": [self processArguments:app],
+-  });
++  };
++}
++
+++ (id<FBResponsePayload>)handleFastPreflight:(FBRouteRequest *)request
++{
++  NSNumber *locked = [self screenLocked];
++  // Python reads activeAppInfo without a session, then window/size with one.
++  NSString *bundle = [self activeAppInfoForSession:nil][@"bundleId"];
++  NSDictionary *size = [FBElementCommands windowSizeForRequest:request];
++  return FBResponseWithObject(@{@"locked": locked, @"bundleId": bundle, @"size": size});
+ }
+ 
+ /**
+diff --git i/WebDriverAgentLib/Commands/FBElementCommands.h w/WebDriverAgentLib/Commands/FBElementCommands.h
+index 3c07ee6..f879e91 100644
+--- i/WebDriverAgentLib/Commands/FBElementCommands.h
++++ w/WebDriverAgentLib/Commands/FBElementCommands.h
+@@ -12,8 +12,12 @@
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
++@class FBRouteRequest;
++
+ @interface FBElementCommands : NSObject <FBCommandHandler>
+ 
+++ (NSDictionary *)windowSizeForRequest:(FBRouteRequest *)request;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+diff --git i/WebDriverAgentLib/Commands/FBElementCommands.m w/WebDriverAgentLib/Commands/FBElementCommands.m
+index af67cca..e0a887c 100644
+--- i/WebDriverAgentLib/Commands/FBElementCommands.m
++++ w/WebDriverAgentLib/Commands/FBElementCommands.m
+@@ -955,6 +955,11 @@ static CGFloat FBClampCGFloat(CGFloat v, CGFloat lo, CGFloat hi)
+ }
+ 
+ + (id<FBResponsePayload>)handleGetWindowSize:(FBRouteRequest *)request
++{
++  return FBResponseWithObject([self windowSizeForRequest:request]);
++}
++
+++ (NSDictionary *)windowSizeForRequest:(FBRouteRequest *)request
+ {
+   XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
+ 
+@@ -964,10 +969,10 @@ static CGFloat FBClampCGFloat(CGFloat v, CGFloat lo, CGFloat hi)
+ #else
+   CGSize screenSize = FBAdjustDimensionsForApplication(frame.size, app.interfaceOrientation);
+ #endif
+-  return FBResponseWithObject(@{
++  return @{
+     @"width": @(screenSize.width),
+     @"height": @(screenSize.height),
+-  });
++  };
+ }
+ 
+ 
