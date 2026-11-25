@@ -37,17 +37,17 @@ class Client:
 
 
 def observation(snapshot, label):
-    if snapshot["bundleId"] == CALCULATOR:
+    if snapshot["bundleId"].casefold() == CALCULATOR:
         for row in snapshot["ui"]:
             if row["label"] == label:
                 return {key: row[key] for key in ("type", "label", "x", "y")}
     return None
 
 
-def wait(client, arm, label, budget):
+def wait(client, arm, label, budget, bundle):
     if arm == "flow":
         value = client.call("/wda/fastFlow", {
-            "label": label, "bundleId": CALCULATOR, "timeoutMs": budget,
+            "label": label, "bundleId": bundle, "timeoutMs": budget,
         })["value"]
         return value["observation"], value["samples"]
     deadline = time.monotonic() + budget / 1000
@@ -93,7 +93,7 @@ def trial(client, pool, command, arm, case, args):
     trigger = None
     if case == "transition":
         trigger = pool.submit(delayed_launch, command, start + args.delay_ms / 1000)
-    result, samples = wait(client, arm, label, budget)
+    result, samples = wait(client, arm, label, budget, fixture["bundleId"])
     end = time.monotonic()
     row = dict(case=case, arm=arm, timeout_ms=budget, samples=samples,
                wait_requests=client.requests - count, response_body_bytes=client.body_bytes - size,
@@ -101,7 +101,7 @@ def trial(client, pool, command, arm, case, args):
     if trigger is not None:
         row["launch_start_ms"] = round((trigger.result() - start) * 1000, 2)
     after = client.call(FAST_UI)
-    row["valid"] = (after["bundleId"] == CALCULATOR and observation(after, args.label) == control
+    row["valid"] = (after["bundleId"].casefold() == CALCULATOR and observation(after, args.label) == control
                     and result == expected and type(samples) is int and samples >= 1)
     if result == expected:
         row["observation"] = result

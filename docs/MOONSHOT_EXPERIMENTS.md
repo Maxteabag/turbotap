@@ -112,3 +112,28 @@ Eight alternating-order pairs per operation. Wall time includes process startup,
 | turbo-diff | rust | 451.12 | capture 72.80, decode 4.19, diff 0.24 |
 | turbo-ocr | python | 430.25 | capture 76.54, decode 15.21 |
 | turbo-ocr | rust | 344.92 | capture 73.54, decode 3.52 |
+
+## Rust synthetic replay
+
+A 320 × 480 grayscale fixture isolated fresh-process overhead. Each command ran nine times per language in alternating order. The harness compared outputs on each pair and checked raw screenshot byte equality. On-device HTTP and app transitions are absent. The replay flow uses a restricted set of read-only operations.
+
+| Operation | Rust median ms | Python median ms |
+|---|---:|---:|
+| cold | 6.27 | 24.42 |
+| preflight | 5.77 | 15.89 |
+| screenshot | 8.51 | 24.54 |
+| decode | 8.53 | 43.31 |
+| cuts | 8.97 | 44.94 |
+| fastUI | 8.28 | 27.91 |
+| flow | 9.56 | 48.77 |
+| diff | 8.95 | 32.73 |
+| ocr | 133.17 | 149.84 |
+
+## Display-change latency
+
+Sixteen randomized trials cleared the entry, verified zero, tapped 7 and verified the final Calculator readout. A changed display region required ten differing pixels above the luminance threshold. Streaming observed independently while the tap request was in flight. The pull arm requested its first frame after acknowledgement.
+
+| Arm | Trials | Detected | Median tap acknowledgment ms | Median first visible change ms |
+|---|---:|---:|---:|---:|
+| pull | 8 | 8 | 259.8 | 336.6 |
+| stream | 8 | 8 | 250.3 | 187.7 |
