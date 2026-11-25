@@ -179,8 +179,14 @@ pub fn reload() -> Arc<Config> {
         }
     }
     let (cfg, file_mac_host) = load_config_from(stamp.path.clone(), stamp.meta.is_some(), mac_host_env.as_deref());
+    let mut guard = CURRENT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = guard.as_ref() {
+        if cached.stamp == stamp && cached.mac_host_env == mac_host_env {
+            return cached.config.clone();
+        }
+    }
     let arc = Arc::new(cfg);
-    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(CachedConfig {
+    *guard = Some(CachedConfig {
         stamp,
         mac_host_env,
         file_mac_host,
