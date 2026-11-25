@@ -5240,6 +5240,44 @@ def cmd_ocr(client, args):
         print(f"({x:3d}, {y:3d})  {ln.text}")
 
 
+def cmd_vision_ocr(client, args):
+    status, _, body = client.req_raw("POST", "/wda/fastOCR", {"mode": args.mode, "capture": "png"})
+    unsupported = "WDA lacks /wda/fastOCR. Use a runner built with patches/wda-vision.patch."
+    if status in (404, 405, 501):
+        raise RuntimeError(unsupported)
+    if not status:
+        raise RuntimeError(f"Cannot reach WDA for Vision OCR: {body.decode(errors='replace')}")
+    try:
+        response = json.loads(body)
+    except ValueError:
+        raise RuntimeError(f"Invalid JSON from /wda/fastOCR (HTTP {status})") from None
+    value = response.get("value") if isinstance(response, dict) else None
+    if isinstance(value, dict) and "error" in value:
+        if value["error"] in ("unknown command", "unknown method", "unsupported operation"):
+            raise RuntimeError(unsupported)
+        raise RuntimeError(f"Vision OCR failed: {value.get('message') or value['error']}")
+    if not 200 <= status < 300:
+        raise RuntimeError(f"/wda/fastOCR failed (HTTP {status})")
+    if (not isinstance(value, dict) or "error" in response or response.get("status", 0) != 0
+            or value.get("mode") != args.mode or not isinstance(value.get("lines"), list)):
+        raise RuntimeError("Invalid /wda/fastOCR response: expected the requested mode and a lines array")
+
+    lines = []
+    fields = ("x", "y", "width", "height", "confidence")
+    for i, line in enumerate(value["lines"]):
+        if not isinstance(line, dict) or not isinstance(line.get("text"), str) or not line["text"]:
+            raise RuntimeError(f"Invalid /wda/fastOCR line {i}: expected recognized text")
+        for field in fields:
+            number = line.get(field)
+            if type(number) not in (int, float) or not 0 <= number <= 1:
+                raise RuntimeError(f"Invalid /wda/fastOCR line {i}: {field} must be a number in [0, 1]")
+        if (line["width"] == 0 or line["height"] == 0 or line["x"] + line["width"] > 1
+                or line["y"] + line["height"] > 1):
+            raise RuntimeError(f"Invalid /wda/fastOCR line {i}: expected a nonempty box within the screen")
+        lines.append({key: line[key] for key in ("text", *fields)})
+    print(json.dumps({"mode": args.mode, "lines": lines}, ensure_ascii=False))
+
+
 def cmd_tap_ocr(client, args):
     _preimport_pil_async()
     client.ensure_session(apply_fast_settings=True)
@@ -5531,6 +5569,9 @@ def _main():
     sp_ocr.add_argument("--scale", type=float, default=1.5, help="OCR px per point")
     sp_ocr.add_argument("--y0", type=int, default=0, help="crop band top (pt)")
     sp_ocr.add_argument("--y1", type=int, default=None, help="crop band bottom (pt), default screen bottom")
+    vision = sub.add_parser("vision-ocr", help="read the full screen as JSON using the optional WDA Vision patch")
+    vision.add_argument("--mode", choices=("fast", "accurate"), default="accurate",
+                        help="accurate uses language correction (default), fast disables it")
     sp_tap_ocr = sub.add_parser("tap-ocr")
     sp_tap_ocr.add_argument("text")
     sub.add_parser("tree")
@@ -5561,6 +5602,7 @@ def _main():
         "unlock": cmd_unlock,
         "deploy": cmd_deploy,
         "ocr": cmd_ocr,
+        "vision-ocr": cmd_vision_ocr,
         "tap-ocr": cmd_tap_ocr,
         "tree": cmd_tree,
         "screenshot": cmd_screenshot,
