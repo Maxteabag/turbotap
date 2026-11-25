@@ -21,7 +21,7 @@ def read_preflight(client, fast):
 class PreflightTests(unittest.TestCase):
     def test_complete_fast_read_matches_legacy_fields_and_cache(self):
         for locked, bundle, size in [(True, "system", (400, 800)),
-                                     (False, "example", (812.5, 375))]:
+                                     (False, "example", (812.0, 375))]:
             payload = {"locked": locked, "bundleId": bundle,
                        "size": dict(zip(("width", "height"), size))}
             def fast_only(method, path, data):
@@ -38,9 +38,21 @@ class PreflightTests(unittest.TestCase):
                 self.assertEqual(fast._load_session_cache()["screen_pt"], list(map(int, size)))
 
     def test_fallback_reads_all_three_fields_again(self):
-        partial = {"locked": False, "bundleId": "outgoing", "size": {"width": 99}}
-        for response in ({"error": 404}, {"error": "connection lost"}, [], {"value": partial},
-                         {"value": dict(partial, locked=1, size={"width": 99, "height": 50})}):
+        size = {"width": 99, "height": 50}
+        value = {"locked": False, "bundleId": "outgoing", "size": size}
+        malformed = [
+            dict(value, locked=1),
+            dict(value, size={"width": 99}),
+            *(dict(value, bundleId=bundle) for bundle in (None, "", " \t\n")),
+        ]
+        for field in size:
+            for n in (True, False, "50", 0, -1, 0.5, 50.5,
+                      float("nan"), float("inf"), float("-inf")):
+                malformed.append(dict(value, size={**size, field: n}))
+
+        responses = [{"error": 404}, {"error": "connection lost"}, []]
+        responses.extend({"value": payload} for payload in malformed)
+        for response in responses:
             with self.subTest(response=response), isolated_cache():
                 client = MockWDAClient(locked=True, active_app="incoming", screen_pt=(300, 600),
                                        custom_handler=lambda m, p, d: response if p.endswith("/fastPreflight") else None)

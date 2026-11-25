@@ -785,8 +785,6 @@ class WDAClient:
 
 
 def _fast_preflight(client, sid):
-    from math import isfinite
-
     response = client.req("GET", f"/session/{sid}/wda/fastPreflight")
     if not isinstance(response, dict) or "error" in response:
         return None
@@ -794,13 +792,17 @@ def _fast_preflight(client, sid):
     if not isinstance(value, dict) or type(value.get("locked")) is not bool:
         return None
     size = value.get("size")
-    if not isinstance(value.get("bundleId"), str) or not isinstance(size, dict):
+    bundle = value.get("bundleId")
+    if not isinstance(bundle, str) or not bundle.strip() or not isinstance(size, dict):
         return None
     for key in ("width", "height"):
         n = size.get(key)
-        if type(n) is not int and not (type(n) is float and isfinite(n)):
+        # WDA reads an integral rectangle from wdFrame. Orientation may swap the axes.
+        if type(n) is not int and not (type(n) is float and n.is_integer()):
             return None
-    return value["locked"], value["bundleId"], size
+        if n <= 0:
+            return None
+    return value["locked"], bundle, size
 
 
 def cmd_preflight(client, args):
