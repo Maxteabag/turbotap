@@ -1590,8 +1590,9 @@ fn test_tapel_checks_the_selected_elements_own_label() {
     // substring/name fallback predicate, and its actual label / name.
     let q = serde_json::to_string("Send").unwrap();
     let fallback = format!("(label CONTAINS[c] {q} OR name CONTAINS[c] {q}) AND enabled == 1");
-    let refused: [(Option<&str>, Option<&str>); 6] = [
+    let refused: [(Option<&str>, Option<&str>); 7] = [
         (Some("Send payment"), None),
+        (None, Some("Send message")), // name only: the label itself is not a plain Send
         (Some("Send all funds"), Some("Send all funds")),
         (None, Some("sendPaymentButton")), // name only, not a plain Send
         (Some("Send"), Some("sendPaymentButton")), // label and name disagree
@@ -1617,8 +1618,32 @@ fn test_tapel_checks_the_selected_elements_own_label() {
         assert!(input_posts(&mock).is_empty(), "{label:?}/{name:?}: {:?}", input_posts(&mock));
         flow.close();
     }
+    // A failed attribute lookup is not an absent one: label lookup HTTP 500 with name
+    // "Send", or label "Send" with the name lookup failing, gets no exception.
+    for (fail, label, name) in [("label", None, Some("Send")), ("name", Some("Send"), None)] {
+        let mut st = state_with_app(json!(ALLOWED));
+        st.element_map.insert(fallback.clone(), Dyn::one(json!({"ELEMENT": "err-1"})));
+        st.element_rects.insert("err-1".into(), json!({"x": 100, "y": 700, "width": 40, "height": 20}));
+        if let Some(l) = label {
+            st.element_labels.insert("err-1".into(), json!(l));
+        }
+        if let Some(n) = name {
+            st.element_names.insert("err-1".into(), json!(n));
+        }
+        let mock = MockWda::start(st);
+        let failing = format!("/element/err-1/attribute/{fail}");
+        mock.set_custom_handler(move |_, _, p, _| p.ends_with(&failing).then(|| json!({"error": 500, "body": "boom"})));
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+        match flow.step("tapel:Send") {
+            Err(Error::Flow(m)) => assert!(m.contains("matches --deny"), "{fail} lookup failed: {m}"),
+            other => panic!("{fail} lookup failed: expected --deny refusal, got {other:?}"),
+        }
+        assert!(input_posts(&mock).is_empty(), "{fail}: {:?}", input_posts(&mock));
+        assert!(mock.tapped_points().is_empty(), "{fail}");
+        flow.close();
+    }
     // The same fallback selecting an element whose own label is exactly Send is allowed.
-    for (label, name) in [(Some("Send"), None), (Some("Send"), Some("send")), (None, Some("Send message"))] {
+    for (label, name) in [(Some("Send"), None), (Some("Send"), Some("send")), (Some("Send message"), Some("Send  Message"))] {
         let mut st = state_with_app(json!(ALLOWED));
         st.element_map.insert(fallback.clone(), Dyn::one(json!({"ELEMENT": "ok-1"})));
         st.element_rects.insert("ok-1".into(), json!({"x": 100, "y": 700, "width": 40, "height": 20}));

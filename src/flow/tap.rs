@@ -100,6 +100,27 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+
+/// An element attribute as read from WDA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ElAttr {
+    /// Read successfully, non-empty.
+    Value(String),
+    /// Read successfully: null or empty.
+    Empty,
+    /// The request failed or the answer was not a string.
+    Failed,
+}
+
+impl ElAttr {
+    fn value(&self) -> Option<&str> {
+        match self {
+            ElAttr::Value(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 impl<R: Reader> Flow<R> {
     /// `self.controls()` / `self.controls(deadline=deadline)` from the tap code.
     fn tap_ctl(&mut self, deadline: Option<f64>) -> Result<Vec<Control>> {
@@ -1015,6 +1036,22 @@ impl<R: Reader> Flow<R> {
     }
 
     /// L3760. Returns the tapped point (the `tapel:` step result is `[x, y]`).
+    /// One accessibility attribute of element `eid`, keeping a failed lookup apart
+    /// from a successful empty one.
+    fn element_attr(&mut self, eid: &str, attr: &str) -> ElAttr {
+        let p = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
+        let r = self.c.get(&p);
+        if !r.is_object() || json::has_err(&r) {
+            return ElAttr::Failed;
+        }
+        match json::get(&r, "value") {
+            Value::Null => ElAttr::Empty,
+            Value::String(s) if s.trim().is_empty() => ElAttr::Empty,
+            Value::String(s) => ElAttr::Value(s.trim().to_string()),
+            _ => ElAttr::Failed,
+        }
+    }
+
     pub fn tap_el(&mut self, label: &str, timeout: Option<f64>) -> Result<(i64, i64)> {
         self.wait_active_app(1.5, 0.03, None);
         let q = json::dumps(&Value::String(label.to_string()));
@@ -1046,23 +1083,18 @@ impl<R: Reader> Flow<R> {
                         }
                         // The element may have been found by a substring or by its name:
                         // check what it actually is, not only the query.
-                        let attr = |c: &mut crate::wda::WdaClient, a: &str| {
-                            let p = c.spath(&format!("/element/{eid}/attribute/{a}"));
-                            let r = c.get(&p);
-                            json::get(&r, "value").as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
-                        };
-                        let (el_label, el_name) = (attr(&mut self.c, "label"), attr(&mut self.c, "name"));
+                        let (el_label, el_name) = (self.element_attr(&eid, "label"), self.element_attr(&eid, "name"));
                         let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-                        // The label the exception may rely on: unambiguous (label and name
-                        // agree, or only one is set). Unknown or disagreeing: no exception.
+                        // The exception needs a successfully read label that is exactly a
+                        // plain Send, and a name that was read too and is empty or the
+                        // same. Unreadable or disagreeing attributes: no exception.
                         let own: Option<String> = match (&el_label, &el_name) {
-                            (Some(l), Some(n)) if fold(l) == fold(n) => Some(l.clone()),
-                            (Some(l), None) => Some(l.clone()),
-                            (None, Some(n)) => Some(n.clone()),
+                            (ElAttr::Value(l), ElAttr::Empty) => Some(l.clone()),
+                            (ElAttr::Value(l), ElAttr::Value(n)) if fold(l) == fold(n) => Some(l.clone()),
                             _ => None,
                         };
                         let may_relax = own.as_deref().is_some_and(super::is_plain_send);
-                        for t in [Some(label), el_label.as_deref(), el_name.as_deref()].into_iter().flatten() {
+                        for t in [Some(label), el_label.value(), el_name.value()].into_iter().flatten() {
                             self.guard_with(t, "tap", may_relax)?;
                         }
                         self.tap_point_with(x, y, own.as_deref().unwrap_or(label), None, may_relax)?;
