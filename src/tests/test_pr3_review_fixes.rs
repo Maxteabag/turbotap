@@ -627,6 +627,9 @@ fn test_cold_geometry_and_reconnect_respect_absolute_deadline() {
             }
             None
         });
+        // Load libtesseract first: its one-time process init (40-150 ms dlopen) is not
+        // what this test measures and would eat the 0.15 s budget before /window/size.
+        let _ = crate::ocr::tess_lib();
         let reader = ScreenReader::new(1.5, None, 11, false);
         let mut flow = new_flow(&m, reader);
         let t0 = clock::real_now();

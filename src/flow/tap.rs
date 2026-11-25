@@ -155,6 +155,14 @@ impl<R: Reader> Flow<R> {
         if json::truthy(json::get(&res, "deadline_exceeded")) {
             return Err(Error::DeadlineExceeded("tap deadline exceeded".into()));
         }
+        // A transport error (socket timeout capped by the deadline) that comes back at
+        // or after the deadline is the deadline expiring, not a failed tap: Python's
+        // in-process test double returned the late 404 instead of timing out.
+        if let Some(d) = deadline {
+            if json::get(&res, "error").is_string() && clock::now() >= d {
+                return Err(Error::DeadlineExceeded("tap deadline exceeded".into()));
+            }
+        }
         crate::wda::check_wda_ok(res, "tap", false)?;
         let now = clock::now();
         self.last_action_ts = now;
