@@ -536,9 +536,12 @@ impl crate::out::Sink for StreamSink {
 
 fn open_cwd_dir() -> std::io::Result<std::fs::File> {
     // On Linux, O_PATH|O_DIRECTORY works in search-only (0111) directories and supports fchdir(2).
+    // On macOS, O_SEARCH (= O_EXEC|O_DIRECTORY) checks search permission only and supports fchdir(2).
     #[cfg(target_os = "linux")]
     let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_SEARCH | libc::O_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: "." is NUL-terminated; O_CLOEXEC prevents leaking the handle to child processes.
     let fd = unsafe { libc::open(c".".as_ptr(), flags) };

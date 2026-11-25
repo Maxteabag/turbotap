@@ -381,11 +381,12 @@ fn test_daemon_restores_original_cwd_identity_after_rename_and_reuse() {
 }
 
 /// PR #12 review: starting the daemon in a search-only (`0111`, unreadable) directory
-/// must capture the baseline handle (via `O_PATH | O_DIRECTORY` on Linux), stay up,
-/// and handle repeated forwarded requests from another working directory.
-#[cfg(target_os = "linux")]
+/// must capture the baseline handle (`O_PATH | O_DIRECTORY` on Linux, `O_SEARCH` on
+/// macOS), stay up, and handle repeated forwarded requests from another working directory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn test_daemon_stays_up_in_search_only_0111_directory() {
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
     struct RestoreMode(PathBuf);
     impl Drop for RestoreMode {
@@ -404,6 +405,7 @@ fn test_daemon_stays_up_in_search_only_0111_directory() {
     if unsafe { libc::geteuid() } != 0 {
         assert!(std::fs::read_dir(&search_only).is_err(), "expected 0111 dir listing to fail");
     }
+    #[cfg(target_os = "linux")]
     let search_meta = std::fs::metadata(&search_only).unwrap();
 
     let start_doc = doc(&home.run_in_dir(&search_only, &["daemon", "start", "--idle", "120"]));
@@ -419,13 +421,16 @@ fn test_daemon_stays_up_in_search_only_0111_directory() {
     assert_eq!(status["pid"], json!(pid));
     assert_eq!(status["requests"], json!(2));
 
-    let proc_cwd = PathBuf::from(format!("/proc/{pid}/cwd"));
-    let daemon_cwd_meta = std::fs::metadata(&proc_cwd).expect("stat /proc/<pid>/cwd");
-    assert_eq!(
-        (daemon_cwd_meta.dev(), daemon_cwd_meta.ino()),
-        (search_meta.dev(), search_meta.ino()),
-        "daemon cwd did not restore back to search-only startup dir"
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let proc_cwd = PathBuf::from(format!("/proc/{pid}/cwd"));
+        let daemon_cwd_meta = std::fs::metadata(&proc_cwd).expect("stat /proc/<pid>/cwd");
+        assert_eq!(
+            (daemon_cwd_meta.dev(), daemon_cwd_meta.ino()),
+            (search_meta.dev(), search_meta.ino()),
+            "daemon cwd did not restore back to search-only startup dir"
+        );
+    }
 }
 
 #[test]
