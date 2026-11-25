@@ -1,0 +1,80 @@
+diff --git i/WebDriverAgentLib/Commands/FBDebugCommands.m w/WebDriverAgentLib/Commands/FBDebugCommands.m
+index 9eb5996..b04c102 100644
+--- i/WebDriverAgentLib/Commands/FBDebugCommands.m
++++ w/WebDriverAgentLib/Commands/FBDebugCommands.m
+@@ -209,6 +209,7 @@ static void FBFastUICollect(id<FBXCElementSnapshot> _Nullable snapshot,
+     [[FBRoute GET:@"/wda/accessibleSource"].withoutSession respondWithTarget:self action:@selector(handleGetAccessibleSourceCommand:)],
+     [[FBRoute GET:@"/wda/fastUI"] respondWithTarget:self action:@selector(handleFastUI:)],
+     [[FBRoute GET:@"/wda/fastUI"].withoutSession respondWithTarget:self action:@selector(handleFastUI:)],
++    [[FBRoute POST:@"/wda/fastFlow"].withoutSession respondWithTarget:self action:@selector(handleFastFlow:)],
+   ];
+ }
+ 
+@@ -369,4 +370,67 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
+   return FBResponseWithRawData(jsonData, @"application/json;charset=UTF-8");
+ }
+ 
++// One fixed predicate: first v5 fastUI(text=1) row with this label in this bundle.
+++ (id<FBResponsePayload>)handleFastFlow:(FBRouteRequest *)request
++{
++  NSDictionary *args = request.arguments;
++  if (![args isKindOfClass:NSDictionary.class]) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Expected a JSON object" traceback:nil]);
++  }
++  NSString *label = args[@"label"];
++  NSString *bundle = args[@"bundleId"];
++  NSNumber *budget = args[@"timeoutMs"];
++  if (args.count != 3 || ![label isKindOfClass:NSString.class] || label.length == 0 || label.length > 256
++      || ![bundle isKindOfClass:NSString.class] || bundle.length == 0 || bundle.length > 255
++      || ![budget isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)budget) == CFBooleanGetTypeID()
++      || !isfinite(budget.doubleValue) || budget.doubleValue < 0 || budget.doubleValue > 2000
++      || budget.doubleValue != floor(budget.doubleValue)) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:
++      @"Expected only label, bundleId and integer timeoutMs (0..2000)" traceback:nil]);
++  }
++  NSProcessInfo *clock = NSProcessInfo.processInfo;
++  NSTimeInterval deadline = clock.systemUptime + budget.doubleValue / 1000.0;
++  NSUInteger samples = 0;
++  do {
++    @autoreleasepool {
++      ++samples;
++      XCUIApplication *application = XCUIApplication.fb_activeApplication;
++      id<FBXCElementSnapshot> snapshot = [application fb_standardSnapshot];
++      if (nil == snapshot) {
++        return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
++      }
++      if ([bundle compare:application.bundleID ?: @"" options:NSLiteralSearch] == NSOrderedSame) {
++        CGRect rootFrame = snapshot.frame;
++        BOOL rootValid = isfinite(rootFrame.size.width) && isfinite(rootFrame.size.height)
++          && rootFrame.size.width >= 1.0 && rootFrame.size.height >= 1.0;
++        CGFloat screenW = rootValid ? rootFrame.size.width : (CGFloat)0.0;
++        CGFloat screenH = rootValid ? rootFrame.size.height : (CGFloat)0.0;
++#if !TARGET_OS_WATCH
++        if (!rootValid) {
++          CGSize fallbackSize = UIScreen.mainScreen.bounds.size;
++          screenW = fallbackSize.width;
++          screenH = fallbackSize.height;
++        }
++#endif
++        NSInteger sw = (NSInteger)llround(screenW);
++        NSInteger sh = (NSInteger)llround(screenH);
++        NSMutableArray<NSMutableDictionary<NSString *, id> *> *items = [NSMutableArray array];
++        FBFastUICollect(snapshot, screenW, screenH, sw, sh, YES, NO, CGRectZero, NULL, NULL, nil, items);
++        for (NSDictionary *row in items) {
++          if ([label compare:row[@"label"] ?: @"" options:NSLiteralSearch] == NSOrderedSame) {
++            NSDictionary *observation = [row dictionaryWithValuesForKeys:@[@"type", @"label", @"x", @"y"]];
++            return FBResponseWithObject(@{@"observation": observation, @"samples": @(samples)});
++          }
++        }
++      }
++    }
++    NSTimeInterval remaining = deadline - clock.systemUptime;
++    if (remaining <= 0.0) {
++      break;
++    }
++    [NSThread sleepForTimeInterval:MIN(0.050, remaining)];
++  } while (clock.systemUptime < deadline);
++  return FBResponseWithObject(@{@"observation": NSNull.null, @"samples": @(samples)});
++}
++
+ @end
