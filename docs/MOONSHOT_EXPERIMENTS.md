@@ -284,3 +284,10 @@ The iPhone completed 25 blocks from 01:18 to 06:06 CET, with 48 captures per blo
 | 0.9 | new | 200 | 96,185 | 90.3 | 19.9 | 1,200 |
 
 Across the 25 blocks, reusing the connection reduced median HTTP time in every block at each quality. Median within-block savings were 12.1 ms (quality 0.25), 16.7 ms (0.6) and 17.9 ms (0.9). Lower JPEG quality reduced bandwidth but also reduced digit localization on this screen. The repeated static layout limits how far these accuracy results generalize.
+
+
+## Original-runner handoff and verification limits
+
+The final overnight block produced all 48 observations. The lab then launched the preserved signed v5 runner from its original build products. XCTest timed out while enabling UI automation, and the status endpoint was unreachable at the last lab check. A clean build of the pinned v5 source also succeeded. Device ownership passed to the next operator while a separate original-v5 startup was in progress. Post-rollback runtime health, the final lock state, and the planned original-runner repeat of the corrected baseline and fallback measurements remain unverified. The corrected CLI baseline above uses the v0.9.0 client against the v5-compatible lab runner.
+
+The final offline verification passed all 117 unit tests, Python compilation, deployment-script syntax, wheel asset checks and patch checks. The experimental worktrees were removed and the publication diff was scanned for private identifiers.
