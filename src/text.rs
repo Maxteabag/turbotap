@@ -242,7 +242,9 @@ pub fn clean_text(s: &str) -> String {
 /// Compile a user regex (`re:...`, `--deny`) case-insensitively with Python-like
 /// syntax (lookaround supported). None when invalid.
 pub fn compile_icase(pattern: &str) -> Option<fancy_regex::Regex> {
-    fancy_regex::RegexBuilder::new(pattern).case_insensitive(true).build().ok()
+    // An inline `(?i)` group: fancy-regex 0.14 ignores `RegexBuilder::case_insensitive`
+    // for patterns it delegates to the `regex` crate (e.g. the default --deny list).
+    fancy_regex::Regex::new(&format!("(?i:{pattern})")).ok()
 }
 
 /// First match of `rx` in `s` (a regex runtime error counts as no match).
