@@ -223,3 +223,57 @@ fn test_deny_evaluation_error_fails_closed_with_zero_action_posts() {
         .collect();
     assert!(actions.is_empty(), "action POSTs dispatched: {actions:?}");
 }
+
+/// Every string value (not key) in a JSON document.
+fn string_values(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| string_values(x, out)),
+        serde_json::Value::Object(m) => m.values().for_each(|x| string_values(x, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn test_key_shaped_credential_keeps_the_flow_schema_and_exit_status() {
+    for secret in ["ok", "step", "steps", "total_ms"] {
+        let _cache = isolated_cache();
+        let home = crate::testutil::TempDir::new("tt-home-");
+        let home_s = home.path().to_string_lossy().into_owned();
+        let _env = set_env(&[
+            ("HOME", Some(home_s.as_str())),
+            ("XDG_STATE_HOME", Some(home_s.as_str())),
+            ("WDA_UDID", None),
+            ("WDA_URL", None),
+            ("WDA_DEVICE", None),
+            ("WDA_TURBO", None),
+            ("TURBOTAP_DAEMON", None),
+            ("TT_SYNTHETIC", Some(secret)),
+        ]);
+        let mock = MockWda::start(MockState::default());
+        let cap = Capture::start();
+        let argv: Vec<String> =
+            ["--no-daemon", "--url", mock.url.as_str(), "flow", "setclip:env:TT_SYNTHETIC"].iter().map(|s| s.to_string()).collect();
+        let code = crate::cli::run_cli(&argv);
+        let (out, err) = (cap.stdout(), cap.stderr());
+        drop(cap);
+        assert_eq!(code, 0, "{secret}: exit {code}; stdout={out} stderr={err}");
+        assert_eq!(mock.calls_to("/wda/setPasteboard").len(), 1, "{secret}");
+        assert_eq!(mock.state().pasteboard, secret);
+        let doc: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{secret}: {e}: {out}"));
+        let keys: Vec<&str> = doc.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["ok", "steps", "reads", "total_ms"], "{secret}: {doc}");
+        assert_eq!(doc["ok"], json!(true));
+        let step = doc["steps"][0].as_object().unwrap();
+        assert_eq!(step.keys().map(String::as_str).collect::<Vec<_>>(), ["step", "ms", "result"], "{secret}");
+        assert_eq!(step["step"], json!("setclip:env:TT_SYNTHETIC"));
+        assert_eq!(step["result"], json!(format!("len={}", secret.len())));
+        let mut vals = Vec::new();
+        string_values(&doc, &mut vals);
+        assert!(vals.iter().all(|v| !v.contains(secret)), "{secret} exposed as a value: {vals:?}");
+        for line in err.lines() {
+            let item: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(item["step"], json!("setclip:env:TT_SYNTHETIC"), "{secret}: {line}");
+        }
+    }
+}

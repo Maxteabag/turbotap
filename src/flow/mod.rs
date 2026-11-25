@@ -835,7 +835,11 @@ impl<R: Reader> Flow<R> {
         out
     }
 
-    /// Scrub every string (keys and values) in an output value.
+    /// Scrub every string value in an output value. Object keys are never touched:
+    /// every key in flow output is a fixed protocol key (`ok`, `steps`, `step`, `ui`,
+    /// `value`, ...) chosen by turbotap, never user or device data, so a credential
+    /// that happens to equal or contain a key name can neither rename nor collide with
+    /// a field.
     pub fn scrub_value(&self, v: &mut Value) {
         if self.secrets.is_empty() {
             return;
@@ -843,13 +847,7 @@ impl<R: Reader> Flow<R> {
         match v {
             Value::String(s) => *s = self.scrub(s),
             Value::Array(a) => a.iter_mut().for_each(|x| self.scrub_value(x)),
-            Value::Object(m) => {
-                let old = std::mem::take(m);
-                for (k, mut x) in old {
-                    self.scrub_value(&mut x);
-                    m.insert(self.scrub(&k), x);
-                }
-            }
+            Value::Object(m) => m.values_mut().for_each(|x| self.scrub_value(x)),
             _ => {}
         }
     }
@@ -874,6 +872,12 @@ impl<R: Reader> Flow<R> {
 
     /// Run every step; the result dict printed by `turbotap flow`.
     pub fn run(&mut self, steps: &[String]) -> Result<Value> {
+        self.run_outcome(steps).map(|(_, v)| v)
+    }
+
+    /// [`run`](Self::run) plus the success flag, decided from the run itself (never
+    /// read back from the serialized, scrubbed result).
+    pub fn run_outcome(&mut self, steps: &[String]) -> Result<(bool, Value)> {
         let t0 = clock::real_now();
         let mut done: Vec<Value> = Vec::new();
         for spec in steps {
@@ -912,7 +916,7 @@ impl<R: Reader> Flow<R> {
                         "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
                     });
                     self.scrub_value(&mut res);
-                    return Ok(res);
+                    return Ok((false, res));
                 }
                 Err(e) if e.is_flow() => {
                     let visible: Vec<String> = self
@@ -941,7 +945,7 @@ impl<R: Reader> Flow<R> {
                     });
                     // Earlier credential steps may still be visible on screen.
                     self.scrub_value(&mut res);
-                    return Ok(res);
+                    return Ok((false, res));
                 }
                 Err(e) => return Err(self.scrub_error(e)),
             }
@@ -953,7 +957,7 @@ impl<R: Reader> Flow<R> {
             "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
         });
         self.scrub_value(&mut res);
-        Ok(res)
+        Ok((true, res))
     }
 }
 
@@ -1014,9 +1018,9 @@ pub fn cmd_flow(client: WdaClient, steps: &[String], timeout: f64, scale: f64, d
     client.ensure_session(None, true)?;
     let reader = ScreenReader::new(scale, None, 11, needs_ocr);
     let mut flow = Flow::new(client, reader, timeout, deny, !quiet)?;
-    let res = flow.run(steps);
+    let res = flow.run_outcome(steps);
     flow.close();
-    let res = res?;
+    let (ok, res) = res?;
     crate::outln!("{}", json::dumps_utf8(&res));
-    Ok(if json::truthy(json::get(&res, "ok")) { 0 } else { 1 })
+    Ok(if ok { 0 } else { 1 })
 }
