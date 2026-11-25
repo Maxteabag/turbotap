@@ -7,8 +7,8 @@
 //! `grab` incl. ETag/304 conditional `/wda/fastScreenshot`, `_cuts`, `_ocr_raw` with
 //! dark-mode pre-inversion and uniform-strip skip, `read` with the strip-hash cache).
 //!
-//! The strip cache keys strips by BLAKE2b digest (Python used SHA-256; the key is
-//! internal). Sauvola reads use a separate key prefix.
+//! The strip cache keys strips by a fast 128-bit streaming hash (Python used SHA-256;
+//! the key is internal). Sauvola reads use a separate key prefix.
 //!
 //! Strips of one `read` run on scoped threads, so no OCR work ever outlives the
 //! call that started it (Python needed per-request pool draining for that). Engines
@@ -22,7 +22,7 @@ use crate::text::{Line, Word};
 use crate::wda::WdaClient;
 use serde_json::{json as j, Value};
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_float, c_int, c_void, CStr};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 
@@ -79,8 +79,33 @@ type FnSetPsm = unsafe extern "C" fn(*mut c_void, c_int);
 type FnSetVar = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
 type FnSetImage = unsafe extern "C" fn(*mut c_void, *const u8, c_int, c_int, c_int, c_int);
 type FnGetTsv = unsafe extern "C" fn(*mut c_void, c_int) -> *mut c_char;
+type FnRecognize = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+type FnGetIterator = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+type FnRiPageIter = unsafe extern "C" fn(*const c_void) -> *const c_void;
+type FnPiAtBeginning = unsafe extern "C" fn(*const c_void, c_int) -> c_int;
+type FnPiBoundingBox = unsafe extern "C" fn(*const c_void, c_int, *mut c_int, *mut c_int, *mut c_int, *mut c_int) -> c_int;
+type FnRiGetText = unsafe extern "C" fn(*const c_void, c_int) -> *mut c_char;
+type FnRiConfidence = unsafe extern "C" fn(*const c_void, c_int) -> c_float;
+type FnRiNext = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+type FnRiDelete = unsafe extern "C" fn(*mut c_void);
 type FnDeleteText = unsafe extern "C" fn(*mut c_char);
 type FnDelete = unsafe extern "C" fn(*mut c_void);
+
+const RIL_TEXTLINE: c_int = 2;
+const RIL_WORD: c_int = 3;
+
+/// Optional direct `TessResultIterator` C-API symbols (skips TSV formatting + `parse_tsv`).
+struct TessIterApi {
+    recognize: FnRecognize,
+    get_iter: FnGetIterator,
+    ri_page_iter: FnRiPageIter,
+    pi_at_beg: FnPiAtBeginning,
+    pi_bbox: FnPiBoundingBox,
+    ri_text: FnRiGetText,
+    ri_conf: FnRiConfidence,
+    ri_next: FnRiNext,
+    ri_delete: FnRiDelete,
+}
 
 /// The loaded libtesseract C API (function pointers resolved once).
 pub struct TessLib {
@@ -90,6 +115,7 @@ pub struct TessLib {
     set_var: FnSetVar,
     set_image: FnSetImage,
     get_tsv: FnGetTsv,
+    iter: Option<TessIterApi>,
     delete_text: FnDeleteText,
     delete: FnDelete,
     _lib: libloading::Library,
@@ -149,6 +175,23 @@ fn load_tess() -> Option<TessLib> {
         })()
     }
     .ok()?;
+    // Optional direct ResultIterator API (present in libtesseract 4/5; falls back to GetTsvText if missing).
+    let iter = unsafe {
+        (|| -> std::result::Result<TessIterApi, libloading::Error> {
+            Ok(TessIterApi {
+                recognize: *lib.get::<FnRecognize>(b"TessBaseAPIRecognize\0")?,
+                get_iter: *lib.get::<FnGetIterator>(b"TessBaseAPIGetIterator\0")?,
+                ri_page_iter: *lib.get::<FnRiPageIter>(b"TessResultIteratorGetPageIteratorConst\0")?,
+                pi_at_beg: *lib.get::<FnPiAtBeginning>(b"TessPageIteratorIsAtBeginningOf\0")?,
+                pi_bbox: *lib.get::<FnPiBoundingBox>(b"TessPageIteratorBoundingBox\0")?,
+                ri_text: *lib.get::<FnRiGetText>(b"TessResultIteratorGetUTF8Text\0")?,
+                ri_conf: *lib.get::<FnRiConfidence>(b"TessResultIteratorConfidence\0")?,
+                ri_next: *lib.get::<FnRiNext>(b"TessResultIteratorNext\0")?,
+                ri_delete: *lib.get::<FnRiDelete>(b"TessResultIteratorDelete\0")?,
+            })
+        })()
+    }
+    .ok();
     // Leptonica prints "Error in boxClipToRectangle" for harmless empty boxes.
     let lept = LEPT_NAMES.iter().find_map(|n| unsafe { libloading::Library::new(n) }.ok());
     if let Some(l) = lept.as_ref() {
@@ -158,7 +201,7 @@ fn load_tess() -> Option<TessLib> {
         }
     }
     let (create, init2, set_psm, set_var, set_image, get_tsv, delete_text, delete) = api;
-    Some(TessLib { create, init2, set_psm, set_var, set_image, get_tsv, delete_text, delete, _lib: lib, _lept: lept })
+    Some(TessLib { create, init2, set_psm, set_var, set_image, get_tsv, iter, delete_text, delete, _lib: lib, _lept: lept })
 }
 
 /// libtesseract, or None (callers then fork the `tesseract` binary).
@@ -209,25 +252,77 @@ impl TessApi {
         }
     }
 
-    /// `_tesseract_tsv_raw`: TSV for an 8-bit grayscale buffer.
-    fn tsv(&mut self, raw: &[u8], w: u32, h: u32) -> Result<String> {
+    /// Recognise an 8-bit grayscale sub-image `(w x h)` with row stride `stride` bytes
+    /// and return level-5 words (`conf > 30`) grouped by textline, using the direct
+    /// `TessResultIterator` C API when available (falling back to `GetTsvText` + `parse_tsv`).
+    fn words_strided(&mut self, raw: &[u8], w: u32, h: u32, stride: u32) -> Result<Vec<RawWords>> {
         let Some(lib) = self.lib.filter(|_| !self.ptr.is_null()) else {
             return Err(Error::runtime("fake Tesseract engine cannot OCR"));
         };
-        if raw.len() < (w as usize) * (h as usize) {
+        if w == 0 || h == 0 {
+            return Ok(Vec::new());
+        }
+        let min_len = (h as usize - 1).saturating_mul(stride as usize).saturating_add(w as usize);
+        if stride < w || raw.len() < min_len {
             return Err(Error::value("OCR buffer smaller than its size"));
         }
-        // SAFETY: `raw` outlives the call (SetImage copies into a Pix) and holds w*h
-        // bytes at 1 byte per pixel; the TSV string is freed with TessDeleteText.
+        // SAFETY: `raw` outlives `SetImage` (which copies `w x h` bytes with `stride`
+        // into an internal Pix); iterator and UTF-8 strings are freed via C API destructors.
         unsafe {
-            (lib.set_image)(self.ptr, raw.as_ptr(), w as c_int, h as c_int, 1, w as c_int);
+            (lib.set_image)(self.ptr, raw.as_ptr(), w as c_int, h as c_int, 1, stride as c_int);
+            if let Some(it) = lib.iter.as_ref() {
+                if (it.recognize)(self.ptr, std::ptr::null_mut()) != 0 {
+                    return Ok(Vec::new());
+                }
+                let ri = (it.get_iter)(self.ptr);
+                if ri.is_null() {
+                    return Ok(Vec::new());
+                }
+                struct IterGuard(FnRiDelete, *mut c_void);
+                impl Drop for IterGuard {
+                    fn drop(&mut self) {
+                        unsafe { (self.0)(self.1) };
+                    }
+                }
+                let _guard = IterGuard(it.ri_delete, ri);
+                let pi = (it.ri_page_iter)(ri);
+                let mut out: Vec<RawWords> = Vec::new();
+                let mut cur_line: RawWords = Vec::new();
+                loop {
+                    if (it.pi_at_beg)(pi, RIL_TEXTLINE) != 0 && !cur_line.is_empty() {
+                        out.push(std::mem::take(&mut cur_line));
+                    }
+                    let conf = (it.ri_conf)(ri, RIL_WORD) as f64;
+                    if conf > 30.0 {
+                        let tp = (it.ri_text)(ri, RIL_WORD);
+                        if !tp.is_null() {
+                            let txt = CStr::from_ptr(tp).to_string_lossy();
+                            let trimmed = txt.trim();
+                            if !trimmed.is_empty() {
+                                let (mut x0, mut y0, mut x1, mut y1) = (0, 0, 0, 0);
+                                if (it.pi_bbox)(pi, RIL_WORD, &mut x0, &mut y0, &mut x1, &mut y1) != 0 {
+                                    cur_line.push((trimmed.to_string(), x0 as i64, y0 as i64, x1 as i64, y1 as i64));
+                                }
+                            }
+                            (lib.delete_text)(tp);
+                        }
+                    }
+                    if (it.ri_next)(ri, RIL_WORD) == 0 {
+                        break;
+                    }
+                }
+                if !cur_line.is_empty() {
+                    out.push(cur_line);
+                }
+                return Ok(out);
+            }
             let p = (lib.get_tsv)(self.ptr, 0);
             if p.is_null() {
-                return Ok(String::new());
+                return Ok(Vec::new());
             }
             let s = CStr::from_ptr(p).to_string_lossy().into_owned();
             (lib.delete_text)(p);
-            Ok(s)
+            Ok(parse_tsv(&s))
         }
     }
 }
@@ -807,9 +902,9 @@ impl ScreenReader {
             explicit_workers,
         };
         if warm_ocr {
-            // Warm the engines while the first frame is in flight; a failure here
-            // surfaces from the first read instead.
-            let _ = r.ensure_ocr();
+            // Warm libtesseract (including dlopen) and engines in the background while
+            // session setup and the first screenshot are in flight; failures surface on read().
+            let _ = r.start_warm_ocr();
         }
         r
     }
@@ -827,6 +922,36 @@ impl ScreenReader {
         } else {
             self.n.min(COLD_INITIAL_WORKERS)
         }
+    }
+
+    /// Kick off engine warm-up without blocking the caller on `dlopen("libtesseract.so.5")`
+    /// in cold CLI mode, so dynamic library loading and LSTM init overlap with `/wda/fastScreenshot`.
+    fn start_warm_ocr(&self) -> Result<()> {
+        if self.tsv_hook.is_some()
+            || self.ocr_raw_hook.is_some()
+            || crate::config::env("WDA_OCR").as_deref() == Some("binary")
+        {
+            return Ok(());
+        }
+        let mut slot = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return Ok(());
+        }
+        let pool = if let Some(warm) = warm_ocr() {
+            warm.lease(self.psm, self.n)?
+        } else {
+            ensure_omp_thread_limit();
+            let init = self.cold_engine_cap();
+            let pool = Arc::new(EnginePool::new(self.psm, init, real_factory()));
+            let mut warming = self.warming.lock().unwrap_or_else(|e| e.into_inner());
+            for _ in 0..init {
+                let p = pool.clone();
+                warming.push(std::thread::spawn(move || p.grow_one()));
+            }
+            pool
+        };
+        *slot = Some(pool);
+        Ok(())
     }
 
     /// Python `_ensure_ocr`: lease warm daemon engines, or make this reader's own pool
@@ -926,7 +1051,8 @@ impl ScreenReader {
         cuts.into_iter().map(|v| v as u32).collect()
     }
 
-    /// OCR one strip (uniform-strip skip, dark-mode pre-inversion, Sauvola variables).
+    /// OCR one strip (uniform-strip skip, dark-mode pre-inversion, direct
+    /// `TessResultIterator` recognition, Sauvola variables).
     pub fn ocr_raw(&self, raw: &[u8], w: u32, h: u32, sauvola: bool) -> Result<Vec<RawWords>> {
         if let Some(hook) = self.ocr_raw_hook.as_ref() {
             return hook(raw, w, h, sauvola);
@@ -954,12 +1080,15 @@ impl ScreenReader {
                 inverted = Some(raw.iter().map(|&v| !v).collect());
             }
         }
-        let raw: &[u8] = inverted.as_deref().unwrap_or(raw);
-        let tsv = match self.ensure_ocr()? {
-            None => match self.tsv_hook.as_ref() {
-                Some(hook) => hook(raw, w, h, self.psm, sauvola)?,
-                None => tesseract_tsv_binary(raw, w, h, self.psm, sauvola)?,
-            },
+        let buf: &[u8] = inverted.as_deref().unwrap_or(raw);
+        match self.ensure_ocr()? {
+            None => {
+                let tsv = match self.tsv_hook.as_ref() {
+                    Some(hook) => hook(buf, w, h, self.psm, sauvola)?,
+                    None => tesseract_tsv_binary(buf, w, h, self.psm, sauvola)?,
+                };
+                Ok(parse_tsv(&tsv))
+            }
             Some(pool) => {
                 let mut lease = Lease { pool: &pool, api: Some(pool.get()?) };
                 let Some(api) = lease.api.as_mut() else { return Err(Error::runtime("no Tesseract engine")) };
@@ -968,15 +1097,14 @@ impl ScreenReader {
                     api.set_variable(c"thresholding_kfactor", c"0.15");
                     api.set_variable(c"thresholding_window_size", c"0.80");
                 }
-                let res = api.tsv(raw, w, h);
+                let res = api.words_strided(buf, w, h, w);
                 if sauvola {
                     api.set_variable(c"thresholding_method", c"0");
                 }
                 drop(lease);
-                res?
+                res
             }
-        };
-        Ok(parse_tsv(&tsv))
+        }
     }
 
     /// Conditional fastScreenshot needs a runner not already known to ignore the
@@ -1092,6 +1220,37 @@ impl ScreenReader {
         }
         ConditionalShot::Fresh(0, String::new(), b"conditional screenshot failed".to_vec())
     }
+}
+
+/// Fast 128-bit streaming strip hash for the internal 512-entry strip OCR cache
+/// (~9.4x faster than Blake2b-256 on 900 KB frames, saving ~0.67 ms per `read()`).
+fn strip_hash128(bytes: &[u8]) -> [u8; 16] {
+    let mut h1: u64 = 0x9e37_79b9_7f4a_7c15 ^ (bytes.len() as u64);
+    let mut h2: u64 = 0xbf58_476d_1ce4_e5b9 ^ (bytes.len() as u64).rotate_left(32);
+    let chunks = bytes.chunks_exact(16);
+    let rem = chunks.remainder();
+    for c in chunks {
+        let a = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        let b = u64::from_le_bytes([c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]]);
+        h1 = (h1 ^ a).wrapping_mul(0xa076_1d64_78bd_642f);
+        h2 = (h2 ^ b).wrapping_mul(0xe703_7ed1_a0b4_28db);
+        h1 = h1.rotate_left(27) ^ h2;
+        h2 = h2.rotate_left(31).wrapping_add(h1);
+    }
+    for &b in rem {
+        h1 = (h1 ^ b as u64).wrapping_mul(0xa076_1d64_78bd_642f);
+        h2 = h2.rotate_left(13) ^ h1;
+    }
+    h1 ^= h1 >> 30;
+    h1 = h1.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h1 ^= h1 >> 27;
+    h2 ^= h2 >> 30;
+    h2 = h2.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h2 ^= h2 >> 31;
+    let mut out = [0u8; 16];
+    out[0..8].copy_from_slice(&h1.to_le_bytes());
+    out[8..16].copy_from_slice(&h2.to_le_bytes());
+    out
 }
 
 /// `json.dumps(v, sort_keys=True)` input: objects rebuilt with sorted keys.
@@ -1402,8 +1561,7 @@ impl Reader for ScreenReader {
     }
 
     fn read(&mut self, c: &mut WdaClient, opts: ReadOpts) -> Result<Vec<Line>> {
-        use blake2::{digest::consts::U32, Blake2b, Digest};
-        self.ensure_ocr()?;
+        self.start_warm_ocr()?;
         let ReadOpts { y0, y1, img, sauvola, timeout, deadline } = opts;
         let full = y0 == 0 && y1.is_none();
         let fresh_grab = img.is_none();
@@ -1417,8 +1575,8 @@ impl Reader for ScreenReader {
         let mut jobs: Vec<(usize, usize, Vec<u8>)> = Vec::new();
         for pair in cuts.windows(2) {
             let (a, b) = (pair[0] as usize, pair[1] as usize);
-            let digest = Blake2b::<U32>::digest(&data[a * w..b * w]);
-            let mut k = Vec::with_capacity(33);
+            let digest = strip_hash128(&data[a * w..b * w]);
+            let mut k = Vec::with_capacity(17);
             if sauvola {
                 k.push(b'S');
             }
@@ -1524,8 +1682,10 @@ impl Reader for ScreenReader {
 
 /// `turbotap ocr` (L5559).
 pub fn cmd_ocr(client: &mut WdaClient, scale: f64, y0: i64, y1: Option<i64>) -> Result<()> {
-    client.ensure_session(None, true)?;
+    // Start async cold libtesseract warm-up before ensure_session so dlopen + LSTM init
+    // overlap with both session setup and the screenshot round-trip.
     let mut reader = ScreenReader::new(scale, None, 11, true);
+    client.ensure_session(None, true)?;
     let t0 = clock::real_now();
     let lines = reader.read(client, ReadOpts { y0, y1, ..Default::default() })?;
     let dt = (clock::real_now() - t0) * 1000.0;
@@ -1735,5 +1895,16 @@ mod ocr_opt_tests {
         assert!(r_env.explicit_workers);
         assert_eq!(r_env.n, 4);
         assert_eq!(r_env.cold_engine_cap(), 4);
+    }
+
+    #[test]
+    fn strip_hash128_is_deterministic_and_sensitive() {
+        let mut a = vec![240u8; 4096];
+        assert_eq!(strip_hash128(&a), strip_hash128(&a));
+        let h_a = strip_hash128(&a);
+        a[2047] ^= 1;
+        assert_ne!(h_a, strip_hash128(&a));
+        let b = vec![240u8; 4097];
+        assert_ne!(h_a, strip_hash128(&b));
     }
 }
