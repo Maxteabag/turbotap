@@ -142,6 +142,7 @@ _CONN_CLIENTS = None   # WDAClients created during the current daemon request
 _CONN_POOL_IDLE = 60.0
 _CONN_POOL_MAX = 4
 _WARM_OCR = None       # _WarmOCR instance shared by ScreenReaders inside the daemon
+_REQUEST_CLEANUPS = None  # daemon only: callables that drain work a request started
 _POOL_LOCK = None
 
 
@@ -207,12 +208,33 @@ def _release_conn(client):
         pass
 
 
-def _recycle_request_conns():
-    """Daemon: after a request, wait for its OCR workers and park every idle
-    connection its clients opened."""
-    global _CONN_CLIENTS
+def _request_pool(workers):
+    """A worker pool owned by the current request. Inside the daemon it is drained
+    (queued work cancelled, running work awaited) before the next caller's
+    environment and working directory are installed."""
+    pool = _thread_pool(workers)
+    if _REQUEST_CLEANUPS is not None:
+        _REQUEST_CLEANUPS.append(lambda: pool.shutdown(wait=True, cancel_futures=True))
+    return pool
+
+
+def _drain_request_work():
+    """Daemon: run every cleanup the request registered, in order, then the warm
+    OCR pools. Nothing a request started may still run after this returns."""
+    global _REQUEST_CLEANUPS
+    if _REQUEST_CLEANUPS is not None:
+        cleanups, _REQUEST_CLEANUPS = _REQUEST_CLEANUPS, []
+        for fn in cleanups:
+            fn()
     if _WARM_OCR is not None:
         _WARM_OCR.end_request()
+
+
+def _recycle_request_conns():
+    """Daemon: after a request, wait for all of its worker threads and park every
+    idle connection its clients opened."""
+    global _CONN_CLIENTS
+    _drain_request_work()
     clients, _CONN_CLIENTS = _CONN_CLIENTS or [], ([] if _CONN_POOL is not None else None)
     for c in clients:
         _release_conn(c)
@@ -1381,8 +1403,13 @@ def _create_tess_api(psm):
 
 
 def _tess_model_key():
-    """What decides which model data TessBaseAPIInit2(datapath=NULL) loads."""
-    return os.environ.get("TESSDATA_PREFIX") or ""
+    """The model directory TessBaseAPIInit2(datapath=NULL) will load, resolved now.
+
+    TESSDATA_PREFIX may be relative; Tesseract resolves it against the process cwd
+    at init, and the warm daemon switches cwd per request. Keying by the resolved
+    path means the same relative prefix from two directories selects two engines."""
+    prefix = os.environ.get("TESSDATA_PREFIX")
+    return os.path.realpath(prefix) if prefix else ""
 
 
 class _WarmOCR:
@@ -1473,13 +1500,16 @@ class ScreenReader:
             self.pool, self.apis = warm.lease(self.psm, self.n)
             return
         import queue
-        self.pool = _thread_pool(self.n)
+        self.pool = _request_pool(self.n)
         self.apis = queue.Queue()
         if _tess_lib() is not None:
-            import atexit
             for _ in range(self.n):  # warm the engines while the first frame is in flight
                 self.pool.submit(self._new_api)
-            atexit.register(self._close)
+            if _REQUEST_CLEANUPS is not None:
+                _REQUEST_CLEANUPS.append(self._close)  # after the pool drain registered above
+            else:
+                import atexit
+                atexit.register(self._close)
 
     def set_last(self, img, lines=None, ts=None):
         self.last = img
@@ -2613,7 +2643,7 @@ class Flow:
             if self.c._fast_launch is not None:
                 self._side._fast_launch = self.c._fast_launch
         if self._ui_pool is None:
-            self._ui_pool = _thread_pool(1)
+            self._ui_pool = _request_pool(1)
         return self._side, self._ui_pool
 
     def close(self):

@@ -148,6 +148,92 @@ class WarmOCRPartitionTests(unittest.TestCase):
             warm.end_request()
 
 
+class RelativeModelPathTests(unittest.TestCase):
+    """Round 2: the same relative TESSDATA_PREFIX from two working directories."""
+
+    def test_same_relative_prefix_in_two_cwds_gets_two_engines(self):
+        import tempfile
+        made = []
+
+        def init(psm):
+            resolved = os.path.realpath(os.environ["TESSDATA_PREFIX"])  # what Tesseract opens
+            made.append(resolved)
+            return ("engine", resolved)
+
+        old_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b, \
+                mock.patch.object(cli, "_create_tess_api", side_effect=init), \
+                mock.patch.dict(os.environ, {"TESSDATA_PREFIX": "models"}):
+            for d in (a, b):
+                os.makedirs(os.path.join(d, "models"))
+            warm = cli._WarmOCR()
+            try:
+                os.chdir(a)
+                _, apis_a = warm.lease(11, 1)
+                os.chdir(b)
+                _, apis_b = warm.lease(11, 1)
+                os.chdir(a)
+                _, apis_a2 = warm.lease(11, 1)
+            finally:
+                os.chdir(old_cwd)
+                warm.end_request()
+            self.assertIsNot(apis_a, apis_b)
+            self.assertIs(apis_a, apis_a2)
+            self.assertEqual(made, [os.path.realpath(os.path.join(a, "models")),
+                                    os.path.realpath(os.path.join(b, "models"))])
+            self.assertEqual(apis_b.get_nowait(), ("engine", made[1]))
+
+
+class BinaryOCRDrainTests(unittest.TestCase):
+    """Round 2: a failed strip must not leave a sibling running into the next request."""
+
+    def test_failed_strip_drains_running_sibling_before_next_request(self):
+        from tests.helpers import box_img
+        img = box_img(255, boxes=[((10, y, 100, y + 8), 0) for y in range(10, 230, 20)], size=(120, 240))
+        lock = threading.Lock()
+        calls = {"n": 0}
+        seen = []
+        sibling_started = threading.Event()
+
+        def fake_tsv(image, psm=11, api=None, sauvola=False):
+            with lock:
+                calls["n"] += 1
+                first = calls["n"] == 1
+            if first:
+                sibling_started.wait(2)
+                raise RuntimeError("tesseract failed on this strip")
+            sibling_started.set()
+            time.sleep(0.3)
+            seen.append(os.environ.get("TT_REQUEST"))  # a subprocess would inherit this env
+            return ""
+
+        with mock.patch.object(cli, "_REQUEST_CLEANUPS", []), mock.patch.object(cli, "_CONN_CLIENTS", []), \
+                mock.patch.object(cli, "_CONN_POOL", {}), mock.patch.object(cli, "_WARM_OCR", None), \
+                mock.patch.object(cli, "tesseract_tsv", side_effect=fake_tsv), \
+                mock.patch.dict(os.environ, {"WDA_OCR": "binary", "TT_REQUEST": "first"}):
+            reader = cli.ScreenReader(cli.WDAClient("http://127.0.0.1:9"), scale=1.0, workers=2, warm_ocr=False)
+            with self.assertRaisesRegex(RuntimeError, "failed on this strip"):
+                reader.read(img=img)
+            self.assertTrue(sibling_started.is_set())
+            cli._recycle_request_conns()  # what the daemon runs before restoring env/cwd
+            self.assertEqual(seen, ["first"], "a binary OCR worker outlived its request")
+            os.environ["TT_REQUEST"] = "second"  # the next caller's environment
+            time.sleep(0.4)
+            self.assertEqual(seen, ["first"])
+            # The next request gets a fresh, working pool.
+            calls["n"] = 1
+            reader2 = cli.ScreenReader(cli.WDAClient("http://127.0.0.1:9"), scale=1.0, workers=2, warm_ocr=False)
+            reader2.read(img=img)
+            self.assertIn("second", seen)
+            cli._recycle_request_conns()
+
+    def test_outside_the_daemon_pools_are_not_registered(self):
+        self.assertIsNone(cli._REQUEST_CLEANUPS)
+        pool = cli._request_pool(1)
+        self.assertIsNone(cli._REQUEST_CLEANUPS)
+        pool.shutdown(wait=True)
+
+
 class FusedReadDeferredTests(unittest.TestCase):
     def test_patch_ships_fast_ocr_without_the_unguarded_fused_read(self):
         with open(os.path.join(REPO_ROOT, "patches", "wda-turbo.patch"), encoding="utf-8") as f:

@@ -311,6 +311,7 @@ class Server:
         cli = _cli()
         cli._CONN_POOL = {}
         cli._CONN_CLIENTS = []
+        cli._REQUEST_CLEANUPS = []
         cli._http_client()
         cli._thread_pool(1).shutdown(wait=False)
         try:
@@ -336,6 +337,9 @@ class Server:
                 os.unlink(self.path)
         except OSError:
             pass
+        if cli._REQUEST_CLEANUPS is not None:
+            cli._drain_request_work()
+            cli._REQUEST_CLEANUPS = None
         if cli._WARM_OCR is not None:
             cli._WARM_OCR.close()
             cli._WARM_OCR = None
@@ -468,6 +472,7 @@ class Server:
         saved_cwd = os.getcwd()
         saved_streams = sys.stdout, sys.stderr
         cli._CONN_CLIENTS = []
+        cli._REQUEST_CLEANUPS = []
         sys.stdout = _Stream(conn, "out", send_lock)
         sys.stderr = _Stream(conn, "err", send_lock)
         try:
