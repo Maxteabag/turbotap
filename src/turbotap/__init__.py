@@ -1,3 +1,3 @@
 """turbotap — Fast headless CLI for physical iPhones over Wi-Fi via patched WebDriverAgent."""
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
