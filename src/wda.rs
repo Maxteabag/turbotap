@@ -72,6 +72,7 @@ impl Conn {
             match TcpStream::connect_timeout(&addr, to) {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
+                    set_quickack(&s);
                     self.reader = Some(BufReader::with_capacity(64 * 1024, s));
                     return Ok(());
                 }
@@ -163,6 +164,10 @@ impl Conn {
             }
             Some(b) => write_all_pair(r.get_mut(), &self.req_buf, b)?,
         }
+        // Re-arm TCP_QUICKACK on Linux before reading: prevents 40 ms delayed-ACK
+        // stalls when a keep-alive server (e.g. WDA/GCDAsyncSocket) writes response
+        // headers and body in separate segments without TCP_NODELAY.
+        set_quickack(r.get_ref());
         let (resp, close) = read_response_into(r, method, &mut self.line_buf, collect_headers)?;
         if close {
             self.reader = None;
@@ -170,6 +175,27 @@ impl Conn {
         Ok(resp)
     }
 }
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn set_quickack(s: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let on: libc::c_int = 1;
+    // SAFETY: valid open TCP socket fd and properly aligned c_int value.
+    unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            (&on as *const libc::c_int).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn set_quickack(_s: &TcpStream) {}
 
 #[inline]
 fn push_usize_bytes(buf: &mut Vec<u8>, mut n: usize) {
@@ -371,6 +397,9 @@ fn read_response_into(
     if !no_body {
         if chunked {
             loop {
+                if r.buffer().is_empty() {
+                    set_quickack(r.get_ref());
+                }
                 let size_line = read_line_into(r, line_buf)?;
                 let semi = size_line.iter().position(|&b| b == b';').unwrap_or(size_line.len());
                 let size_hex = trim_ascii_bytes(&size_line[..semi]);
@@ -385,13 +414,20 @@ fn read_response_into(
                 }
                 let start = body.len();
                 body.resize(start + size, 0);
+                if r.buffer().len() < size {
+                    set_quickack(r.get_ref());
+                }
                 r.read_exact(&mut body[start..])?;
                 let _ = read_line_into(r, line_buf)?;
             }
         } else if let Some(len) = content_length {
+            if r.buffer().len() < len {
+                set_quickack(r.get_ref());
+            }
             body = vec![0u8; len];
             r.read_exact(&mut body)?;
         } else {
+            set_quickack(r.get_ref());
             r.read_to_end(&mut body)?;
             conn_close = true;
             if collect_headers {
@@ -1775,6 +1811,53 @@ mod transport_tests {
         assert_eq!(r2.status, 200);
         assert_eq!(r2.body, b"ok");
         assert!(!conn.is_connected());
+        srv.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conn_quickack_avoids_delayed_ack_stall_on_two_write_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_nodelay(false);
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let body = br#"{"ok":true}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            );
+            for _ in 0..8 {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                loop {
+                    line.clear();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                s.write_all(head.as_bytes()).unwrap();
+                s.write_all(body).unwrap();
+            }
+        });
+
+        let mut conn = Conn::new("127.0.0.1", port);
+        conn.connect(5.0).unwrap();
+        // Warm up 2 requests, then time 6 requests (would take ~240ms without TCP_QUICKACK).
+        for _ in 0..2 {
+            assert_eq!(conn.request("GET", "/ping", None, &[]).unwrap().status, 200);
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..6 {
+            let resp = conn.request("GET", "/ping", None, &[]).unwrap();
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, br#"{"ok":true}"#);
+        }
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
+        assert!(elapsed_ms < 150.0, "delayed-ACK stall detected: 6 requests took {elapsed_ms:.1} ms");
         srv.join().unwrap();
     }
 }
