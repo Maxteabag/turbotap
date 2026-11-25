@@ -615,6 +615,17 @@ mod unit {
     use super::*;
     use crate::testutil::{set_env, TempDir};
 
+    /// Set `path`'s mtime to now + `secs` (ctime becomes now).
+    fn set_mtime_offset(path: &Path, secs: i64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let t = libc::timespec { tv_sec: now.as_secs() as i64 + secs, tv_nsec: 0 };
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), [t, t].as_ptr(), 0) };
+        assert_eq!(rc, 0, "utimensat failed: {}", std::io::Error::last_os_error());
+    }
+
     #[test]
     fn reload_caches_unchanged_file_and_tracks_mac_host_override() {
         let tmp = TempDir::new("tt-cfg-cache-");
@@ -622,9 +633,12 @@ mod unit {
         std::fs::write(&cfg_path, r#"{"mac_host":"mini-1","app_prefer":{"Mail":"com.apple.mobilemail"}}"#).unwrap();
         let p = cfg_path.to_string_lossy().into_owned();
         let _e = set_env(&[("WDA_CONFIG", Some(p.as_str())), ("WDA_MAC_HOST", None)]);
-        // A just-written file is never cached (racy stamp); once it is older, it is.
+        // A racy stamp (changed within RACY_WINDOW, here deterministically: mtime in the
+        // future) is never cached, however slowly this test runs; once older, it is.
+        set_mtime_offset(&cfg_path, 10);
         let c0 = reload();
-        assert!(!Arc::ptr_eq(&c0, &reload()), "a just-written config.json must not be cached");
+        assert!(!Arc::ptr_eq(&c0, &reload()), "a racy config.json must not be cached");
+        set_mtime_offset(&cfg_path, -10);
         settle_racy_window();
         let c1 = reload();
         let c2 = reload();
