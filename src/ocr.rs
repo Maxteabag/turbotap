@@ -398,12 +398,22 @@ pub fn parse_tsv(tsv: &str) -> Vec<RawWords> {
     out
 }
 
-/// `WDA_OCR_WORKERS` or clamp(cpu count, 2, 6).
-pub fn default_workers() -> usize {
+/// Initial engine cap for an un-daemonised cold `ScreenReader` when the caller did
+/// not explicitly set `workers` or `WDA_OCR_WORKERS`. Avoids paying 6x LSTM model init
+/// + RSS (~33% faster cold CLI, ~53% lower RSS) while keeping `self.n` strip cuts for
+/// fine-grained strip-hash caching and better load balance across the 2 engines.
+const COLD_INITIAL_WORKERS: usize = 2;
+
+fn env_workers() -> Option<usize> {
     crate::config::env("WDA_OCR_WORKERS")
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|v| *v > 0)
         .map(|v| v as usize)
+}
+
+/// `WDA_OCR_WORKERS` or clamp(cpu count, 2, 6).
+pub fn default_workers() -> usize {
+    env_workers()
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6))
 }
 
@@ -549,6 +559,11 @@ impl EnginePool {
     /// Engines created so far.
     pub fn count(&self) -> usize {
         self.lock().count
+    }
+
+    /// Maximum number of engines this pool will create.
+    pub fn max_count(&self) -> usize {
+        self.lock().max
     }
 
     /// Engines currently free (Python `apis.qsize()`).
@@ -750,6 +765,7 @@ pub struct ScreenReader {
     pub ocr_raw_hook: Option<OcrRawHook>,
     pool: Mutex<Option<Arc<EnginePool>>>,
     warming: Mutex<Vec<JoinHandle<()>>>,
+    explicit_workers: bool,
 }
 
 impl Drop for ScreenReader {
@@ -766,10 +782,14 @@ impl Drop for ScreenReader {
 impl ScreenReader {
     /// Python `ScreenReader(client, scale=1.5, workers=None, psm=11, warm_ocr=True)`.
     pub fn new(scale: f64, workers: Option<usize>, psm: i32, warm_ocr: bool) -> ScreenReader {
+        let arg_w = workers.filter(|w| *w > 0);
+        let env_w = env_workers();
+        let explicit_workers = arg_w.is_some() || env_w.is_some();
+        let n = arg_w.or(env_w).unwrap_or_else(default_workers);
         let r = ScreenReader {
             scale,
             psm,
-            n: workers.filter(|w| *w > 0).unwrap_or_else(default_workers),
+            n,
             cache: HashMap::new(),
             last: None,
             last_ts: 0.0,
@@ -784,6 +804,7 @@ impl ScreenReader {
             ocr_raw_hook: None,
             pool: Mutex::new(None),
             warming: Mutex::new(Vec::new()),
+            explicit_workers,
         };
         if warm_ocr {
             // Warm the engines while the first frame is in flight; a failure here
@@ -798,6 +819,16 @@ impl ScreenReader {
         ScreenReader::new(1.5, None, 11, true)
     }
 
+    /// Engine count for a cold (non-daemon) reader: capped at [`COLD_INITIAL_WORKERS`]
+    /// unless the caller set `workers` or `WDA_OCR_WORKERS` explicitly.
+    fn cold_engine_cap(&self) -> usize {
+        if self.explicit_workers {
+            self.n
+        } else {
+            self.n.min(COLD_INITIAL_WORKERS)
+        }
+    }
+
     /// Python `_ensure_ocr`: lease warm daemon engines, or make this reader's own pool
     /// and start creating its engines in the background.
     fn ensure_ocr(&self) -> Result<Option<Arc<EnginePool>>> {
@@ -809,12 +840,16 @@ impl ScreenReader {
             return Ok(Some(p.clone()));
         }
         let pool = if let Some(warm) = warm_ocr() {
-            // Warm daemon: borrow pre-initialised engines; strip cache stays per reader.
+            // Warm daemon: borrow pre-initialised engines (full `self.n`); strip cache stays per reader.
             warm.lease(self.psm, self.n)?
         } else {
-            let pool = Arc::new(EnginePool::new(self.psm, self.n, real_factory()));
+            // Cold CLI (no warm daemon): cap engine creation at COLD_INITIAL_WORKERS unless
+            // explicitly overridden, while keeping `self.n` strip cuts for fine-grained
+            // strip-hash caching and better load balance across the 2 engines.
+            let init = self.cold_engine_cap();
+            let pool = Arc::new(EnginePool::new(self.psm, init, real_factory()));
             let mut warming = self.warming.lock().unwrap_or_else(|e| e.into_inner());
-            for _ in 0..self.n {
+            for _ in 0..init {
                 let p = pool.clone();
                 warming.push(std::thread::spawn(move || p.grow_one()));
             }
@@ -1675,5 +1710,30 @@ mod ocr_opt_tests {
 
         stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(("127.0.0.1", port));
+    }
+
+    #[test]
+    fn cold_reader_caps_engines_at_two_while_preserving_strip_cuts_and_explicit_overrides() {
+        let _env = crate::testutil::set_env(&[("WDA_OCR_WORKERS", None)]);
+        // Un-daemonised default reader keeps full `default_workers()` strip cuts
+        // while capping cold engine creation at COLD_INITIAL_WORKERS (2).
+        let r = ScreenReader::new(1.5, None, 11, false);
+        assert!(!r.explicit_workers);
+        assert_eq!(r.n, default_workers());
+        assert_eq!(r.cold_engine_cap(), r.n.min(COLD_INITIAL_WORKERS));
+
+        // Explicit workers arg overrides the cold cap.
+        let r_arg = ScreenReader::new(1.5, Some(5), 11, false);
+        assert!(r_arg.explicit_workers);
+        assert_eq!(r_arg.n, 5);
+        assert_eq!(r_arg.cold_engine_cap(), 5);
+
+        // Explicit WDA_OCR_WORKERS env var overrides the cold cap.
+        drop(_env);
+        let _env2 = crate::testutil::set_env(&[("WDA_OCR_WORKERS", Some("4"))]);
+        let r_env = ScreenReader::new(1.5, None, 11, false);
+        assert!(r_env.explicit_workers);
+        assert_eq!(r_env.n, 4);
+        assert_eq!(r_env.cold_engine_cap(), 4);
     }
 }
