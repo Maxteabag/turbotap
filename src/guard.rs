@@ -230,6 +230,31 @@ pub struct EndpointIds {
     addrs: std::collections::HashMap<String, Option<Vec<std::net::SocketAddr>>>,
 }
 
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) reaches the same listener as
+/// `a.b.c.d`, so it is compared as IPv4. Native IPv6 addresses stay as they are.
+pub fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+/// [`canonical_ip`] for a socket address: mapped IPv6 becomes IPv4 with the same
+/// port; native IPv6 keeps its port and scope id (flow info does not select an
+/// endpoint and is cleared).
+pub fn canonical_sock(a: &std::net::SocketAddr) -> std::net::SocketAddr {
+    match a {
+        std::net::SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
+            None => std::net::SocketAddr::V6(std::net::SocketAddrV6::new(*v6.ip(), v6.port(), 0, v6.scope_id())),
+        },
+        v4 => *v4,
+    }
+}
+
 /// How the URL we connect to relates to a configured record's URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointRel {
@@ -255,7 +280,7 @@ impl EndpointIds {
             .or_insert_with(|| {
                 let (h, port) = crate::wda::parse_host_port(url.trim());
                 let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
-                let h = h.parse::<std::net::IpAddr>().map(|ip| ip.to_string()).unwrap_or(h);
+                let h = h.parse::<std::net::IpAddr>().map(|ip| canonical_ip(ip).to_string()).unwrap_or(h);
                 (h, port)
             })
             .clone()
@@ -300,6 +325,9 @@ impl EndpointIds {
         let (Some(a), Some(b)) = (self.addrs(ours), self.addrs(theirs)) else {
             return EndpointRel::Unknown;
         };
+        // Compare canonical forms (IPv4-mapped IPv6 reaches the same IPv4 listener).
+        let (a, b): (Vec<_>, Vec<_>) = (a.iter().map(canonical_sock).collect(), b.iter().map(canonical_sock).collect());
+        let a: Vec<_> = a.iter().enumerate().filter(|(i, x)| !a[..*i].contains(x)).map(|(_, x)| *x).collect();
         let shared = a.iter().filter(|x| b.contains(x)).count();
         if shared == 0 {
             EndpointRel::Disjoint
@@ -679,6 +707,26 @@ mod unit {
         ] {
             assert_eq!(ids.rel(ours, theirs), EndpointRel::Same, "{ours} vs {theirs}");
         }
+        // IPv4-mapped IPv6 is the IPv4 endpoint, written either way round.
+        for (ours, theirs) in [
+            ("http://[::ffff:10.0.0.1]:8100", "http://10.0.0.1:8100"),
+            ("http://[::FFFF:a00:1]:8100", "http://10.0.0.1:8100"),
+            ("http://10.0.0.1:8100", "http://[0:0:0:0:0:ffff:10.0.0.1]:8100/"),
+        ] {
+            assert_eq!(ids.rel(ours, theirs), EndpointRel::Same, "{ours} vs {theirs}");
+        }
+        ids.preset("http://mapped.example:8100", &["[::ffff:10.0.0.1]:8100"]);
+        assert_eq!(ids.rel("http://mapped.example:8100", "http://10.0.0.1:8100"), EndpointRel::Same);
+        assert_eq!(ids.rel("http://10.0.0.1:8100", "http://mapped.example:8100"), EndpointRel::Same);
+        // Native IPv6 stays distinct (address, port and scope).
+        let v6 = |s: &str| canonical_sock(&s.parse().unwrap());
+        assert_ne!(v6("[::1]:8100"), v6("127.0.0.1:8100"));
+        assert_ne!(v6("[fe80::1%2]:8100"), v6("[fe80::1%3]:8100"));
+        assert_eq!(v6("[::ffff:127.0.0.1]:8100"), v6("127.0.0.1:8100"));
+        assert_ne!(v6("[::ffff:127.0.0.1]:8100"), v6("127.0.0.1:8101"));
+        // Duplicate records across the two spellings are one endpoint: conflict.
+        let dup = json!({"devices": {"a": {"url": "http://10.0.0.1:8100"}, "b": {"url": "http://[::ffff:10.0.0.1]:8100"}}});
+        assert!(policy_device(&dup, Some("a"), true, None, None).is_err());
         for (ours, theirs) in [("http://10.0.0.2:8100", "http://10.0.0.1:8100"), ("http://10.0.0.1:8101", "http://10.0.0.1:8100")] {
             assert_eq!(ids.rel(ours, theirs), EndpointRel::Disjoint, "{ours} vs {theirs}");
         }

@@ -1273,6 +1273,18 @@ fn test_equivalent_endpoint_spellings_resolve_to_the_configured_device() {
         format!("http://127.0.0.1:0{port}"),
         format!("http://127.1:{port}"),
     ];
+    // IPv4-mapped IPv6 reaches the same IPv4 listener (where this host has IPv6).
+    if std::net::TcpStream::connect_timeout(
+        &format!("[::ffff:127.0.0.1]:{port}").parse().unwrap(),
+        std::time::Duration::from_secs(2),
+    )
+    .is_ok()
+    {
+        spellings.push(format!("http://[::ffff:127.0.0.1]:{port}"));
+        spellings.push(format!("http://[::FFFF:7f00:1]:{port}/"));
+    } else {
+        eprintln!("skipping IPv4-mapped spellings: no IPv6 loopback here");
+    }
     // `localhost` is the same endpoint only where it resolves to 127.0.0.1 alone (with
     // ::1 as well it might reach something else, which is a conflict, tested below).
     {
