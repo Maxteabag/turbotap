@@ -70,15 +70,26 @@ impl Conn {
         self.reader.is_some()
     }
 
+    /// The address this connection is connected to.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.reader.as_ref().and_then(|r| r.get_ref().peer_addr().ok())
+    }
+
     pub fn close(&mut self) {
         self.reader = None;
         self.last_timeout = None;
     }
 
     pub fn connect(&mut self, timeout: f64) -> std::io::Result<()> {
+        let addrs: Vec<std::net::SocketAddr> = (self.host.as_str(), self.port).to_socket_addrs()?.collect();
+        self.connect_to(&addrs, timeout)
+    }
+
+    /// Connect to the first reachable address of `addrs` (no name resolution).
+    pub fn connect_to(&mut self, addrs: &[std::net::SocketAddr], timeout: f64) -> std::io::Result<()> {
         let to = Duration::from_secs_f64(timeout.max(0.001));
         let mut last_err = None;
-        for addr in (self.host.as_str(), self.port).to_socket_addrs()? {
+        for &addr in addrs {
             match TcpStream::connect_timeout(&addr, to) {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
@@ -671,6 +682,10 @@ pub struct WdaClient {
     /// Set when the guard policy could not be read (invalid, unreadable or unstable
     /// config.json): every input is refused with this reason; reads still work.
     pub guard_policy_error: Option<String>,
+    /// When set, connections go only to these addresses (the ones the app guard and
+    /// stop file were resolved for, see [`crate::config::resolve_target`]); the host
+    /// name is never resolved again and a pooled connection elsewhere is not reused.
+    pub pinned_addrs: Option<Vec<std::net::SocketAddr>>,
     /// Test seam: fail this many upcoming POST attempts before anything is sent.
     #[cfg(test)]
     pub(crate) test_fail_post_presend: u32,
@@ -717,6 +732,7 @@ impl WdaClient {
             guard_action: None,
             guard_unlock_scope: false,
             guard_policy_error: None,
+            pinned_addrs: None,
             #[cfg(test)]
             test_fail_post_presend: 0,
             host,
@@ -883,6 +899,7 @@ impl WdaClient {
         side.cache_dir = self.cache_dir.clone();
         side.allowed_apps = self.allowed_apps.clone();
         side.guard_policy_error = self.guard_policy_error.clone();
+        side.pinned_addrs = self.pinned_addrs.clone();
         side.copy_probes_from(self);
         side
     }
@@ -1036,12 +1053,25 @@ impl WdaClient {
 
     // -- transport ----------------------------------------------------------
 
+    /// Connect only to `addrs` from now on (see [`WdaClient::pinned_addrs`]).
+    pub fn pin_addrs(&mut self, addrs: Vec<std::net::SocketAddr>) {
+        self.pinned_addrs = Some(addrs);
+    }
+
     fn ensure_conn(&mut self, timeout: f64) -> std::io::Result<()> {
         if self.conn.is_none() {
             self.conn = take_pooled_conn(&self.host, self.port).or_else(|| Some(Conn::new(&self.host, self.port)));
         }
         let conn = self.conn.as_mut().unwrap();
-        if !conn.is_connected() {
+        if let Some(pinned) = self.pinned_addrs.as_ref() {
+            // A (pooled) connection to an address outside the checked set is closed.
+            if conn.is_connected() && !conn.peer_addr().is_some_and(|a| pinned.contains(&a)) {
+                conn.close();
+            }
+            if !conn.is_connected() {
+                conn.connect_to(pinned, timeout)?;
+            }
+        } else if !conn.is_connected() {
             conn.connect(timeout)?;
         }
         conn.set_timeout(timeout);

@@ -1023,12 +1023,12 @@ fn test_url_override_uses_the_addressed_devices_own_policy() {
     let (b_before, a_before) = (b.calls().len(), a.calls().len());
     let (code, _, err) = flow(&["--device", "a", "--url", b.url.as_str()]);
     assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
-    assert!(err.contains("does not match the endpoint"), "{err}");
+    assert!(err.contains("in config.json is not at"), "{err}");
     std::env::set_var("WDA_DEVICE", "a");
     std::env::set_var("WDA_URL", &b.url);
     let (code, _, err) = flow(&[]);
     assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
-    assert!(err.contains("does not match the endpoint"), "{err}");
+    assert!(err.contains("in config.json is not at"), "{err}");
     std::env::remove_var("WDA_DEVICE");
     std::env::remove_var("WDA_URL");
     assert_eq!((b.calls().len(), a.calls().len()), (b_before, a_before), "WDA contacted despite the conflict");
@@ -1267,13 +1267,21 @@ fn test_equivalent_endpoint_spellings_resolve_to_the_configured_device() {
         std::fs::write(&e.cfg, json!({"devices": devices}).to_string()).unwrap();
     };
     write_cfg(None);
-    let spellings = [
+    let mut spellings = vec![
         format!("http://127.0.0.1:{port}"),
         format!("HTTP://127.0.0.1:{port}/"),
         format!("http://127.0.0.1:0{port}"),
         format!("http://127.1:{port}"),
-        format!("http://localhost:{port}/"),
     ];
+    // `localhost` is the same endpoint only where it resolves to 127.0.0.1 alone (with
+    // ::1 as well it might reach something else, which is a conflict, tested below).
+    {
+        use std::net::ToSocketAddrs;
+        let lh: Vec<std::net::SocketAddr> = ("localhost", port).to_socket_addrs().map(|i| i.collect()).unwrap_or_default();
+        if !lh.is_empty() && lh.iter().all(|a| a.ip() == std::net::IpAddr::from([127, 0, 0, 1])) {
+            spellings.push(format!("http://localhost:{port}/"));
+        }
+    }
     let run_with = |url: &str, cmd: &[&str]| {
         let mut v = vec!["--no-daemon", "--url", url];
         v.extend_from_slice(cmd);
@@ -1311,4 +1319,99 @@ fn test_equivalent_endpoint_spellings_resolve_to_the_configured_device() {
     assert!(err.contains("share the endpoint"), "{err}");
     assert_eq!(mock.calls().len(), before);
     assert!(mock.tapped_points().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Review round 5: UDID checked after the endpoint; transport bound to checked addresses
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_known_endpoint_with_contradicting_udid_is_refused_before_any_call() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mock = MockWda::start(state_with_app(json!(OTHER)));
+    let e = cli_env(&mock.url, &[]);
+    let stop = e.cfg.parent().unwrap().join("p.stop");
+    std::fs::write(&stop, "").unwrap();
+    // No default device: only the record, with its own UDID, stop file and allowlist.
+    std::fs::write(
+        &e.cfg,
+        json!({"devices": {"p": {"url": mock.url, "udid": "UDID-P", "allowed_apps": [ALLOWED], "stop_file": stop.to_string_lossy()}}})
+            .to_string(),
+    )
+    .unwrap();
+    let url = mock.url.clone();
+    for cmd in [&["flow", "--no-deny", "tapxy:1,2"][..], &["flow", "home"][..], &["deploy", "--no-build"][..], &["unlock"][..]] {
+        let mut v = vec!["--no-daemon", "--url", url.as_str(), "--udid", "UDID-X"];
+        v.extend_from_slice(cmd);
+        let (code, _, err) = run(&v);
+        assert_eq!(code, crate::stop::STOP_EXIT, "{cmd:?}: {err}");
+        assert!(err.contains("contradicts device 'p'"), "{cmd:?}: {err}");
+        std::env::set_var("WDA_UDID", "UDID-X");
+        let mut v = vec!["--no-daemon", "--url", url.as_str()];
+        v.extend_from_slice(cmd);
+        let (code, _, err) = run(&v);
+        std::env::remove_var("WDA_UDID");
+        assert_eq!(code, crate::stop::STOP_EXIT, "WDA_UDID {cmd:?}: {err}");
+    }
+    // Still a conflict without the stop file; the matching UDID gets the stop file.
+    std::fs::remove_file(&stop).unwrap();
+    let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "--udid", "UDID-X", "flow", "--no-deny", "tapxy:1,2"]);
+    assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
+    std::fs::write(&stop, "").unwrap();
+    let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "--udid", "UDID-P", "flow", "--no-deny", "tapxy:1,2"]);
+    assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
+    assert!(err.contains("p.stop exists"), "{err}");
+    assert!(mock.calls().is_empty(), "WDA contacted: {:?}", mock.paths());
+    // Matching UDID, no stop file: that device's allowlist applies.
+    std::fs::remove_file(&stop).unwrap();
+    let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "--udid", "UDID-P", "flow", "--no-deny", "--quiet", "tapxy:1,2"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains(&format!("not in allowlist [{ALLOWED}]")), "{err}");
+    assert!(input_posts(&mock).is_empty());
+}
+
+#[test]
+fn test_mixed_candidates_conflict_and_transport_uses_only_checked_addresses() {
+    let _c = isolated_cache();
+    let phone = MockWda::start(state_with_app(json!(ALLOWED)));
+    let other = MockWda::start(state_with_app(json!(ALLOWED)));
+    let phone_addr = format!("127.0.0.1:{}", phone.port());
+    let other_addr = format!("127.0.0.1:{}", other.port());
+    // Resolver: a name whose candidates are the configured phone plus an unrelated
+    // address cannot be assigned to the phone's policy.
+    let cfg = json!({"devices": {"p": {"url": phone.url, "allowed_apps": [ALLOWED]}}});
+    let mut ids = crate::guard::EndpointIds::default();
+    ids.preset("http://phone.test:8100", &[phone_addr.as_str(), other_addr.as_str()]);
+    ids.preset("http://alias.test:8100", &[phone_addr.as_str()]);
+    let e = crate::guard::policy_device_with(&cfg, None, false, Some("http://phone.test:8100"), None, &mut ids).unwrap_err();
+    assert!(e.contains("and to others"), "{e}");
+    assert_eq!(
+        crate::guard::policy_device_with(&cfg, None, false, Some("http://alias.test:8100"), None, &mut ids),
+        Ok(Some("p".into()))
+    );
+    // Transport: pinned to the checked address, the client never resolves the host
+    // again and never talks to anything else, whatever its URL says.
+    let mut c = crate::wda::WdaClient::new("http://alias.test.invalid:8100", TEST_UDID, None);
+    c.pin_addrs(vec![phone_addr.parse().unwrap()]);
+    assert!(!crate::json::has_err(&c.get("/status")), "pinned connect failed");
+    let mut c2 = crate::wda::WdaClient::new(&other.url, TEST_UDID, None);
+    c2.pin_addrs(vec![phone_addr.parse().unwrap()]);
+    c2.get("/status");
+    c2.post("/wda/fastTap", &json!({"x": 1, "y": 2}));
+    assert!(other.calls().is_empty(), "unchecked address contacted: {:?}", other.paths());
+    assert_eq!(phone.paths().iter().filter(|p| p.as_str() == "/status").count(), 2);
+    // An open connection outside a newly pinned set is not reused.
+    let mut c3 = crate::wda::WdaClient::new(&other.url, TEST_UDID, None);
+    c3.get("/status");
+    assert_eq!(other.calls().len(), 1);
+    c3.pin_addrs(vec![phone_addr.parse().unwrap()]);
+    c3.get("/status");
+    assert_eq!(other.calls().len(), 1, "kept using the old connection");
+    assert_eq!(phone.paths().iter().filter(|p| p.as_str() == "/status").count(), 3);
+    // An empty checked set connects nowhere.
+    let mut c4 = crate::wda::WdaClient::new(&phone.url, TEST_UDID, None);
+    c4.pin_addrs(Vec::new());
+    assert!(crate::json::has_err(&c4.get("/status")));
+    assert_eq!(phone.paths().iter().filter(|p| p.as_str() == "/status").count(), 3);
 }

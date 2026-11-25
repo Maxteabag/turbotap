@@ -313,6 +313,9 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         None => crate::guard::resolve_allowlist(target.dev_key.as_deref(), &allow_app_values(&m, sm)),
     };
     let mut client = WdaClient::new(&url, &target.udid, target.dev_key.as_deref());
+    // Connect only to the addresses the identity, allowlist and stop file were
+    // resolved for; the host name is not resolved again.
+    client.pin_addrs(target.addrs.clone());
     match allowed {
         Ok(list) => client.set_allowed_apps(list),
         // A broken config.json or an unresolvable device never means "no guard".

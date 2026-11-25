@@ -437,6 +437,9 @@ pub struct DeviceTarget {
     /// nothing may act on a phone; `url`/`udid` fall back to the plain precedence
     /// (override, else the selected record) so read-only commands still work.
     pub identity_error: Option<String>,
+    /// The socket addresses `url` resolved to while the identity was checked; the
+    /// client connects only to these ([`crate::wda::WdaClient::pin_addrs`]).
+    pub addrs: Vec<std::net::SocketAddr>,
 }
 
 /// Resolve the target device from CLI args, env and config.json. Overrides
@@ -457,21 +460,36 @@ pub fn resolve_target(url_arg: Option<&str>, device_arg: Option<&str>, udid_arg:
             udid_ov.clone().or_else(|| str_of(crate::json::get(r, "udid"))).unwrap_or_default(),
         )
     };
-    match crate::guard::policy_device(&cfg.raw, selected.as_deref(), explicit, url_ov.as_deref(), udid_ov.as_deref()) {
+    let mut ids = crate::guard::EndpointIds::default();
+    let resolved = crate::guard::policy_device_with(
+        &cfg.raw,
+        selected.as_deref(),
+        explicit,
+        url_ov.as_deref(),
+        udid_ov.as_deref(),
+        &mut ids,
+    );
+    let mut t = match resolved {
         Ok(Some(k)) => {
             let (url, udid) = fields(rec(&k));
-            DeviceTarget { url, udid, dev_key: Some(k), identity_error: None }
+            DeviceTarget { url, udid, dev_key: Some(k), identity_error: None, addrs: Vec::new() }
         }
         Ok(None) => {
             // No configured record: only overrides (or an unconfigured --device name).
             let (url, udid) = fields(&crate::json::NULL);
-            DeviceTarget { url, udid, dev_key: selected, identity_error: None }
+            DeviceTarget { url, udid, dev_key: selected, identity_error: None, addrs: Vec::new() }
         }
         Err(e) => {
             let (url, udid) = fields(selected.as_deref().map(rec).unwrap_or(&crate::json::NULL));
-            DeviceTarget { url, udid, dev_key: selected, identity_error: Some(e) }
+            DeviceTarget { url, udid, dev_key: selected, identity_error: Some(e), addrs: Vec::new() }
         }
+    };
+    // The same resolution the identity check used (cached), so the transport can be
+    // bound to exactly the addresses that were checked.
+    if let Some(u) = t.url.as_deref() {
+        t.addrs = ids.addrs(u);
     }
+    t
 }
 
 /// `(url, udid, device_key)` of [`resolve_target`]; Err when no WDA URL is configured.
