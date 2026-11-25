@@ -708,3 +708,70 @@ impl Drop for MockWda {
         let _ = TcpStream::connect(("127.0.0.1", self.port));
     }
 }
+
+/// `(status, content_type, body)` from a [`RouterServer`] route.
+pub type RouterReply = (u16, String, Vec<u8>);
+type Router = Arc<dyn Fn(&str, &str, &Value) -> RouterReply + Send + Sync>;
+
+/// Python `tests/test_wda_client.py::_LoopbackWDAServer`: a keep-alive HTTP/1.1
+/// loopback server where `router(method, path, payload)` answers every request on
+/// its own thread with no shared lock, so a slow route never blocks other
+/// connections. Every request is recorded as `(method, path)`.
+pub struct RouterServer {
+    pub url: String,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl RouterServer {
+    pub fn start(router: impl Fn(&str, &str, &Value) -> RouterReply + Send + Sync + 'static) -> RouterServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback WDA");
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let router: Router = Arc::new(router);
+        let (stop2, req2) = (stop.clone(), requests.clone());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if stop2.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(s) = conn else { continue };
+                let _ = s.set_nodelay(true);
+                let (router, stop, reqs) = (router.clone(), stop2.clone(), req2.clone());
+                std::thread::spawn(move || {
+                    let Ok(mut writer) = s.try_clone() else { return };
+                    let mut reader = BufReader::new(s);
+                    while !stop.load(Ordering::SeqCst) {
+                        let Some((method, path, _h, body)) = read_request(&mut reader) else { return };
+                        reqs.lock().unwrap_or_else(|e| e.into_inner()).push((method.clone(), path.clone()));
+                        let data: Value =
+                            if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap_or(Value::Null) };
+                        let (status, ct, body) = router(&method, &path, &data);
+                        if write_response(&mut writer, status, &ct, &[], &body).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        RouterServer { url: format!("http://127.0.0.1:{port}"), port, stop, requests }
+    }
+
+    pub fn requests(&self) -> Vec<(String, String)> {
+        self.requests.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Drop for RouterServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
+
+/// A JSON 200 reply for a [`RouterServer`] route.
+pub fn router_json(v: &Value) -> RouterReply {
+    (200, "application/json".to_string(), serde_json::to_vec(v).unwrap_or_default())
+}

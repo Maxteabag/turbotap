@@ -9,7 +9,7 @@ pub mod fake_reader;
 pub mod mock_wda;
 
 pub use fake_reader::FakeReader;
-pub use mock_wda::{ekey, Dyn, MockState, MockWda, Seq};
+pub use mock_wda::{ekey, router_json, Dyn, MockState, MockWda, RouterReply, RouterServer, Seq};
 
 use crate::image::{Frame, GrayImage};
 use crate::text::{Line, Word};
