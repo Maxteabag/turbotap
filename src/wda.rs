@@ -1441,3 +1441,13 @@ pub fn cmd_unlock(client: &mut WdaClient) -> Result<()> {
     crate::outln!("{}", json::dumps(&j!({"ok": true, "unlocked_now": was_locked, "locked": false})));
     Ok(())
 }
+
+#[cfg(test)]
+impl WdaClient {
+    /// Test seam: preset the keep-alive connection's target, so the first attempt of
+    /// the next request connects there (Python tests swapped the HTTPConnection class
+    /// to make one connect() fail before the request was sent).
+    pub(crate) fn test_preset_conn(&mut self, host: &str, port: u16) {
+        self.conn = Some(Conn::new(host, port));
+    }
+}

@@ -375,7 +375,10 @@ impl<R: Reader> Flow<R> {
             "tapif" => return some(self.tap_if(&arg, 1.0)?),
             "tapbatch" => return some(self.tap_batch(&arg)?),
             "toggle" => return some(self.toggle(&arg)?),
-            "tapel" => return some(self.tap_el(&arg, None)?),
+            "tapel" => {
+                let (x, y) = self.tap_el(&arg, None)?;
+                return Ok(Some(j!([x, y])));
+            }
             "tapxy" => {
                 let parts: Vec<&str> = arg.split(',').collect();
                 if parts.len() != 2 {
