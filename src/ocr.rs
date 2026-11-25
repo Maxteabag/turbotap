@@ -1348,3 +1348,160 @@ pub fn cmd_ocr(client: &mut WdaClient, scale: f64, y0: i64, y1: Option<i64>) -> 
     }
     Ok(())
 }
+
+/// The WarmOCR / binary-drain tests of tests/test_review_pr9.py, ported against this
+/// module's API (`WarmOcr::with_factory` replaces patching `_create_tess_api`,
+/// `ScreenReader::tsv_hook` replaces patching `tesseract_tsv`).
+#[cfg(test)]
+mod review_pr9_tests {
+    use super::*;
+    use crate::testutil::{box_img, set_env};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Python `_lease`: lease under `TESSDATA_PREFIX=prefix` (or unset) and list the
+    /// pool's engines.
+    fn lease(warm: &WarmOcr, prefix: Option<&str>, workers: usize) -> (Arc<EnginePool>, Vec<String>) {
+        let pool = {
+            let _env = set_env(&[("TESSDATA_PREFIX", prefix)]);
+            warm.lease(11, workers).unwrap()
+        };
+        let tags = pool.free_tags();
+        (pool, tags)
+    }
+
+    #[test]
+    fn engines_are_partitioned_by_model_data_in_both_orders() {
+        for order in [(Some("/models/a"), None), (None, Some("/models/a"))] {
+            let warm = WarmOcr::with_factory(|psm| {
+                Ok(TessApi::fake(format!("engine|{psm}|{}", std::env::var("TESSDATA_PREFIX").unwrap_or_else(|_| "None".into()))))
+            });
+            let first = lease(&warm, order.0, 2);
+            let second = lease(&warm, order.1, 2);
+            let again = lease(&warm, order.0, 2);
+            warm.end_request();
+            assert!(!Arc::ptr_eq(&first.0, &second.0), "{order:?}");
+            assert!(Arc::ptr_eq(&first.0, &again.0), "{order:?}");
+            let want = |p: Option<&str>| format!("engine|11|{}", p.unwrap_or("None"));
+            assert!(first.1.iter().all(|t| *t == want(order.0)), "{order:?}: {:?}", first.1);
+            assert!(second.1.iter().all(|t| *t == want(order.1)), "{order:?}: {:?}", second.1);
+            assert_eq!(again.1.len(), 2, "{order:?}"); // reused, not re-initialised
+            assert_eq!(again.0.count(), 2, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn end_request_cancels_queued_strips_and_waits_for_running_ones() {
+        // Python leased a per-request thread pool and submitted work to it. Here strips
+        // run on threads scoped to each read, so nothing can stay queued after a read
+        // returns; what remains is the engine side: end_request waits for a running
+        // strip to give its engine back.
+        let warm = Arc::new(WarmOcr::with_factory(|_| Ok(TessApi::fake("e"))));
+        let (pool, _) = lease(&warm, None, 1);
+        let done = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let started = Arc::new(AtomicBool::new(false));
+        let (p2, d2, s2) = (pool.clone(), done.clone(), started.clone());
+        let running = std::thread::spawn(move || {
+            let api = p2.get().unwrap();
+            s2.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            d2.lock().unwrap().push(true);
+            p2.put(api);
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        warm.end_request();
+        assert_eq!(*done.lock().unwrap(), vec![true]);
+        assert_eq!(pool.free_count(), pool.count());
+        running.join().unwrap();
+        let (again, _) = lease(&warm, None, 1);
+        assert!(Arc::ptr_eq(&again, &pool)); // the engines are reused across requests
+        warm.end_request();
+    }
+
+    #[test]
+    fn same_relative_prefix_in_two_cwds_gets_two_engines() {
+        let made = Arc::new(Mutex::new(Vec::<String>::new()));
+        let m2 = made.clone();
+        let warm = WarmOcr::with_factory(move |_| {
+            // What Tesseract opens: the prefix resolved against the cwd at init.
+            let resolved = std::fs::canonicalize(std::env::var("TESSDATA_PREFIX").unwrap_or_default())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            m2.lock().unwrap().push(resolved.clone());
+            Ok(TessApi::fake(format!("engine|{resolved}")))
+        });
+        let (a, b) = (crate::testutil::TempDir::new("tt-ocr-a-"), crate::testutil::TempDir::new("tt-ocr-b-"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d.path().join("models")).unwrap();
+        }
+        let old_cwd = std::env::current_dir().unwrap();
+        let (pa, pb, pa2) = {
+            // The env lock also serialises this cwd change against other env tests.
+            let _env = set_env(&[("TESSDATA_PREFIX", Some("models"))]);
+            let res = (|| {
+                std::env::set_current_dir(a.path())?;
+                let pa = warm.lease(11, 1);
+                std::env::set_current_dir(b.path())?;
+                let pb = warm.lease(11, 1);
+                std::env::set_current_dir(a.path())?;
+                let pa2 = warm.lease(11, 1);
+                Ok::<_, std::io::Error>((pa, pb, pa2))
+            })();
+            std::env::set_current_dir(&old_cwd).unwrap();
+            warm.end_request();
+            let (pa, pb, pa2) = res.unwrap();
+            (pa.unwrap(), pb.unwrap(), pa2.unwrap())
+        };
+        assert!(!Arc::ptr_eq(&pa, &pb));
+        assert!(Arc::ptr_eq(&pa, &pa2));
+        let real = |d: &crate::testutil::TempDir| std::fs::canonicalize(d.path().join("models")).unwrap().to_string_lossy().into_owned();
+        assert_eq!(*made.lock().unwrap(), vec![real(&a), real(&b)]);
+        assert_eq!(pb.free_tags(), vec![format!("engine|{}", real(&b))]);
+    }
+
+    #[test]
+    fn failed_strip_drains_running_sibling_before_next_request() {
+        let boxes: Vec<((i64, i64, i64, i64), u8)> = (10..230).step_by(20).map(|y| ((10, y, 100, y + 8), 0u8)).collect();
+        let img = box_img(255, &boxes, (120, 240));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sibling_started = Arc::new(AtomicBool::new(false));
+        let (c2, s2, st2) = (calls.clone(), seen.clone(), sibling_started.clone());
+        let hook: TsvHook = Arc::new(move |_raw: &[u8], _w, _h, _psm, _sauvola| {
+            let first = c2.fetch_add(1, Ordering::SeqCst) == 0;
+            if first {
+                let t0 = std::time::Instant::now();
+                while !st2.load(Ordering::SeqCst) && t0.elapsed().as_secs_f64() < 2.0 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                return Err(Error::runtime("tesseract failed on this strip"));
+            }
+            st2.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            // a subprocess would inherit this env
+            s2.lock().unwrap().push(std::env::var("TT_REQUEST").unwrap_or_default());
+            Ok(String::new())
+        });
+        let _env = set_env(&[("WDA_OCR", Some("binary")), ("TT_REQUEST", Some("first"))]);
+        let mut client = WdaClient::new("http://127.0.0.1:9", "", None);
+        let mut reader = ScreenReader::new(1.0, Some(2), 11, false);
+        reader.tsv_hook = Some(hook.clone());
+        match reader.read(&mut client, ReadOpts::img(img.clone())) {
+            Err(e) => assert!(e.to_string().contains("failed on this strip"), "{e}"),
+            Ok(l) => panic!("expected the strip failure, got {} lines", l.len()),
+        }
+        assert!(sibling_started.load(Ordering::SeqCst));
+        // read() returned: no strip of it may still be running.
+        assert_eq!(*seen.lock().unwrap(), vec!["first".to_string()], "a binary OCR worker outlived its request");
+        std::env::set_var("TT_REQUEST", "second"); // the next caller's environment
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(*seen.lock().unwrap(), vec!["first".to_string()]);
+        // The next request gets a fresh, working reader.
+        calls.store(1, Ordering::SeqCst);
+        let mut reader2 = ScreenReader::new(1.0, Some(2), 11, false);
+        reader2.tsv_hook = Some(hook);
+        reader2.read(&mut client, ReadOpts::img(img)).unwrap();
+        assert!(seen.lock().unwrap().contains(&"second".to_string()));
+    }
+}
