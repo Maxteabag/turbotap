@@ -81,6 +81,14 @@ def operation(op, directory, raw=False):
 
 
 def main(args):
+    if args[:1] == ["live"]:
+        from live import run
+        try:
+            if len(args) != 2:
+                raise ValueError()
+            return run(args[1])
+        except Exception:
+            raise SystemExit("live observation refused or unavailable") from None
     if args == ["cold"]:
         return {"ready": True}
     op, path, *flags = args

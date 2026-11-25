@@ -1,10 +1,12 @@
+mod live;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::GrayImage;
 use serde_json::{Value, json};
 use std::{collections::HashSet, env, error::Error, fs, io::Write, path::Path, process::Command};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-const USAGE: &str = "turbotap-replay cold | <preflight|screenshot|decode|cuts|fastUI|diff|ocr|flow> FIXTURE_DIR [--raw (screenshot only)]";
+const USAGE: &str = "turbotap-replay cold | <preflight|screenshot|decode|cuts|fastUI|diff|ocr|flow> FIXTURE_DIR [--raw (screenshot only)] | live <preflight|screenshot|fastUI|flow>";
 
 fn read_json(dir: &Path, name: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(dir.join(name))?)?)
@@ -12,6 +14,10 @@ fn read_json(dir: &Path, name: &str) -> Result<Value> {
 
 fn screenshot(dir: &Path) -> Result<Vec<u8>> {
     let reply = read_json(dir, "screenshot.json")?;
+    screenshot_bytes(&reply)
+}
+
+fn screenshot_bytes(reply: &Value) -> Result<Vec<u8>> {
     let bytes = STANDARD.decode(reply["value"].as_str().ok_or("missing screenshot")?)?;
     if bytes.is_empty() {
         return Err("empty screenshot".into());
@@ -61,6 +67,32 @@ fn cuts(img: &GrayImage) -> Vec<u32> {
     rows
 }
 
+fn control_count(ui: &Value) -> Result<Value> {
+    let width = ui["screen"][0].as_i64().ok_or("invalid screen")?;
+    let height = ui["screen"][1].as_i64().ok_or("invalid screen")?;
+    let mut controls = HashSet::new();
+    for item in ui["ui"].as_array().ok_or("invalid UI")? {
+        let (Some(x), Some(y)) = (item["x"].as_i64(), item["y"].as_i64()) else {
+            continue;
+        };
+        let kind = item["type"].as_str().unwrap_or("");
+        let label = item["label"]
+            .as_str()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !kind.is_empty()
+            && !label.is_empty()
+            && (1..width).contains(&x)
+            && (1..height).contains(&y)
+        {
+            controls.insert((label, x / 4, y / 4));
+        }
+    }
+    Ok(json!({"controls":controls.len()}))
+}
+
 fn operation(dir: &Path, op: &str) -> Result<Value> {
     Ok(match op {
         "preflight" => {
@@ -86,30 +118,7 @@ fn operation(dir: &Path, op: &str) -> Result<Value> {
         "cuts" => json!({"rows":cuts(&frame(dir,"frame.png")?)}),
         "fastUI" => {
             let reply = read_json(dir, "fastui.json")?;
-            let ui = &reply;
-            let width = ui["screen"][0].as_i64().ok_or("invalid screen")?;
-            let height = ui["screen"][1].as_i64().ok_or("invalid screen")?;
-            let mut controls = HashSet::new();
-            for item in ui["ui"].as_array().ok_or("invalid UI")? {
-                let (Some(x), Some(y)) = (item["x"].as_i64(), item["y"].as_i64()) else {
-                    continue;
-                };
-                let kind = item["type"].as_str().unwrap_or("");
-                let label = item["label"]
-                    .as_str()
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !kind.is_empty()
-                    && !label.is_empty()
-                    && (1..width).contains(&x)
-                    && (1..height).contains(&y)
-                {
-                    controls.insert((label, x / 4, y / 4));
-                }
-            }
-            json!({"controls":controls.len()})
+            control_count(&reply)?
         }
         "diff" => {
             let a = frame(dir, "frame.png")?;
@@ -145,6 +154,10 @@ fn run() -> Result<()> {
                 .lock()
                 .write_all(&screenshot(Path::new(dir))?)?;
         }
+        [mode, op] if mode == "live" => println!(
+            "{}",
+            live::run(op).map_err(|_| "live observation refused or unavailable")?
+        ),
         [op, dir] => {
             let dir = Path::new(dir);
             let result = if op == "flow" {

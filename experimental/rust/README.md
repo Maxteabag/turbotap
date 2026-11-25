@@ -46,3 +46,40 @@ python bench.py fixture --runs 9
 The Python comparator is an offline harness. Except for cuts and fastUI it
 implements the same local work directly. Timings describe these commands and
 fixture sizes only.
+
+## Read-only HTTP A/B
+
+From the repository root, with an existing WDA session, an unlocked device
+already showing Calculator, and the HTTP origin exported in `WDA_URL`:
+
+```bash
+cd experimental/rust
+cargo build --release --locked
+(
+  set -eu
+  : "${WDA_URL:?export the WDA HTTP origin first}"
+  for op in preflight screenshot fastUI flow; do
+    echo "Rust $op"
+    time -p ./target/release/turbotap-replay live "$op"
+    echo "Python $op"
+    time -p python compare.py live "$op"
+  done
+)
+```
+
+Each timed command starts a fresh process. The fixed flow runs preflight,
+screenshot and fastUI in order on a reusable HTTP connection. Both clients
+use GET only. Preflight uses the existing status session and window size.
+Screenshot decodes base64 in memory and reports its byte length. fastUI
+reports the same deduplicated control count in both implementations. Successful
+output contains only metric names and integers. Failures discard the entire
+result and print a generic error. Live mode has no raw-output option.
+
+Each observation checks unlocked state and the Calculator foreground bundle
+before and after fetching. fastUI also checks its returned bundle. The
+screenshot endpoint has no atomic bundle check. A switch away and back
+between guards could go undetected, and system overlays can appear over an
+app. Use an isolated Calculator session when running live.
+
+Run `python check_http.py` after the build for the synthetic loopback check.
+It overrides WDA_URL for every child process and closes the server on exit.
