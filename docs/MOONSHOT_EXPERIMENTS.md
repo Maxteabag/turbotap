@@ -236,3 +236,13 @@ Two clean exports of WDA commit `d17782422d55ff1e5e0ceb74eb1fd509cc0c35b6` recei
 ## Jev visual grounding
 
 Eleven synthetic icon boards randomized the positions and opaque IDs of four pictograms. The image arm selected 17/22 present targets, compared with 0/22 when only the prompt and IDs were sent. Both arms abstained on all 11 missing targets. All five image misses were abstentions on the filled-square stop icon. Median full-response latency for three batched choices was 168.60 ms with the PNG and 168.01 ms with text alone. Estimated image-arm list cost was $0.00043428 for eleven requests. The boards contained no device pixels. The [grounding harness and receipts](../experimental/jev-vision/) reproduce this synthetic comparison.
+
+## Stock flow versus fixed keypad batching
+
+On the same 7 + 4 task as Jev, five randomized trials per stock v0.9.0 arm started with a verified zero and ended with an independently verified 11. CLI time includes a new process. Result verification is timed separately from the CLI. The fixed batch assumes stable keypad positions.
+
+| Arm | Successes | Median CLI ms | Median through result verification ms |
+|---|---:|---:|---:|
+| tapel | 5/5 | 2194.3 | 2309.6 |
+| batch | 5/5 | 1942.7 | 2045.7 |
+| fixed | 5/5 | 692.1 | 804.3 |
