@@ -293,7 +293,14 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     crate::config::reload();
     crate::skills::sync_skills_if_stale();
     let (url, udid, dev_key) = crate::config::resolve_device_settings(s(&m, "url"), s(&m, "device"), s(&m, "udid"))?;
-    let allowed = crate::guard::resolve_allowlist(dev_key.as_deref(), &allow_app_values(&m, sm));
+    let (url_ov, udid_ov, explicit) = crate::config::device_overrides(s(&m, "url"), s(&m, "device"), s(&m, "udid"));
+    let allowed = crate::guard::resolve_allowlist(
+        dev_key.as_deref(),
+        explicit,
+        url_ov.as_deref(),
+        udid_ov.as_deref(),
+        &allow_app_values(&m, sm),
+    );
     let mut client = WdaClient::new(&url, &udid, dev_key.as_deref());
     match allowed {
         Ok(list) => client.set_allowed_apps(list),

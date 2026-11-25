@@ -117,17 +117,37 @@ pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Op
     Ok((s, stamp))
 }
 
-/// Where config.json is: `(path, metadata, stat error)`. Metadata None and no error
-/// means genuinely absent (NotFound); a stat error other than NotFound (permissions,
-/// I/O) is reported so the file is never mistaken for "no config".
-fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>, Option<String>) {
-    fn stat(p: &Path) -> std::result::Result<Option<std::fs::Metadata>, String> {
-        match std::fs::metadata(p) {
+/// An existing symlink among `p`'s ancestors whose target cannot be resolved.
+fn broken_link_ancestor(p: &Path) -> Option<PathBuf> {
+    p.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).find_map(|a| {
+        let lm = std::fs::symlink_metadata(a).ok()?;
+        (lm.file_type().is_symlink() && std::fs::metadata(a).is_err()).then(|| a.to_path_buf())
+    })
+}
+
+/// `metadata(p)`, telling a genuinely absent entry (Ok(None)) apart from one that
+/// exists but cannot be resolved: a dangling or unreadable symlink at `p` or on its
+/// path, permissions, I/O (Err). Only the former may mean "no config".
+pub(crate) fn stat_config_entry(p: &Path) -> std::result::Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(p) {
+        Ok(lm) => match std::fs::metadata(p) {
             Ok(m) => Ok(Some(m)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if lm.file_type().is_symlink() => Err(format!("{} is a link whose target cannot be read: {e}", p.display())),
             Err(e) => Err(format!("cannot stat {}: {e}", p.display())),
-        }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match broken_link_ancestor(p) {
+            Some(a) => Err(format!("{} cannot be resolved: {} is a link whose target is missing", p.display(), a.display())),
+            None => Ok(None),
+        },
+        Err(e) => Err(format!("cannot stat {}: {e}", p.display())),
     }
+}
+
+/// Where config.json is: `(path, metadata, stat error)`. Metadata None and no error
+/// means genuinely absent; an entry that exists but cannot be resolved (dangling
+/// symlink, permissions, I/O) is reported so it is never mistaken for "no config".
+fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>, Option<String>) {
+    let stat = stat_config_entry;
     if let Some(p) = env_nonempty("WDA_CONFIG") {
         let ep = expanduser(&p);
         return match stat(&ep) {
@@ -328,6 +348,21 @@ impl Drop for CacheDirGuard {
 pub fn override_cache_dir(p: &Path) -> CacheDirGuard {
     let prev = CACHE_DIR_OVERRIDE.with(|c| c.borrow_mut().replace(p.to_path_buf()));
     CacheDirGuard(prev)
+}
+
+/// Which device-identity sources outrank config.json for this invocation:
+/// `(url override, udid override, device chosen explicitly)` from CLI args and env
+/// (same precedence as [`resolve_device_settings`]). The app guard uses them to pick
+/// the policy of the device actually addressed.
+pub fn device_overrides(url_arg: Option<&str>, device_arg: Option<&str>, udid_arg: Option<&str>) -> (Option<String>, Option<String>, bool) {
+    let url = url_arg.filter(|s| !s.is_empty()).map(String::from).or_else(|| env_nonempty("WDA_URL"));
+    let udid = udid_arg
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| env_nonempty("WDA_UDID"))
+        .or_else(|| env_nonempty("IPHONE_UDID"));
+    let explicit = device_arg.is_some_and(|s| !s.is_empty()) || env_nonempty("WDA_DEVICE").is_some();
+    (url, udid, explicit)
 }
 
 /// `(url, udid, device_key)` from CLI args, env and config.json.

@@ -143,26 +143,26 @@ pub fn classify(path: &str, body: Option<&[u8]>) -> RequestKind {
 /// The foreground bundle ID from a `/wda/activeAppInfo` body, accepted only from an
 /// unambiguous success envelope (see the module docs); Err(reason) otherwise.
 pub fn foreground_from_envelope(v: &Value) -> std::result::Result<String, String> {
-    use crate::json::get;
-    if !v.is_object() {
+    let Some(top) = v.as_object() else {
         return Err("activeAppInfo failed: not a JSON object".into());
-    }
-    if !get(v, "error").is_null() {
+    };
+    // Any `error` key (even null) and any `status` other than an absent one or 0 (even
+    // null) is not an unambiguous success.
+    if top.contains_key("error") {
         return Err("activeAppInfo failed: error in response".into());
     }
-    match get(v, "status") {
-        Value::Null => {}
-        s if s.as_i64() == Some(0) => {}
-        _ => return Err("activeAppInfo failed: nonzero protocol status".into()),
+    match top.get("status") {
+        None => {}
+        Some(s) if s.as_i64() == Some(0) || s.as_u64() == Some(0) => {}
+        Some(_) => return Err("activeAppInfo failed: protocol status is not 0".into()),
     }
-    let value = get(v, "value");
-    if !value.is_object() {
+    let Some(value) = top.get("value").and_then(Value::as_object) else {
         return Err("activeAppInfo returned no bundleId".into());
-    }
-    if !get(value, "error").is_null() {
+    };
+    if value.contains_key("error") {
         return Err("activeAppInfo failed: error in response value".into());
     }
-    match get(value, "bundleId").as_str().map(str::trim).filter(|s| !s.is_empty()) {
+    match value.get("bundleId").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
         Some(b) => Ok(b.to_string()),
         None => Err("activeAppInfo returned no bundleId".into()),
     }
@@ -219,15 +219,91 @@ pub fn effective_allowlist(cfg: &Value, device_key: Option<&str>, env_value: Opt
     Ok(out)
 }
 
-/// [`effective_allowlist`] from the loaded config and the process environment.
-/// Err(reason) when config.json exists but could not be loaded, or its allowlist is
-/// malformed: the caller must then fail every input closed.
-pub fn resolve_allowlist(device_key: Option<&str>, cli: &[String]) -> std::result::Result<Vec<String>, String> {
+fn norm_url(u: &str) -> String {
+    u.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// The config.json device whose policy governs this invocation: the device actually
+/// addressed, not just the one named by `--device`/`WDA_DEVICE`/`default_device`.
+///
+/// Without a URL/UDID override the endpoint comes from the selected record, so that
+/// record is it. With an override (`--url`/`WDA_URL`, `--udid`/`WDA_UDID`), the
+/// selected record must match it (URL equal; UDID equal when the record has one);
+/// otherwise an implicitly selected default yields to the single configured device
+/// that does match. An explicit selection that conflicts, several matches, or a
+/// default device with an endpoint no record describes is an identity conflict
+/// (Err): input then fails closed. With no device selected and no match, the
+/// top-level policy applies (Ok(None)).
+pub fn policy_device(
+    cfg: &Value,
+    selected: Option<&str>,
+    selected_explicitly: bool,
+    url_override: Option<&str>,
+    udid_override: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
+    let empty = serde_json::Map::new();
+    let devices = crate::json::get(cfg, "devices").as_object().unwrap_or(&empty);
+    let sel = selected.filter(|k| devices.contains_key(*k));
+    if url_override.is_none() && udid_override.is_none() {
+        return Ok(sel.map(String::from));
+    }
+    let field = |rec: &Value, k: &str| rec.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let matches = |rec: &Value| {
+        let url_ok = url_override.is_none_or(|u| field(rec, "url").is_some_and(|ru| norm_url(&ru) == norm_url(u)));
+        let udid_ok = udid_override.is_none_or(|d| field(rec, "udid").is_none_or(|ru| ru == d.trim()));
+        url_ok && udid_ok
+    };
+    let endpoint = || {
+        let mut parts = Vec::new();
+        if let Some(u) = url_override {
+            parts.push(format!("url {u}"));
+        }
+        if let Some(d) = udid_override {
+            parts.push(format!("udid {d}"));
+        }
+        parts.join(", ")
+    };
+    if let Some(k) = sel {
+        if matches(&devices[k]) {
+            return Ok(Some(k.to_string()));
+        }
+        if selected_explicitly {
+            return Err(format!("device '{k}' in config.json does not match the endpoint ({})", endpoint()));
+        }
+    }
+    let hits: Vec<&String> = devices.iter().filter(|(_, rec)| matches(rec)).map(|(k, _)| k).collect();
+    match (hits.as_slice(), sel) {
+        ([one], _) => Ok(Some((*one).clone())),
+        ([], None) => Ok(None),
+        ([], Some(k)) => Err(format!(
+            "the endpoint ({}) is not device '{k}' nor any other device in config.json; pass --device or add it to config.json",
+            endpoint()
+        )),
+        (many, _) => Err(format!(
+            "the endpoint ({}) matches several devices in config.json ({}); pass --device",
+            endpoint(),
+            many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// [`effective_allowlist`] for the device actually addressed ([`policy_device`]),
+/// from the loaded config and the process environment. Err(reason) when config.json
+/// exists but could not be loaded, its allowlist is malformed, or the device identity
+/// conflicts: the caller must then fail every input closed.
+pub fn resolve_allowlist(
+    selected: Option<&str>,
+    selected_explicitly: bool,
+    url_override: Option<&str>,
+    udid_override: Option<&str>,
+    cli: &[String],
+) -> std::result::Result<Vec<String>, String> {
     let cfg = crate::config::current();
     if let Some(e) = cfg.load_error.as_ref() {
         return Err(e.clone());
     }
-    effective_allowlist(&cfg.raw, device_key, crate::config::env(ENV_ALLOWED_APPS).as_deref(), cli).map_err(|e| e.to_string())
+    let dev = policy_device(&cfg.raw, selected, selected_explicitly, url_override, udid_override)?;
+    effective_allowlist(&cfg.raw, dev.as_deref(), crate::config::env(ENV_ALLOWED_APPS).as_deref(), cli).map_err(|e| e.to_string())
 }
 
 const HINT: &str = "(use --allow-app <bundle_id> for this run)";
@@ -367,6 +443,10 @@ mod unit {
             json!({"value": {"bundleId": "com.example.a", "error": "no such window"}}),
             json!({"status": 13, "value": {"bundleId": "com.example.a"}}),
             json!({"status": "13", "value": {"bundleId": "com.example.a"}}),
+            json!({"status": null, "value": {"bundleId": "com.example.a"}}),
+            json!({"status": 0.5, "value": {"bundleId": "com.example.a"}}),
+            json!({"error": null, "value": {"bundleId": "com.example.a"}}),
+            json!({"value": {"bundleId": "com.example.a", "error": null}}),
             json!({"error": "unknown error", "value": {"bundleId": "com.example.a"}}),
             json!({"value": {"bundleId": ""}}),
             json!({"value": {"bundleId": 7}}),
@@ -377,6 +457,45 @@ mod unit {
         ] {
             assert!(ok(bad.clone()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn policy_follows_the_device_actually_addressed() {
+        let cfg = json!({
+            "default_device": "a",
+            "devices": {
+                "a": {"url": "http://10.0.0.1:8100", "udid": "UDID-A", "allowed_apps": ["com.example.a"]},
+                "b": {"url": "http://10.0.0.2:8100/", "udid": "UDID-B", "allowed_apps": ["com.example.b"]},
+                "c": {"url": "http://10.0.0.3:8100", "udid": "UDID-C"},
+                "c2": {"url": "http://10.0.0.3:8100", "udid": "UDID-C2"},
+            }
+        });
+        let pd = |sel: Option<&str>, ex: bool, u: Option<&str>, d: Option<&str>| policy_device(&cfg, sel, ex, u, d);
+        // No override: the selected record is the endpoint.
+        assert_eq!(pd(Some("a"), false, None, None), Ok(Some("a".into())));
+        assert_eq!(pd(None, false, None, None), Ok(None));
+        // URL override of b's endpoint under default a: b's own policy.
+        assert_eq!(pd(Some("a"), false, Some("http://10.0.0.2:8100"), None), Ok(Some("b".into())));
+        assert_eq!(pd(None, false, Some("HTTP://10.0.0.2:8100/"), None), Ok(Some("b".into())));
+        // Matching override keeps the selection.
+        assert_eq!(pd(Some("a"), true, Some("http://10.0.0.1:8100/"), Some("UDID-A")), Ok(Some("a".into())));
+        // Explicit selection that contradicts the endpoint: conflict.
+        assert!(pd(Some("a"), true, Some("http://10.0.0.2:8100"), None).is_err());
+        assert!(pd(Some("a"), true, None, Some("UDID-B")).is_err());
+        // UDID override alone picks b under default a.
+        assert_eq!(pd(Some("a"), false, None, Some("UDID-B")), Ok(Some("b".into())));
+        // Unknown endpoint: conflict under a selected device, top-level without one.
+        assert!(pd(Some("a"), false, Some("http://10.9.9.9:8100"), None).is_err());
+        assert_eq!(pd(None, false, Some("http://10.9.9.9:8100"), None), Ok(None));
+        // Several records share the endpoint: ambiguous.
+        assert!(pd(None, false, Some("http://10.0.0.3:8100"), None).is_err());
+        // A record without a udid could be any phone: a UDID-only override is ambiguous.
+        let cfg2 = json!({"default_device": "a", "devices": {
+            "a": {"url": "http://10.0.0.1:8100", "udid": "UDID-A"},
+            "b": {"url": "http://10.0.0.2:8100", "udid": "UDID-B"},
+            "n": {"url": "http://10.0.0.4:8100"},
+        }});
+        assert!(policy_device(&cfg2, Some("a"), false, None, Some("UDID-B")).is_err());
     }
 
     #[test]

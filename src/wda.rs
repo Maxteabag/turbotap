@@ -774,11 +774,15 @@ impl WdaClient {
     /// Live foreground bundle ID from `GET /wda/activeAppInfo` (never cached).
     /// Err(reason) when the request fails or the answer has no bundle ID.
     pub fn live_foreground_app(&mut self, deadline: Option<f64>) -> std::result::Result<String, String> {
-        match self.req_typed_with_deadline("GET", "/wda/activeAppInfo", 5.0, deadline, |b| serde_json::from_slice::<Value>(b)) {
-            TypedHttpResult::Ok(v) => crate::guard::foreground_from_envelope(&v),
-            TypedHttpResult::HttpError { status } => Err(format!("activeAppInfo failed: HTTP {status}")),
-            TypedHttpResult::TransportError(_) => Err("activeAppInfo failed".into()),
-            TypedHttpResult::DeadlineExceeded => Err("activeAppInfo failed: deadline exceeded".into()),
+        // Raw status on purpose: the shared typed helper treats every status below 400
+        // (redirects included) as success, but only an actual 2xx may authorize input.
+        match self.exchange_borrowed("GET", "/wda/activeAppInfo", None, &[], 5.0, deadline, false, |b| {
+            serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
+        }) {
+            Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => crate::guard::foreground_from_envelope(&v),
+            Ok(Some((status, _, _))) => Err(format!("activeAppInfo failed: HTTP {status}")),
+            Ok(None) => Err("activeAppInfo failed: deadline exceeded".into()),
+            Err(_) => Err("activeAppInfo failed".into()),
         }
     }
 

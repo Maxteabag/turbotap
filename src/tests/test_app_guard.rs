@@ -384,6 +384,15 @@ fn test_error_envelopes_carrying_an_allowed_bundle_are_not_proof_of_foreground()
         json!({"status": 7, "sessionId": "s", "value": {"bundleId": ALLOWED}}),
         json!({"error": "unknown error", "value": {"bundleId": ALLOWED}}),
         json!({"value": ALLOWED}),
+        // A redirect is not a success, whatever its body says.
+        json!({"__raw__": {
+            "status": 302,
+            "content_type": "application/json",
+            "headers": {"Location": "/elsewhere"},
+            "body": format!(r#"{{"value": {{"bundleId": "{ALLOWED}"}}, "sessionId": "s"}}"#),
+        }}),
+        // An explicit null protocol status is not "absent or 0".
+        json!({"status": null, "value": {"bundleId": ALLOWED}}),
     ];
     for resp in cases {
         let mock = MockWda::start(state_with_app(resp.clone()));
@@ -889,4 +898,120 @@ fn test_allow_app_is_a_global_value_option_for_daemon_routing() {
     assert!(crate::cli::daemon_requested_env(&s(&["--allow-app=com.example.x", "flow", "ui"]), Some("1")));
     let (cmd, ..) = crate::cli::cli_subcommand(&s(&["--allow-app", "com.example.x", "flow"]));
     assert_eq!(cmd.as_deref(), Some("flow"));
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2: dangling policy links, device identity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_dangling_policy_link_fails_closed() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mock = MockWda::start(state_with_app(json!(OTHER)));
+    let e = cli_env(&mock.url, &[]);
+    let dir = e.cfg.parent().unwrap().to_path_buf();
+    let target = dir.join("policy-v1.json");
+    let link = dir.join("policy.json");
+    std::fs::write(&target, json!({"devices": {"d": {"url": mock.url, "allowed_apps": [ALLOWED]}}, "default_device": "d"}).to_string())
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    std::env::set_var("WDA_CONFIG", &link);
+    let url = mock.url.clone();
+    let tap = ["--no-daemon", "--url", url.as_str(), "flow", "--no-deny", "--quiet", "tapxy:1,2"];
+    // Valid linked policy: the other app is refused by the list.
+    let (code, _, err) = run(&tap);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains(&format!("not in allowlist [{ALLOWED}]")), "{err}");
+    // The target disappears mid-replacement: the link still exists, so no "no config".
+    std::fs::remove_file(&target).unwrap();
+    let (code, _, err) = run(&tap);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("app guard policy unavailable"), "{err}");
+    assert!(err.contains("is a link whose target cannot be read"), "{err}");
+    assert!(input_posts(&mock).is_empty(), "{:?}", input_posts(&mock));
+    // A dangling link for the config directory itself (default location) too.
+    std::env::remove_var("WDA_CONFIG");
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    std::fs::create_dir_all(home.join(".config")).unwrap();
+    std::os::unix::fs::symlink(home.join("missing-config-dir"), home.join(".config/turbotap")).unwrap();
+    let (code, _, err) = run(&tap);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("is a link whose target is missing"), "{err}");
+    assert!(input_posts(&mock).is_empty(), "{:?}", input_posts(&mock));
+    // Genuinely absent (no link, no file) still means no policy.
+    std::fs::remove_file(home.join(".config/turbotap")).unwrap();
+    let (code, _, err) = run(&tap);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(mock.tapped_points().len(), 1);
+}
+
+#[test]
+fn test_url_override_uses_the_addressed_devices_own_policy() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    const A_APP: &str = "com.example.a-app";
+    const B_APP: &str = "com.example.b-app";
+    // Both phones show the app device A may use; device B may not use it.
+    let a = MockWda::start(state_with_app(json!(A_APP)));
+    let b = MockWda::start(state_with_app(json!(A_APP)));
+    let unknown = MockWda::start(state_with_app(json!(A_APP)));
+    let e = cli_env(&a.url, &[]);
+    std::fs::write(
+        &e.cfg,
+        json!({
+            "default_device": "a",
+            "devices": {
+                "a": {"url": a.url, "allowed_apps": [A_APP]},
+                "b": {"url": format!("{}/", b.url), "allowed_apps": [B_APP]},
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let flow = |pre: &[&str]| {
+        let mut v = vec!["--no-daemon"];
+        v.extend_from_slice(pre);
+        v.extend_from_slice(&["flow", "--no-deny", "--quiet", "tapxy:3,4"]);
+        run(&v)
+    };
+    // Default device, its own endpoint: allowed.
+    assert_eq!(flow(&[]).0, 0);
+    assert_eq!(a.tapped_points().len(), 1);
+    // --url / WDA_URL to device B: B's own list applies, so A's app is refused on B.
+    let (code, _, err) = flow(&["--url", b.url.as_str()]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains(&format!("not in allowlist [{B_APP}]")), "{err}");
+    std::env::set_var("WDA_URL", &b.url);
+    let (code, _, err) = flow(&[]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains(&format!("not in allowlist [{B_APP}]")), "{err}");
+    std::env::remove_var("WDA_URL");
+    assert!(input_posts(&b).is_empty(), "{:?}", input_posts(&b));
+    // B's own app on B works through either override.
+    b.state().active_app = Seq::one(json!(B_APP));
+    assert_eq!(flow(&["--url", b.url.as_str()]).0, 0);
+    std::env::set_var("WDA_URL", &b.url);
+    assert_eq!(flow(&[]).0, 0);
+    std::env::remove_var("WDA_URL");
+    assert_eq!(b.tapped_points().len(), 2);
+    // Explicit device A pointed at B's endpoint: identity conflict, no input.
+    b.state().active_app = Seq::one(json!(A_APP));
+    let (code, _, err) = flow(&["--device", "a", "--url", b.url.as_str()]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("does not match the endpoint"), "{err}");
+    std::env::set_var("WDA_DEVICE", "a");
+    std::env::set_var("WDA_URL", &b.url);
+    let (code, _, err) = flow(&[]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("does not match the endpoint"), "{err}");
+    std::env::remove_var("WDA_DEVICE");
+    std::env::remove_var("WDA_URL");
+    assert_eq!(b.tapped_points().len(), 2);
+    // An endpoint no record describes, under default device A: conflict, no input.
+    let (code, _, err) = flow(&["--url", unknown.url.as_str()]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("is not device 'a'"), "{err}");
+    assert!(input_posts(&unknown).is_empty());
+    assert_eq!(a.tapped_points().len(), 1);
 }
