@@ -84,8 +84,10 @@ def trial(client, pool, command, arm, case, args):
         raise RuntimeError("Timeout sentinel unexpectedly present")
     if case == "transition":
         client.call("/wda/homescreen", {})
-        if client.call(FAST_UI)["bundleId"] != "com.apple.springboard":
-            raise RuntimeError("Transition setup did not reach the Home Screen")
+        setup_end = time.monotonic() + 3
+        while client.call(FAST_UI).get("bundleId", "").casefold() != "com.apple.springboard":
+            if time.monotonic() >= setup_end:
+                raise RuntimeError("Transition setup did not reach the Home Screen")
 
     count, size = client.requests, client.body_bytes
     budget = {"best": 0, "timeout": args.timeout_ms, "transition": 2000}[case]
@@ -132,6 +134,16 @@ def main():
         if args.launch_host:
             command = ["ssh", "-oBatchMode=yes", "--", args.launch_host, shlex.join(command)]
     client = Client(os.environ["WDA_URL"])
+    if command:
+        # devicectl uses the canonical case from the device's app metadata.
+        bundle = client.call(FAST_UI).get("bundleId", "")
+        if bundle.casefold() != CALCULATOR:
+            raise RuntimeError("Start in Calculator")
+        if args.launch_host:
+            command[-1] = shlex.join(["xcrun", "devicectl", "device", "process", "launch",
+                                       "--device", selector, bundle])
+        else:
+            command[-1] = bundle
     valid = True
     observed_transitions = set()
     arms = ["v5", "flow"] if args.arm == "both" else [args.arm]

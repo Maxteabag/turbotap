@@ -3,6 +3,7 @@
 FIXTURE_URL selects the HTML page. With the Vision overlay installed, run under
 timeout 120. Only scores and elapsed times are emitted. Restores Calculator.
 """
+import argparse
 import json
 import os
 import random
@@ -23,6 +24,9 @@ def tokens(lines):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--capture-study", action="store_true")
+    args = parser.parse_args()
     client = WDAClient(os.environ["WDA_URL"], os.environ.get("WDA_UDID", ""))
     sid = client.ensure_session()
     def active():
@@ -51,6 +55,9 @@ def main():
             raise RuntimeError(f"could not verify fixture; browser={saw_browser}, recognized references={verified_count}")
         reader = ScreenReader(client)
         arms = ["host 1", "host 1.5", "host 2", "fast", "accurate"] * 6
+        if args.capture_study:
+            arms = [f"{mode} {capture} {scale}" for mode in ("fast", "accurate")
+                    for capture, scale in (("png", 1), ("cgimage", 1), ("cgimage", 0.5))] * 6
         random.Random(53).shuffle(arms)
         for arm in arms:
             if active() not in BROWSERS:
@@ -62,7 +69,11 @@ def main():
                 reader._dev = reader.scale / 3
                 lines = [line.text for line in reader.read(timeout=5)]
             else:
-                response = client.req("POST", "/wda/fastOCR", {"mode": arm}, timeout=6)
+                mode, *capture = arm.split()
+                body = {"mode": mode}
+                if capture:
+                    body.update(capture=capture[0], scale=float(capture[1]))
+                response = client.req("POST", "/wda/fastOCR", body, timeout=6)
                 lines = [line["text"] for line in response["value"]["lines"]]
             elapsed = (time.perf_counter()-start)*1000
             seen = tokens(lines)

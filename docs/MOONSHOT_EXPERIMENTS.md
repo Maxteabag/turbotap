@@ -139,3 +139,54 @@ Sixteen randomized trials cleared the entry, verified zero, tapped 7 and verifie
 |---|---:|---:|---:|---:|
 | pull | 8 | 8 | 259.8 | 336.6 |
 | stream | 8 | 8 | 250.3 | 187.7 |
+
+## Multilingual browser fixture on iPhone
+
+Safari rendered a static HTML page served by the experimental runner over device loopback. Before timing, the harness verified six or more reference words on screen. Each trial scored the twelve rendered reference words after Unicode normalization and case folding. The fixture alternates light and dark rows and uses 14, 18 and 24 CSS pixels. Repeated trials measure this one layout.
+
+| Arm | Median wall ms | Reference hits / 72 |
+|---|---:|---:|
+| accurate | 240.8 | 66 |
+| fast | 141.2 | 24 |
+| host 1 | 68.6 | 12 |
+| host 1.5 | 78.4 | 12 |
+| host 2 | 106.6 | 12 |
+
+## Fused preflight on Calculator
+
+Twelve alternating-order pairs used the candidate CLI against one installed build. The harness compared every returned field except the elapsed time within each pair. All pairs agreed.
+
+| Arm | CLI wall median ms | Inside preflight median ms |
+|---|---:|---:|
+| stock sequence | 237.7 | 205.6 |
+| combined | 229.5 | 193.6 |
+
+## On-device predicate waits
+
+Six paired trials per case compared a host poll of fastUI against a bounded runner-side wait for one exact label. Best case used a present Calculator key with zero wait budget. Timeout case used an absent label with a 750 ms budget. Requests and bytes cover the wait only.
+
+| Case | Arm | Median wall ms | Median HTTP requests | Median response body bytes |
+|---|---|---:|---:|---:|
+| best | v5 | 117.1 | 1 | 1164 |
+| best | flow | 117.2 | 1 | 199 |
+| timeout | v5 | 815.1 | 5 | 5820 |
+| timeout | flow | 771.7 | 1 | 121 |
+
+## Capture path and resolution
+
+Matched modes were shuffled within each scene. Direct capture obtains a CGImage from the XCTest screenshot object. The half-resolution arm resamples on device. Recognition uses the same Vision API across arms. The two scenes have independent reference sets.
+
+| Scene | Mode and capture | Median wall ms | Reference hits |
+|---|---|---:|---:|
+| calc | fastOCR accurate cgimage 0.5 | 217.7 | 48/80 |
+| calc | fastOCR accurate cgimage 1 | 216.1 | 56/80 |
+| calc | fastOCR accurate png 1 | 286.1 | 56/80 |
+| calc | fastOCR fast cgimage 0.5 | 142.7 | 0/80 |
+| calc | fastOCR fast cgimage 1 | 216.9 | 0/80 |
+| calc | fastOCR fast png 1 | 148.5 | 0/80 |
+| fixture | accurate cgimage 0.5 | 235.6 | 72/72 |
+| fixture | accurate cgimage 1 | 239.4 | 66/72 |
+| fixture | accurate png 1 | 239.5 | 66/72 |
+| fixture | fast cgimage 0.5 | 140.4 | 24/72 |
+| fixture | fast cgimage 1 | 137.9 | 24/72 |
+| fixture | fast png 1 | 139.1 | 24/72 |

@@ -3,6 +3,7 @@
 Requires the experimental Vision overlay, foreground Calculator, WDA_URL, and
 baseline Python on PYTHONPATH. Run with timeout 120. No recognized text is logged.
 """
+import argparse
 import json
 import os
 import random
@@ -23,10 +24,16 @@ def get_reference(client):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--capture-study", action="store_true")
+    args = parser.parse_args()
     client = WDAClient(os.environ["WDA_URL"], os.getenv("WDA_UDID", ""))
     client.ensure_session()
     reader = ScreenReader(client)
     arms = ["host", "fastOCR fast", "fastOCR accurate", "fastRead fast", "fastRead accurate"] * 10
+    if args.capture_study:
+        arms = [f"fastOCR {mode} {capture} {scale}" for mode in ("fast", "accurate")
+                for capture, scale in (("png", 1), ("cgimage", 1), ("cgimage", 0.5))] * 8
     random.Random(82).shuffle(arms)
     for arm in arms:
         keys, (width, height) = get_reference(client)
@@ -39,8 +46,11 @@ def main():
             observations = [(t, (x0+x1)/2, (y0+y1)/2) for line in lines
                             for t, x0, y0, x1, y1 in line.words]
         else:
-            path, mode = arm.split()
-            status, _, payload = client.req_raw("POST", "/wda/"+path, {"mode": mode}, timeout=8)
+            path, mode, *capture = arm.split()
+            body = {"mode": mode}
+            if capture:
+                body.update(capture=capture[0], scale=float(capture[1]))
+            status, _, payload = client.req_raw("POST", "/wda/"+path, body, timeout=8)
             elapsed = (time.perf_counter_ns()-start)/1e6
             obj = json.loads(payload)["value"]
             if status != 200 or not isinstance(obj.get("lines"), list):
