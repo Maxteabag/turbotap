@@ -122,6 +122,124 @@ APP_CACHE_DIR = os.path.expanduser("~/.cache/turbotap")
 SESSION_SETTINGS_TTL = 1800  # seconds before re-applying /appium/settings for the same WDA session
 
 
+def _reload_config():
+    """Re-read env-derived configuration. The warm daemon calls this per request so
+    each caller's WDA_CONFIG / WDA_MAC_HOST / config.json edits apply exactly as in a
+    fresh process."""
+    global CONFIG_PATH, _CFG, MAC_HOST, APP_PREFER
+    CONFIG_PATH = _default_config_path()
+    _CFG = load_config()
+    MAC_HOST = os.environ.get("WDA_MAC_HOST") or _CFG.get("mac_host") or "mac"
+    APP_PREFER = {k.casefold(): v for k, v in (_CFG.get("app_prefer") or {}).items()}
+
+
+# Warm-daemon hooks (None in a normal one-shot process). The daemon installs a
+# keep-alive connection pool and pre-initialised Tesseract engines; everything else
+# (sessions, capability probes, frames, OCR strip caches, app-switch state) stays
+# request-scoped because each request builds a fresh WDAClient/ScreenReader/Flow.
+_CONN_POOL = None      # {(host, port): [(HTTPConnection, idle_since_monotonic)]}
+_CONN_CLIENTS = None   # WDAClients created during the current daemon request
+_CONN_POOL_IDLE = 60.0
+_CONN_POOL_MAX = 4
+_WARM_OCR = None       # _WarmOCR instance shared by ScreenReaders inside the daemon
+_REQUEST_CLEANUPS = None  # daemon only: callables that drain work a request started
+_POOL_LOCK = None
+
+
+def _pool_lock():
+    global _POOL_LOCK
+    if _POOL_LOCK is None:
+        import threading
+        _POOL_LOCK = threading.Lock()
+    return _POOL_LOCK
+
+
+def _conn_alive(conn):
+    """False when the peer already closed (or sent unsolicited bytes on) an idle socket."""
+    sock = getattr(conn, "sock", None)
+    if sock is None:
+        return False
+    import select
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        return False
+    return not readable
+
+
+def _take_pooled_conn(host, port):
+    pool = _CONN_POOL
+    if pool is None:
+        return None
+    with _pool_lock():
+        entries = pool.get((host, port)) or []
+        while entries:
+            conn, since = entries.pop()
+            if time.monotonic() - since <= _CONN_POOL_IDLE and _conn_alive(conn):
+                return conn
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return None
+
+
+def _release_conn(client):
+    """Return a client's idle keep-alive connection to the daemon pool, or close it.
+
+    A connection still carrying a request (a worker thread that outlived its caller)
+    is never pooled, closed or detached here: its owner finishes with it and it is
+    discarded with the client, so no later request can read another's reply."""
+    conn = getattr(client, "_conn", None)
+    if conn is None or getattr(client, "_inflight", 0):
+        return
+    client._conn = None
+    pool = _CONN_POOL
+    if pool is not None and getattr(conn, "sock", None) is not None:
+        key = (conn.host, conn.port)
+        with _pool_lock():
+            entries = pool.setdefault(key, [])
+            if len(entries) < _CONN_POOL_MAX:
+                entries.append((conn, time.monotonic()))
+                return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _request_pool(workers):
+    """A worker pool owned by the current request. Inside the daemon it is drained
+    (queued work cancelled, running work awaited) before the next caller's
+    environment and working directory are installed."""
+    pool = _thread_pool(workers)
+    if _REQUEST_CLEANUPS is not None:
+        _REQUEST_CLEANUPS.append(lambda: pool.shutdown(wait=True, cancel_futures=True))
+    return pool
+
+
+def _drain_request_work():
+    """Daemon: run every cleanup the request registered, in order, then the warm
+    OCR pools. Nothing a request started may still run after this returns."""
+    global _REQUEST_CLEANUPS
+    if _REQUEST_CLEANUPS is not None:
+        cleanups, _REQUEST_CLEANUPS = _REQUEST_CLEANUPS, []
+        for fn in cleanups:
+            fn()
+    if _WARM_OCR is not None:
+        _WARM_OCR.end_request()
+
+
+def _recycle_request_conns():
+    """Daemon: after a request, wait for all of its worker threads and park every
+    idle connection its clients opened."""
+    global _CONN_CLIENTS
+    _drain_request_work()
+    clients, _CONN_CLIENTS = _CONN_CLIENTS or [], ([] if _CONN_POOL is not None else None)
+    for c in clients:
+        _release_conn(c)
+
+
 def _session_cache_path(base_url="", udid=""):
     netloc = _urlsplit(base_url).netloc if base_url else ""
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", udid or netloc or "default")
@@ -165,6 +283,18 @@ class WDAClient:
         self.device_key = device_key
         self.sid = None
         self._conn = None
+        self._inflight = 0  # requests currently using self._conn (another thread may own it)
+        self.last_response_headers = None
+        if os.environ.get("WDA_TURBO") == "0":
+            self.turbo = False
+        if _CONN_CLIENTS is not None:
+            _CONN_CLIENTS.append(self)
+
+    def _new_conn(self, u, timeout):
+        conn = _take_pooled_conn(u.hostname, u.port or 80)
+        if conn is None:
+            conn = _http_client().HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+        return conn
 
     def _side_client(self):
         if type(self) is not WDAClient:
@@ -179,6 +309,7 @@ class WDAClient:
         side._fast_pinch = self._fast_pinch
         side._fast_tap_batch = self._fast_tap_batch
         side._fast_launch = self._fast_launch
+        side._etag_shot = self._etag_shot
         return side
 
     def _session_cache_file(self):
@@ -238,14 +369,19 @@ class WDAClient:
         cls = type(self)
         return cls.req_raw is not WDAClient.req_raw or cls.req is WDAClient.req
 
-    def req_raw(self, method, path, data=None, timeout=25, deadline=None):
+    def req_raw(self, method, path, data=None, timeout=25, deadline=None, headers=None):
         """Raw HTTP request on the same persistent keep-alive connection.
-        Returns (status_code, content_type, raw_bytes).
+        Returns (status_code, content_type, raw_bytes); the response headers of the
+        last answered request are kept in self.last_response_headers.
         Retries reconnects only for idempotent reads (GET/HEAD) or provably
         unsent writes (connection failed before transmitting the request)."""
         hc = _http_client()
         body = json.dumps(data).encode() if data is not None else None
+        extra = headers
         headers = {"Content-Type": "application/json"} if data is not None else {}
+        if extra:
+            headers.update(extra)
+        self.last_response_headers = None
         u = _urlsplit(self.base_url)
         idempotent = method.upper() in ("GET", "HEAD")
         for attempt in (0, 1):
@@ -258,7 +394,7 @@ class WDAClient:
             sent = False
             try:
                 if self._conn is None:
-                    self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=eff_timeout)
+                    self._conn = self._new_conn(u, eff_timeout)
                 self._conn.timeout = eff_timeout
                 if self._conn.sock is None:
                     self._conn.connect()
@@ -267,10 +403,15 @@ class WDAClient:
                 if deadline is not None and time.monotonic() >= deadline:
                     return 0, "", b"deadline exceeded"
                 sent = True
-                self._conn.request(method, path, body=body, headers=headers)
-                resp = self._conn.getresponse()
-                raw = resp.read()
+                self._inflight += 1
+                try:
+                    self._conn.request(method, path, body=body, headers=headers)
+                    resp = self._conn.getresponse()
+                    raw = resp.read()
+                finally:
+                    self._inflight -= 1
                 ct = resp.getheader("Content-Type") or ""
+                self.last_response_headers = {k.lower(): v for k, v in resp.getheaders()}
                 return resp.status, ct, raw
             except (hc.HTTPException, OSError) as e:
                 self._conn = None
@@ -300,7 +441,7 @@ class WDAClient:
             sent = False
             try:
                 if self._conn is None:
-                    self._conn = hc.HTTPConnection(u.hostname, u.port or 80, timeout=eff_timeout)
+                    self._conn = self._new_conn(u, eff_timeout)
                 self._conn.timeout = eff_timeout
                 if self._conn.sock is None:
                     self._conn.connect()
@@ -309,9 +450,13 @@ class WDAClient:
                 if deadline is not None and time.monotonic() >= deadline:
                     return {"error": "deadline exceeded", "deadline_exceeded": True}
                 sent = True
-                self._conn.request(method, path, body=body, headers=headers)
-                resp = self._conn.getresponse()
-                raw = resp.read()
+                self._inflight += 1
+                try:
+                    self._conn.request(method, path, body=body, headers=headers)
+                    resp = self._conn.getresponse()
+                    raw = resp.read()
+                finally:
+                    self._inflight -= 1
                 if resp.status >= 400:
                     # Same shape as the old urllib HTTPError path: callers test .get("error").
                     return {"error": resp.status, "body": raw.decode(errors="replace")[:400]}
@@ -396,8 +541,9 @@ class WDAClient:
         subprocess.run(cmd, check=True, env=env)
 
     # None = not probed yet; True when the wda-turbo patch is running. WDA_TURBO=0
-    # forces the stock endpoints (benchmark baseline).
-    turbo = False if os.environ.get("WDA_TURBO") == "0" else None
+    # forces the stock endpoints (benchmark baseline); __init__ applies it per client so
+    # the warm daemon honours each caller's environment.
+    turbo = None
     _raw_shot = None         # None = not probed; True = binary /wda/fastScreenshot; False = legacy JSON
     _fast_ui = None          # None = not probed; True = /wda/fastUI; False = fallback to SOURCE_LITE
     _fast_keys = None        # None = not probed; True = /wda/fastKeys; False = fallback to /wda/keys
@@ -405,6 +551,7 @@ class WDAClient:
     _fast_pinch = None       # None = not probed; True = /wda/fastPinch; False = fallback to /wda/pinch
     _fast_tap_batch = None   # None = not probed; True = /wda/fastTapBatch; False = sequential fast_tap
     _fast_launch = None      # None = not probed; True = /wda/fastLaunch; False = terminate + launchUnattached/activate
+    _etag_shot = None        # None = not probed; True = conditional /wda/fastScreenshot (v6); False = runner ignores it
 
     def fast_tap(self, x, y, duration=None, deadline=None):
         """Coordinate tap (or long-press when duration is given, e.g. 0.65 s).
@@ -784,12 +931,70 @@ class WDAClient:
         raise RuntimeError("iPhone is still locked after entering passcode")
 
 
-def cmd_preflight(client, _args):
+_UNSUPPORTED_ROUTE_STATUS = (404, 405, 501)
+_UNSUPPORTED_ROUTE_ERRORS = ("unknown command", "unknown method", "unsupported operation")
+
+
+def _is_unsupported_route(res):
+    """True when WDA definitively lacks a route (stock or older wda-turbo runner),
+    as opposed to a transient failure that must not be remembered."""
+    if not isinstance(res, dict):
+        return False
+    err = res.get("error")
+    if err in _UNSUPPORTED_ROUTE_STATUS:
+        return True
+    value = res.get("value")
+    return isinstance(value, dict) and value.get("error") in _UNSUPPORTED_ROUTE_ERRORS
+
+
+def _fast_preflight(client, sid):
+    """(locked, bundleId, size) from one wda-turbo v6 GET /wda/fastPreflight, or None.
+
+    The runner reads the same three values as the stock sequence (lock state, the
+    sessionless foreground app, then the session's window size), in that order. Any
+    missing route, failed request or malformed field returns None so the caller
+    re-reads all three fields with the stock endpoints; a definitively missing route
+    is remembered for this WDA session so stock runners pay the probe only once."""
+    cached = client._load_session_cache() if hasattr(client, "_load_session_cache") else {}
+    if (cached.get("base_url") == client.base_url and cached.get("sid") == sid
+            and cached.get("fast_preflight") is False):
+        return None
+    response = client.req("GET", f"/session/{sid}/wda/fastPreflight")
+    if _is_unsupported_route(response):
+        if hasattr(client, "_save_session_cache"):
+            client._save_session_cache({"fast_preflight": False})
+        return None
+    if not isinstance(response, dict) or "error" in response:
+        return None
+    value = response.get("value")
+    if not isinstance(value, dict) or type(value.get("locked")) is not bool:
+        return None
+    size = value.get("size")
+    bundle = value.get("bundleId")
+    if not isinstance(bundle, str) or not bundle.strip() or not isinstance(size, dict):
+        return None
+    for key in ("width", "height"):
+        n = size.get(key)
+        # WDA reads an integral rectangle; orientation may swap the axes.
+        if type(n) is not int and not (type(n) is float and n.is_integer()):
+            return None
+        if n <= 0:
+            return None
+    return value["locked"], bundle, size
+
+
+def cmd_preflight(client, args):
     t0 = time.perf_counter()
     sid = client.ensure_session(apply_fast_settings=True)
-    locked = client.req("GET", "/wda/locked").get("value")
-    app = client.req("GET", "/wda/activeAppInfo").get("value", {}).get("bundleId")
-    sz = client.req("GET", f"/session/{sid}/window/size").get("value") or {}
+    snapshot = None
+    if sid and not getattr(args, "stock", False) and client.turbo is not False:
+        snapshot = _fast_preflight(client, sid)
+    if snapshot is None:
+        locked = client.req("GET", "/wda/locked").get("value")
+        app = client.req("GET", "/wda/activeAppInfo").get("value", {}).get("bundleId")
+        sz = client.req("GET", f"/session/{sid}/window/size").get("value") or {}
+    else:
+        locked, app, sz = snapshot
     if sz.get("width") and sz.get("height"):
         client._save_session_cache({"screen_pt": [int(sz["width"]), int(sz["height"])]})
     dt = (time.perf_counter() - t0) * 1000
@@ -821,11 +1026,13 @@ def _tess_lib():
     OMP_THREAD_LIMIT=1 is set at import: Tesseract's own OpenMP threads made a
     full-screen pass 312 ms vs 181 ms single-threaded, and they fight the strip
     threads below."""
+    if os.environ.get("WDA_OCR") == "binary":
+        # Benchmark baseline: fork the tesseract binary per call. Checked on every call,
+        # before the native cache, so a warm daemon honours each caller's choice.
+        return None
     if "lib" not in _TESS:
         lib = None
         try:
-            if os.environ.get("WDA_OCR") == "binary":  # benchmark baseline: fork per call
-                raise OSError("WDA_OCR=binary")
             import ctypes
             import ctypes.util
             _TESS["ctypes"] = ctypes
@@ -1183,6 +1390,75 @@ def _text_overlap(a, b):
     return len(sa & sb) / max(len(sa), len(sb))
 
 
+def _create_tess_api(psm):
+    lib = _tess_lib()
+    api = lib.TessBaseAPICreate()
+    # OEM_LSTM_ONLY (1) matches the CLI --oem 1 fallback and avoids loading
+    # legacy engine tables from combined eng.traineddata.
+    if lib.TessBaseAPIInit2(api, None, b"eng", 1) != 0:
+        raise RuntimeError("TessBaseAPIInit2 failed (eng.traineddata missing?)")
+    lib.TessBaseAPISetPageSegMode(api, psm)
+    lib.TessBaseAPISetVariable(api, b"debug_file", b"/dev/null")
+    return api
+
+
+def _tess_model_key():
+    """The model directory TessBaseAPIInit2(datapath=NULL) will load, resolved now.
+
+    TESSDATA_PREFIX may be relative; Tesseract resolves it against the process cwd
+    at init, and the warm daemon switches cwd per request. Keying by the resolved
+    path means the same relative prefix from two directories selects two engines."""
+    prefix = os.environ.get("TESSDATA_PREFIX")
+    return os.path.realpath(prefix) if prefix else ""
+
+
+class _WarmOCR:
+    """Pre-initialised libtesseract engines for the warm daemon.
+
+    Engines are partitioned by (page segmentation mode, effective model data), so a
+    request never gets an engine initialised under another caller's TESSDATA_PREFIX.
+    LSTM-only engines carry no per-image state between calls and Sauvola variables
+    are reset after every use. Worker threads are per request: end_request() cancels
+    queued strips and waits for running ones, so every engine is back in its queue
+    and no OCR work outlives the request that started it."""
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._engines = {}        # (psm, model key) -> (queue.Queue of engines, count)
+        self._request_pools = []
+
+    def lease(self, psm, workers):
+        import queue
+        key = (psm, _tess_model_key())
+        with self._lock:
+            apis, count = self._engines.get(key, (None, 0))
+            if apis is None:
+                apis = queue.Queue()
+            while count < workers:
+                apis.put(_create_tess_api(psm))
+                count += 1
+            self._engines[key] = (apis, count)
+            pool = _thread_pool(workers)
+            self._request_pools.append(pool)
+            return pool, apis
+
+    def end_request(self):
+        with self._lock:
+            pools, self._request_pools = self._request_pools, []
+        for pool in pools:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def close(self):
+        self.end_request()
+        lib = _tess_lib()
+        with self._lock:
+            engines, self._engines = list(self._engines.values()), {}
+        for apis, _ in engines:
+            while lib is not None and not apis.empty():
+                lib.TessBaseAPIDelete(apis.get_nowait())
+
+
 class ScreenReader:
     """Full-screen OCR for any app, no coordinates known in advance.
 
@@ -1208,20 +1484,32 @@ class ScreenReader:
         self._pt = None
         self._pt_from_cache = False
         self._dev = scale / 3.0  # typical 3x iOS Retina; auto-corrected after 1st grab
+        # Conditional fastScreenshot: (request key, ETag, image bytes) of this reader's
+        # last raw frame. Never shared between readers or clients.
+        self._shot_validator = None
+        self.conditional_hits = 0
         if warm_ocr:
             self._ensure_ocr()
 
     def _ensure_ocr(self):
         if self.pool is not None:
             return
+        warm = _WARM_OCR
+        if warm is not None and _tess_lib() is not None:
+            # Warm daemon: borrow pre-initialised engines; strip cache stays per reader.
+            self.pool, self.apis = warm.lease(self.psm, self.n)
+            return
         import queue
-        self.pool = _thread_pool(self.n)
+        self.pool = _request_pool(self.n)
         self.apis = queue.Queue()
         if _tess_lib() is not None:
-            import atexit
             for _ in range(self.n):  # warm the engines while the first frame is in flight
                 self.pool.submit(self._new_api)
-            atexit.register(self._close)
+            if _REQUEST_CLEANUPS is not None:
+                _REQUEST_CLEANUPS.append(self._close)  # after the pool drain registered above
+            else:
+                import atexit
+                atexit.register(self._close)
 
     def set_last(self, img, lines=None, ts=None):
         self.last = img
@@ -1233,15 +1521,7 @@ class ScreenReader:
         self.last_lines = None
 
     def _new_api(self):
-        lib = _tess_lib()
-        api = lib.TessBaseAPICreate()
-        # OEM_LSTM_ONLY (1) matches the CLI --oem 1 fallback and avoids loading
-        # legacy engine tables from combined eng.traineddata.
-        if lib.TessBaseAPIInit2(api, None, b"eng", 1) != 0:
-            raise RuntimeError("TessBaseAPIInit2 failed (eng.traineddata missing?)")
-        lib.TessBaseAPISetPageSegMode(api, self.psm)
-        lib.TessBaseAPISetVariable(api, b"debug_file", b"/dev/null")
-        self.apis.put(api)
+        self.apis.put(_create_tess_api(self.psm))
 
     def _close(self):
         lib = _tess_lib()
@@ -1332,7 +1612,9 @@ class ScreenReader:
                 req_timeout = _rem()
                 if use_raw:
                     payload["raw"] = True
-                    if eff_deadline is not None:
+                    if self._conditional_ok():
+                        status, ct, body = self._conditional_shot(payload, req_timeout, eff_deadline)
+                    elif eff_deadline is not None:
                         try:
                             status, ct, body = self.c.req_raw("POST", "/wda/fastScreenshot", payload, timeout=req_timeout, deadline=eff_deadline)
                         except TypeError:
@@ -1415,6 +1697,63 @@ class ScreenReader:
             if img.size != out:
                 img = img.resize(out, getattr(Image, "Resampling", Image).BILINEAR)
             return img
+
+    def _conditional_ok(self):
+        """Conditional fastScreenshot needs the real transport (response headers) and a
+        runner not already known to ignore the "etag" request (pre-v6 wda-turbo)."""
+        c = self.c
+        if getattr(c, "_etag_shot", None) is False or os.environ.get("WDA_CONDITIONAL_SHOT") == "0":
+            return False
+        return type(c).req_raw is WDAClient.req_raw or getattr(c, "supports_conditional_shot", False)
+
+    def _conditional_shot(self, payload, req_timeout, deadline):
+        """POST /wda/fastScreenshot with this reader's last validator for the identical
+        request (endpoint, session, crop, scale, quality, format). HTTP 304 reuses the
+        retained bytes; any other answer replaces or drops the validator. Returns the
+        same (status, content_type, bytes) triple as req_raw, with 304 mapped to 200."""
+        key = (self.c.base_url, self.c.sid, json.dumps(payload, sort_keys=True))
+        validator = self._shot_validator
+        if validator is not None and validator[0] != key:
+            validator = self._shot_validator = None
+        for attempt in (0, 1):
+            data = dict(payload, etag=True)
+            headers = None
+            if validator is not None:
+                data["ifNoneMatch"] = validator[1]
+                headers = {"If-None-Match": validator[1]}
+            kwargs = {"headers": headers}
+            if deadline is not None:
+                kwargs.update(timeout=req_timeout, deadline=deadline)
+            status, ct, body = self.c.req_raw("POST", "/wda/fastScreenshot", data, **kwargs)
+            hdrs = getattr(self.c, "last_response_headers", None) or {}
+            etag = hdrs.get("etag")
+            if status == 304:
+                # The v6 runner names the matched validator on every 304; anything else
+                # (missing or different tag) is refetched unconditionally.
+                if validator is not None and etag == validator[1]:
+                    self.conditional_hits += 1
+                    return 200, validator[3], validator[2]
+                # A 304 we cannot pair with our own retained bytes: never guess a frame.
+                validator = self._shot_validator = None
+                if attempt == 0:
+                    if deadline is not None:
+                        if time.monotonic() >= deadline:
+                            return 0, "", b"deadline exceeded"
+                        req_timeout = max(0.05, deadline - time.monotonic())
+                    continue
+                return 0, "", b"unpaired 304 Not Modified"
+            if status == 200 and ct.lower().startswith("image/") and body:
+                if isinstance(etag, str) and len(etag) >= 3 and etag[0] == etag[-1] == '"':
+                    self._shot_validator = (key, etag, body, ct)
+                    self.c._etag_shot = True
+                else:
+                    self._shot_validator = None
+                    if getattr(self.c, "_etag_shot", None) is None:
+                        self.c._etag_shot = False  # pre-v6 runner ignores "etag"
+            else:
+                self._shot_validator = None
+            return status, ct, body
+        return 0, "", b"conditional screenshot failed"
 
     def _cuts(self, img, data=None):
         """Strip boundaries at the most uniform row near each 1/n of the height."""
@@ -2128,6 +2467,9 @@ FLOW_HELP = """steps (one argument each, run in order):
   back                  iOS edge-swipe back gesture
   read                  OCR text once it holds still + labelled controls with (x, y)
   read:ocr / read:Y0-Y1 OCR only (whole screen / a band)
+  read:vision[:fast]    on-device Apple Vision OCR via wda-turbo v6 /wda/fastOCR (accurate
+                        by default at 0.5x direct capture; :fast trades accuracy for ~90 ms);
+                        fails clearly on runners without /wda/fastOCR instead of reading nothing
   settle                wait until two frames in a row are identical
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
@@ -2301,19 +2643,18 @@ class Flow:
             if self.c._fast_launch is not None:
                 self._side._fast_launch = self.c._fast_launch
         if self._ui_pool is None:
-            self._ui_pool = _thread_pool(1)
+            self._ui_pool = _request_pool(1)
         return self._side, self._ui_pool
 
     def close(self):
         if self._ui_pool is not None:
-            self._ui_pool.shutdown(wait=False)
+            # Cancel tree fetches that have not started and wait for a running one: its
+            # side connection must be idle before it is recycled or closed, and no worker
+            # may outlive the request (the warm daemon restores process state next).
+            self._ui_pool.shutdown(wait=True, cancel_futures=True)
             self._ui_pool = None
         if self._side is not None and self._side is not self.c and getattr(self._side, "_conn", None) is not None:
-            try:
-                self._side._conn.close()
-            except Exception:
-                pass
-            self._side._conn = None
+            _release_conn(self._side)
 
     def _invalidate_ctl_cache(self):
         self._ctl_cache = None
@@ -5130,6 +5471,17 @@ class Flow:
             self._last_alert_text = None
             self._last_alert_buttons = None
             ui = None
+            engine, _, mode = arg.strip().partition(":")
+            if engine.strip().lower() == "vision":
+                mode = (mode or "accurate").strip().lower()
+                if mode not in VISION_MODES:
+                    raise FlowError(f"read:vision mode must be accurate or fast, not {mode!r}")
+                try:
+                    lines = vision_lines(self.c, self.r.pt_size(), mode=mode)
+                except (RuntimeError, TimeoutError) as e:  # incl. VisionUnsupported
+                    raise FlowError(f"read:vision: {e}") from None
+                self.reads.append({"lines": [l.as_dict() for l in lines], "engine": "vision", "mode": mode})
+                return len(lines)
             if arg and arg != "ocr":
                 y0, y1 = (int(v) for v in arg.split("-"))
                 lines = self.r.read(y0, y1)
@@ -5215,6 +5567,117 @@ def cmd_ocr(client, args):
     for ln in lines:
         x, y = ln.center
         print(f"({x:3d}, {y:3d})  {ln.text}")
+
+
+VISION_MODES = ("accurate", "fast")
+VISION_DEFAULT_SCALE = 0.5  # accurate @ 0.5x direct CGImage: 72/72 multilingual words, ~235 ms (PR #8)
+_VISION_BOX_TOLERANCE = 1e-3
+
+
+class VisionUnsupported(RuntimeError):
+    """The runner has no /wda/fastOCR (stock WDA or wda-turbo before v6)."""
+
+
+def _vision_ocr_raw(client, mode="accurate", scale=VISION_DEFAULT_SCALE, deadline=None):
+    """On-device Apple Vision text recognition via wda-turbo v6 POST /wda/fastOCR.
+
+    Returns validated lines [{"text", "confidence", "x", "y", "width", "height"}] with
+    the box normalised to the screen (top-left origin, 0..1). An empty list means the
+    runner recognised no text; every failure raises instead of pretending the screen
+    is empty."""
+    if mode not in VISION_MODES:
+        raise RuntimeError(f"Vision mode must be one of {', '.join(VISION_MODES)}, not {mode!r}")
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not 0 < scale <= 1:
+        raise RuntimeError("Vision --scale must be a number greater than zero and at most one")
+    payload = {"mode": mode, "capture": "cgimage", "scale": scale}
+    kwargs = {}
+    if deadline is not None:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("Vision OCR deadline exceeded")
+        kwargs = {"timeout": max(0.05, rem), "deadline": deadline}
+    status, _, body = client.req_raw("POST", "/wda/fastOCR", payload, **kwargs)
+    unsupported = ("WDA lacks /wda/fastOCR (stock WebDriverAgent or wda-turbo before v6). "
+                   "Run `turbotap deploy` to install wda-turbo v6, or use host OCR (read:ocr / turbotap ocr).")
+    if status in _UNSUPPORTED_ROUTE_STATUS:
+        raise VisionUnsupported(unsupported)
+    if not status:
+        raise RuntimeError(f"Cannot reach WDA for Vision OCR: {body.decode(errors='replace')}")
+    try:
+        response = json.loads(body)
+    except ValueError:
+        raise RuntimeError(f"Invalid JSON from /wda/fastOCR (HTTP {status})") from None
+    value = response.get("value") if isinstance(response, dict) else None
+    if isinstance(value, dict) and "error" in value:
+        if value["error"] in _UNSUPPORTED_ROUTE_ERRORS:
+            raise VisionUnsupported(unsupported)
+        if value["error"] == "invalid argument":
+            raise RuntimeError("WDA rejected the Vision request (older Vision overlay without scaled "
+                               f"CGImage capture?): {value.get('message') or value['error']}")
+        raise RuntimeError(f"Vision OCR failed: {value.get('message') or value['error']}")
+    if not 200 <= status < 300:
+        raise RuntimeError(f"/wda/fastOCR failed (HTTP {status})")
+    if (not isinstance(value, dict) or response.get("status", 0) != 0
+            or value.get("mode") != mode or not isinstance(value.get("lines"), list)):
+        raise RuntimeError("Invalid /wda/fastOCR response: expected the requested mode and a lines array")
+    image = value.get("image")
+    if (not isinstance(image, dict) or image.get("capture") != "cgimage"
+            or type(image.get("scale")) not in (int, float) or image["scale"] != scale):
+        raise RuntimeError("WDA did not confirm the requested scaled CGImage capture; redeploy wda-turbo v6")
+    lines = []
+    for i, line in enumerate(value["lines"]):
+        if not isinstance(line, dict) or not isinstance(line.get("text"), str) or not line["text"].strip():
+            raise RuntimeError(f"Invalid /wda/fastOCR line {i}: expected recognized text")
+        box = {}
+        for field in ("x", "y", "width", "height", "confidence"):
+            n = line.get(field)
+            if (type(n) not in (int, float) or n != n
+                    or not -_VISION_BOX_TOLERANCE <= n <= 1 + _VISION_BOX_TOLERANCE):
+                raise RuntimeError(f"Invalid /wda/fastOCR line {i}: {field} must be a number in [0, 1]")
+            box[field] = min(1.0, max(0.0, float(n)))
+        if (box["width"] <= 0 or box["height"] <= 0
+                or box["x"] + box["width"] > 1 + _VISION_BOX_TOLERANCE
+                or box["y"] + box["height"] > 1 + _VISION_BOX_TOLERANCE):
+            raise RuntimeError(f"Invalid /wda/fastOCR line {i}: expected a nonempty box within the screen")
+        box["width"] = min(box["width"], 1.0 - box["x"])
+        box["height"] = min(box["height"], 1.0 - box["y"])
+        if box["width"] <= 0 or box["height"] <= 0:
+            raise RuntimeError(f"Invalid /wda/fastOCR line {i}: box is empty once clipped to the screen")
+        lines.append({"text": line["text"], **box})
+    return lines
+
+
+def vision_lines(client, screen_pt, mode="accurate", scale=VISION_DEFAULT_SCALE, deadline=None):
+    """Vision OCR as [Line] in screen points (same shape as ScreenReader.read)."""
+    w, h = screen_pt
+    out = []
+    for ln in _vision_ocr_raw(client, mode=mode, scale=scale, deadline=deadline):
+        x0, y0 = ln["x"] * w, ln["y"] * h
+        out.append(Line([(ln["text"], x0, y0, x0 + ln["width"] * w, y0 + ln["height"] * h)]))
+    out.sort(key=lambda l: (l.y0, l.x0))
+    return out
+
+
+def cmd_vision_ocr(client, args):
+    client.ensure_session(apply_fast_settings=True)
+    reader = ScreenReader(client, warm_ocr=False)
+    pt = reader.pt_size()
+    t0 = time.perf_counter()
+    raw = _vision_ocr_raw(client, mode=args.mode, scale=args.scale)
+    dt = (time.perf_counter() - t0) * 1000
+    w, h = pt
+    lines = []
+    for ln in sorted(raw, key=lambda d: (d["y"], d["x"])):
+        lines.append({
+            "text": ln["text"],
+            "x": int((ln["x"] + ln["width"] / 2) * w),
+            "y": int((ln["y"] + ln["height"] / 2) * h),
+            "confidence": round(ln["confidence"], 3),
+            "box": [round(ln[k], 5) for k in ("x", "y", "width", "height")],
+        })
+    print(json.dumps({"ok": True, "engine": "vision", "mode": args.mode, "scale": args.scale,
+                      "screen_pt": [w, h], "lines": lines, "elapsed_ms": round(dt, 1)},
+                     ensure_ascii=False))
 
 
 def cmd_tap_ocr(client, args):
@@ -5469,9 +5932,23 @@ def cmd_otp_type(client, args):
     print(json.dumps({"ok": True, "digits_typed": len(code)}))
 
 
-def main():
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if _daemon_requested(argv):
+        from . import daemon
+        code = daemon.forward(argv)
+        if code is not None:
+            sys.exit(code)
+    run_cli(argv)
+
+
+def run_cli(argv):
+    """One CLI invocation in this process (the warm daemon calls this per request)."""
     try:
-        _main()
+        rc = _main(argv)
+        if isinstance(rc, int) and rc:
+            sys.exit(rc)
     except (RuntimeError, OSError) as e:
         sys.exit(f"turbotap: {e}")
     except KeyboardInterrupt:
@@ -5483,14 +5960,60 @@ def main():
         raise
 
 
-def _main():
+_DAEMON_LOCAL_CMDS = frozenset({"daemon", "install-skill", "deploy"})
+_GLOBAL_VALUE_OPTS = frozenset({"--url", "--device", "--udid"})
+
+
+def _cli_subcommand(argv):
+    """(subcommand or None, --daemon seen, --no-daemon seen, other option seen)
+    from the global options that precede the subcommand."""
+    daemon = no_daemon = other = False
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--daemon":
+            daemon = True
+        elif tok == "--no-daemon":
+            no_daemon = True
+        elif tok in _GLOBAL_VALUE_OPTS:
+            i += 1
+        elif tok.startswith("-"):
+            if tok.split("=", 1)[0] not in _GLOBAL_VALUE_OPTS:
+                other = True
+        else:
+            return tok, daemon, no_daemon, other
+        i += 1
+    return None, daemon, no_daemon, other
+
+
+def _daemon_requested(argv):
+    """True when this invocation should go through the warm daemon: --daemon or
+    TURBOTAP_DAEMON=1, not --no-daemon, and a device subcommand (daemon management,
+    install-skill, deploy and bare --help always run here)."""
+    cmd, daemon, no_daemon, other = _cli_subcommand(argv)
+    env = os.environ.get("TURBOTAP_DAEMON", "").strip().lower() in ("1", "true", "yes", "on")
+    return bool((daemon or env) and not no_daemon and not other and cmd and cmd not in _DAEMON_LOCAL_CMDS)
+
+
+def _main(argv=None):
     import argparse
     p = argparse.ArgumentParser(description="Fast generic WebDriverAgent (WDA) controller for physical iOS devices")
     p.add_argument("--url", default=None, help="WDA base URL (or set WDA_URL / ~/.config/turbotap/config.json)")
     p.add_argument("--device", default=None, help="device key from ~/.config/turbotap/config.json (or WDA_DEVICE)")
     p.add_argument("--udid", default=None, help="device UDID (or WDA_UDID / config.json)")
+    p.add_argument("--daemon", action="store_true",
+                   help="run through the warm local daemon when it is running (or TURBOTAP_DAEMON=1); "
+                   "falls back to this process otherwise")
+    p.add_argument("--no-daemon", action="store_true", help="never use the daemon, even with TURBOTAP_DAEMON=1")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("preflight")
+    sp_pre = sub.add_parser("preflight", help="session, lock state, foreground app and screen size")
+    sp_pre.add_argument("--stock", action="store_true",
+                        help="skip the combined wda-turbo v6 /wda/fastPreflight read and use the three stock reads")
+    sp_daemon = sub.add_parser("daemon", help="opt-in warm local daemon (private Unix socket) for repeated CLI calls")
+    sp_daemon.add_argument("action", choices=("start", "stop", "status"))
+    sp_daemon.add_argument("--idle", type=float, default=None, metavar="SECONDS",
+                           help="exit after this long without requests (default 900, or TURBOTAP_DAEMON_IDLE)")
+    sp_daemon.add_argument("--foreground", action="store_true", help="start: serve in this process (for a supervisor)")
     sub.add_parser("unlock")
     sp_skill = sub.add_parser("install-skill", help="install the turbotap agent skills (Claude Code, Codex, ...)",
                               description="Copy the turbotap and turbotap-retro skills into agent skill folders. "
@@ -5506,6 +6029,12 @@ def _main():
     sp_ocr.add_argument("--scale", type=float, default=1.5, help="OCR px per point")
     sp_ocr.add_argument("--y0", type=int, default=0, help="crop band top (pt)")
     sp_ocr.add_argument("--y1", type=int, default=None, help="crop band bottom (pt), default screen bottom")
+    sp_vision = sub.add_parser("vision-ocr", help="on-device Apple Vision OCR of the full screen as JSON (wda-turbo v6)")
+    sp_vision.add_argument("--mode", choices=VISION_MODES, default="accurate",
+                           help="accurate uses language correction (default); fast skips it")
+    sp_vision.add_argument("--scale", type=float, default=VISION_DEFAULT_SCALE, metavar="FACTOR",
+                           help=f"direct CGImage capture at this fraction of each dimension, 0 < FACTOR <= 1 "
+                           f"(default {VISION_DEFAULT_SCALE})")
     sp_tap_ocr = sub.add_parser("tap-ocr")
     sp_tap_ocr.add_argument("text")
     sub.add_parser("tree")
@@ -5525,9 +6054,12 @@ def _main():
     sp_otp.add_argument("--after-rowid", type=int, default=0)
     sp_otp.add_argument("--timeout", type=float, default=20.0)
     sp_otp.add_argument("--mac-host", default=MAC_HOST)
-    args = p.parse_args()
+    args = p.parse_args(argv)
     if args.cmd == "install-skill":
         return cmd_install_skill(args)
+    if args.cmd == "daemon":
+        from . import daemon
+        return daemon.cmd_daemon(args)
     sync_skills_if_stale()
     url, udid, dev_key = resolve_device_settings(args.url, args.device, args.udid)
     client = WDAClient(url, udid=udid, device_key=dev_key)
@@ -5536,6 +6068,7 @@ def _main():
         "unlock": cmd_unlock,
         "deploy": cmd_deploy,
         "ocr": cmd_ocr,
+        "vision-ocr": cmd_vision_ocr,
         "tap-ocr": cmd_tap_ocr,
         "tree": cmd_tree,
         "screenshot": cmd_screenshot,
