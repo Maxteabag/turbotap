@@ -75,8 +75,13 @@ pub fn cli_subcommand(argv: &[String]) -> (Option<String>, bool, bool, bool) {
 /// `TURBOTAP_DAEMON=1`, not `--no-daemon`, and a device subcommand (daemon management,
 /// install-skill, deploy and bare `--help` always run here).
 pub fn daemon_requested(argv: &[String]) -> bool {
+    daemon_requested_env(argv, std::env::var("TURBOTAP_DAEMON").ok().as_deref())
+}
+
+/// [`daemon_requested`] with an explicit `TURBOTAP_DAEMON` value.
+pub(crate) fn daemon_requested_env(argv: &[String], turbotap_daemon: Option<&str>) -> bool {
     let (cmd, daemon, no_daemon, other) = cli_subcommand(argv);
-    let env = std::env::var("TURBOTAP_DAEMON").unwrap_or_default();
+    let env = turbotap_daemon.unwrap_or("");
     let env = matches!(env.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
     match cmd {
         Some(c) => (daemon || env) && !no_daemon && !other && !DAEMON_LOCAL_CMDS.contains(&c.as_str()),

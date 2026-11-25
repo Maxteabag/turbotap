@@ -287,6 +287,11 @@ pub fn pool_len() -> usize {
     POOL.lock().unwrap().as_ref().map(|m| m.values().map(Vec::len).sum()).unwrap_or(0)
 }
 
+/// Idle pooled connections for one `(host, port)` (tests/diagnostics).
+pub fn pool_len_for(host: &str, port: u16) -> usize {
+    POOL.lock().unwrap().as_ref().and_then(|m| m.get(&(host.to_string(), port)).map(Vec::len)).unwrap_or(0)
+}
+
 /// Close every pooled connection but keep pooling enabled.
 pub fn pool_clear() {
     if let Some(m) = POOL.lock().unwrap().as_mut() {

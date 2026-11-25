@@ -5,7 +5,9 @@
 //!   against it.
 //! - [`fake_reader::FakeReader`]: deterministic `Reader` double (Python `FakeReader`).
 //! - image helpers (`solid_img`, `box_img`, `encode_image_bytes`) and `make_line`.
+pub mod as_bin;
 pub mod fake_reader;
+pub mod loopback;
 pub mod mock_wda;
 
 pub use fake_reader::FakeReader;
