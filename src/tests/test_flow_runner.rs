@@ -2632,6 +2632,21 @@ fn test_assert_assertnot_and_alert_text_verbs() {
     flow_old.close();
 }
 
+/// Hermetic env for tests that reach CLI/config code: HOME in a TempDir and no
+/// WDA_* device settings (keep both guards alive for the test).
+fn hermetic_env() -> (TempDir, EnvGuard) {
+    let home = TempDir::new("turbotap-test-home-");
+    let home_s = home.path().to_string_lossy().into_owned();
+    let g = set_env(&[
+        ("HOME", Some(home_s.as_str())),
+        ("WDA_UDID", None),
+        ("WDA_URL", None),
+        ("WDA_DEVICE", None),
+        ("TURBOTAP_DAEMON", None),
+    ]);
+    (home, g)
+}
+
 // ---------------------------------------------------------------------------
 // LazyImportAndWarmupTests
 // ---------------------------------------------------------------------------
@@ -2642,6 +2657,7 @@ fn test_assert_assertnot_and_alert_text_verbs() {
 #[test]
 fn test_import_and_help_do_not_load_pil_or_http_client() {
     let _cache = isolated_cache();
+    let (_home, _env) = hermetic_env();
     let mock = MockWda::start(MockState::default());
     let argv = |extra: &[&str]| {
         let mut v: Vec<String> = vec!["--no-daemon".into(), "--url".into(), mock.url.clone()];
@@ -2659,6 +2675,7 @@ fn test_import_and_help_do_not_load_pil_or_http_client() {
 #[test]
 fn test_ui_only_flow_skips_ocr_warmup() {
     let _cache = isolated_cache();
+    let (_home, _env) = hermetic_env();
     let mock = MockWda::start(with_fast_ui(fui(json!([{"type": "Button", "label": "Settings", "x": 100, "y": 200}]))));
     let steps: Vec<String> = vec!["ui".into(), "tapxy:100,200".into()];
     assert!(!crate::flow::flow_needs_ocr(&steps));
@@ -2669,6 +2686,7 @@ fn test_ui_only_flow_skips_ocr_warmup() {
 #[test]
 fn test_url_only_flow_skips_ocr_warmup() {
     let _cache = isolated_cache();
+    let (_home, _env) = hermetic_env();
     let mock = MockWda::start(MockState::default());
     let steps: Vec<String> = vec!["url:https://example.com".into()];
     assert!(!crate::flow::flow_needs_ocr(&steps));
