@@ -10,6 +10,7 @@ import random
 import time
 
 from turbotap.cli import ScreenReader, WDAClient
+from vision_provenance import effective_image
 
 
 def get_reference(client):
@@ -58,6 +59,10 @@ def main():
             if path == "fastRead" and obj["fastUI"]["bundleId"].casefold() != "com.apple.calculator":
                 raise RuntimeError("unexpected fused tree")
             timing = {k: float(obj["timing"][k]) for k in ("captureMs", "axMs", "recognitionMs", "totalMs")}
+            if obj.get("mode") != mode:
+                raise RuntimeError("Vision mode mismatch")
+            if args.capture_study:
+                timing.update(effective_image(obj, body))
             timing["wire_bytes"] = len(payload)
             observations = [(n["text"], width*(n["x"]+n["width"]/2), height*(n["y"]+n["height"]/2))
                             for n in obj["lines"]]

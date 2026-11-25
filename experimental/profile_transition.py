@@ -49,16 +49,20 @@ def trial(c, arm):
     with_stream = arm == "stream"
     response = urllib.request.urlopen(os.environ["MJPEG_URL"], timeout=3) if with_stream else None
     stop = threading.Event()
-    latest = []
+    latest = None
+    start = before = observed = None
     cv = threading.Condition()
 
     def receive():
+        nonlocal latest, observed
         while not stop.is_set():
             frame = get_frame(response)
             arrived = time.perf_counter()
             region = display_roi(frame, screen, y)
             with cv:
-                latest[:] = [(arrived, region)]
+                latest = region
+                if start is not None and arrived >= start and observed is None and changed(before, region):
+                    observed = arrived
                 cv.notify_all()
 
     reader = threading.Thread(target=receive, daemon=True) if response else None
@@ -66,34 +70,32 @@ def trial(c, arm):
         if reader:
             reader.start()
             with cv:
-                if not cv.wait_for(lambda: bool(latest), 3):
+                if not cv.wait_for(lambda: latest is not None, 3):
                     raise RuntimeError("no MJPEG baseline")
-                before = latest[0][1]
         else:
             before = display_roi(pull(), screen, y)
         # Recheck the same buttons immediately before dispatch.
         if observe(c)[0] != options:
             raise RuntimeError("keypad changed")
         x, key_y = options["7"]
-        start = time.perf_counter()
+        with cv:
+            if reader:
+                before = latest
+            start = time.perf_counter()
         result = c.req("POST", "/wda/fastTap", {"x": x, "y": key_y}, timeout=3)
         ack = time.perf_counter()
         if "error" in result:
             raise RuntimeError("tap uncertain")
-        observed = None
-        last = start
-        while time.perf_counter() < start+3:
-            if reader:
-                with cv:
-                    if not cv.wait_for(lambda: latest[0][0] > last, 1):
-                        break
-                    last, region = latest[0]
-            else:
-                region = display_roi(pull(), screen, y)
-                last = time.perf_counter()
-            if changed(before, region):
-                observed = last
-                break
+        if reader:
+            with cv:
+                cv.wait_for(lambda: observed is not None, max(0, start + 3 - time.perf_counter()))
+        else:
+            while time.perf_counter() < start + 3:
+                frame = pull()
+                arrived = time.perf_counter()
+                if changed(before, display_roi(frame, screen, y)):
+                    observed = arrived
+                    break
         verify(c, "7", y)
         return dict(arm=arm, verified=True, ack_ms=(ack-start)*1000,
                     visible_ms=(observed-start)*1000 if observed else None)

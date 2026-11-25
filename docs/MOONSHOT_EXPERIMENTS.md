@@ -1,5 +1,7 @@
 # Turbotap moonshot experiments
 
+**Measurement correction pending.** The original cold baseline used a polling wait that can add up to roughly 50 ms. Preflight recorded the requested route, and the capture study recorded the requested image mode and scale. Neither series recorded enough evidence to establish the effective arm. The transition reader could overwrite its first changed frame while the tap request was in flight. Treat those timings and the associated arm-specific claims as provisional until the corrected runs replace them.
+
 ## Reproducing the comparisons
 
 The [device measurements](../experimental/results/iphone17.jsonl) contain one JSON record per observation, keyed by series. The daemon, RapidOCR, and conditional JPEG series use their native grouped records. The [Jev receipts](../experimental/jev/) include the mapped synthetic choices. No image files are required to inspect the results.

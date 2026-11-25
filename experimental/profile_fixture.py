@@ -13,6 +13,7 @@ import time
 import unicodedata
 
 from profile_ocr import WORDS
+from vision_provenance import effective_image
 from turbotap.cli import ScreenReader, WDAClient
 
 BROWSERS = {"com.apple.mobilesafari", "com.google.chrome.ios", "com.brave.ios.browser",
@@ -64,6 +65,7 @@ def main():
                 raise RuntimeError("browser left foreground")
             reader.cache.clear()
             start = time.perf_counter()
+            provenance = {}
             if arm.startswith("host"):
                 reader.scale = float(arm.split()[1])
                 reader._dev = reader.scale / 3
@@ -74,10 +76,15 @@ def main():
                 if capture:
                     body.update(capture=capture[0], scale=float(capture[1]))
                 response = client.req("POST", "/wda/fastOCR", body, timeout=6)
-                lines = [line["text"] for line in response["value"]["lines"]]
+                value = response["value"]
+                if value.get("mode") != mode:
+                    raise RuntimeError("Vision mode mismatch")
+                if args.capture_study:
+                    provenance = effective_image(value, body)
+                lines = [line["text"] for line in value["lines"]]
             elapsed = (time.perf_counter()-start)*1000
             seen = tokens(lines)
-            print(json.dumps(dict(arm=arm, ms=elapsed, found=[w for w in WORDS if w.casefold() in seen])), flush=True)
+            print(json.dumps(dict(arm=arm, ms=elapsed, found=[w for w in WORDS if w.casefold() in seen], **provenance)), flush=True)
     finally:
         subprocess.run([sys.executable,"-m","turbotap","flow","open:com.apple.calculator"],
                        capture_output=True, timeout=12, check=True)
