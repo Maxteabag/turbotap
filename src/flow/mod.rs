@@ -104,7 +104,11 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   settle                wait until two frames in a row are identical
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
-taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.";
+taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.
+with allowed_apps in config.json (or TURBOTAP_ALLOWED_APPS / --allow-app), every input step is refused unless
+the live foreground app is on that list; open:/launch: check the target app, url: is refused (iOS picks the receiving app).
+--no-deny never disables this app guard. while a configured stop_file (or TURBOTAP_STOP_FILE) exists,
+flow/unlock/deploy/tap-ocr/otp-type exit 6 before contacting WDA.";
 
 /// Verbs that run host Tesseract OCR (the CLI warms libtesseract engines only for these).
 /// Note: `read:vision*` and directional `swipe:left|right|up|down` are filtered out in
@@ -401,7 +405,34 @@ impl<R: Reader> Flow<R> {
     }
 
     /// Run one step; returns its result (string, number) or None.
+    ///
+    /// With the app guard on ([`crate::guard`]), an input step first checks the live
+    /// foreground app, `url:` is refused, and any refusal during the step
+    /// (even one a step swallowed, like `tapif:`) fails it with
+    /// [`Error::AppGuard`].
     pub fn step(&mut self, spec: &str) -> Result<Option<Value>> {
+        if !self.c.app_guard_active() {
+            return self.step_inner(spec);
+        }
+        let label = safe_step(spec);
+        let prev = self.c.guard_action.replace(label.clone());
+        let res = self.guarded_step(spec, &label);
+        self.c.guard_action = prev;
+        self.c.guard_result(res)
+    }
+
+    fn guarded_step(&mut self, spec: &str, label: &str) -> Result<Option<Value>> {
+        let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
+        let verb = verb.trim().to_lowercase();
+        if crate::guard::step_is_input(&verb, arg) {
+            self.c.ensure_allowed_app(label, None)?;
+        } else if verb == "url" {
+            self.c.ensure_url_allowed(label)?;
+        }
+        self.step_inner(spec)
+    }
+
+    fn step_inner(&mut self, spec: &str) -> Result<Option<Value>> {
         let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
         let verb_trimmed = verb.trim();
         let verb: std::borrow::Cow<'_, str> =
@@ -427,8 +458,11 @@ impl<R: Reader> Flow<R> {
                 self.switched_from_app_name = None;
             }
             "open" | "launch" => {
-                self.mark_action(false, false);
                 let bid = crate::apps::resolve_app(arg, &self.c.udid, &self.c.base_url, &self.c.cache_dir)?;
+                // The target must be allowed; what is in front now does not matter.
+                let label = self.c.guard_action.clone().unwrap_or_else(|| safe_step(spec));
+                self.c.ensure_allowed_target(&label, Some(&bid))?;
+                self.mark_action(false, false);
                 let bundle_changed = self.bundle.as_deref() != Some(bid.as_str());
                 if verb.as_ref() == "launch" {
                     let r = self.c.fast_launch(&bid, true);
@@ -909,6 +943,7 @@ impl<R: Reader> Flow<R> {
             Error::Value(m) => Error::Value(f(m)),
             Error::Os(m) => Error::Os(f(m)),
             Error::Subprocess { cmd, code } => Error::Subprocess { cmd: f(cmd), code },
+            Error::AppGuard(m) => Error::AppGuard(f(m)),
         }
     }
 
@@ -1050,8 +1085,11 @@ pub fn cmd_tap_ocr(client: WdaClient, text: &str) -> Result<()> {
         ScreenReader::default_reader()
     };
     let mut flow = Flow::new(client, reader, 8.0, Some(DENY_DEFAULT), false)?;
+    flow.c.guard_action = Some("tap-ocr".into());
+    flow.c.ensure_allowed_app("tap-ocr", None)?;
     let t0 = clock::real_now();
-    let m: Match = flow.tap_text(text)?;
+    let m = flow.tap_text(text);
+    let m: Match = flow.c.guard_result(m)?;
     crate::outln!(
         "{}",
         json::dumps(&j!({"ok": true, "matched": m.text, "x": m.x, "y": m.y, "ms": ((clock::real_now() - t0) * 1000.0).round() as i64}))

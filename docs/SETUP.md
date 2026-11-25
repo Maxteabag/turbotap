@@ -57,7 +57,8 @@ Create `~/.config/turbotap/config.json` (`chmod 600`):
   "devices": {
     "iphone": {
       "url": "http://192.168.1.50:8100",
-      "udid": "000081XX-XXXXXXXXXXXXXXXX"
+      "udid": "000081XX-XXXXXXXXXXXXXXXX",
+      "allowed_apps": ["com.example.app"]
     }
   },
   "app_prefer": {

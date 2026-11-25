@@ -3,7 +3,7 @@
 //!
 //! Env vars: `WDA_CONFIG`, `WDA_URL`, `WDA_DEVICE`, `WDA_UDID` (`IPHONE_UDID`),
 //! `WDA_MAC_HOST`, `WDA_PASSCODE`, `WDA_PASSCODE_CMD`, `TURBOTAP_TYPING_FREQ`,
-//! `TURBOTAP_DAEMON`, `WDA_OCR`, `TESSDATA_PREFIX`, `WDA_TURBO`,
+//! `TURBOTAP_DAEMON`, `TURBOTAP_ALLOWED_APPS`, `TURBOTAP_STOP_FILE`, `WDA_OCR`, `TESSDATA_PREFIX`, `WDA_TURBO`,
 //! `WDA_CONDITIONAL_SHOT`, `WDA_OCR_WORKERS`.
 //!
 //! Everything is read at call time (or per [`reload`]) so the warm daemon applies
@@ -51,6 +51,10 @@ pub struct Config {
     pub mac_host: String,
     /// `app_prefer` with casefolded keys.
     pub app_prefer: HashMap<String, String>,
+    /// Why config.json exists but could not be used (unreadable, not a JSON object,
+    /// or changing while read). None when it loaded or is genuinely absent. The app
+    /// guard fails every input closed while this is set.
+    pub load_error: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -93,11 +97,18 @@ impl FileStamp {
     }
 }
 
-/// Read a UTF-8 file and return `(contents, Some(stamp))` only when the path
-/// resolves to the same `(dev, ino, ctime, mtime, len)` before and after reading
-/// and the byte count matches `len`. If the file changed mid-read, returns
-/// `Ok((contents, None))` so callers never cache an unstable snapshot.
-pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Option<FileStamp>)> {
+/// How a read relates to concurrent changes of the file.
+pub(crate) enum ReadStability {
+    /// Same `(dev, ino, ctime, mtime, len)` before and after, old enough to cache.
+    Stable(FileStamp),
+    /// Unchanged during the read, but too recent to cache (see [`RACY_WINDOW`]).
+    Racy,
+    /// The file changed while it was read.
+    Changed,
+}
+
+/// Read a UTF-8 file and say whether the contents are a consistent snapshot.
+pub(crate) fn read_to_string_checked(path: &Path) -> std::io::Result<(String, ReadStability)> {
     use std::io::Read;
     let abs = crate::skills::abspath(path);
     let mut f = std::fs::File::open(path)?;
@@ -105,48 +116,148 @@ pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Op
     let mut s = String::new();
     f.read_to_string(&mut s)?;
     let after = std::fs::metadata(path).ok().map(|m| FileMetaStamp::from(&m));
-    let stamp = if after.as_ref() == Some(&before) && s.len() as u64 == before.len {
-        Some(FileStamp { path: abs, meta: before })
+    let st = if after.as_ref() != Some(&before) || s.len() as u64 != before.len {
+        ReadStability::Changed
+    } else if before.is_racy() {
+        ReadStability::Racy
     } else {
-        None
+        ReadStability::Stable(FileStamp { path: abs, meta: before })
     };
-    Ok((s, stamp))
+    Ok((s, st))
 }
 
-fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>) {
+/// Read a UTF-8 file and return `(contents, Some(stamp))` only when the path
+/// resolves to the same `(dev, ino, ctime, mtime, len)` before and after reading,
+/// the byte count matches `len`, and the stamp is not racy. Otherwise
+/// `Ok((contents, None))` so callers never cache an unstable or ambiguous snapshot.
+pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Option<FileStamp>)> {
+    let (s, st) = read_to_string_checked(path)?;
+    Ok((s, if let ReadStability::Stable(stamp) = st { Some(stamp) } else { None }))
+}
+
+/// A stamp younger than this cannot be trusted: file timestamps come from a coarse
+/// kernel clock (a few ms), so a same-length rewrite within the same tick would keep
+/// an identical `(ctime, mtime, len)` and a cache would serve the old contents
+/// forever (git's "racy" files). Such reads are used but never cached.
+pub(crate) const RACY_WINDOW: f64 = 0.05;
+
+impl FileMetaStamp {
+    fn is_racy(&self) -> bool {
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs_f64(),
+            Err(_) => return true,
+        };
+        let t = |secs: i64, nsec: i64| secs as f64 + nsec as f64 / 1e9;
+        let newest = t(self.ctime, self.ctime_nsec).max(t(self.mtime, self.mtime_nsec));
+        now - newest <= RACY_WINDOW
+    }
+}
+
+/// Test helper: wait until files written so far are old enough to be cached.
+#[cfg(test)]
+pub(crate) fn settle_racy_window() {
+    std::thread::sleep(std::time::Duration::from_secs_f64(RACY_WINDOW + 0.03));
+}
+
+/// An existing symlink among `p`'s ancestors whose target cannot be resolved.
+fn broken_link_ancestor(p: &Path) -> Option<PathBuf> {
+    p.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).find_map(|a| {
+        let lm = std::fs::symlink_metadata(a).ok()?;
+        (lm.file_type().is_symlink() && std::fs::metadata(a).is_err()).then(|| a.to_path_buf())
+    })
+}
+
+/// `metadata(p)`, telling a genuinely absent entry (Ok(None)) apart from one that
+/// exists but cannot be resolved: a dangling or unreadable symlink at `p` or on its
+/// path, permissions, I/O (Err). Only the former may mean "no config".
+pub(crate) fn stat_config_entry(p: &Path) -> std::result::Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(p) {
+        Ok(lm) => match std::fs::metadata(p) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if lm.file_type().is_symlink() => Err(format!("{} is a link whose target cannot be read: {e}", p.display())),
+            Err(e) => Err(format!("cannot stat {}: {e}", p.display())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match broken_link_ancestor(p) {
+            Some(a) => Err(format!("{} cannot be resolved: {} is a link whose target is missing", p.display(), a.display())),
+            None => Ok(None),
+        },
+        Err(e) => Err(format!("cannot stat {}: {e}", p.display())),
+    }
+}
+
+/// Where config.json is: `(path, metadata, stat error)`. Metadata None and no error
+/// means genuinely absent; an entry that exists but cannot be resolved (dangling
+/// symlink, permissions, I/O) is reported so it is never mistaken for "no config".
+fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>, Option<String>) {
+    let stat = stat_config_entry;
     if let Some(p) = env_nonempty("WDA_CONFIG") {
         let ep = expanduser(&p);
-        let meta = std::fs::metadata(&ep).ok();
-        return (ep, meta);
+        return match stat(&ep) {
+            Ok(m) => (ep, m, None),
+            Err(e) => (ep, None, Some(e)),
+        };
     }
     let h = home();
     let primary = h.join(".config/turbotap/config.json");
-    if let Ok(m) = std::fs::metadata(&primary) {
-        return (primary, Some(m));
+    match stat(&primary) {
+        Ok(Some(m)) => return (primary, Some(m), None),
+        Ok(None) => {}
+        Err(e) => return (primary, None, Some(e)),
     }
     let legacy = h.join(".config/iphone-wda/config.json");
-    if let Ok(m) = std::fs::metadata(&legacy) {
-        return (legacy, Some(m));
+    match stat(&legacy) {
+        Ok(Some(m)) => return (legacy, Some(m), None),
+        Ok(None) => {}
+        Err(e) => return (legacy, None, Some(e)),
     }
-    (primary, None)
+    (primary, None, None)
+}
+
+/// Read and parse config.json, retrying a read that raced a writer. Ok(Some(stamp))
+/// only for a stable read.
+fn read_config_object(path: &Path) -> std::result::Result<(Value, Option<FileStamp>), String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let (text, st) = read_to_string_checked(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let stamp = match st {
+            ReadStability::Stable(stamp) => Some(stamp),
+            // A consistent but very recent snapshot: use it, never cache it.
+            ReadStability::Racy => None,
+            ReadStability::Changed => {
+                last = format!("{} changed while being read", path.display());
+                continue;
+            }
+        };
+        return match serde_json::from_str::<Value>(&text) {
+            Ok(v) if v.is_object() => Ok((v, stamp)),
+            Ok(_) => Err(format!("{} is not a JSON object", path.display())),
+            Err(e) => Err(format!("{} is not valid JSON: {e}", path.display())),
+        };
+    }
+    Err(last)
 }
 
 fn load_config_from(
     path: PathBuf,
     exists: bool,
+    stat_error: Option<String>,
     mac_host_env: Option<&str>,
 ) -> (Config, Option<String>, Option<FileStamp>) {
     let mut cache_stamp = None;
-    let raw = if exists {
-        match read_to_string_stamped(&path) {
-            Ok((s, stable_stamp)) => match serde_json::from_str::<Value>(&s) {
-                Ok(v) if v.is_object() => {
-                    cache_stamp = stable_stamp;
-                    v
-                }
-                _ => Value::Object(Default::default()),
-            },
-            Err(_) => Value::Object(Default::default()),
+    let mut load_error = stat_error;
+    let raw = if exists && load_error.is_none() {
+        match read_config_object(&path) {
+            Ok((v, stamp)) => {
+                cache_stamp = stamp;
+                v
+            }
+            Err(e) => {
+                load_error = Some(e);
+                Value::Object(Default::default())
+            }
         }
     } else {
         Value::Object(Default::default())
@@ -164,14 +275,14 @@ fn load_config_from(
             }
         }
     }
-    (Config { path, raw, mac_host, app_prefer }, file_mac_host, cache_stamp)
+    (Config { path, raw, mac_host, app_prefer, load_error }, file_mac_host, cache_stamp)
 }
 
 impl Config {
     pub fn load() -> Config {
-        let (path, meta) = resolve_config_path_and_meta();
+        let (path, meta, stat_error) = resolve_config_path_and_meta();
         let mac_host_env = env_nonempty("WDA_MAC_HOST");
-        load_config_from(path, meta.is_some(), mac_host_env.as_deref()).0
+        load_config_from(path, meta.is_some(), stat_error, mac_host_env.as_deref()).0
     }
 
     pub fn get(&self, key: &str) -> &Value {
@@ -207,7 +318,7 @@ pub fn current() -> Arc<Config> {
 /// Skips re-reading and re-parsing `config.json` only when the resolved path and
 /// `(dev, ino, ctime, mtime, len)` match a previously verified stable read.
 pub fn reload() -> Arc<Config> {
-    let (path, meta) = resolve_config_path_and_meta();
+    let (path, meta, stat_error) = resolve_config_path_and_meta();
     let lookup_stamp = meta.as_ref().map(|m| FileStamp::from_meta(&path, m));
     let mac_host_env = env_nonempty("WDA_MAC_HOST");
     if let Some(ref cur_stamp) = lookup_stamp {
@@ -239,7 +350,7 @@ pub fn reload() -> Arc<Config> {
             }
         }
     }
-    let (cfg, file_mac_host, cache_stamp) = load_config_from(path, meta.is_some(), mac_host_env.as_deref());
+    let (cfg, file_mac_host, cache_stamp) = load_config_from(path, meta.is_some(), stat_error, mac_host_env.as_deref());
     let mut guard = CURRENT.write().unwrap_or_else(|e| e.into_inner());
     if let (Some(ref stamp), Some(cached)) = (&cache_stamp, guard.as_ref()) {
         if cached.stamp.as_ref() == Some(stamp)
@@ -286,40 +397,117 @@ pub fn override_cache_dir(p: &Path) -> CacheDirGuard {
     CacheDirGuard(prev)
 }
 
-/// `(url, udid, device_key)` from CLI args, env and config.json.
+/// Which device-identity sources outrank config.json for this invocation:
+/// `(url override, udid override, device chosen explicitly)` from CLI args and env
+/// (same precedence as [`resolve_device_settings`]). The app guard uses them to pick
+/// the policy of the device actually addressed.
+pub fn device_overrides(url_arg: Option<&str>, device_arg: Option<&str>, udid_arg: Option<&str>) -> (Option<String>, Option<String>, bool) {
+    let url = url_arg.filter(|s| !s.is_empty()).map(String::from).or_else(|| env_nonempty("WDA_URL"));
+    let udid = udid_arg
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| env_nonempty("WDA_UDID"))
+        .or_else(|| env_nonempty("IPHONE_UDID"));
+    let explicit = device_arg.is_some_and(|s| !s.is_empty()) || env_nonempty("WDA_DEVICE").is_some();
+    (url, udid, explicit)
+}
+
+/// The device key named by `--device`, `WDA_DEVICE` or `default_device` (same
+/// precedence as [`resolve_device_settings`]).
+pub fn selected_device_key(device_arg: Option<&str>) -> Option<String> {
+    device_arg
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| env_nonempty("WDA_DEVICE"))
+        .or_else(|| current().get("default_device").as_str().filter(|s| !s.is_empty()).map(String::from))
+}
+
+/// The device one invocation talks to, resolved once so the WDA endpoint, UDID,
+/// device key, allowlist and stop file all describe the same phone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceTarget {
+    /// WDA base URL (None: nothing configured; the caller reports it).
+    pub url: Option<String>,
+    pub udid: String,
+    /// The config.json device key the endpoint belongs to (or the unconfigured name
+    /// given with `--device`/`WDA_DEVICE`).
+    pub dev_key: Option<String>,
+    /// Set when the selected device and the `--url`/`--udid` overrides contradict
+    /// each other or match several records ([`crate::guard::policy_device`]). Then
+    /// nothing may act on a phone; `url`/`udid` fall back to the plain precedence
+    /// (override, else the selected record) so read-only commands still work.
+    pub identity_error: Option<String>,
+    /// The socket addresses `url` resolved to while the identity was checked; the
+    /// client connects only to these ([`crate::wda::WdaClient::pin_addrs`]).
+    pub addrs: Vec<std::net::SocketAddr>,
+}
+
+/// Resolve the target device from CLI args, env and config.json. Overrides
+/// (`--url`/`WDA_URL`, `--udid`/`WDA_UDID`/`IPHONE_UDID`) pick the configured
+/// device they describe, and its other fields come from that same record: a
+/// URL-only override for device B uses B's UDID and key, a UDID-only override for B
+/// connects to B's URL.
+pub fn resolve_target(url_arg: Option<&str>, device_arg: Option<&str>, udid_arg: Option<&str>) -> DeviceTarget {
+    let cfg = current();
+    let (url_ov, udid_ov, explicit) = device_overrides(url_arg, device_arg, udid_arg);
+    let selected = selected_device_key(device_arg);
+    let devices = cfg.get("devices");
+    let rec = |k: &str| crate::json::get(devices, k);
+    let str_of = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let fields = |r: &Value| {
+        (
+            url_ov.clone().or_else(|| str_of(crate::json::get(r, "url"))),
+            udid_ov.clone().or_else(|| str_of(crate::json::get(r, "udid"))).unwrap_or_default(),
+        )
+    };
+    let mut ids = crate::guard::EndpointIds::default();
+    let resolved = crate::guard::policy_device_with(
+        &cfg.raw,
+        selected.as_deref(),
+        explicit,
+        url_ov.as_deref(),
+        udid_ov.as_deref(),
+        &mut ids,
+    );
+    let mut t = match resolved {
+        Ok(Some(k)) => {
+            let (url, udid) = fields(rec(&k));
+            DeviceTarget { url, udid, dev_key: Some(k), identity_error: None, addrs: Vec::new() }
+        }
+        Ok(None) => {
+            // No configured record: only overrides (or an unconfigured --device name).
+            let (url, udid) = fields(&crate::json::NULL);
+            DeviceTarget { url, udid, dev_key: selected, identity_error: None, addrs: Vec::new() }
+        }
+        Err(e) => {
+            let (url, udid) = fields(selected.as_deref().map(rec).unwrap_or(&crate::json::NULL));
+            DeviceTarget { url, udid, dev_key: selected, identity_error: Some(e), addrs: Vec::new() }
+        }
+    };
+    // The same resolution the identity check used (cached), so the transport can be
+    // bound to exactly the addresses that were checked.
+    if let Some(u) = t.url.as_deref() {
+        t.addrs = ids.addrs(u).unwrap_or_default();
+    }
+    t
+}
+
+/// `(url, udid, device_key)` of [`resolve_target`]; Err when no WDA URL is configured.
 pub fn resolve_device_settings(
     url_arg: Option<&str>,
     device_arg: Option<&str>,
     udid_arg: Option<&str>,
 ) -> Result<(String, String, Option<String>)> {
-    let cfg = current();
-    let devices = cfg.get("devices");
-    let dev_key: Option<String> = device_arg
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| env_nonempty("WDA_DEVICE"))
-        .or_else(|| cfg.get("default_device").as_str().filter(|s| !s.is_empty()).map(String::from));
-    let dev = dev_key.as_deref().map(|k| crate::json::get(devices, k)).unwrap_or(&crate::json::NULL);
-    let str_of = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(String::from);
-    let url = url_arg
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| env_nonempty("WDA_URL"))
-        .or_else(|| str_of(crate::json::get(dev, "url")));
-    let udid = udid_arg
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| env_nonempty("WDA_UDID"))
-        .or_else(|| env_nonempty("IPHONE_UDID"))
-        .or_else(|| str_of(crate::json::get(dev, "udid")))
-        .unwrap_or_default();
-    let Some(url) = url else {
-        return Err(Error::runtime(format!(
-            "No WDA URL configured. Pass --url http://<iphone-ip>:8100, set WDA_URL, or configure {}",
-            cfg.path.display()
-        )));
-    };
-    Ok((url, udid, dev_key))
+    let t = resolve_target(url_arg, device_arg, udid_arg);
+    let url = t.url.ok_or_else(no_url_error)?;
+    Ok((url, t.udid, t.dev_key))
+}
+
+pub fn no_url_error() -> Error {
+    Error::runtime(format!(
+        "No WDA URL configured. Pass --url http://<iphone-ip>:8100, set WDA_URL, or configure {}",
+        current().path.display()
+    ))
 }
 
 /// Run a shell-split credential command and return its stdout (Python
@@ -434,6 +622,10 @@ mod unit {
         std::fs::write(&cfg_path, r#"{"mac_host":"mini-1","app_prefer":{"Mail":"com.apple.mobilemail"}}"#).unwrap();
         let p = cfg_path.to_string_lossy().into_owned();
         let _e = set_env(&[("WDA_CONFIG", Some(p.as_str())), ("WDA_MAC_HOST", None)]);
+        // A just-written file is never cached (racy stamp); once it is older, it is.
+        let c0 = reload();
+        assert!(!Arc::ptr_eq(&c0, &reload()), "a just-written config.json must not be cached");
+        settle_racy_window();
         let c1 = reload();
         let c2 = reload();
         assert!(Arc::ptr_eq(&c1, &c2), "unchanged config.json should reuse cached Arc<Config>");

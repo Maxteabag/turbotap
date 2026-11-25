@@ -78,11 +78,14 @@ Create `~/.config/turbotap/config.json`:
   "devices": {
     "iphone": {
       "url": "http://192.168.1.50:8100",
-      "udid": "000081XX-XXXXXXXXXXXXXXXX"
+      "udid": "000081XX-XXXXXXXXXXXXXXXX",
+      "allowed_apps": ["com.example.app"]
     }
   }
 }
 ```
+
+`allowed_apps` is optional but recommended: it turns on the app guard (see [Safety and quirks](#safety-and-quirks)).
 
 Deploy and start the patched WebDriverAgent on the iPhone (over SSH to the Mac in `mac_host`), then make sure it responds:
 
@@ -138,6 +141,26 @@ If you don't want to patch WDA, `turbotap` still works against stock WDA and fal
 ## Safety and quirks
 
 By default, `turbotap` blocks taps on buttons matching `Send`, `Pay`, `Buy`, `Delete`, `Cancel booking`, or `Start call` (`--deny`). Pass `--no-deny` when you actually want it to press one of those.
+
+**App guard.** List the apps `turbotap` may control in `allowed_apps` (per device under `devices.<name>`, or top-level for all devices; a device's own list wins). With a list in place, every input (`tap:`, `tapxy:`, `tapel:`, `tapif:`, `tapbatch:`, `toggle:`, `slider:`, `picker:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `scroll:`, `scrollto:`, `back`, `type:`, `cleartype:`, `typedigits:`, `pintap:`, `key:`, `search:`, `dismisskb`, `setclip:`, `alert:accept|dismiss`, `tap-ocr`, `otp-type`) first asks WDA which app is in front (`/wda/activeAppInfo`, live, never cached) and is refused unless that app is on the list. The check runs again right before every request that would touch the screen, so an app switch in the middle of a step is caught too. If WDA can't say which app is in front, or answers with an error (an HTTP error, an `error` field, or a nonzero `status`), the action is refused. Only an HTTP 2xx answer counts. If `config.json` exists but can't be read or parsed (including a symlink whose target is missing), every input is refused until it is valid again (read-only commands still work); only a missing file means no list. `turbotap` resolves one device per run: with `--url`/`WDA_URL` or `--udid`/`WDA_UDID` it is the configured device at that endpoint (compared the way turbotap connects: host and port as parsed, and resolved addresses, so `localhost`, `127.1`, the IPv4-mapped `[::ffff:127.0.0.1]` or a zero-padded port all count as the same endpoint; turbotap then connects only to the addresses it checked) or with that UDID, and its URL, UDID, `allowed_apps` and `stop_file` are all used together (a UDID-only override connects to that device's URL). A `--device`/`WDA_DEVICE` that names a different device, several matching devices, two devices configured at the same endpoint, a `--udid` that contradicts the device at that URL or belongs to another configured device, a host name that resolves to a device plus other addresses, a configured host name on the same port that cannot be looked up right now, or a default device used with an endpoint no device in `config.json` has, makes `flow`, `unlock`, `deploy`, `tap-ocr` and `otp-type` stop with exit 6 before any request. A fixed `tapbatch:fixed:` or `pintap:` sends one touch at a time while the guard is on, so the check runs before each touch. A refusal stops the run with exit 1 and nothing is sent:
+
+```text
+turbotap: app guard refused tap:Message: foreground app 'com.example.other' is not in allowlist [com.example.app] (use --allow-app <bundle_id> for this run)
+```
+
+- `open:APP` / `launch:APP` check the target app instead, so a flow can start from the Home Screen: `open:com.example.app` works, opening an app that isn't listed is refused before anything is launched.
+- `url:` is refused while the guard is on: iOS decides which app receives a URL (any scheme, and even `https://` links can open another app as a universal link), so no list entry can vouch for it. Use `open:<bundle_id>` and navigate inside the app.
+- `unlock` may type the passcode on the lock screen, and `home` is always allowed.
+- Read-only steps (`read`, `ui`, `ocr`, `wait:`, `assert:`, `alert:text`, `clipboard`, `shot:`, `preflight`, `tree`, `screenshot`) work in any app.
+- `--allow-app BUNDLE_ID` (repeatable, before or after `flow`/`tap-ocr`/`otp-type`) adds an app for one run; `TURBOTAP_ALLOWED_APPS=a,b` adds apps for every run in that environment. Neither can remove an app from the configured list, and with no config they turn the guard on by themselves.
+- `--no-deny` only turns off the label filter above. It never weakens the app guard.
+
+**Stop file.** Set `"stop_file": "/path/to/stop.file"` (per device under `devices.<name>`, or top-level for devices without their own) and/or `TURBOTAP_STOP_FILE=/path/to/stop.file`. While any of these paths exists on the machine running `turbotap`, `deploy`, `unlock`, `flow`, `tap-ocr` and `otp-type` stop at once with exit code 6, before any request to WDA, and nothing retries. Read-only commands (`preflight`, `ocr`, `tree`, `screenshot`, `vision-ocr`) still work. A symlink counts even if its target is missing, and if the path can't be checked (permissions, a file where a directory should be) or `config.json` can't be read, the commands are refused too. `--no-deny` and `--allow-app` don't change this, and the warm daemon checks it for every request. Create the file to freeze the phone, delete it to continue:
+
+```bash
+touch ~/turbotap.stop      # with "stop_file": "~/turbotap.stop" in config.json
+rm ~/turbotap.stop
+```
 
 `tap:TEXT` prefers a button, app keypad `Key`, or link labelled exactly `TEXT` over a longer OCR line (`tap:"Sign In"` won't hit `Sign in with another account`), and deprioritizes iOS status-bar matches (`y < 54`) behind in-app text unless targeted explicitly. `wait:TEXT` is OCR-first and falls back to the accessibility tree for low-contrast or colored buttons, while `gone:TEXT` polls until a spinner or sheet disappears. Tapping a switch row's label flips the switch itself, and `Next`/`Previous` pick the form's button over the keyboard toolbar's copy. When a step fails, the JSON lists the visible text and the top 30 interactive controls with their exact labels.
 
