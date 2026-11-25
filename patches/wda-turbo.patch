@@ -1,8 +1,16 @@
 diff --git a/WebDriverAgentLib/Commands/FBCustomCommands.m b/WebDriverAgentLib/Commands/FBCustomCommands.m
-index 6dee73b..fbf238c 100644
+index 6dee73b..80d8c67 100644
 --- a/WebDriverAgentLib/Commands/FBCustomCommands.m
 +++ b/WebDriverAgentLib/Commands/FBCustomCommands.m
-@@ -35,6 +35,67 @@
+@@ -14,6 +14,7 @@
+ #import <XCTest/XCUIDevice.h>
+ #import <CoreLocation/CoreLocation.h>
+ 
++#import "FBElementCommands.h"
+ #import "FBConfiguration.h"
+ #import "FBKeyboard.h"
+ #import "FBNotificationsHelper.h"
+@@ -35,6 +36,67 @@
  #import "XCUIElement+FBIsVisible.h"
  #import "XCUIElementQuery.h"
  #import "FBUnattachedAppLauncher.h"
@@ -70,7 +78,15 @@ index 6dee73b..fbf238c 100644
  
  @implementation FBCustomCommands
  
-@@ -75,6 +136,8 @@
+@@ -50,6 +112,7 @@
+     [[FBRoute POST:@"/wda/lock"] respondWithTarget:self action:@selector(handleLock:)],
+     [[FBRoute POST:@"/wda/unlock"].withoutSession respondWithTarget:self action:@selector(handleUnlock:)],
+     [[FBRoute POST:@"/wda/unlock"] respondWithTarget:self action:@selector(handleUnlock:)],
++    [[FBRoute GET:@"/wda/fastPreflight"] respondWithTarget:self action:@selector(handleFastPreflight:)],
+     [[FBRoute GET:@"/wda/locked"].withoutSession respondWithTarget:self action:@selector(handleIsLocked:)],
+     [[FBRoute GET:@"/wda/locked"] respondWithTarget:self action:@selector(handleIsLocked:)],
+     [[FBRoute GET:@"/wda/screen"] respondWithTarget:self action:@selector(handleGetScreen:)],
+@@ -75,6 +138,8 @@
      [[FBRoute POST:@"/wda/expectNotification"] respondWithTarget:self action:@selector(handleExpectNotification:)],
      [[FBRoute POST:@"/wda/siri/activate"] respondWithTarget:self action:@selector(handleActivateSiri:)],
      [[FBRoute POST:@"/wda/apps/launchUnattached"].withoutSession respondWithTarget:self action:@selector(handleLaunchUnattachedApp:)],
@@ -79,7 +95,56 @@ index 6dee73b..fbf238c 100644
      [[FBRoute GET:@"/wda/device/hingeAngle"] respondWithTarget:self action:@selector(handleGetSimulatedHingeAngle:)],
      [[FBRoute GET:@"/wda/device/hingeAngle"].withoutSession respondWithTarget:self action:@selector(handleGetSimulatedHingeAngle:)],
      [[FBRoute POST:@"/wda/device/hingeAngle"] respondWithTarget:self action:@selector(handleSetSimulatedHingeAngle:)],
-@@ -386,6 +449,81 @@
+@@ -207,8 +272,12 @@
+ 
+ + (id<FBResponsePayload>)handleIsLocked:(FBRouteRequest *)request
+ {
+-  BOOL isLocked = [XCUIDevice sharedDevice].fb_isScreenLocked;
+-  return FBResponseWithObject(isLocked ? @YES : @NO);
++  return FBResponseWithObject([self screenLocked]);
++}
++
+++ (NSNumber *)screenLocked
++{
++  return @([XCUIDevice sharedDevice].fb_isScreenLocked);
+ }
+ 
+ + (id<FBResponsePayload>)handleUnlock:(FBRouteRequest *)request
+@@ -222,16 +291,30 @@
+ 
+ + (id<FBResponsePayload>)handleActiveAppInfo:(FBRouteRequest *)request
+ {
+-  XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
++  return FBResponseWithObject([self activeAppInfoForSession:request.session]);
++}
++
+++ (NSDictionary *)activeAppInfoForSession:(FBSession *)session
++{
++  XCUIApplication *app = session.activeApplication ?: XCUIApplication.fb_activeApplication;
+   // .identifier can be nil if the app stopped answering accessibility requests
+   // and accessibilityDeadline aborted the underlying snapshot fetch (#1210).
+   NSString *name = app.identifier ?: @"unknown";
+-  return FBResponseWithObject(@{
++  return @{
+     @"pid": @(app.processID),
+     @"bundleId": app.bundleID,
+     @"name": name,
+     @"processArguments": [self processArguments:app],
+-  });
++  };
++}
++
+++ (id<FBResponsePayload>)handleFastPreflight:(FBRouteRequest *)request
++{
++  NSNumber *locked = [self screenLocked];
++  // Python reads activeAppInfo without a session, then window/size with one.
++  NSString *bundle = [self activeAppInfoForSession:nil][@"bundleId"];
++  NSDictionary *size = [FBElementCommands windowSizeForRequest:request];
++  return FBResponseWithObject(@{@"locked": locked, @"bundleId": bundle, @"size": size});
+ }
+ 
+ /**
+@@ -386,6 +469,81 @@
    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"LSApplicationWorkspace failed to launch app" traceback:nil]);
  }
  
@@ -161,8 +226,21 @@ index 6dee73b..fbf238c 100644
  + (id <FBResponsePayload>)handleResetAppAuth:(FBRouteRequest *)request
  {
    NSNumber *resource = request.arguments[@"resource"];
+diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.h b/WebDriverAgentLib/Commands/FBDebugCommands.h
+index 99728e0..9ba0407 100644
+--- a/WebDriverAgentLib/Commands/FBDebugCommands.h
++++ b/WebDriverAgentLib/Commands/FBDebugCommands.h
+@@ -14,6 +14,8 @@ NS_ASSUME_NONNULL_BEGIN
+ 
+ @interface FBDebugCommands : NSObject <FBCommandHandler>
+ 
+++ (nullable NSDictionary *)fastUIPayloadForRequest:(FBRouteRequest *)request;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
 diff --git a/WebDriverAgentLib/Commands/FBDebugCommands.m b/WebDriverAgentLib/Commands/FBDebugCommands.m
-index 42ea74b..9eb5996 100644
+index 42ea74b..6e7fe08 100644
 --- a/WebDriverAgentLib/Commands/FBDebugCommands.m
 +++ b/WebDriverAgentLib/Commands/FBDebugCommands.m
 @@ -8,13 +8,193 @@
@@ -368,14 +446,14 @@ index 42ea74b..9eb5996 100644
    ];
  }
  
-@@ -78,4 +260,113 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
+@@ -78,4 +260,122 @@ static NSString *const SOURCE_FORMAT_DESCRIPTION = @"description";
    return FBResponseWithObject(application.fb_accessibilityTree ?: @{});
  }
  
 +// wda-turbo: single-snapshot on-device UI control walk (zero per-node customActions /
 +// accessibility IPC, prunes off-screen cells, skips soft-keyboard keys, compact JSON).
 +// Optional query params: ?text=1&waitBundle=<bundleId>&waitMs=<ms> (capped at 2000 ms).
-++ (id<FBResponsePayload>)handleFastUI:(FBRouteRequest *)request
+++ (nullable NSDictionary *)fastUIPayloadForRequest:(FBRouteRequest *)request
 +{
 +  XCUIApplication *application = XCUIApplication.fb_activeApplication;
 +  NSString *waitBundle = request.parameters[@"waitBundle"];
@@ -404,7 +482,7 @@ index 42ea74b..9eb5996 100644
 +    snapshot = [application fb_standardSnapshot];
 +  }
 +  if (nil == snapshot) {
-+    return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
++    return nil;
 +  }
 +  CGRect rootFrame = snapshot.frame;
 +  BOOL rootValid = isfinite(rootFrame.size.width) && isfinite(rootFrame.size.height)
@@ -464,6 +542,15 @@ index 42ea74b..9eb5996 100644
 +      @"height": @((NSInteger)llround(kbRect.size.height)),
 +    };
 +  }
++  return payload;
++}
++
+++ (id<FBResponsePayload>)handleFastUI:(FBRouteRequest *)request
++{
++  NSDictionary *payload = [self fastUIPayloadForRequest:request];
++  if (nil == payload) {
++    return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
++  }
 +  NSError *jsonError = nil;
 +  NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload
 +                                                     options:(NSJSONWritingOptions)0
@@ -482,8 +569,25 @@ index 42ea74b..9eb5996 100644
 +}
 +
  @end
+diff --git a/WebDriverAgentLib/Commands/FBElementCommands.h b/WebDriverAgentLib/Commands/FBElementCommands.h
+index 3c07ee6..f879e91 100644
+--- a/WebDriverAgentLib/Commands/FBElementCommands.h
++++ b/WebDriverAgentLib/Commands/FBElementCommands.h
+@@ -12,8 +12,12 @@
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
++@class FBRouteRequest;
++
+ @interface FBElementCommands : NSObject <FBCommandHandler>
+ 
+++ (NSDictionary *)windowSizeForRequest:(FBRouteRequest *)request;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
 diff --git a/WebDriverAgentLib/Commands/FBElementCommands.m b/WebDriverAgentLib/Commands/FBElementCommands.m
-index 97afb7b..af67cca 100644
+index 97afb7b..e0a887c 100644
 --- a/WebDriverAgentLib/Commands/FBElementCommands.m
 +++ b/WebDriverAgentLib/Commands/FBElementCommands.m
 @@ -40,6 +40,14 @@
@@ -900,20 +1004,48 @@ index 97afb7b..af67cca 100644
  + (id<FBResponsePayload>)handlePinch:(FBRouteRequest *)request
  {
    XCUIElement *element = [self targetFromRequest:request];
+@@ -562,6 +955,11 @@
+ }
+ 
+ + (id<FBResponsePayload>)handleGetWindowSize:(FBRouteRequest *)request
++{
++  return FBResponseWithObject([self windowSizeForRequest:request]);
++}
++
+++ (NSDictionary *)windowSizeForRequest:(FBRouteRequest *)request
+ {
+   XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
+ 
+@@ -571,10 +969,10 @@
+ #else
+   CGSize screenSize = FBAdjustDimensionsForApplication(frame.size, app.interfaceOrientation);
+ #endif
+-  return FBResponseWithObject(@{
++  return @{
+     @"width": @(screenSize.width),
+     @"height": @(screenSize.height),
+-  });
++  };
+ }
+ 
+ 
 diff --git a/WebDriverAgentLib/Commands/FBScreenshotCommands.m b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
-index 9586a19..f647625 100644
+index 9586a19..7e8d419 100644
 --- a/WebDriverAgentLib/Commands/FBScreenshotCommands.m
 +++ b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
-@@ -9,6 +9,57 @@
+@@ -9,6 +9,74 @@
  #import "FBScreenshotCommands.h"
  
  #import "XCUIDevice+FBHelpers.h"
 +#import <ImageIO/ImageIO.h>
 +#import <math.h>
++#import <CommonCrypto/CommonDigest.h>
 +#import "FBScreenshot.h"
 +#import "FBCommandStatus.h"
 +#import "FBRouteRequest.h"
 +@import UniformTypeIdentifiers;
++#import "FBDebugCommands.h"
++@import Vision;
 +
 +// wda-turbo: downscale JPEG/PNG via ImageIO thumbnail subsampling (avoids full RGBA
 +// UIGraphicsImageRenderer redraw and per-call FBImageProcessor dispatch queue alloc).
@@ -959,24 +1091,45 @@ index 9586a19..f647625 100644
 +  CFRelease(thumb);
 +  return ok ? out : srcData;
 +}
++
++// wda-turbo: strong validator for conditional fastScreenshot, a quoted lowercase SHA-256 hex digest.
++static NSString *FBImageETag(NSData *data)
++{
++  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
++  CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
++  NSMutableString *tag = [NSMutableString stringWithCapacity:2 * CC_SHA256_DIGEST_LENGTH + 2];
++  [tag appendString:@"\""];
++  for (NSUInteger i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
++    [tag appendFormat:@"%02x", digest[i]];
++  }
++  [tag appendString:@"\""];
++  return tag;
++}
  
  @implementation FBScreenshotCommands
  
-@@ -20,6 +71,8 @@
+@@ -20,6 +88,12 @@
    @[
      [[FBRoute GET:@"/screenshot"].withoutSession.standalone respondWithTarget:self action:@selector(handleGetScreenshot:)],
      [[FBRoute GET:@"/screenshot"].standalone respondWithTarget:self action:@selector(handleGetScreenshot:)],
 +    [[FBRoute POST:@"/wda/fastScreenshot"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastScreenshot:)],
 +    [[FBRoute POST:@"/wda/fastScreenshot"].standalone respondWithTarget:self action:@selector(handleFastScreenshot:)],
++    [[FBRoute POST:@"/wda/fastOCR"].withoutSession.standalone respondWithTarget:self action:@selector(handleFastOCR:)],
++    [[FBRoute POST:@"/wda/fastOCR"].standalone respondWithTarget:self action:@selector(handleFastOCR:)],
++    [[FBRoute POST:@"/wda/fastRead"].withoutSession respondWithTarget:self action:@selector(handleFastRead:)],
++    [[FBRoute POST:@"/wda/fastRead"] respondWithTarget:self action:@selector(handleFastRead:)],
    ];
  }
  
-@@ -37,4 +90,37 @@
+@@ -37,4 +111,184 @@
    return FBResponseWithObject(screenshot);
  }
  
 +// wda-turbo: {"x0":0,"y0":460,"x1":430,"y1":700,"quality":0.8,"scale":1.0,"raw":true} (points) ->
 +// raw image/jpeg|image/png when "raw":true, or base64 JSON otherwise; scale < 1 downscales on-device.
++// Raw requests may add "etag":true for a quoted SHA-256 ETag of the final image bytes, and
++// "ifNoneMatch":"<etag>" to get HTTP 304 with an empty body when the fresh capture is identical.
++// Every request captures a new frame; the runner keeps no frames or validators between requests.
 ++ (id<FBResponsePayload>)handleFastScreenshot:(FBRouteRequest *)request
 +{
 +  NSDictionary *a = request.arguments ?: @{};
@@ -1003,17 +1156,161 @@ index 9586a19..f647625 100644
 +  id rawArg = a[@"raw"];
 +  if ([rawArg respondsToSelector:@selector(boolValue)] && [rawArg boolValue]) {
 +    NSString *ct = [uti conformsToType:UTTypePNG] ? @"image/png" : @"image/jpeg";
++    id etagArg = a[@"etag"];
++    id ifNoneMatch = a[@"ifNoneMatch"];
++    BOOL conditional = [ifNoneMatch isKindOfClass:NSString.class];
++    if (conditional || ([etagArg respondsToSelector:@selector(boolValue)] && [etagArg boolValue])) {
++      NSString *tag = FBImageETag(data);
++      return FBResponseWithRawDataETag(data, ct, tag, conditional && [tag isEqualToString:ifNoneMatch]);
++    }
 +    return FBResponseWithRawData(data, ct);
 +  }
 +  return FBResponseWithObject([data base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0]);
 +}
 +
++// The fused read takes the AX snapshot immediately after screenshot capture.
+++ (id<FBResponsePayload>)handleVisionRead:(FBRouteRequest *)request includeUI:(BOOL)includeUI
++{
++  NSDictionary *args = request.arguments;
++  id mode = args[@"mode"] ?: @"fast";
++  if (![@"fast" isEqual:mode] && ![@"accurate" isEqual:mode]) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"mode must be fast or accurate" traceback:nil]);
++  }
++  id capture = args[@"capture"] ?: @"png";
++  BOOL direct = [@"cgimage" isEqual:capture];
++  if (!direct && ![@"png" isEqual:capture]) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"capture must be png or cgimage" traceback:nil]);
++  }
++  id scaleArg = args[@"scale"] ?: @1;
++  if (![scaleArg isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)scaleArg) == CFBooleanGetTypeID()) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"scale must be a number" traceback:nil]);
++  }
++  CGFloat scale = [scaleArg doubleValue];
++  if (!isfinite(scale) || scale <= 0 || scale > 1 || (!direct && scale != 1)) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"scale must be in (0, 1]; PNG requires scale 1" traceback:nil]);
++  }
++  for (NSString *key in args) {
++    if (![@"mode" isEqual:key] && ![@"capture" isEqual:key] && ![@"scale" isEqual:key]) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Supported keys are mode, capture and scale" traceback:nil]);
++    }
++  }
++
++  @autoreleasepool {
++    NSProcessInfo *clock = NSProcessInfo.processInfo;
++    NSTimeInterval start = clock.systemUptime;
++    XCUIScreenshot *shot = XCUIScreen.mainScreen.screenshot;
++    NSTimeInterval shotReady = clock.systemUptime;
++    UIImage * __attribute__((objc_precise_lifetime)) pixels = direct ? shot.image : nil;
++    NSData *png = direct ? nil : shot.PNGRepresentation;
++    NSTimeInterval captured = clock.systemUptime;
++    if (direct ? pixels.CGImage == NULL : png.length == 0) {
++      return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:@"No screenshot available" traceback:nil]);
++    }
++    NSDictionary *ui = nil;
++    if (includeUI) {
++      ui = [FBDebugCommands fastUIPayloadForRequest:request];
++      if (nil == ui) {
++        return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
++      }
++    }
++    NSTimeInterval prepStart = clock.systemUptime;
++    CGSize sourceSize;
++    CGSize inputSize;
++    VNImageRequestHandler *handler;
++    if (direct) {
++      sourceSize = CGSizeMake(round(pixels.size.width * pixels.scale), round(pixels.size.height * pixels.scale));
++      inputSize = CGSizeMake(MAX(1, round(sourceSize.width * scale)), MAX(1, round(sourceSize.height * scale)));
++      if (pixels.imageOrientation != UIImageOrientationUp || !CGSizeEqualToSize(inputSize, sourceSize)) {
++        UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
++        format.scale = 1;
++        format.opaque = YES;
++        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:inputSize format:format];
++        UIImage *original = pixels;
++        pixels = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
++          [original drawInRect:(CGRect){CGPointZero, inputSize}];
++        }];
++      }
++      handler = [[VNImageRequestHandler alloc] initWithCGImage:pixels.CGImage options:@{}];
++    } else {
++      CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)png, NULL);
++      if (src == NULL) {
++        return FBResponseWithUnknownErrorFormat(@"Cannot inspect screenshot dimensions");
++      }
++      NSDictionary *props = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(src, 0, NULL));
++      CFRelease(src);
++      CGFloat w = [props[(__bridge NSString *)kCGImagePropertyPixelWidth] doubleValue];
++      CGFloat h = [props[(__bridge NSString *)kCGImagePropertyPixelHeight] doubleValue];
++      NSInteger orientation = [props[(__bridge NSString *)kCGImagePropertyOrientation] integerValue];
++      sourceSize = orientation >= 5 && orientation <= 8 ? CGSizeMake(h, w) : CGSizeMake(w, h);
++      inputSize = sourceSize;
++      handler = [[VNImageRequestHandler alloc] initWithData:png options:@{}];
++    }
++    NSTimeInterval recognitionStart = clock.systemUptime;
++    VNRecognizeTextRequest *ocr = [[VNRecognizeTextRequest alloc] init];
++    BOOL accurate = [@"accurate" isEqual:mode];
++    ocr.recognitionLevel = accurate ? VNRequestTextRecognitionLevelAccurate : VNRequestTextRecognitionLevelFast;
++    ocr.usesLanguageCorrection = accurate;
++    NSError *error = nil;
++    if (![handler performRequests:@[ocr] error:&error]) {
++      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Vision text recognition failed" traceback:nil]);
++    }
++
++    NSMutableArray *lines = [NSMutableArray array];
++    for (VNRecognizedTextObservation *item in ocr.results) {
++      VNRecognizedText *best = [item topCandidates:1].firstObject;
++      if (best.string.length == 0) {
++        continue;
++      }
++      CGRect box = item.boundingBox;
++      [lines addObject:@{
++        @"text": best.string,
++        @"confidence": @(best.confidence),
++        @"x": @(CGRectGetMinX(box)),
++        @"y": @(1.0 - CGRectGetMaxY(box)),
++        @"width": @(CGRectGetWidth(box)),
++        @"height": @(CGRectGetHeight(box)),
++      }];
++    }
++    NSTimeInterval end = clock.systemUptime;
++    NSMutableDictionary *result = [@{@"mode": mode, @"lines": lines, @"timing": @{
++      @"startUptimeMs": @(start * 1000.0),
++      @"screenshotMs": @((shotReady - start) * 1000.0),
++      @"representationMs": @((captured - shotReady) * 1000.0),
++      @"inputPrepMs": @((recognitionStart - prepStart) * 1000.0),
++      @"captureMs": @((captured - start) * 1000.0),
++      @"axMs": @(includeUI ? (prepStart - captured) * 1000.0 : 0.0),
++      @"recognitionMs": @((end - recognitionStart) * 1000.0),
++      @"totalMs": @((end - start) * 1000.0),
++    }} mutableCopy];
++    result[@"image"] = @{
++      @"capture": capture, @"scale": @(scale),
++      @"sourcePixels": @[@(sourceSize.width), @(sourceSize.height)],
++      @"inputPixels": @[@(inputSize.width), @(inputSize.height)],
++      @"pngBytes": @(png.length),
++    };
++    if (nil != ui) {
++      result[@"fastUI"] = ui;
++    }
++    return FBResponseWithObject(result);
++  }
++}
++
+++ (id<FBResponsePayload>)handleFastOCR:(FBRouteRequest *)request
++{
++  return [self handleVisionRead:request includeUI:NO];
++}
++
+++ (id<FBResponsePayload>)handleFastRead:(FBRouteRequest *)request
++{
++  return [self handleVisionRead:request includeUI:YES];
++}
++
  @end
 diff --git a/WebDriverAgentLib/Routing/FBResponsePayload.h b/WebDriverAgentLib/Routing/FBResponsePayload.h
-index b29b8f9..404ef61 100644
+index b29b8f9..8ea549a 100644
 --- a/WebDriverAgentLib/Routing/FBResponsePayload.h
 +++ b/WebDriverAgentLib/Routing/FBResponsePayload.h
-@@ -52,6 +52,11 @@ id<FBResponsePayload> FBResponseWithUnknownErrorFormat(NSString *errorFormat, ..
+@@ -52,6 +52,16 @@ id<FBResponsePayload> FBResponseWithUnknownErrorFormat(NSString *errorFormat, ..
   */
  id<FBResponsePayload> FBResponseWithStatus(FBCommandStatus *status);
  
@@ -1022,11 +1319,16 @@ index b29b8f9..404ef61 100644
 + */
 +id<FBResponsePayload> FBResponseWithRawData(NSData *data, NSString *contentType);
 +
++/**
++ wda-turbo: raw binary payload with an ETag header. notModified sends HTTP 304 with an empty body.
++ */
++id<FBResponsePayload> FBResponseWithRawDataETag(NSData *data, NSString *contentType, NSString *etag, BOOL notModified);
++
  /**
   Returns a response payload as a NSDictionary for given element.
   Set compact=NO to include further attributes (defined by FBConfiguration.elementResponseAttributes)
 diff --git a/WebDriverAgentLib/Routing/FBResponsePayload.m b/WebDriverAgentLib/Routing/FBResponsePayload.m
-index 5d0098a..d1cf182 100644
+index 5d0098a..88bff83 100644
 --- a/WebDriverAgentLib/Routing/FBResponsePayload.m
 +++ b/WebDriverAgentLib/Routing/FBResponsePayload.m
 @@ -10,6 +10,7 @@
@@ -1037,13 +1339,15 @@ index 5d0098a..d1cf182 100644
  #import "FBSession.h"
  #import "FBMathUtils.h"
  #import "FBConfiguration.h"
-@@ -88,6 +89,38 @@ id<FBResponsePayload> FBResponseWithUnknownErrorFormat(NSString *format, ...)
+@@ -88,6 +89,52 @@ id<FBResponsePayload> FBResponseWithUnknownErrorFormat(NSString *format, ...)
    return payload;
  }
  
 +@interface FBResponseRawDataPayload : NSObject <FBResponsePayload>
 +@property (nonatomic, strong, readonly) NSData *data;
 +@property (nonatomic, copy, readonly) NSString *contentType;
++@property (nonatomic, copy) NSString *etag;
++@property (nonatomic) BOOL notModified;
 +- (instancetype)initWithData:(NSData *)data contentType:(NSString *)contentType;
 +@end
 +
@@ -1062,8 +1366,12 @@ index 5d0098a..d1cf182 100644
 +- (void)dispatchWithResponse:(RouteResponse *)response
 +{
 +  [response setHeader:@"Content-Type" value:self.contentType];
-+  [response setStatusCode:kHTTPStatusCodeOK];
-+  [response respondWithData:self.data];
++  if (nil != self.etag) {
++    [response setHeader:@"ETag" value:self.etag];
++    [response setHeader:@"Cache-Control" value:@"no-cache"];
++  }
++  [response setStatusCode:self.notModified ? kHTTPStatusCodeNotModified : kHTTPStatusCodeOK];
++  [response respondWithData:self.notModified ? [NSData data] : self.data];
 +}
 +
 +@end
@@ -1071,6 +1379,14 @@ index 5d0098a..d1cf182 100644
 +id<FBResponsePayload> FBResponseWithRawData(NSData *data, NSString *contentType)
 +{
 +  return [[FBResponseRawDataPayload alloc] initWithData:data contentType:contentType];
++}
++
++id<FBResponsePayload> FBResponseWithRawDataETag(NSData *data, NSString *contentType, NSString *etag, BOOL notModified)
++{
++  FBResponseRawDataPayload *payload = [[FBResponseRawDataPayload alloc] initWithData:data contentType:contentType];
++  payload.etag = etag;
++  payload.notModified = notModified;
++  return payload;
 +}
 +
  id<FBResponsePayload> FBResponseWithStatus(FBCommandStatus *status)

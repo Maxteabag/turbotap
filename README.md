@@ -32,7 +32,7 @@ turbotap flow open:Weather read
 turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" tap:Get
 ```
 
-Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `assert:`, `assertnot:`, `alert:text`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
+Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`/`tapbatch:fixed:`, `read:vision`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `assert:`, `assertnot:`, `alert:text`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
 
 ## Requirements
 
@@ -113,6 +113,21 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 | Scroll | ~2000ms | 150-350ms | Clean drag stop with no fling momentum (`dur=0.08, rel=0.08`) |
 | UI tree | ~2600ms | 158-198ms | Single-RTT `/wda/fastUI?waitBundle=...` (trimmed `/source` fallback ~297ms) |
 | Multi-step flow | 14.4-15.7s | **1.0-6.0s** | Single process, persistent connection, pixel-still confirmation, keypad cache |
+| `preflight` | ~245ms | **~230ms** | v6 `/wda/fastPreflight` folds lock, app and size into one request (same fields, stock fallback) |
+| Polling an unchanged screen | 1.22MB / 20 frames | **244KB** | v6 conditional `/wda/fastScreenshot`: `304 Not Modified` reuses the last JPEG |
+| Read + UI tree (`read`) | ~204ms serial | **~95ms** | Frame capture and `/wda/fastUI` run in parallel on separate connections |
+| Repeated separate CLI calls (OCR) | ~555ms | **~288ms** | Opt-in warm daemon (`turbotap daemon start`, `--daemon`) |
+| Hard-to-read text (`read:vision`) | 12/72 words (host OCR) | **72/72 words, ~235ms** | v6 on-device Apple Vision OCR (`/wda/fastOCR`) |
+
+The last five rows were measured on an iPhone 17 during the overnight lab in [PR #8](https://github.com/Maxteabag/turbotap/pull/8). Those workloads were small: Calculator, Settings and one multilingual test page. Expect different numbers on other screens.
+
+### Warm daemon (optional)
+
+When an agent runs many separate `turbotap` commands rather than one `flow`, each new process pays for Python startup, Pillow and Tesseract engine loading. `turbotap daemon start` keeps one process warm on a private Unix socket (`~/.cache/turbotap/daemon.sock`, mode 0600, in a user-only directory). It exits after 15 idle minutes (`--idle SECONDS`). Add `--daemon` to a command, or set `TURBOTAP_DAEMON=1`, to route through it. Each request runs with the caller's environment and working directory, and gets a fresh WDA client, screen reader and flow, so nothing about sessions, frames or app switches carries over between calls. If the daemon is not running, is out of date, or does not confirm a request, the command runs in-process as usual. `turbotap daemon status` and `turbotap daemon stop` manage it.
+
+### On-device Vision OCR
+
+`read:vision` (flow) and `turbotap vision-ocr` run Apple's Vision text recognizer on the iPhone (wda-turbo v6). It is slower than host OCR on simple screens but reads far more text across scripts and font sizes. Use `read:vision:fast` for lower latency. Runners without `/wda/fastOCR` give a clear error rather than an empty result.
 
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) explains each trick behind these numbers: session caching, strip-parallel OCR, zero-momentum drag, trimmed UI trees, app-switch freshness, and iOS quirks.
 
