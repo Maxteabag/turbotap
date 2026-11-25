@@ -656,6 +656,11 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, msg: &Map<String, V
     let (Some(argv), Some(env), Some(cwd)) = (argv, env, cwd) else {
         return send(conn, &j!({"error": "malformed request"}));
     };
+    // Reject before accepting anything `set_var` / `set_current_dir` cannot represent,
+    // so a bad request never changes process state (the client then runs locally).
+    if !env.iter().all(|(k, v)| valid_env_entry(k, v)) || cwd.contains('\0') || argv.iter().any(|a| a.contains('\0')) {
+        return send(conn, &j!({"error": "invalid request: environment, argv or cwd entry"}));
+    }
     if let Some(cmd) = crate::cli::cli_subcommand(&argv).0 {
         if crate::cli::DAEMON_LOCAL_CMDS.contains(&cmd.as_str()) {
             return send(conn, &j!({"error": "runs in the calling process"}));
@@ -709,14 +714,45 @@ fn drain_request_work() {
     }
 }
 
+/// True when `std::env::set_var(k, v)` accepts the pair (no panic): a non-empty
+/// key without `=` or NUL, and a value without NUL.
+pub fn valid_env_entry(k: &str, v: &str) -> bool {
+    !k.is_empty() && !k.contains('=') && !k.contains('\0') && !v.contains('\0')
+}
+
+/// Restores the daemon's own environment, working directory and output sink when
+/// dropped, so a panic anywhere in request setup, execution or cleanup can never
+/// leave the next request with this caller's process state.
+struct RequestStateGuard {
+    saved_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    saved_cwd: Option<std::path::PathBuf>,
+}
+
+impl RequestStateGuard {
+    fn capture() -> RequestStateGuard {
+        RequestStateGuard { saved_env: std::env::vars_os().collect(), saved_cwd: std::env::current_dir().ok() }
+    }
+}
+
+impl Drop for RequestStateGuard {
+    fn drop(&mut self) {
+        crate::out::set_sink(None);
+        install_env(std::mem::take(&mut self.saved_env).into_iter());
+        if let Some(d) = self.saved_cwd.take() {
+            let _ = std::env::set_current_dir(d);
+        }
+        let _ = std::panic::catch_unwind(crate::config::reload);
+    }
+}
+
 /// Run one CLI invocation with the caller's environment, cwd and streams.
 fn execute(conn: &UnixStream, argv: &[String], env: &[(String, String)], cwd: &str) -> i32 {
     let sink = match conn.try_clone() {
         Ok(c) => Arc::new(StreamSink { conn: c, lock: Mutex::new(()), broken: AtomicBool::new(false) }),
         Err(_) => return 1,
     };
-    let saved_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
-    let saved_cwd = std::env::current_dir().ok();
+    // Installed before any process state changes; restores it on every exit path.
+    let _restore = RequestStateGuard::capture();
     crate::out::set_sink(Some(sink.clone()));
     install_env(env.iter().map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v))));
     if std::env::var_os("OMP_THREAD_LIMIT").is_none() {
@@ -744,13 +780,9 @@ fn execute(conn: &UnixStream, argv: &[String], env: &[(String, String)], cwd: &s
             }
         }
     };
-    drain_request_work();
-    crate::out::set_sink(None);
-    install_env(saved_env.into_iter());
-    if let Some(d) = saved_cwd {
-        let _ = std::env::set_current_dir(d);
+    if std::panic::catch_unwind(drain_request_work).is_err() {
+        crate::errln!("turbotap: internal error while draining request work");
     }
-    crate::config::reload();
     code
 }
 
@@ -760,7 +792,17 @@ fn install_env(vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsStrin
         std::env::remove_var(k);
     }
     for (k, v) in vars {
-        if !k.is_empty() && !k.to_string_lossy().contains('=') {
+        // Skip anything set_var would panic on (requests are validated up front; the
+        // daemon's own saved environment always passes).
+        let ok = match (k.to_str(), v.to_str()) {
+            (Some(ks), Some(vs)) => valid_env_entry(ks, vs),
+            _ => {
+                use std::os::unix::ffi::OsStrExt;
+                let (kb, vb) = (k.as_bytes(), v.as_bytes());
+                !kb.is_empty() && !kb.contains(&b'=') && !kb.contains(&0) && !vb.contains(&0)
+            }
+        };
+        if ok {
             std::env::set_var(k, v);
         }
     }

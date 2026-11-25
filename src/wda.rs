@@ -1079,6 +1079,9 @@ impl WdaClient {
         let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
         let r = self.post("/wda/setPasteboard", &j!({"content": encoded, "contentType": content_type}));
         if !r.is_object() || json::has_err(&r) {
+            if echoes_secret(&r, text) {
+                return Err(Error::runtime(format!("setPasteboard failed (error {})", json::py_str(json::get(&r, "error")))));
+            }
             return Err(Error::runtime(format!("setPasteboard failed: {}", json::py_repr(&r))));
         }
         Ok(r)
@@ -1312,6 +1315,17 @@ pub fn check_wda_ok(res: Value, action: &str, redact: bool) -> Result<Value> {
         return Err(Error::flow(format!("{action} failed: {}", json::py_str(detail))));
     }
     Ok(res)
+}
+
+/// True when a WDA answer quotes `secret` back (raw or base64), so error messages
+/// built from it must be redacted.
+pub fn echoes_secret(res: &Value, secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    use base64::Engine;
+    let text = json::py_repr(res);
+    text.contains(secret) || text.contains(&base64::engine::general_purpose::STANDARD.encode(secret.as_bytes()))
 }
 
 pub const UNSUPPORTED_ROUTE_STATUS: [i64; 3] = [404, 405, 501];

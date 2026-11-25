@@ -7,6 +7,7 @@ mod test_packaging_and_assets;
 mod test_pr3_review_fixes;
 mod test_preflight;
 mod test_read_full_parallel;
+mod test_review_pr10;
 mod test_review_pr9;
 mod test_ui_parsing;
 mod test_vision_ocr;

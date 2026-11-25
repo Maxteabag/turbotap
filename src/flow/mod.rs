@@ -130,6 +130,23 @@ pub fn is_url_scheme(s: &str) -> bool {
         .is_match(s)
 }
 
+/// Verbs whose argument is text typed or tapped into the device (PINs, passwords,
+/// clipboard contents). Their inline values and `cmd:` command lines never appear in
+/// flow output; `env:VAR` names are shown.
+pub const SECRET_ARG_VERBS: &[&str] = &["pintap", "typedigits", "cleartype", "type", "setclip"];
+
+/// The step as it may appear in flow output (success items, stderr progress and
+/// `failed_step`): secret-bearing arguments are replaced by `<redacted>`.
+pub fn safe_step(spec: &str) -> String {
+    let Some((verb, arg)) = spec.split_once(':') else {
+        return spec.to_string();
+    };
+    if !SECRET_ARG_VERBS.contains(&verb.trim().to_lowercase().as_str()) || arg.starts_with("env:") {
+        return spec.to_string();
+    }
+    format!("{verb}:<redacted>")
+}
+
 /// Resolve `env:VAR` / `cmd:COMMAND` so secrets never appear in argv or step logs.
 pub fn secret_arg(verb: &str, arg: &str) -> Result<String> {
     if let Some(var) = arg.strip_prefix("env:") {
@@ -275,8 +292,22 @@ impl<R: Reader> Flow<R> {
     /// Refuse taps on text matching `--deny`.
     pub fn guard(&self, text: &str, action: &str) -> Result<()> {
         if let Some(rx) = self.deny.as_ref() {
-            if !text.is_empty() && rx.is_match(text).unwrap_or(false) {
-                return Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text))));
+            if text.is_empty() {
+                return Ok(());
+            }
+            match rx.is_match(text) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text))));
+                }
+                // An evaluation error (e.g. backtrack limit) is an unverified result, not a
+                // non-match: fail closed before any action is dispatched.
+                Err(e) => {
+                    return Err(Error::flow(format!(
+                        "refusing to {action} {}: --deny could not be evaluated ({e})",
+                        json::py_repr_str(text)
+                    )));
+                }
             }
         }
         Ok(())
@@ -436,7 +467,8 @@ impl<R: Reader> Flow<R> {
                 self.last_tap_type = None;
                 self.mark_action(false, true);
                 let r = self.c.fast_keys(&text, None);
-                check_wda_ok(r, "type", is_secret)?;
+                let redact = is_secret || crate::wda::echoes_secret(&r, &text);
+                check_wda_ok(r, "type", redact)?;
             }
             "key" => {
                 let kname = arg.trim().to_lowercase();
@@ -641,14 +673,17 @@ impl<R: Reader> Flow<R> {
         let redact = is_secret || secure;
         let p = self.c.spath(&format!("/element/{eid}/clear"));
         let r = self.c.post(&p, &j!({}));
-        check_wda_ok(r, "cleartype clear", redact)?;
+        let red = redact || crate::wda::echoes_secret(&r, &text);
+        check_wda_ok(r, "cleartype clear", red)?;
         clock::sleep(0.15);
         let p = self.c.spath(&format!("/element/{eid}/click"));
         let r = self.c.post(&p, &j!({}));
-        check_wda_ok(r, "cleartype click", redact)?;
+        let red = redact || crate::wda::echoes_secret(&r, &text);
+        check_wda_ok(r, "cleartype click", red)?;
         clock::sleep(0.15);
         let r = self.c.fast_keys(&text, None);
-        check_wda_ok(r, "cleartype", redact)?;
+        let red = redact || crate::wda::echoes_secret(&r, &text);
+        check_wda_ok(r, "cleartype", red)?;
         clock::sleep(0.20);
         if !secure {
             let p = self.c.spath(&format!("/element/{eid}/attribute/value"));
@@ -762,7 +797,7 @@ impl<R: Reader> Flow<R> {
             match self.step(spec) {
                 Ok(res) => {
                     let mut item = serde_json::Map::new();
-                    item.insert("step".into(), j!(spec));
+                    item.insert("step".into(), j!(safe_step(spec)));
                     item.insert("ms".into(), j!(((clock::real_now() - s0) * 1000.0).round() as i64));
                     if let Some(r) = res {
                         item.insert("result".into(), r);
@@ -791,7 +826,7 @@ impl<R: Reader> Flow<R> {
                     };
                     return Ok(j!({
                         "ok": false,
-                        "failed_step": spec,
+                        "failed_step": safe_step(spec),
                         "error": e.to_string(),
                         "steps": done,
                         "visible": visible,

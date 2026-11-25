@@ -275,6 +275,37 @@ fn test_idle_timeout_exits_and_cleans_up() {
     assert!(daemon::ping().is_none());
 }
 
+/// PR #10 review: a request whose environment `set_var` cannot represent is rejected
+/// before it changes any process state, and the daemon serves the next request with
+/// clean state (neither the bad entries nor the rest of that request's env leak).
+#[test]
+fn test_rejected_request_leaves_the_daemon_clean_for_the_next_one() {
+    let (home, start_doc) = DaemonHome::started("120");
+    let srv = LoopbackWda::start(wda_router());
+    let argv = ["--url", srv.url.as_str(), "preflight"];
+    for bad in [("BAD\0KEY", "1"), ("A=B", "1"), ("", "1"), ("TT_NUL_VALUE", "x\0y")] {
+        // WDA_TURBO=0 rides along: it must not survive into the next request.
+        let (code, out, err) = home.forward(&argv, &[bad, ("WDA_TURBO", "0")], None);
+        assert_eq!((code, out.as_str(), err.as_str()), (None, "", ""), "{bad:?} was not refused");
+    }
+    assert!(srv.paths().is_empty(), "a rejected request reached WDA: {:?}", srv.paths());
+    let (code, out, _) = home.forward(&argv, &[], None);
+    assert_eq!(code, Some(0));
+    assert_eq!(doc(&out)["ok"], json!(true));
+    assert!(srv.paths().iter().any(|p| p.ends_with("/fastPreflight")), "{:?}", srv.paths());
+    let status = doc(&home.run(&["daemon", "status"]));
+    assert_eq!((&status["running"], &status["pid"]), (&json!(true), &start_doc["pid"]));
+}
+
+#[test]
+fn test_valid_env_entry_matches_set_var_rules() {
+    assert!(daemon::valid_env_entry("HOME", "/x"));
+    assert!(daemon::valid_env_entry("K", ""));
+    for (k, v) in [("", "v"), ("A=B", "v"), ("A\0", "v"), ("K", "a\0b")] {
+        assert!(!daemon::valid_env_entry(k, v), "{k:?}={v:?}");
+    }
+}
+
 #[test]
 fn test_stale_code_fingerprint_falls_back_and_retires_the_daemon() {
     let home = DaemonHome::new();

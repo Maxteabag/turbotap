@@ -172,16 +172,20 @@ pub fn resolve_device_settings(
     Ok((url, udid, dev_key))
 }
 
-/// Run a shell-split command and return its stdout (Python
+/// Run a shell-split credential command and return its stdout (Python
 /// `subprocess.check_output(shlex.split(cmd), text=True)`).
+///
+/// Used for `passcode_cmd`, `WDA_PASSCODE_CMD` and `cmd:` step values, so it never
+/// echoes the command line in errors (it may embed a secret) and discards the
+/// command's stderr instead of passing it through to the caller's output.
 pub fn check_output(cmd: &str) -> Result<String> {
-    let parts = shlex::split(cmd).ok_or_else(|| Error::value(format!("cannot parse command: {cmd}")))?;
+    let parts = shlex::split(cmd).ok_or_else(|| Error::value("cannot parse the credential command (unbalanced quotes?)"))?;
     let Some((prog, args)) = parts.split_first() else {
         return Err(Error::value("empty command"));
     };
     let out = std::process::Command::new(prog)
         .args(args)
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::null())
         .output()
         .map_err(|e| Error::Os(format!("{prog}: {e}")))?;
     if !out.status.success() {
