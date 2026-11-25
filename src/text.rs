@@ -89,23 +89,54 @@ impl Match {
 // ---------------------------------------------------------------------------
 
 /// Python `str.isspace()` / `re` `\s` for str patterns.
+#[inline]
 pub fn py_isspace(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
+/// Fast ASCII equivalent of [`py_isspace`].
+#[inline]
+fn ascii_py_isspace(b: u8) -> bool {
+    matches!(b, b' ' | 0x09..=0x0d | 0x1c..=0x1f)
+}
+
 /// Python `re` `\w` for str patterns (`str.isalnum()` or `_`).
+#[inline]
 pub fn py_isword(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
 /// Python `str.isalpha()` for a single char.
+#[inline]
 fn py_isalpha(c: char) -> bool {
     c.is_alphabetic()
 }
 
-/// `re.sub(r"\s+", " ", s).strip()`.
-fn collapse_ws(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// `re.sub(r"\s+", " ", s).strip()` written into a reusable buffer.
+fn collapse_ws_into(s: &str, out: &mut String) {
+    out.clear();
+    if s.is_ascii() {
+        let bytes = s.as_bytes();
+        let n = bytes.len();
+        let mut i = 0;
+        while i < n {
+            while i < n && ascii_py_isspace(bytes[i]) {
+                i += 1;
+            }
+            if i >= n {
+                break;
+            }
+            let start = i;
+            while i < n && !ascii_py_isspace(bytes[i]) {
+                i += 1;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&s[start..i]);
+        }
+        return;
+    }
     let mut pending = false;
     for ch in s.chars() {
         if py_isspace(ch) {
@@ -118,6 +149,12 @@ fn collapse_ws(s: &str) -> String {
             out.push(ch);
         }
     }
+}
+
+/// `re.sub(r"\s+", " ", s).strip()`.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    collapse_ws_into(s, &mut out);
     out
 }
 
@@ -187,9 +224,49 @@ pub fn casefold(s: &str) -> String {
     out
 }
 
+/// `re.sub(r"\s+", " ", s.lower()).strip()` written into a reusable buffer.
+pub(crate) fn norm_into(s: &str, out: &mut String) {
+    out.clear();
+    if s.is_ascii() {
+        let bytes = s.as_bytes();
+        let n = bytes.len();
+        let mut i = 0;
+        while i < n {
+            while i < n && ascii_py_isspace(bytes[i]) {
+                i += 1;
+            }
+            if i >= n {
+                break;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            let start = i;
+            let mut has_upper = false;
+            while i < n && !ascii_py_isspace(bytes[i]) {
+                if bytes[i].is_ascii_uppercase() {
+                    has_upper = true;
+                }
+                i += 1;
+            }
+            if !has_upper {
+                out.push_str(&s[start..i]);
+            } else {
+                for &b in &bytes[start..i] {
+                    out.push(b.to_ascii_lowercase() as char);
+                }
+            }
+        }
+        return;
+    }
+    collapse_ws_into(&s.to_lowercase(), out);
+}
+
 /// `re.sub(r"\s+", " ", s.lower()).strip()`.
 pub fn norm(s: &str) -> String {
-    collapse_ws(&s.to_lowercase())
+    let mut out = String::with_capacity(s.len());
+    norm_into(s, &mut out);
+    out
 }
 
 fn accent_trans(c: char) -> Option<&'static str> {
@@ -212,31 +289,68 @@ fn accent_trans(c: char) -> Option<&'static str> {
     })
 }
 
+fn fold_accents_into(s: &str, out: &mut String) {
+    use unicode_normalization::char::{canonical_combining_class, decompose_compatible};
+    out.clear();
+    if s.is_empty() {
+        return;
+    }
+    if s.is_ascii() {
+        out.push_str(s);
+        return;
+    }
+    for ch in s.chars() {
+        if let Some(r) = accent_trans(ch) {
+            out.push_str(r);
+        } else if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            decompose_compatible(ch, |d| {
+                if canonical_combining_class(d) == 0 {
+                    out.push(d);
+                }
+            });
+        }
+    }
+}
+
 /// Strip combining diacritics (NFKD) and transliterate Nordic/European letters.
 pub fn fold_accents(s: &str) -> String {
-    use unicode_normalization::char::canonical_combining_class;
-    use unicode_normalization::UnicodeNormalization;
     if s.is_empty() || s.is_ascii() {
         return s.to_string();
     }
-    let mut tr = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match accent_trans(ch) {
-            Some(r) => tr.push_str(r),
-            None => tr.push(ch),
-        }
-    }
-    tr.nfkd().filter(|&c| canonical_combining_class(c) == 0).collect()
+    let mut out = String::with_capacity(s.len());
+    fold_accents_into(s, &mut out);
+    out
 }
 
+#[inline]
 fn is_invisible(c: char) -> bool {
     matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
 }
 
 /// Strip invisible bidi/zero-width marks and collapse Unicode whitespace.
 pub fn clean_text(s: &str) -> String {
-    let stripped: String = s.chars().filter(|&c| !is_invisible(c)).collect();
-    collapse_ws(&stripped)
+    if s.is_ascii() {
+        return collapse_ws(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut pending = false;
+    for ch in s.chars() {
+        if is_invisible(ch) {
+            continue;
+        }
+        if py_isspace(ch) {
+            pending = true;
+        } else {
+            if pending && !out.is_empty() {
+                out.push(' ');
+            }
+            pending = false;
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Compile a user regex (`re:...`, `--deny`) case-insensitively with Python-like
@@ -254,17 +368,20 @@ fn rx_find<'t>(rx: &fancy_regex::Regex, s: &'t str) -> Option<&'t str> {
 
 /// `re.search(rf"(?<!\w){re.escape(want)}(?!\w)", t)` without a regex.
 fn wb_search(t: &str, want: &str) -> bool {
-    if want.is_empty() {
+    if want.is_empty() || want.len() > t.len() {
         return false;
     }
-    for (i, _) in t.char_indices() {
-        if !t[i..].starts_with(want) {
-            continue;
-        }
+    let mut pos = 0;
+    while let Some(rel) = t[pos..].find(want) {
+        let i = pos + rel;
         let before_ok = t[..i].chars().next_back().map_or(true, |c| !py_isword(c));
         let after_ok = t[i + want.len()..].chars().next().map_or(true, |c| !py_isword(c));
         if before_ok && after_ok {
             return true;
+        }
+        match t[i..].chars().next() {
+            Some(c) => pos = i + c.len_utf8(),
+            None => break,
         }
     }
     false
@@ -318,8 +435,57 @@ fn all_alpha(s: &str) -> bool {
 
 type Span = (usize, usize);
 
-/// Python `_match_line_tokens` -> `(rank, icon_stripped, span)`.
-fn match_line_tokens(ln: &Line, cur_t: &str, cur_words: &[String], cur_want: &str, wb: bool) -> Option<(u8, bool, Span)> {
+fn populate_norm_words(ln: &Line, out: &mut Vec<String>) {
+    let n = ln.words.len();
+    if out.len() < n {
+        out.resize_with(n, String::new);
+    } else {
+        out.truncate(n);
+    }
+    for (w, dst) in ln.words.iter().zip(out.iter_mut()) {
+        norm_into(&w.text, dst);
+    }
+}
+
+fn populate_folded_words(words: &[String], out: &mut Vec<String>) {
+    let n = words.len();
+    if out.len() < n {
+        out.resize_with(n, String::new);
+    } else {
+        out.truncate(n);
+    }
+    for (w, dst) in words.iter().zip(out.iter_mut()) {
+        fold_accents_into(w, dst);
+    }
+}
+
+fn find_span_in_words(cur_words: &[String], cur_want: &str, wb: bool, chunk_buf: &mut String) -> Option<Span> {
+    let n = cur_words.len();
+    for size in 1..=n {
+        for i in 0..=(n - size) {
+            let s: &str = if size == 1 {
+                &cur_words[i]
+            } else {
+                chunk_buf.clear();
+                for (k, w) in cur_words[i..i + size].iter().enumerate() {
+                    if k > 0 {
+                        chunk_buf.push(' ');
+                    }
+                    chunk_buf.push_str(w);
+                }
+                chunk_buf.as_str()
+            };
+            let hit = if wb { wb_search(s, cur_want) } else { s.contains(cur_want) };
+            if hit {
+                return Some((i, i + size));
+            }
+        }
+    }
+    None
+}
+
+/// Line-level match check and rank/icon classification before word-span lookup.
+fn classify_line_match(cur_t: &str, cur_want: &str, wb: bool) -> Option<(u8, bool)> {
     let ok = if wb { wb_search(cur_t, cur_want) } else { cur_t.contains(cur_want) };
     if !ok {
         return None;
@@ -341,33 +507,35 @@ fn match_line_tokens(ln: &Line, cur_t: &str, cur_words: &[String], cur_want: &st
             rank = 2;
         }
     }
-    let mut span = None;
-    if icon_stripped && ln.words.len() >= 2 && has_non_word(&ln.words[0].text) && !has_alpha(&ln.words[0].text) {
-        span = Some((1, ln.words.len()));
-    } else {
-        let n = cur_words.len();
-        'outer: for size in 1..=n {
-            for i in 0..=(n - size) {
-                let chunk = cur_words[i..i + size].join(" ");
-                let hit = if wb { wb_search(&chunk, cur_want) } else { chunk.contains(cur_want) };
-                if hit {
-                    span = Some((i, i + size));
-                    break 'outer;
-                }
-            }
-        }
-    }
-    span.map(|s| (rank, icon_stripped, s))
+    Some((rank, icon_stripped))
 }
 
-/// First fuzzy word window of `k` words with ratio >= fuzzy.
-fn fuzzy_window(words: &[String], want: &str, fuzzy: f64) -> Option<Span> {
-    let k = want.split(py_isspace).filter(|p| !p.is_empty()).count().max(1);
+/// First fuzzy word window of `k` words with ratio >= fuzzy, using upper-bound short-circuits.
+fn fuzzy_window_prepared(
+    words: &[String],
+    k: usize,
+    target: &mut PreparedTarget,
+    fuzzy: f64,
+    chunk_buf: &mut String,
+    a_chars_buf: &mut Vec<char>,
+) -> Option<Span> {
     let n = words.len();
     let count = (n as i64 - k as i64 + 1).max(1) as usize;
     for i in 0..count {
         let end = (i + k).min(n);
-        if seq_ratio(&words[i.min(end)..end].join(" "), want) >= fuzzy {
+        let s: &str = if i < end && end - i == 1 {
+            &words[i]
+        } else {
+            chunk_buf.clear();
+            for (idx, w) in words[i.min(end)..end].iter().enumerate() {
+                if idx > 0 {
+                    chunk_buf.push(' ');
+                }
+                chunk_buf.push_str(w);
+            }
+            chunk_buf.as_str()
+        };
+        if target.ratio_str_at_least(s, fuzzy, a_chars_buf).is_some() {
             return Some((i, end));
         }
     }
@@ -405,44 +573,82 @@ pub fn find_text(lines: &[Line], label: &str, fuzzy: f64, where_: Option<&str>) 
     let short_alpha_f =
         !is_rx && !want_f.is_empty() && (short_alpha || (want_f.chars().count() <= 3 && all_alpha(&want_f)));
     let want_has_digit = want.chars().any(|c| c.is_numeric());
+    let fuzzy_enabled = !is_rx && fuzzy != 0.0 && !short_alpha && !short_alpha_f && !want_has_digit;
+    let want_k = if fuzzy_enabled { want.split(py_isspace).filter(|p| !p.is_empty()).count().max(1) } else { 1 };
+    let want_f_k = if fuzzy_enabled && !want_f.is_empty() {
+        want_f.split(py_isspace).filter(|p| !p.is_empty()).count().max(1)
+    } else {
+        1
+    };
+    let mut target_want: Option<PreparedTarget> = None;
+    let mut target_want_f: Option<PreparedTarget> = None;
+
+    // Reusable scratch buffers across lines.
+    let mut t_buf = String::new();
+    let mut t_f_buf = String::new();
+    let mut words_buf: Vec<String> = Vec::new();
+    let mut words_f_buf: Vec<String> = Vec::new();
+    let mut chunk_buf = String::new();
+    let mut a_chars_buf: Vec<char> = Vec::new();
+
     // (in_status, rank, folded, icon_stripped, y) + Match
     let mut best: Option<((bool, u8, bool, bool, i64), Match)> = None;
     for ln in lines {
-        let t = norm(&ln.text);
-        let words: Vec<String> = ln.words.iter().map(|w| norm(&w.text)).collect();
         let mut icon_stripped = false;
         let mut folded = false;
         let mut span: Option<Span> = None;
         let mut rank: u8 = 2;
         if let Some(rx) = &rx {
-            let hit = rx_find(rx, &ln.text);
-            rank = if hit == Some(ln.text.as_str()) { 0 } else { 2 };
-            if let Some(h) = hit {
-                let need = norm(h);
-                let n = words.len();
-                'outer: for size in 1..=n {
-                    for i in 0..=(n - size) {
-                        if words[i..i + size].join(" ").contains(&need) {
-                            span = Some((i, i + size));
-                            break 'outer;
-                        }
-                    }
-                }
-            }
+            let Some(h) = rx_find(rx, &ln.text) else { continue };
+            rank = if h == ln.text.as_str() { 0 } else { 2 };
+            let need = norm(h);
+            populate_norm_words(ln, &mut words_buf);
+            span = find_span_in_words(&words_buf, &need, false, &mut chunk_buf);
         } else {
-            let res = match_line_tokens(ln, &t, &words, &want, short_alpha);
-            let t_f = fold_accents(&t);
-            let mut words_f: Option<Vec<String>> = None;
-            let fold_differs = t_f != t || want_f != want;
+            norm_into(&ln.text, &mut t_buf);
+            let mut words_ready = false;
+            let mut words_f_ready = false;
+
+            let res: Option<(u8, bool, Span)> = if let Some((r_rank, r_icon)) = classify_line_match(&t_buf, &want, short_alpha) {
+                let s = if r_icon && ln.words.len() >= 2 && has_non_word(&ln.words[0].text) && !has_alpha(&ln.words[0].text) {
+                    Some((1, ln.words.len()))
+                } else {
+                    populate_norm_words(ln, &mut words_buf);
+                    words_ready = true;
+                    find_span_in_words(&words_buf, &want, short_alpha, &mut chunk_buf)
+                };
+                s.map(|sp| (r_rank, r_icon, sp))
+            } else {
+                None
+            };
+
+            let t_is_ascii = t_buf.is_ascii();
+            let t_f: &str = if t_is_ascii {
+                &t_buf
+            } else {
+                fold_accents_into(&t_buf, &mut t_f_buf);
+                &t_f_buf
+            };
+            let fold_differs = (!t_is_ascii && t_f != t_buf.as_str()) || want_f != want;
             if !want_f.is_empty() && !t_f.is_empty() && res.is_none_or(|r| r.0 > 0) && fold_differs {
-                let wf: Vec<String> = words.iter().map(|w| fold_accents(w)).collect();
-                let res_f = match_line_tokens(ln, &t_f, &wf, &want_f, short_alpha_f);
-                words_f = Some(wf);
-                if let Some(rf) = res_f {
-                    if res.is_none_or(|r| rf.0 < r.0) {
-                        (rank, icon_stripped) = (rf.0, rf.1);
-                        span = Some(rf.2);
-                        folded = true;
+                if let Some((rf_rank, rf_icon)) = classify_line_match(t_f, &want_f, short_alpha_f) {
+                    if res.is_none_or(|r| rf_rank < r.0) {
+                        let s = if rf_icon && ln.words.len() >= 2 && has_non_word(&ln.words[0].text) && !has_alpha(&ln.words[0].text) {
+                            Some((1, ln.words.len()))
+                        } else {
+                            if !words_ready {
+                                populate_norm_words(ln, &mut words_buf);
+                                words_ready = true;
+                            }
+                            populate_folded_words(&words_buf, &mut words_f_buf);
+                            words_f_ready = true;
+                            find_span_in_words(&words_f_buf, &want_f, short_alpha_f, &mut chunk_buf)
+                        };
+                        if let Some(sp) = s {
+                            (rank, icon_stripped) = (rf_rank, rf_icon);
+                            span = Some(sp);
+                            folded = true;
+                        }
                     }
                 }
             }
@@ -453,15 +659,24 @@ pub fn find_text(lines: &[Line], label: &str, fuzzy: f64, where_: Option<&str>) 
                     folded = false;
                 }
             }
-            if span.is_none() && fuzzy != 0.0 && !short_alpha && !short_alpha_f && !want_has_digit {
-                if let Some(s) = fuzzy_window(&words, &want, fuzzy) {
+            // A rank-3 fuzzy match can never beat a non-status exact/prefix/substring match (rank < 3).
+            let can_fuzzy_beat_best = !best.as_ref().is_some_and(|(bk, _)| !bk.0 && bk.1 < 3);
+            if span.is_none() && fuzzy_enabled && can_fuzzy_beat_best {
+                if !words_ready {
+                    populate_norm_words(ln, &mut words_buf);
+                }
+                let tw = target_want.get_or_insert_with(|| PreparedTarget::new(&want));
+                if let Some(s) = fuzzy_window_prepared(&words_buf, want_k, tw, fuzzy, &mut chunk_buf, &mut a_chars_buf) {
                     span = Some(s);
                     rank = 3;
                     folded = false;
                 }
                 if span.is_none() && !want_f.is_empty() && !t_f.is_empty() && fold_differs {
-                    let wf = words_f.get_or_insert_with(|| words.iter().map(|w| fold_accents(w)).collect());
-                    if let Some(s) = fuzzy_window(wf, &want_f, fuzzy) {
+                    if !words_f_ready {
+                        populate_folded_words(&words_buf, &mut words_f_buf);
+                    }
+                    let twf = target_want_f.get_or_insert_with(|| PreparedTarget::new(&want_f));
+                    if let Some(s) = fuzzy_window_prepared(&words_f_buf, want_f_k, twf, fuzzy, &mut chunk_buf, &mut a_chars_buf) {
                         span = Some(s);
                         rank = 3;
                         folded = true;
@@ -625,33 +840,152 @@ pub fn text_overlap(a: &[String], b: &[String]) -> f64 {
 // difflib.SequenceMatcher (isjunk=None, autojunk=True) over chars
 // ---------------------------------------------------------------------------
 
-struct SeqMatcher<'a> {
-    a: &'a [char],
-    b: &'a [char],
-    b2j: std::collections::HashMap<char, Vec<usize>>,
+struct PreparedTarget {
+    b: Vec<char>,
+    b_is_ascii: bool,
+    b_ascii_counts: [u32; 128],
+    b_non_ascii_counts: Vec<(char, u32)>,
+    b2j: Option<std::collections::HashMap<char, Vec<usize>>>,
+    prev_len: Vec<usize>,
+    prev_gen: Vec<u32>,
+    curr_len: Vec<usize>,
+    curr_gen: Vec<u32>,
+    gen: u32,
+    queue: Vec<(usize, usize, usize, usize)>,
 }
 
-impl<'a> SeqMatcher<'a> {
-    fn new(a: &'a [char], b: &'a [char]) -> SeqMatcher<'a> {
+impl PreparedTarget {
+    fn new(b_str: &str) -> PreparedTarget {
+        let b_is_ascii = b_str.is_ascii();
+        let mut b = Vec::with_capacity(if b_is_ascii { b_str.len() } else { b_str.chars().count() });
+        let mut b_ascii_counts = [0u32; 128];
+        let mut b_non_ascii_counts: Vec<(char, u32)> = Vec::new();
+        for c in b_str.chars() {
+            b.push(c);
+            let u = c as u32;
+            if u < 128 {
+                b_ascii_counts[u as usize] += 1;
+            } else if let Some((_, cnt)) = b_non_ascii_counts.iter_mut().find(|(k, _)| *k == c) {
+                *cnt += 1;
+            } else {
+                b_non_ascii_counts.push((c, 1));
+            }
+        }
+        PreparedTarget {
+            b,
+            b_is_ascii,
+            b_ascii_counts,
+            b_non_ascii_counts,
+            b2j: None,
+            prev_len: Vec::new(),
+            prev_gen: Vec::new(),
+            curr_len: Vec::new(),
+            curr_gen: Vec::new(),
+            gen: 0,
+            queue: Vec::new(),
+        }
+    }
+
+    fn ensure_b2j(&mut self) {
+        if self.b2j.is_some() {
+            return;
+        }
         let mut b2j: std::collections::HashMap<char, Vec<usize>> = std::collections::HashMap::new();
-        for (i, &c) in b.iter().enumerate() {
+        for (i, &c) in self.b.iter().enumerate() {
             b2j.entry(c).or_default().push(i);
         }
-        let n = b.len();
+        let n = self.b.len();
         if n >= 200 {
             let ntest = n / 100 + 1;
             b2j.retain(|_, idxs| idxs.len() <= ntest);
         }
-        SeqMatcher { a, b, b2j }
+        self.b2j = Some(b2j);
+        self.prev_len.resize(n, 0);
+        self.prev_gen.resize(n, 0);
+        self.curr_len.resize(n, 0);
+        self.curr_gen.resize(n, 0);
     }
 
-    fn find_longest_match(&self, alo: usize, ahi: usize, blo: usize, bhi: usize) -> (usize, usize, usize) {
-        let (a, b) = (self.a, self.b);
+    /// Upper bound `real_quick_ratio` and `quick_ratio` short-circuit before exact SequenceMatcher.
+    fn ratio_str_at_least(&mut self, a_str: &str, cutoff: f64, a_chars_buf: &mut Vec<char>) -> Option<f64> {
+        let a_is_ascii = a_str.is_ascii();
+        let a_len = if a_is_ascii { a_str.len() } else { a_str.chars().count() };
+        let total_len = a_len + self.b.len();
+        if total_len == 0 {
+            return (1.0 >= cutoff).then_some(1.0);
+        }
+        // difflib real_quick_ratio() upper bound: 2 * min(|a|, |b|) / (|a| + |b|)
+        let real_quick = 2.0 * a_len.min(self.b.len()) as f64 / total_len as f64;
+        if real_quick < cutoff {
+            return None;
+        }
+        // difflib quick_ratio() upper bound: 2 * multiset_intersection(a, b) / (|a| + |b|)
+        let mut ub = 0usize;
+        if self.b_is_ascii && a_is_ascii {
+            let mut avail = self.b_ascii_counts;
+            for &byte in a_str.as_bytes() {
+                let slot = &mut avail[byte as usize];
+                if *slot > 0 {
+                    *slot -= 1;
+                    ub += 1;
+                }
+            }
+        } else if self.b_is_ascii {
+            let mut avail = self.b_ascii_counts;
+            for c in a_str.chars() {
+                let u = c as u32;
+                if u < 128 {
+                    let slot = &mut avail[u as usize];
+                    if *slot > 0 {
+                        *slot -= 1;
+                        ub += 1;
+                    }
+                }
+            }
+        } else {
+            let mut avail_ascii = self.b_ascii_counts;
+            let mut avail_non = self.b_non_ascii_counts.clone();
+            for c in a_str.chars() {
+                let u = c as u32;
+                if u < 128 {
+                    let slot = &mut avail_ascii[u as usize];
+                    if *slot > 0 {
+                        *slot -= 1;
+                        ub += 1;
+                    }
+                } else if let Some((_, cnt)) = avail_non.iter_mut().find(|(k, _)| *k == c) {
+                    if *cnt > 0 {
+                        *cnt -= 1;
+                        ub += 1;
+                    }
+                }
+            }
+        }
+        if 2.0 * ub as f64 / (total_len as f64) < cutoff {
+            return None;
+        }
+        a_chars_buf.clear();
+        a_chars_buf.extend(a_str.chars());
+        let r = self.ratio_chars_exact(a_chars_buf);
+        (r >= cutoff).then_some(r)
+    }
+
+    fn find_longest_match(&mut self, a: &[char], alo: usize, ahi: usize, blo: usize, bhi: usize) -> (usize, usize, usize) {
+        let b2j = self.b2j.as_ref().expect("ensure_b2j called");
+        let b = &self.b;
         let (mut besti, mut bestj, mut bestsize) = (alo, blo, 0usize);
-        let mut j2len: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        // Reserve a fresh generation pair for the initial empty prev_gen.
+        if self.gen >= u32::MAX - 2 - (ahi - alo) as u32 {
+            self.prev_gen.fill(0);
+            self.curr_gen.fill(0);
+            self.gen = 0;
+        }
+        self.gen += 1;
+        let mut prev_g = self.gen;
         for i in alo..ahi {
-            let mut newj2len = std::collections::HashMap::new();
-            if let Some(js) = self.b2j.get(&a[i]) {
+            self.gen += 1;
+            let curr_g = self.gen;
+            if let Some(js) = b2j.get(&a[i]) {
                 for &j in js {
                     if j < blo {
                         continue;
@@ -659,8 +993,10 @@ impl<'a> SeqMatcher<'a> {
                     if j >= bhi {
                         break;
                     }
-                    let k = j.checked_sub(1).and_then(|p| j2len.get(&p)).copied().unwrap_or(0) + 1;
-                    newj2len.insert(j, k);
+                    let prev = if j > 0 && self.prev_gen[j - 1] == prev_g { self.prev_len[j - 1] } else { 0 };
+                    let k = prev + 1;
+                    self.curr_gen[j] = curr_g;
+                    self.curr_len[j] = k;
                     if k > bestsize {
                         besti = i + 1 - k;
                         bestj = j + 1 - k;
@@ -668,7 +1004,9 @@ impl<'a> SeqMatcher<'a> {
                     }
                 }
             }
-            j2len = newj2len;
+            std::mem::swap(&mut self.prev_len, &mut self.curr_len);
+            std::mem::swap(&mut self.prev_gen, &mut self.curr_gen);
+            prev_g = curr_g;
         }
         // No junk (isjunk=None): only the non-junk extension loops can fire.
         while besti > alo && bestj > blo && a[besti - 1] == b[bestj - 1] {
@@ -682,38 +1020,40 @@ impl<'a> SeqMatcher<'a> {
         (besti, bestj, bestsize)
     }
 
-    fn matches(&self) -> usize {
-        let mut queue = vec![(0usize, self.a.len(), 0usize, self.b.len())];
+    fn matches(&mut self, a: &[char]) -> usize {
+        self.ensure_b2j();
+        self.queue.clear();
+        self.queue.push((0usize, a.len(), 0usize, self.b.len()));
         let mut total = 0;
-        while let Some((alo, ahi, blo, bhi)) = queue.pop() {
-            let (i, j, k) = self.find_longest_match(alo, ahi, blo, bhi);
+        while let Some((alo, ahi, blo, bhi)) = self.queue.pop() {
+            let (i, j, k) = self.find_longest_match(a, alo, ahi, blo, bhi);
             if k > 0 {
                 total += k;
                 if alo < i && blo < j {
-                    queue.push((alo, i, blo, j));
+                    self.queue.push((alo, i, blo, j));
                 }
                 if i + k < ahi && j + k < bhi {
-                    queue.push((i + k, ahi, j + k, bhi));
+                    self.queue.push((i + k, ahi, j + k, bhi));
                 }
             }
         }
         total
     }
-}
 
-fn ratio_chars(a: &[char], b: &[char]) -> f64 {
-    let len = a.len() + b.len();
-    if len == 0 {
-        return 1.0;
+    fn ratio_chars_exact(&mut self, a: &[char]) -> f64 {
+        let len = a.len() + self.b.len();
+        if len == 0 {
+            return 1.0;
+        }
+        2.0 * self.matches(a) as f64 / len as f64
     }
-    2.0 * SeqMatcher::new(a, b).matches() as f64 / len as f64
 }
 
 /// `difflib.SequenceMatcher(None, a, b).ratio()` over chars.
 pub fn seq_ratio(a: &str, b: &str) -> f64 {
     let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    ratio_chars(&a, &b)
+    let mut target = PreparedTarget::new(b);
+    target.ratio_chars_exact(&a)
 }
 
 /// `difflib.get_close_matches(word, possibilities, n, cutoff)`.
@@ -721,17 +1061,68 @@ pub fn get_close_matches(word: &str, possibilities: &[String], n: usize, cutoff:
     if n == 0 {
         return Vec::new();
     }
-    let w: Vec<char> = word.chars().collect();
+    let mut target = PreparedTarget::new(word);
+    let mut a_chars_buf: Vec<char> = Vec::new();
     let mut result: Vec<(f64, &String)> = Vec::new();
     for x in possibilities {
-        let xa: Vec<char> = x.chars().collect();
-        // real_quick_ratio/quick_ratio are upper bounds of ratio(): ratio alone decides.
-        let r = ratio_chars(&xa, &w);
-        if r >= cutoff {
+        if let Some(r) = target.ratio_str_at_least(x, cutoff, &mut a_chars_buf) {
             result.push((r, x));
         }
     }
     // heapq.nlargest(n, [(score, x)]): by score, then string, descending.
     result.sort_by(|p, q| q.0.partial_cmp(&p.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| q.1.cmp(p.1)));
     result.into_iter().take(n).map(|(_, x)| x.clone()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_py_isspace_matches_char_py_isspace() {
+        for b in 0u8..=127 {
+            assert_eq!(ascii_py_isspace(b), py_isspace(b as char), "mismatch for byte 0x{b:02x}");
+        }
+    }
+
+    #[test]
+    fn clean_text_norm_and_fold_accents_edge_cases() {
+        assert_eq!(clean_text("  Hello\t\u{000b}\u{001f}World  "), "Hello World");
+        assert_eq!(clean_text("Wi\u{200b}-Fi\u{feff} \u{200e} 5G"), "Wi-Fi 5G");
+        assert_eq!(norm("  GENERAL\t\nSoftware  "), "general software");
+        assert_eq!(norm("  Straße  "), "straße");
+        assert_eq!(fold_accents("Café Åpne Søk Ære Straße Đorđe Łódź Cœur"), "Cafe Apne Sok Aere Strasse Dorde Lodz Coeur");
+    }
+
+    #[test]
+    fn prepared_target_upper_bounds_match_exact_seq_ratio() {
+        let targets = ["Settings", "Accessibillty", "Søkeresultater", "", "a"];
+        let cands = [
+            "Settings",
+            "Settlngs",
+            "Accessibility",
+            "Soker",
+            "Søkeresultater",
+            "Søkeresultatr",
+            "Completely Different String Here",
+            "",
+            "a",
+            "ab",
+        ];
+        let mut buf = Vec::new();
+        for t in targets {
+            let mut pt = PreparedTarget::new(t);
+            for cutoff in [0.0, 0.5, 0.75, 0.84, 0.99, 1.0] {
+                for c in cands {
+                    let exact = seq_ratio(c, t);
+                    let got = pt.ratio_str_at_least(c, cutoff, &mut buf);
+                    if exact >= cutoff {
+                        assert_eq!(got, Some(exact), "dropped match c={c:?} t={t:?} cutoff={cutoff}");
+                    } else {
+                        assert_eq!(got, None, "false match c={c:?} t={t:?} cutoff={cutoff}");
+                    }
+                }
+            }
+        }
+    }
 }

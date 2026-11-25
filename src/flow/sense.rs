@@ -1,12 +1,12 @@
 //! Sensing: active-app provenance, waiting, reading, settling, controls,
 //! `read_full`, system alerts (Python Flow L2680-3133 and L4328-4893).
-use super::{Flow, ProbeSnapshot, STALE_UI_BACKOFF};
+use super::{scope_controls, Flow, ProbeSnapshot, STALE_UI_BACKOFF};
 use crate::clock;
 use crate::error::{Error, Result};
 use crate::image::{box_diff, content_pixel_still, frame_reacted, thumb_diff, Frame};
 use crate::json;
 use crate::ocr::{ReadOpts, Reader};
-use crate::text::{self, clean_text, controls_in_region, find_text, split_where, text_overlap, Line, Match, DEFAULT_FUZZY};
+use crate::text::{self, clean_text, find_text, split_where, text_overlap, Line, Match, DEFAULT_FUZZY};
 use crate::ui::{self, Control};
 use crate::wda::{WdaClient, SPRINGBOARD};
 use serde_json::Value;
@@ -121,6 +121,9 @@ fn ok_dict(r: &Value) -> bool {
 
 /// `re.split(r"(?<!\\)\|", spec)`.
 fn split_unescaped_pipes(spec: &str) -> Vec<String> {
+    if !spec.contains('\\') {
+        return spec.split('|').map(String::from).collect();
+    }
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut prev: Option<char> = None;
@@ -459,16 +462,19 @@ impl<R: Reader> Flow<R> {
                 // Confirm stability with one cheap raw screenshot (~34 ms): if the entire
                 // screen and the target box are pixel-still between two distinct grabs,
                 // skip a redundant second full OCR pass (200-700 ms).
-                let p_img = prev_img.clone().expect("checked above");
-                let p = prev.clone().expect("checked above");
+                let p_img = prev_img.as_ref().expect("checked above");
+                let (px, py) = {
+                    let p = prev.as_ref().expect("checked above");
+                    (p.x, p.y)
+                };
                 let cur_img = self.grab()?;
-                if !Arc::ptr_eq(&cur_img, &p_img)
-                    && (still(Some(&p_img), Some(&cur_img)) || tdiff(&p_img, &cur_img) < 0.8)
-                    && bdiff(&p_img, &cur_img, p.x, p.y, self.r.scale()) < 2.0
+                if !Arc::ptr_eq(&cur_img, p_img)
+                    && (still(Some(p_img), Some(&cur_img)) || tdiff(p_img, &cur_img) < 0.8)
+                    && bdiff(p_img, &cur_img, px, py, self.r.scale()) < 2.0
                 {
-                    self.r.set_last(Some(cur_img), prev_lines.clone(), None);
+                    self.r.set_last(Some(cur_img), prev_lines.take(), None);
                     self.wait_settled_ts = clock::now();
-                    return Ok(p);
+                    return Ok(prev.take().expect("checked above"));
                 }
                 lines = self.read_img(&cur_img)?;
                 self.r.set_last(Some(cur_img), Some(lines.clone()), None);
@@ -484,34 +490,39 @@ impl<R: Reader> Flow<R> {
                     || prev.as_ref().is_some_and(|p| (mm.x - p.x).abs() <= 3 && (mm.y - p.y).abs() <= 3);
                 if ok {
                     self.wait_settled_ts = clock::now();
-                    return Ok(mm.clone());
+                    return Ok(m.unwrap());
                 }
             }
             let found = m.is_some();
-            prev = m;
-            prev_img = if found { self.r.last() } else { None };
-            prev_lines = if found { Some(lines.clone()) } else { None };
-            let now = clock::wall();
-            let recent_open = self.pending_bundle_ts != 0.0 && (clock::now() - self.pending_bundle_ts) < 2.0;
-            let ui_interval: f64 = if recent_open && (now - start) < 1.2 { 0.35 } else { 0.8 };
-            if !found
-                && (frames >= 2 || now - start >= ui_interval.min(0.4))
-                && (last_ui == 0.0 || now - last_ui >= ui_interval)
-            {
-                let raw = self.text_controls()?;
-                let ctl = controls_in_region(&raw, &lines, where_);
-                last_ui = clock::wall();
-                if let Some(cm) = ui::find_control_match(&ctl, &label, Some(ui::WAIT_UI_TYPES), allow_disabled) {
-                    self.wait_settled_ts = clock::now();
-                    return Ok(cm);
-                }
-                if let Some(cur_img) = self.r.last() {
-                    if Some(frame_id(&cur_img)) != last_sauvola_id {
-                        last_sauvola_id = Some(frame_id(&cur_img));
-                        if let Some(slines) = self.read_sauvola(Some(cur_img))?.filter(|s| !s.is_empty()) {
-                            if let Some(sm) = find(&slines, &label, where_) {
-                                self.wait_settled_ts = clock::now();
-                                return Ok(sm);
+            if found {
+                prev = m;
+                prev_img = self.r.last();
+                prev_lines = Some(lines);
+            } else {
+                prev = None;
+                prev_img = None;
+                prev_lines = None;
+                let now = clock::wall();
+                let recent_open = self.pending_bundle_ts != 0.0 && (clock::now() - self.pending_bundle_ts) < 2.0;
+                let ui_interval: f64 = if recent_open && (now - start) < 1.2 { 0.35 } else { 0.8 };
+                if (frames >= 2 || now - start >= ui_interval.min(0.4))
+                    && (last_ui == 0.0 || now - last_ui >= ui_interval)
+                {
+                    let raw = self.text_controls()?;
+                    let ctl = scope_controls(&raw, &lines, where_);
+                    last_ui = clock::wall();
+                    if let Some(cm) = ui::find_control_match(&ctl, &label, Some(ui::WAIT_UI_TYPES), allow_disabled) {
+                        self.wait_settled_ts = clock::now();
+                        return Ok(cm);
+                    }
+                    if let Some(cur_img) = self.r.last() {
+                        if Some(frame_id(&cur_img)) != last_sauvola_id {
+                            last_sauvola_id = Some(frame_id(&cur_img));
+                            if let Some(slines) = self.read_sauvola(Some(cur_img))?.filter(|s| !s.is_empty()) {
+                                if let Some(sm) = find(&slines, &label, where_) {
+                                    self.wait_settled_ts = clock::now();
+                                    return Ok(sm);
+                                }
                             }
                         }
                     }
@@ -594,7 +605,7 @@ impl<R: Reader> Flow<R> {
                 let raw_ctl = self.text_controls()?;
                 last_ui = clock::wall();
                 for (label, w) in &cands {
-                    let ctl = controls_in_region(&raw_ctl, &lines, w.as_deref());
+                    let ctl = scope_controls(&raw_ctl, &lines, w.as_deref());
                     if let Some(cm) = ui::find_control_match(&ctl, label, Some(ui::WAIT_UI_TYPES), true) {
                         self.wait_settled_ts = clock::now();
                         return Ok(cm);
@@ -687,7 +698,7 @@ impl<R: Reader> Flow<R> {
             return Ok(Some(m.text));
         }
         let raw = self.text_controls()?;
-        let ctl = controls_in_region(&raw, &lines, where_);
+        let ctl = scope_controls(&raw, &lines, where_);
         Ok(ui::find_control_match(&ctl, base, Some(ui::WAIT_UI_TYPES), true).map(|cm| cm.text))
     }
 
@@ -1176,9 +1187,9 @@ impl<R: Reader> Flow<R> {
             if let (Some(last), Some(cached_lines)) = (self.r.last(), self.r.last_lines()) {
                 if last_ts != 0.0 && (t0 - last_ts) < 0.25 && has_content_of(&cached_lines) {
                     prev_img = Some(last.clone());
-                    prev_texts = Some(texts_of(&cached_lines));
-                    prev_has_content = true;
                     texts = texts_of(&cached_lines);
+                    prev_texts = Some(texts.clone());
+                    prev_has_content = true;
                     lines = cached_lines.clone();
                     populated_frames = 1;
                     if fut.is_some() {
@@ -1199,7 +1210,8 @@ impl<R: Reader> Flow<R> {
                 }
             }
         }
-        while !already_stable {
+        if !already_stable {
+          loop {
             let cur_img: Option<Frame>;
             if let Some(pimg) = pending_img.take() {
                 lines = self.read_img(&pimg)?;
@@ -1262,6 +1274,7 @@ impl<R: Reader> Flow<R> {
                     }
                 }
             }
+          }
         }
         if let Some(p) = probes.as_ref() {
             let fut_fresh = fut.is_some()
@@ -1348,8 +1361,11 @@ impl<R: Reader> Flow<R> {
                 if c.kind != "Text" {
                     return true;
                 }
-                let head: String = c.label.chars().take(40).collect();
-                if find(&lines, &head, None).is_some() {
+                let head = match c.label.char_indices().nth(40) {
+                    Some((i, _)) => &c.label[..i],
+                    None => c.label.as_str(),
+                };
+                if find(&lines, head, None).is_some() {
                     return false;
                 }
                 let tn = text::norm(&c.label);

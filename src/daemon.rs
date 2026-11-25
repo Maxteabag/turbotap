@@ -22,9 +22,14 @@
 //! environment.
 use crate::error::{Error, Result};
 use crate::json;
+use serde::ser::SerializeMap;
+use serde::Serialize;
 use serde_json::{json as j, Map, Value};
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -54,15 +59,13 @@ pub fn log_path() -> PathBuf {
 /// Version + protocol + binary identity: a daemon started before an upgrade refuses
 /// requests (the client then runs them itself).
 pub fn code_fingerprint() -> String {
-    let mut parts = vec![crate::VERSION.to_string(), PROTOCOL.to_string()];
     match std::env::current_exe().and_then(std::fs::metadata) {
         Ok(st) => {
             let mtime_ns = st.mtime() as i128 * 1_000_000_000 + st.mtime_nsec() as i128;
-            parts.push(format!("{}:{mtime_ns}", st.len()));
+            format!("{}/{}/{}:{mtime_ns}", crate::VERSION, PROTOCOL, st.len())
         }
-        Err(_) => parts.push("?".to_string()),
+        Err(_) => format!("{}/{}/?", crate::VERSION, PROTOCOL),
     }
-    parts.join("/")
 }
 
 fn encode(obj: &Value) -> Vec<u8> {
@@ -79,43 +82,63 @@ fn proto_err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
 }
 
+fn parse_json_obj(line: &[u8]) -> std::io::Result<Map<String, Value>> {
+    let msg: Value = serde_json::from_slice(line).map_err(|e| proto_err(&e.to_string()))?;
+    match msg {
+        Value::Object(m) => Ok(m),
+        _ => Err(proto_err("expected a JSON object")),
+    }
+}
+
 /// Newline-delimited JSON reader over a socket.
+/// Uses `BufReader::fill_buf` directly (never `read_until`) so single-chunk lines parse
+/// zero-copy without shifting/draining a `Vec<u8>`, while still propagating `EINTR` on SIGINT.
 struct Lines<'a> {
-    sock: &'a UnixStream,
-    buf: Vec<u8>,
+    reader: BufReader<&'a UnixStream>,
+    scratch: Vec<u8>,
 }
 
 impl<'a> Lines<'a> {
     fn new(sock: &'a UnixStream) -> Lines<'a> {
-        Lines { sock, buf: Vec::new() }
+        Lines { reader: BufReader::with_capacity(8192, sock), scratch: Vec::new() }
     }
 
     fn read(&mut self) -> std::io::Result<Map<String, Value>> {
+        self.scratch.clear();
         loop {
-            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = self.buf.drain(..=pos).collect();
-                let msg: Value =
-                    serde_json::from_slice(&line[..line.len() - 1]).map_err(|e| proto_err(&e.to_string()))?;
-                return match msg {
-                    Value::Object(m) => Ok(m),
-                    _ => Err(proto_err("expected a JSON object")),
-                };
-            }
-            if self.buf.len() > MAX_LINE {
-                return Err(proto_err("message too large"));
-            }
-            let mut chunk = [0u8; 65536];
-            let n = (&*self.sock).read(&mut chunk)?;
-            if n == 0 {
+            let avail = self.reader.fill_buf()?;
+            if avail.is_empty() {
                 return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"));
             }
-            self.buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                let res = if self.scratch.is_empty() {
+                    parse_json_obj(&avail[..pos])
+                } else if self.scratch.len() + pos > MAX_LINE {
+                    Err(proto_err("message too large"))
+                } else {
+                    self.scratch.extend_from_slice(&avail[..pos]);
+                    parse_json_obj(&self.scratch)
+                };
+                self.reader.consume(pos + 1);
+                return res;
+            }
+            let len = avail.len();
+            if self.scratch.len() + len > MAX_LINE {
+                self.reader.consume(len);
+                return Err(proto_err("message too large"));
+            }
+            self.scratch.extend_from_slice(avail);
+            self.reader.consume(len);
         }
     }
 }
 
 fn send(sock: &UnixStream, obj: &Value) -> std::io::Result<()> {
     (&*sock).write_all(&encode(obj))
+}
+
+fn send_bytes(sock: &UnixStream, bytes: &[u8]) -> std::io::Result<()> {
+    (&*sock).write_all(bytes)
 }
 
 fn uid() -> u32 {
@@ -277,16 +300,46 @@ pub fn forward(argv: &[String]) -> Option<i32> {
     code
 }
 
+struct EnvPairs<'a>(&'a [(String, String)]);
+
+impl Serialize for EnvPairs<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0 {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct RunMsg<'a> {
+    v: u32,
+    op: &'static str,
+    argv: &'a [String],
+    env: EnvPairs<'a>,
+    cwd: &'a str,
+    fingerprint: &'a str,
+}
+
 /// [`forward`] with an explicit request and output sink (tests call this directly).
 pub(crate) fn forward_request(req: &ForwardRequest, sink: &mut dyn FnMut(Stream, &str)) -> Option<i32> {
     let sock = connect(CONNECT_TIMEOUT)?;
     let mut committed = false;
-    let env: Map<String, Value> = req.env.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
-    let msg = j!({"v": PROTOCOL, "op": "run", "argv": req.argv, "env": env, "cwd": req.cwd, "fingerprint": req.fingerprint});
+    let msg = RunMsg {
+        v: PROTOCOL,
+        op: "run",
+        argv: &req.argv,
+        env: EnvPairs(&req.env),
+        cwd: &req.cwd,
+        fingerprint: &req.fingerprint,
+    };
+    let mut payload = serde_json::to_vec(&msg).ok()?;
+    payload.push(b'\n');
     let res: std::io::Result<i32> = (|| {
         sock.set_read_timeout(secs(FIRST_REPLY_TIMEOUT))?;
         sock.set_write_timeout(secs(FIRST_REPLY_TIMEOUT))?;
-        send(&sock, &msg)?;
+        send_bytes(&sock, &payload)?;
         let mut reader = Lines::new(&sock);
         let mut m = reader.read()?;
         if json::truthy(m.get("queued").unwrap_or(&Value::Null)) {
@@ -298,14 +351,20 @@ pub(crate) fn forward_request(req: &ForwardRequest, sink: &mut dyn FnMut(Stream,
         }
         sock.set_read_timeout(None)?;
         sock.set_write_timeout(None)?;
-        send(&sock, &j!({"go": true}))?;
+        send_bytes(&sock, b"{\"go\":true}\n")?;
         committed = true;
         loop {
             let m = reader.read()?;
             if let Some(v) = m.get("out") {
-                sink(Stream::Out, &json::py_str(v));
+                match v {
+                    Value::String(s) => sink(Stream::Out, s),
+                    other => sink(Stream::Out, &json::py_str(other)),
+                }
             } else if let Some(v) = m.get("err") {
-                sink(Stream::Err, &json::py_str(v));
+                match v {
+                    Value::String(s) => sink(Stream::Err, s),
+                    other => sink(Stream::Err, &json::py_str(other)),
+                }
             } else if let Some(code) = m.get("exit") {
                 return Ok(match code {
                     Value::Number(n) if n.is_i64() => n.as_i64().unwrap_or(1) as i32,
@@ -342,30 +401,37 @@ pub(crate) fn forward_request(req: &ForwardRequest, sink: &mut dyn FnMut(Stream,
 /// stdout/stderr replacement that streams one request's output to its client.
 struct StreamSink {
     conn: UnixStream,
-    lock: Mutex<()>,
+    buf: Mutex<Vec<u8>>,
     broken: AtomicBool,
 }
 
 impl StreamSink {
-    fn write(&self, key: &str, s: &str) {
-        if s.is_empty() || self.broken.load(Ordering::SeqCst) {
+    fn write(&self, prefix: &[u8], s: &str) {
+        if s.is_empty() || self.broken.load(Ordering::Relaxed) {
             return;
         }
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut m = Map::new();
-        m.insert(key.to_string(), Value::String(s.to_string()));
-        if send(&self.conn, &Value::Object(m)).is_err() {
-            self.broken.store(true, Ordering::SeqCst); // client went away; finish the command regardless
+        let mut buf = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        if self.broken.load(Ordering::Relaxed) {
+            return;
+        }
+        buf.clear();
+        buf.extend_from_slice(prefix);
+        if serde_json::to_writer(&mut *buf, s).is_err() {
+            return;
+        }
+        buf.extend_from_slice(b"}\n");
+        if (&self.conn).write_all(&buf).is_err() {
+            self.broken.store(true, Ordering::Relaxed); // client went away; finish the command regardless
         }
     }
 }
 
 impl crate::out::Sink for StreamSink {
     fn stdout(&self, s: &str) {
-        self.write("out", s);
+        self.write(br#"{"out":"#, s);
     }
     fn stderr(&self, s: &str) {
-        self.write("err", s);
+        self.write(br#"{"err":"#, s);
     }
 }
 
@@ -481,8 +547,12 @@ impl Server {
             crate::wda::set_pool_enabled(false);
             self.warmed = false;
         }
-        // Closing the file releases the flock.
-        self.lock_file = None;
+        // Explicitly unlock before closing so a concurrent fork() between open and
+        // exec cannot keep the flock held on the duplicated open file description.
+        if let Some(file) = self.lock_file.take() {
+            // SAFETY: valid open fd owned by `file`.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 
     pub fn serve_forever(&mut self) {
@@ -636,23 +706,38 @@ fn handle(inner: &Inner, conn: UnixStream) {
             inner.stopping.store(true, Ordering::SeqCst);
             send(&conn, &j!({"ok": true, "stopping": true, "pid": std::process::id()}))
         } else if op == "run" {
-            run(inner, &conn, &mut reader, &msg)
+            run(inner, &conn, &mut reader, msg)
         } else {
             send(&conn, &j!({"error": "unknown op"}))
         }
     })();
 }
 
-fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, msg: &Map<String, Value>) -> std::io::Result<()> {
-    let argv: Option<Vec<String>> = msg
-        .get("argv")
-        .and_then(Value::as_array)
-        .and_then(|a| a.iter().map(|x| x.as_str().map(String::from)).collect());
-    let env: Option<Vec<(String, String)>> = msg
-        .get("env")
-        .and_then(Value::as_object)
-        .and_then(|m| m.iter().map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect());
-    let cwd = msg.get("cwd").and_then(Value::as_str).map(String::from);
+fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, mut msg: Map<String, Value>) -> std::io::Result<()> {
+    let argv: Option<Vec<String>> = match msg.remove("argv") {
+        Some(Value::Array(a)) => a
+            .into_iter()
+            .map(|x| match x {
+                Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    };
+    let env: Option<Vec<(String, String)>> = match msg.remove("env") {
+        Some(Value::Object(m)) => m
+            .into_iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => Some((k, s)),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    };
+    let cwd = match msg.remove("cwd") {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    };
     let (Some(argv), Some(env), Some(cwd)) = (argv, env, cwd) else {
         return send(conn, &j!({"error": "malformed request"}));
     };
@@ -681,14 +766,14 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, msg: &Map<String, V
             Ok(g) => g,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                send(conn, &j!({"queued": true}))?;
+                send_bytes(conn, b"{\"queued\":true}\n")?;
                 inner.exec_lock.lock().unwrap_or_else(|e| e.into_inner())
             }
         };
         if inner.stopping.load(Ordering::SeqCst) {
             return send(conn, &j!({"error": "stopping"}));
         }
-        send(conn, &j!({"ready": true}))?;
+        send_bytes(conn, b"{\"ready\":true}\n")?;
         conn.set_read_timeout(secs(GO_TIMEOUT))?;
         if !json::truthy(reader.read()?.get("go").unwrap_or(&Value::Null)) {
             return Ok(());
@@ -697,7 +782,7 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, msg: &Map<String, V
         conn.set_write_timeout(None)?;
         let code = execute(conn, &argv, &env, &cwd);
         inner.state.lock().unwrap_or_else(|e| e.into_inner()).requests += 1;
-        let _ = send(conn, &j!({"exit": code}));
+        let _ = send_bytes(conn, format!("{{\"exit\":{code}}}\n").as_bytes());
         Ok(())
     })();
     touch(inner, -1);
@@ -720,65 +805,79 @@ pub fn valid_env_entry(k: &str, v: &str) -> bool {
     !k.is_empty() && !k.contains('=') && !k.contains('\0') && !v.contains('\0')
 }
 
+fn valid_os_env_entry(k: &OsStr, v: &OsStr) -> bool {
+    let (kb, vb) = (k.as_bytes(), v.as_bytes());
+    !kb.is_empty() && !kb.contains(&b'=') && !kb.contains(&0) && !vb.contains(&0)
+}
+
+fn is_config_env_key(k: &OsStr) -> bool {
+    k == OsStr::new("HOME") || k == OsStr::new("WDA_CONFIG") || k == OsStr::new("WDA_MAC_HOST")
+}
+
 /// Restores the daemon's own environment, working directory and output sink when
 /// dropped, so a panic anywhere in request setup, execution or cleanup can never
 /// leave the next request with this caller's process state.
 struct RequestStateGuard {
-    saved_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    saved_env: HashMap<OsString, OsString>,
     saved_cwd: Option<std::path::PathBuf>,
+    config_env_changed: bool,
 }
 
 impl RequestStateGuard {
     fn capture() -> RequestStateGuard {
-        RequestStateGuard { saved_env: std::env::vars_os().collect(), saved_cwd: std::env::current_dir().ok() }
+        RequestStateGuard {
+            saved_env: std::env::vars_os().collect(),
+            saved_cwd: std::env::current_dir().ok(),
+            config_env_changed: false,
+        }
     }
 }
 
 impl Drop for RequestStateGuard {
     fn drop(&mut self) {
         crate::out::set_sink(None);
-        install_env(std::mem::take(&mut self.saved_env).into_iter());
+        let restored_config_env = restore_env_diff(std::mem::take(&mut self.saved_env));
         if let Some(d) = self.saved_cwd.take() {
             let _ = std::env::set_current_dir(d);
         }
-        let _ = std::panic::catch_unwind(crate::config::reload);
+        if self.config_env_changed || restored_config_env {
+            let _ = std::panic::catch_unwind(crate::config::reload);
+        }
     }
 }
 
 /// Run one CLI invocation with the caller's environment, cwd and streams.
 fn execute(conn: &UnixStream, argv: &[String], env: &[(String, String)], cwd: &str) -> i32 {
     let sink = match conn.try_clone() {
-        Ok(c) => Arc::new(StreamSink { conn: c, lock: Mutex::new(()), broken: AtomicBool::new(false) }),
+        Ok(c) => Arc::new(StreamSink {
+            conn: c,
+            buf: Mutex::new(Vec::with_capacity(256)),
+            broken: AtomicBool::new(false),
+        }),
         Err(_) => return 1,
     };
     // Installed before any process state changes; restores it on every exit path.
-    let _restore = RequestStateGuard::capture();
+    let mut restore = RequestStateGuard::capture();
     crate::out::set_sink(Some(sink.clone()));
-    install_env(env.iter().map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v))));
-    if std::env::var_os("OMP_THREAD_LIMIT").is_none() {
-        std::env::set_var("OMP_THREAD_LIMIT", "1");
-    }
+    restore.config_env_changed = apply_request_env(&restore.saved_env, env);
     let code = match std::env::set_current_dir(cwd) {
         Err(e) => {
             let err = crate::cli::py_os_error(&e, cwd);
             crate::errln!("turbotap: cannot use working directory {}: {err}", json::py_repr_str(cwd));
             1
         }
-        Ok(()) => {
-            crate::config::reload();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::cli::run_cli(argv))) {
-                Ok(code) => code,
-                Err(p) => {
-                    let msg = p
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "panic".to_string());
-                    crate::errln!("turbotap: internal error: {msg}");
-                    1
-                }
+        Ok(()) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::cli::run_cli(argv))) {
+            Ok(code) => code,
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "panic".to_string());
+                crate::errln!("turbotap: internal error: {msg}");
+                1
             }
-        }
+        },
     };
     if std::panic::catch_unwind(drain_request_work).is_err() {
         crate::errln!("turbotap: internal error while draining request work");
@@ -786,26 +885,77 @@ fn execute(conn: &UnixStream, argv: &[String], env: &[(String, String)], cwd: &s
     code
 }
 
-/// Replace the whole process environment (see the module docs for why this is sound).
-fn install_env(vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>) {
-    for (k, _) in std::env::vars_os() {
-        std::env::remove_var(k);
+/// Diff-apply the request's environment onto the process environment (only removing keys
+/// absent from `target` and only setting keys whose value changed, plus ensuring
+/// `OMP_THREAD_LIMIT=1` when absent). Returns true when any config-affecting key changed.
+fn apply_request_env(saved: &HashMap<OsString, OsString>, target: &[(String, String)]) -> bool {
+    let omp_key = OsStr::new("OMP_THREAD_LIMIT");
+    let omp_default = OsStr::new("1");
+    let mut target_map: HashMap<&OsStr, &OsStr> = HashMap::with_capacity(target.len());
+    for (k, v) in target {
+        target_map.insert(OsStr::new(k), OsStr::new(v));
     }
-    for (k, v) in vars {
-        // Skip anything set_var would panic on (requests are validated up front; the
-        // daemon's own saved environment always passes).
-        let ok = match (k.to_str(), v.to_str()) {
-            (Some(ks), Some(vs)) => valid_env_entry(ks, vs),
-            _ => {
-                use std::os::unix::ffi::OsStrExt;
-                let (kb, vb) = (k.as_bytes(), v.as_bytes());
-                !kb.is_empty() && !kb.contains(&b'=') && !kb.contains(&0) && !vb.contains(&0)
+    let mut config_changed = false;
+    let omp_in_target = target_map.contains_key(omp_key);
+    for (k, cur_v) in saved {
+        let ks = k.as_os_str();
+        if target_map.contains_key(ks) {
+            continue;
+        }
+        if !omp_in_target && ks == omp_key && cur_v.as_os_str() == omp_default {
+            continue;
+        }
+        if is_config_env_key(ks) {
+            config_changed = true;
+        }
+        std::env::remove_var(ks);
+    }
+    for (&k, &new_v) in &target_map {
+        if saved.get(k).map(OsString::as_os_str) != Some(new_v) && valid_os_env_entry(k, new_v) {
+            if is_config_env_key(k) {
+                config_changed = true;
             }
-        };
-        if ok {
-            std::env::set_var(k, v);
+            std::env::set_var(k, new_v);
         }
     }
+    if !omp_in_target && saved.get(omp_key).map(OsString::as_os_str) != Some(omp_default) {
+        std::env::set_var(omp_key, omp_default);
+    }
+    config_changed
+}
+
+/// Diff-restore the process environment back to `saved`, inspecting the live environment
+/// so any mutations or panics during the request are completely reverted. Returns true
+/// when any config-affecting key was modified.
+fn restore_env_diff(mut remaining: HashMap<OsString, OsString>) -> bool {
+    let mut config_changed = false;
+    for (k, cur_v) in std::env::vars_os() {
+        match remaining.remove(&k) {
+            None => {
+                if is_config_env_key(&k) {
+                    config_changed = true;
+                }
+                std::env::remove_var(&k);
+            }
+            Some(saved_v) => {
+                if cur_v != saved_v && valid_os_env_entry(&k, &saved_v) {
+                    if is_config_env_key(&k) {
+                        config_changed = true;
+                    }
+                    std::env::set_var(&k, &saved_v);
+                }
+            }
+        }
+    }
+    for (k, saved_v) in remaining {
+        if valid_os_env_entry(&k, &saved_v) {
+            if is_config_env_key(&k) {
+                config_changed = true;
+            }
+            std::env::set_var(&k, &saved_v);
+        }
+    }
+    config_changed
 }
 
 /// Bind, warm and serve until stopped or idle (Python `serve`).
@@ -936,5 +1086,57 @@ pub fn cmd_daemon(action: &str, idle: Option<f64>, foreground: bool) -> Result<i
             );
             Ok(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+    use crate::testutil::set_env;
+
+    #[test]
+    fn diff_env_apply_and_restore_is_exact_and_panic_safe() {
+        let _lock = set_env(&[("TT_DIFF_KEEP", Some("same")), ("TT_DIFF_MOD", Some("old")), ("TT_DIFF_ADD", None)]);
+        {
+            let guard = RequestStateGuard::capture();
+            let mut target: Vec<(String, String)> = guard
+                .saved_env
+                .iter()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
+                .filter(|(k, _)| k != "TT_DIFF_KEEP")
+                .collect();
+            for (k, v) in &mut target {
+                if k == "TT_DIFF_MOD" {
+                    *v = "new".to_string();
+                }
+            }
+            target.push(("TT_DIFF_ADD".to_string(), "added".to_string()));
+            apply_request_env(&guard.saved_env, &target);
+            assert_eq!(std::env::var("TT_DIFF_KEEP").ok(), None);
+            assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("new"));
+            assert_eq!(std::env::var("TT_DIFF_ADD").ok().as_deref(), Some("added"));
+            // Also simulate a mid-request mutation not in `target`.
+            std::env::set_var("TT_DIFF_EXTRA", "mutated");
+        }
+        // Guard dropped: every change must be reverted exactly.
+        assert_eq!(std::env::var("TT_DIFF_KEEP").ok().as_deref(), Some("same"));
+        assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("old"));
+        assert_eq!(std::env::var("TT_DIFF_ADD").ok(), None);
+        assert_eq!(std::env::var("TT_DIFF_EXTRA").ok(), None);
+    }
+
+    #[test]
+    fn lines_reader_handles_multi_line_and_large_payloads() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let big = "x".repeat(16_384);
+        let payload = format!("{{\"out\":\"first\"}}\n{{\"out\":\"{big}\"}}\n{{\"exit\":0}}\n");
+        let writer = std::thread::spawn(move || {
+            b.write_all(payload.as_bytes()).unwrap();
+        });
+        let mut lines = Lines::new(&a);
+        assert_eq!(lines.read().unwrap().get("out").and_then(Value::as_str), Some("first"));
+        assert_eq!(lines.read().unwrap().get("out").and_then(Value::as_str), Some(big.as_str()));
+        assert_eq!(lines.read().unwrap().get("exit").and_then(Value::as_i64), Some(0));
+        writer.join().unwrap();
     }
 }

@@ -81,8 +81,11 @@ pub fn daemon_requested(argv: &[String]) -> bool {
 /// [`daemon_requested`] with an explicit `TURBOTAP_DAEMON` value.
 pub(crate) fn daemon_requested_env(argv: &[String], turbotap_daemon: Option<&str>) -> bool {
     let (cmd, daemon, no_daemon, other) = cli_subcommand(argv);
-    let env = turbotap_daemon.unwrap_or("");
-    let env = matches!(env.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    let env = turbotap_daemon.unwrap_or("").trim();
+    let env = env == "1"
+        || env.eq_ignore_ascii_case("true")
+        || env.eq_ignore_ascii_case("yes")
+        || env.eq_ignore_ascii_case("on");
     match cmd {
         Some(c) => (daemon || env) && !no_daemon && !other && !DAEMON_LOCAL_CMDS.contains(&c.as_str()),
         None => false,
@@ -233,10 +236,7 @@ fn b(m: &ArgMatches, k: &str) -> bool {
 
 /// Python `_main` (L5998): parse, then dispatch. Returns the exit code.
 fn main_inner(argv: &[String]) -> Result<i32> {
-    let mut full = Vec::with_capacity(argv.len() + 1);
-    full.push("turbotap".to_string());
-    full.extend(argv.iter().cloned());
-    let m = match build_command().try_get_matches_from(full) {
+    let m = match build_command().try_get_matches_from(std::iter::once("turbotap").chain(argv.iter().map(String::as_str))) {
         Ok(m) => m,
         Err(e) => {
             let text = e.render().to_string();
@@ -248,7 +248,6 @@ fn main_inner(argv: &[String]) -> Result<i32> {
             return Ok(e.exit_code());
         }
     };
-    crate::config::reload();
     let Some((cmd, sm)) = m.subcommand() else {
         return Ok(2);
     };
@@ -263,6 +262,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         }
         _ => {}
     }
+    crate::config::reload();
     crate::skills::sync_skills_if_stale();
     let (url, udid, dev_key) = crate::config::resolve_device_settings(s(&m, "url"), s(&m, "device"), s(&m, "udid"))?;
     let mut client = WdaClient::new(&url, &udid, dev_key.as_deref());
@@ -343,10 +343,21 @@ pub fn cmd_tree(client: &mut WdaClient) -> Result<()> {
 /// Python `base64.b64decode` (non-alphabet characters are discarded).
 fn b64decode_lenient(s: &str) -> Result<Vec<u8>> {
     use base64::Engine;
-    let clean: String = s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')).collect();
-    let trimmed = clean.trim_end_matches('=');
+    if s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')) {
+        let trimmed = s.trim_end_matches('=');
+        return base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(trimmed)
+            .map_err(|e| Error::value(format!("Incorrect base64 data: {e}")));
+    }
+    let mut clean: Vec<u8> = s
+        .bytes()
+        .filter(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        .collect();
+    while clean.last() == Some(&b'=') {
+        clean.pop();
+    }
     base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(trimmed)
+        .decode(&clean)
         .map_err(|e| Error::value(format!("Incorrect base64 data: {e}")))
 }
 

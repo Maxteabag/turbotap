@@ -229,6 +229,81 @@ fn test_each_request_gets_its_callers_environment_and_working_directory() {
     assert_eq!(doc(&out)["path"], json!("shot.png"));
 }
 
+/// PR #11 review: overwriting `config.json` in place with unchanged inode, length,
+/// and restored nanosecond mtime must route the next warm-daemon request to the new
+/// endpoint, and relative `WDA_CONFIG` paths must resolve per caller working directory.
+#[test]
+fn test_warm_daemon_reloads_config_after_inplace_mtime_preserved_overwrite_and_cwd_change() {
+    let make_router = |bundle: &'static str| {
+        move |_m: &str, path: &str, _p: &Value| {
+            let ok = |v: Value| {
+                (200, "application/json".to_string(), json!({"value": v, "sessionId": "sid-ab"}).to_string().into_bytes())
+            };
+            if path == "/status" {
+                return ok(json!({"ready": true}));
+            }
+            if path.ends_with("/appium/settings") {
+                return ok(json!({}));
+            }
+            if path.ends_with("/wda/fastPreflight") {
+                return ok(json!({"locked": false, "bundleId": bundle, "size": {"width": 430, "height": 932}}));
+            }
+            (404, "application/json".into(), br#"{"value":{"error":"unknown command"}}"#.to_vec())
+        }
+    };
+    let srv_a = LoopbackWda::start(make_router("com.example.endpoint-a"));
+    let srv_b = LoopbackWda::start(make_router("com.example.endpoint-b"));
+    let (home, _) = DaemonHome::started("120");
+
+    // Equalize JSON payload length even if loopback port numbers differ in digit count.
+    let cfg_body = |url: &str, target_len: usize| {
+        let base = format!(r#"{{"default_device":"d","devices":{{"d":{{"url":"{url}"}}}},"pad":""}}"#);
+        let pad_len = target_len.saturating_sub(base.len());
+        let pad = "x".repeat(pad_len);
+        format!(r#"{{"default_device":"d","devices":{{"d":{{"url":"{url}"}}}},"pad":"{pad}"}}"#)
+    };
+    let target_len = cfg_body(&srv_a.url, 0).len().max(cfg_body(&srv_b.url, 0).len()) + 4;
+    let body_a = cfg_body(&srv_a.url, target_len);
+    let body_b = cfg_body(&srv_b.url, target_len);
+    assert_eq!(body_a.len(), body_b.len());
+
+    let cfg_path = home.tmp.path().join("config.json");
+    std::fs::write(&cfg_path, &body_a).unwrap();
+    let cfg_str = cfg_path.to_string_lossy().into_owned();
+
+    // Warm the daemon on endpoint A.
+    let (code_a, out_a, err_a) = home.forward(&["preflight"], &[("WDA_CONFIG", cfg_str.as_str())], None);
+    assert_eq!(code_a, Some(0), "stderr={err_a}");
+    let doc_a = doc(&out_a);
+    assert_eq!(doc_a["active_app"], json!("com.example.endpoint-a"));
+    assert_eq!(doc_a["wda_url"], json!(srv_a.url));
+    assert!(!srv_a.paths().is_empty());
+    assert!(srv_b.paths().is_empty());
+
+    // Overwrite config.json in place with same inode, length, and nanosecond mtime -> must route to B.
+    crate::config::overwrite_preserving_inode_and_mtime(&cfg_path, &body_b);
+    let (code_b, out_b, err_b) = home.forward(&["preflight"], &[("WDA_CONFIG", cfg_str.as_str())], None);
+    assert_eq!(code_b, Some(0), "stderr={err_b}");
+    let doc_b = doc(&out_b);
+    assert_eq!(doc_b["active_app"], json!("com.example.endpoint-b"));
+    assert_eq!(doc_b["wda_url"], json!(srv_b.url));
+    assert!(!srv_b.paths().is_empty(), "warm daemon kept routing to endpoint A");
+
+    // Relative WDA_CONFIG must resolve in each caller's working directory.
+    let dir_a = home.tmp.path().join("cwd-a");
+    let dir_b = home.tmp.path().join("cwd-b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    std::fs::write(dir_a.join("rel.json"), &body_a).unwrap();
+    std::fs::write(dir_b.join("rel.json"), &body_b).unwrap();
+    let (c1, o1, e1) = home.forward(&["preflight"], &[("WDA_CONFIG", "rel.json")], Some(&dir_a));
+    assert_eq!(c1, Some(0), "stderr={e1}");
+    assert_eq!(doc(&o1)["active_app"], json!("com.example.endpoint-a"));
+    let (c2, o2, e2) = home.forward(&["preflight"], &[("WDA_CONFIG", "rel.json")], Some(&dir_b));
+    assert_eq!(c2, Some(0), "stderr={e2}");
+    assert_eq!(doc(&o2)["active_app"], json!("com.example.endpoint-b"));
+}
+
 #[test]
 fn test_errors_keep_exit_codes_and_stderr() {
     let (home, _) = DaemonHome::started("120");

@@ -106,10 +106,12 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   shot:PATH             save a fresh screenshot as PNG
 taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.";
 
-/// Verbs that need screen capture/OCR (the CLI warms OCR engines only for these).
+/// Verbs that run host Tesseract OCR (the CLI warms libtesseract engines only for these).
+/// Note: `read:vision*` and directional `swipe:left|right|up|down` are filtered out in
+/// [`flow_needs_ocr`]; pixel-only steps (`shot`, `settle`, `scroll`, `search`) never touch Tesseract.
 pub const IMAGE_STEP_VERBS: &[&str] = &[
-    "wait", "expect", "waitany", "gone", "assert", "assertnot", "tap", "tapif", "longpress", "doubletap", "scroll",
-    "scrollto", "swipe", "back", "read", "search", "settle", "shot",
+    "wait", "expect", "waitany", "gone", "assert", "assertnot", "tap", "tapif", "longpress", "doubletap", "scrollto",
+    "swipe", "back", "read",
 ];
 pub const STALE_UI_BACKOFF: [f64; 3] = [0.05, 0.08, 0.12];
 pub const INPUT_FOCUS_SETTLE: f64 = 0.25;
@@ -138,6 +140,14 @@ pub const SECRET_ARG_VERBS: &[&str] = &["pintap", "typedigits", "cleartype", "ty
 /// Verbs whose value is always a credential (PINs, passwords), in any form.
 pub const CREDENTIAL_VERBS: &[&str] = &["pintap", "typedigits", "cleartype"];
 
+/// Return `ctl` borrowed when `where_` is unset/empty, avoiding a full `Vec<Control>` clone.
+pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Option<&str>) -> std::borrow::Cow<'a, [Control]> {
+    match where_.filter(|w| !w.is_empty()) {
+        Some(w) => std::borrow::Cow::Owned(crate::text::controls_in_region(ctl, lines, Some(w))),
+        None => std::borrow::Cow::Borrowed(ctl),
+    }
+}
+
 /// True when the step enters a credential: `pintap`/`typedigits`/`cleartype` in any
 /// form, or `type`/`setclip` with an `env:`/`cmd:` value (the documented way to pass
 /// secrets). Its value is scrubbed from all flow output, and if it fails no screen
@@ -145,9 +155,10 @@ pub const CREDENTIAL_VERBS: &[&str] = &["pintap", "typedigits", "cleartype"];
 /// stays readable in later `read` results.
 pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
-    let verb = verb.trim().to_lowercase();
-    CREDENTIAL_VERBS.contains(&verb.as_str())
-        || ((verb == "type" || verb == "setclip") && (arg.starts_with("env:") || arg.starts_with("cmd:")))
+    let verb = verb.trim();
+    CREDENTIAL_VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb))
+        || ((verb.eq_ignore_ascii_case("type") || verb.eq_ignore_ascii_case("setclip"))
+            && (arg.starts_with("env:") || arg.starts_with("cmd:")))
 }
 
 /// The step as it may appear in flow output (success items, stderr progress and
@@ -156,7 +167,8 @@ pub fn safe_step(spec: &str) -> String {
     let Some((verb, arg)) = spec.split_once(':') else {
         return spec.to_string();
     };
-    if !SECRET_ARG_VERBS.contains(&verb.trim().to_lowercase().as_str()) || arg.starts_with("env:") {
+    let trimmed = verb.trim();
+    if !SECRET_ARG_VERBS.iter().any(|v| v.eq_ignore_ascii_case(trimmed)) || arg.starts_with("env:") {
         return spec.to_string();
     }
     format!("{verb}:<redacted>")
@@ -186,11 +198,33 @@ pub struct CtlCache {
     pub img: Frame,
 }
 
+/// Compiled `--deny` guard. The built-in [`DENY_DEFAULT`] regex is compiled lazily on
+/// first [`Flow::guard`] evaluation and cached process-wide in a `OnceLock` (saving
+/// ~3-4 ms on every `turbotap flow` call and completely skipping compilation on
+/// non-tapping flows like `flow ui`). Custom `--deny` patterns are compiled and
+/// validated eagerly in [`Flow::new`].
+pub enum DenyGuard {
+    Default,
+    Custom(fancy_regex::Regex),
+}
+
+impl DenyGuard {
+    fn regex(&self) -> &fancy_regex::Regex {
+        match self {
+            DenyGuard::Default => {
+                static DEFAULT_RX: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+                DEFAULT_RX.get_or_init(|| crate::text::compile_icase(DENY_DEFAULT).expect("DENY_DEFAULT regex is valid"))
+            }
+            DenyGuard::Custom(rx) => rx,
+        }
+    }
+}
+
 pub struct Flow<R: Reader = ScreenReader> {
     pub c: WdaClient,
     pub r: R,
     pub timeout: f64,
-    pub deny: Option<fancy_regex::Regex>,
+    pub deny: Option<DenyGuard>,
     pub bundle: Option<String>,
     pub pending_bundle: Option<String>,
     pub pending_bundle_ts: f64,
@@ -228,10 +262,11 @@ impl<R: Reader> Flow<R> {
     /// `deny` None or "" disables the guard.
     pub fn new(c: WdaClient, r: R, timeout: f64, deny: Option<&str>, log: bool) -> Result<Flow<R>> {
         let deny = match deny.filter(|d| !d.is_empty()) {
-            Some(d) => Some(
+            Some(d) if d == DENY_DEFAULT => Some(DenyGuard::Default),
+            Some(d) => Some(DenyGuard::Custom(
                 crate::text::compile_icase(d)
                     .ok_or_else(|| Error::value(format!("invalid --deny regex: {}", json::py_repr_str(d))))?,
-            ),
+            )),
             None => None,
         };
         Ok(Flow {
@@ -310,11 +345,11 @@ impl<R: Reader> Flow<R> {
 
     /// Refuse taps on text matching `--deny`.
     pub fn guard(&self, text: &str, action: &str) -> Result<()> {
-        if let Some(rx) = self.deny.as_ref() {
+        if let Some(guard) = self.deny.as_ref() {
             if text.is_empty() {
                 return Ok(());
             }
-            match rx.is_match(text) {
+            match guard.regex().is_match(text) {
                 Ok(false) => {}
                 Ok(true) => {
                     return Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text))));
@@ -367,10 +402,7 @@ impl<R: Reader> Flow<R> {
 
     /// Run one step; returns its result (string, number) or None.
     pub fn step(&mut self, spec: &str) -> Result<Option<Value>> {
-        let (verb, arg) = match spec.split_once(':') {
-            Some((v, a)) => (v, a.to_string()),
-            None => (spec, String::new()),
-        };
+        let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
         let verb = verb.trim().to_lowercase();
         if verb != "type" && verb != "key" {
             self.last_tap_type = None;
@@ -390,7 +422,7 @@ impl<R: Reader> Flow<R> {
             }
             "open" | "launch" => {
                 self.mark_action(false, false);
-                let bid = crate::apps::resolve_app(&arg, &self.c.udid.clone(), &self.c.base_url.clone(), &self.c.cache_dir.clone())?;
+                let bid = crate::apps::resolve_app(arg, &self.c.udid, &self.c.base_url, &self.c.cache_dir)?;
                 let prev_bundle = self.bundle.clone();
                 if verb == "launch" {
                     let r = self.c.fast_launch(&bid, true);
@@ -415,40 +447,40 @@ impl<R: Reader> Flow<R> {
                 }
                 return some(bid);
             }
-            "url" => return some(self.open_url(&arg)?),
-            "wait" | "expect" => return some(self.wait(&arg, None, false, None, true)?.text),
-            "waitany" => return some(self.wait_any(&arg, None)?.text),
-            "gone" => self.gone(&arg, None)?,
-            "assert" => return some(self.assert_text(&arg)?),
-            "assertnot" => return some(self.assert_not_text(&arg)?),
-            "tap" => return some(self.tap_text(&arg)?.text),
-            "tapif" => return some(self.tap_if(&arg, 1.0)?),
-            "tapbatch" => return some(self.tap_batch(&arg)?),
-            "toggle" => return some(self.toggle(&arg)?),
+            "url" => return some(self.open_url(arg)?),
+            "wait" | "expect" => return some(self.wait(arg, None, false, None, true)?.text),
+            "waitany" => return some(self.wait_any(arg, None)?.text),
+            "gone" => self.gone(arg, None)?,
+            "assert" => return some(self.assert_text(arg)?),
+            "assertnot" => return some(self.assert_not_text(arg)?),
+            "tap" => return some(self.tap_text(arg)?.text),
+            "tapif" => return some(self.tap_if(arg, 1.0)?),
+            "tapbatch" => return some(self.tap_batch(arg)?),
+            "toggle" => return some(self.toggle(arg)?),
             "tapel" => {
-                let (x, y) = self.tap_el(&arg, None)?;
+                let (x, y) = self.tap_el(arg, None)?;
                 return Ok(Some(j!([x, y])));
             }
             "tapxy" => {
                 let parts: Vec<&str> = arg.split(',').collect();
                 if parts.len() != 2 {
-                    return Err(Error::value(format!("tapxy expects X,Y, got {}", json::py_repr_str(&arg))));
+                    return Err(Error::value(format!("tapxy expects X,Y, got {}", json::py_repr_str(arg))));
                 }
                 let x = parse_coord(parts[0])?;
                 let y = parse_coord(parts[1])?;
                 self.tap_point(x, y, "", None)?;
             }
-            "longpress" => return some(self.long_press_text(&arg, 0.65)?.text),
+            "longpress" => return some(self.long_press_text(arg, 0.65)?.text),
             "longpressxy" => {
-                let parts: Vec<String> = arg.split(',').map(|p| p.trim().to_string()).collect();
+                let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
                 if parts.len() != 2 && parts.len() != 3 {
                     return Err(Error::flow(
                         "longpressxy expects X,Y or X,Y,MS (e.g. longpressxy:200,400 or longpressxy:200,400,800)",
                     ));
                 }
-                let invalid = || Error::flow(format!("invalid longpressxy coordinates/duration: {}", json::py_repr_str(&arg)));
-                let x = parse_coord(&parts[0]).map_err(|_| invalid())?;
-                let y = parse_coord(&parts[1]).map_err(|_| invalid())?;
+                let invalid = || Error::flow(format!("invalid longpressxy coordinates/duration: {}", json::py_repr_str(arg)));
+                let x = parse_coord(parts[0]).map_err(|_| invalid())?;
+                let y = parse_coord(parts[1]).map_err(|_| invalid())?;
                 let dur = if parts.len() == 3 {
                     let ds = parts[2].to_lowercase();
                     match ds.strip_suffix('s') {
@@ -459,29 +491,29 @@ impl<R: Reader> Flow<R> {
                     0.65
                 };
                 if dur <= 0.0 || dur.is_nan() {
-                    return Err(Error::flow(format!("longpressxy duration must be > 0, got {}", json::py_repr_str(&arg))));
+                    return Err(Error::flow(format!("longpressxy duration must be > 0, got {}", json::py_repr_str(arg))));
                 }
                 self.long_press_point(x, y, "", dur)?;
                 self.settle(1.2, None, 0.6)?;
                 return some(format!("{x},{y} ({}ms)", (dur * 1000.0).round() as i64));
             }
-            "doubletap" => return some(self.double_tap_text(&arg)?.text),
+            "doubletap" => return some(self.double_tap_text(arg)?.text),
             "doubletapxy" => {
-                let parts: Vec<String> = arg.split(',').map(|p| p.trim().to_string()).collect();
+                let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
                 if parts.len() != 2 {
                     return Err(Error::flow("doubletapxy expects X,Y (e.g. doubletapxy:200,400)"));
                 }
-                let invalid = || Error::flow(format!("invalid doubletapxy coordinates: {}", json::py_repr_str(&arg)));
-                let x = parse_coord(&parts[0]).map_err(|_| invalid())?;
-                let y = parse_coord(&parts[1]).map_err(|_| invalid())?;
+                let invalid = || Error::flow(format!("invalid doubletapxy coordinates: {}", json::py_repr_str(arg)));
+                let x = parse_coord(parts[0]).map_err(|_| invalid())?;
+                let y = parse_coord(parts[1]).map_err(|_| invalid())?;
                 self.double_tap_point(x, y, "", None, None)?;
                 self.settle(1.2, None, 0.6)?;
                 return some(format!("{x},{y}"));
             }
-            "zoom" => return some(self.zoom(&arg)?),
+            "zoom" => return some(self.zoom(arg)?),
             "type" => {
                 let is_secret = arg.starts_with("env:") || arg.starts_with("cmd:");
-                let text = secret_arg(&verb, &arg)?;
+                let text = secret_arg(&verb, arg)?;
                 if is_secret {
                     self.note_secret(&text);
                 }
@@ -497,7 +529,7 @@ impl<R: Reader> Flow<R> {
                 let Some(ch) = ui::key_char(&kname) else {
                     return Err(Error::flow(format!(
                         "unknown key {}; use return|enter|backspace|delete|tab|space|escape",
-                        json::py_repr_str(&arg)
+                        json::py_repr_str(arg)
                     )));
                 };
                 self.wait_input_focus();
@@ -507,10 +539,10 @@ impl<R: Reader> Flow<R> {
                 check_wda_ok(r, &format!("key:{kname}"), false)?;
                 return some(kname);
             }
-            "cleartype" => return some(self.clear_type(&verb, &arg)?),
+            "cleartype" => return some(self.clear_type(&verb, arg)?),
             "dismisskb" => return some(self.dismiss_kb()?),
-            "typedigits" => return some(self.type_digits(&arg)?),
-            "pintap" => return some(self.pin_tap(&arg)?),
+            "typedigits" => return some(self.type_digits(arg)?),
+            "pintap" => return some(self.pin_tap(arg)?),
             "alert" => {
                 let action = arg.trim().to_lowercase();
                 let action = if action.is_empty() { "accept".to_string() } else { action };
@@ -541,33 +573,33 @@ impl<R: Reader> Flow<R> {
                 return some(action);
             }
             "scroll" => {
-                let dir = if arg.is_empty() { "down".to_string() } else { arg.clone() };
-                self.scroll(&dir)?;
+                let dir = if arg.is_empty() { "down" } else { arg };
+                self.scroll(dir)?;
             }
             "scrollto" => {
                 let mut direction = "down".to_string();
-                let mut target = arg.clone();
+                let mut target = arg;
                 if let Some((pfx, rest)) = arg.split_once(':') {
                     let p = pfx.trim().to_lowercase();
                     if p == "up" || p == "down" {
                         direction = p;
-                        target = rest.to_string();
+                        target = rest;
                     }
                 }
-                let (label, where_) = split_where(&target);
+                let (label, where_) = split_where(target);
                 return some(self.scroll_to(&label, where_.as_deref(), 8, &direction)?.text);
             }
-            "swipe" => return some(self.swipe_gesture(&arg)?),
-            "picker" => return some(self.set_picker(&arg)?),
-            "slider" => return some(self.set_slider(&arg)?),
+            "swipe" => return some(self.swipe_gesture(arg)?),
+            "picker" => return some(self.set_picker(arg)?),
+            "slider" => return some(self.set_slider(arg)?),
             "clipboard" | "copy" => {
                 let ct = arg.trim().to_lowercase();
                 let ct = if ct.is_empty() { "plaintext".to_string() } else { ct };
                 return some(self.clipboard(&ct)?);
             }
-            "setclip" => return some(self.set_clipboard(&arg, "plaintext")?),
+            "setclip" => return some(self.set_clipboard(arg, "plaintext")?),
             "back" => self.back()?,
-            "read" => return self.read_step(&arg).map(|n| Some(j!(n))),
+            "read" => return self.read_step(arg).map(|n| Some(j!(n))),
             "ui" => {
                 self.last_alert_text = None;
                 self.last_alert_buttons = None;
@@ -580,7 +612,7 @@ impl<R: Reader> Flow<R> {
             }
             "readel" => {
                 let end = clock::now() + self.timeout;
-                let want = crate::text::casefold(&arg);
+                let want = crate::text::casefold(arg);
                 let hits: Vec<Control> = loop {
                     let hits: Vec<Control> = self
                         .controls(false, None, None, false, false)?
@@ -592,12 +624,12 @@ impl<R: Reader> Flow<R> {
                     }
                 };
                 if hits.is_empty() {
-                    return Err(Error::flow(format!("no element label contains {}", json::py_repr_str(&arg))));
+                    return Err(Error::flow(format!("no element label contains {}", json::py_repr_str(arg))));
                 }
                 self.reads.push(j!({"el": ui::controls_to_value(&hits)}));
                 return some(hits[0].label.clone());
             }
-            "search" => return some(self.search(&arg)?),
+            "search" => return some(self.search(arg)?),
             "settle" => {
                 self.settle(2.0, None, 0.6)?;
             }
@@ -611,7 +643,7 @@ impl<R: Reader> Flow<R> {
             }
             "shot" => {
                 let img = self.r.grab(&mut self.c, 0, None, None, None)?;
-                save_frame(&img, &arg)?;
+                save_frame(&img, arg)?;
             }
             _ => return Err(Error::flow(format!("unknown step {}", json::py_repr_str(spec)))),
         }
@@ -845,7 +877,11 @@ impl<R: Reader> Flow<R> {
             return;
         }
         match v {
-            Value::String(s) => *s = self.scrub(s),
+            Value::String(s) => {
+                if self.secrets.iter().any(|sec| s.contains(sec.as_str())) {
+                    *s = self.scrub(s);
+                }
+            }
             Value::Array(a) => a.iter_mut().for_each(|x| self.scrub_value(x)),
             Value::Object(m) => m.values_mut().for_each(|x| self.scrub_value(x)),
             _ => {}
@@ -991,8 +1027,18 @@ pub fn save_frame(img: &crate::image::GrayImage, path: &str) -> Result<()> {
 /// `turbotap tap-ocr TEXT` (L5683).
 pub fn cmd_tap_ocr(client: WdaClient, text: &str) -> Result<()> {
     let mut client = client;
-    client.ensure_session(None, true)?;
-    let mut flow = Flow::new(client, ScreenReader::default_reader(), 8.0, Some(DENY_DEFAULT), false)?;
+    // Outside the warm daemon, start libtesseract engine warm-up before ensure_session()
+    // so CPU init overlaps the /status (+ /appium/settings) network RTT; if ensure_session
+    // fails, ScreenReader::drop joins its warming threads cleanly.
+    let reader = if crate::ocr::warm_ocr().is_none() {
+        let r = ScreenReader::default_reader();
+        client.ensure_session(None, true)?;
+        r
+    } else {
+        client.ensure_session(None, true)?;
+        ScreenReader::default_reader()
+    };
+    let mut flow = Flow::new(client, reader, 8.0, Some(DENY_DEFAULT), false)?;
     let t0 = clock::real_now();
     let m: Match = flow.tap_text(text)?;
     crate::outln!(
@@ -1004,23 +1050,103 @@ pub fn cmd_tap_ocr(client: WdaClient, text: &str) -> Result<()> {
 }
 
 /// `turbotap flow STEP...` (L5696). Returns the process exit code.
-/// True when any step needs screen capture/OCR (`cmd_flow` warms OCR only then).
+/// True when any step actually runs host Tesseract OCR (`cmd_flow` warms libtesseract
+/// only then). Excludes on-device `read:vision*` and pixel-only steps (`shot`, `settle`,
+/// `scroll`, `search`, directional `swipe:left|right|up|down`).
 pub fn flow_needs_ocr(steps: &[String]) -> bool {
     steps.iter().any(|s| {
-        let v = s.split(':').next().unwrap_or("").trim().to_lowercase();
-        IMAGE_STEP_VERBS.contains(&v.as_str())
+        let (verb, arg) = s.split_once(':').unwrap_or((s, ""));
+        let v = verb.trim();
+        if v.eq_ignore_ascii_case("read") {
+            let engine = arg.trim().split(':').next().unwrap_or("").trim();
+            return !engine.eq_ignore_ascii_case("vision");
+        }
+        if v.eq_ignore_ascii_case("swipe") {
+            return arg.split_once(':').is_some_and(|(_, target)| !target.trim().is_empty());
+        }
+        IMAGE_STEP_VERBS.iter().any(|iv| iv.eq_ignore_ascii_case(v))
     })
 }
 
 pub fn cmd_flow(client: WdaClient, steps: &[String], timeout: f64, scale: f64, deny: Option<&str>, quiet: bool) -> Result<i32> {
     let needs_ocr = flow_needs_ocr(steps);
     let mut client = client;
-    client.ensure_session(None, true)?;
-    let reader = ScreenReader::new(scale, None, 11, needs_ocr);
+    // Outside the warm daemon, start libtesseract engine warm-up before ensure_session()
+    // so ~40-80 ms of engine init overlaps the /status (+ /appium/settings) network RTT;
+    // if ensure_session fails, ScreenReader::drop joins its warming threads cleanly.
+    let reader = if needs_ocr && crate::ocr::warm_ocr().is_none() {
+        let r = ScreenReader::new(scale, None, 11, true);
+        client.ensure_session(None, true)?;
+        r
+    } else {
+        client.ensure_session(None, true)?;
+        ScreenReader::new(scale, None, 11, needs_ocr)
+    };
     let mut flow = Flow::new(client, reader, timeout, deny, !quiet)?;
     let res = flow.run_outcome(steps);
     flow.close();
     let (ok, res) = res?;
     crate::outln!("{}", json::dumps_utf8(&res));
     Ok(if ok { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+    use crate::testutil::FakeReader;
+
+    #[test]
+    fn flow_needs_ocr_skips_vision_shot_settle_scroll_and_directional_swipe() {
+        for no_ocr in [
+            "read:vision",
+            "read:vision:fast",
+            "read:vision:accurate",
+            "READ:VISION:FAST",
+            "shot:/tmp/out.png",
+            "settle",
+            "scroll:down",
+            "scroll:up",
+            "swipe:left",
+            "swipe:right",
+            "swipe:up",
+            "swipe:down",
+            "search:coffee",
+            "ui",
+            "url:https://example.com",
+            "open:Spotify",
+        ] {
+            assert!(!flow_needs_ocr(&[no_ocr.to_string()]), "{no_ocr} must not pre-warm Tesseract");
+        }
+        for needs_ocr in [
+            "read",
+            "read:ocr",
+            "read:0-400",
+            "wait:Settings",
+            "assert:Done",
+            "assertnot:Loading",
+            "tap:Continue",
+            "tapif:Allow",
+            "longpress:Message",
+            "doubletap:Photo",
+            "scrollto:Privacy",
+            "swipe:left:Alice",
+            "swipe:right:Bob@below:Chats",
+            "back",
+            "gone:Spinner",
+        ] {
+            assert!(flow_needs_ocr(&[needs_ocr.to_string()]), "{needs_ocr} must pre-warm Tesseract");
+        }
+    }
+
+    #[test]
+    fn deny_default_is_lazy_and_cached_while_custom_invalid_regex_errors_eagerly() {
+        let c = WdaClient::new("http://127.0.0.1:9", "", None);
+        let flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+        assert!(flow.guard("Delete Account", "tap").is_err());
+        assert!(flow.guard("Settings", "tap").is_ok());
+
+        let c2 = WdaClient::new("http://127.0.0.1:9", "", None);
+        let err = Flow::new(c2, FakeReader::new(vec![]), 1.0, Some("[unclosed"), false).err().unwrap();
+        assert!(err.to_string().contains("invalid --deny regex"), "{err}");
+    }
 }

@@ -84,56 +84,137 @@ pub fn py_str(v: &Value) -> String {
 }
 
 fn py_number(n: &serde_json::Number) -> String {
-    if let Some(i) = n.as_i64() {
-        return i.to_string();
+    let mut out = String::with_capacity(24);
+    if n.is_f64() {
+        write_py_float(&mut out, n.as_f64().unwrap_or(0.0), false);
+    } else if let Some(i) = n.as_i64() {
+        push_i64(&mut out, i);
+    } else if let Some(u) = n.as_u64() {
+        push_u64(&mut out, u);
+    } else {
+        write_py_float(&mut out, n.as_f64().unwrap_or(0.0), false);
     }
-    if let Some(u) = n.as_u64() {
-        return u.to_string();
+    out
+}
+
+#[inline]
+fn push_u64(out: &mut String, mut n: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
     }
-    let f = n.as_f64().unwrap_or(0.0);
-    py_float(f)
+    // SAFETY: buf[i..] contains only ASCII digits '0'..='9'.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+#[inline]
+fn push_i64(out: &mut String, n: i64) {
+    if n < 0 {
+        out.push('-');
+        push_u64(out, n.wrapping_neg() as u64);
+    } else {
+        push_u64(out, n as u64);
+    }
+}
+
+#[inline]
+fn write_u_escape(out: &mut String, u: u16) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let buf = [
+        b'\\',
+        b'u',
+        HEX[((u >> 12) & 0xf) as usize],
+        HEX[((u >> 8) & 0xf) as usize],
+        HEX[((u >> 4) & 0xf) as usize],
+        HEX[(u & 0xf) as usize],
+    ];
+    // SAFETY: all bytes are pure ASCII.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+}
+
+#[inline]
+fn write_x_escape(out: &mut String, b: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let buf = [b'\\', b'x', HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize]];
+    // SAFETY: all bytes are pure ASCII.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+}
+
+fn write_py_float(out: &mut String, f: f64, json_specials: bool) {
+    use std::fmt::Write;
+    if f.is_nan() {
+        out.push_str(if json_specials { "NaN" } else { "nan" });
+        return;
+    }
+    if f.is_infinite() {
+        out.push_str(match (f > 0.0, json_specials) {
+            (true, true) => "Infinity",
+            (false, true) => "-Infinity",
+            (true, false) => "inf",
+            (false, false) => "-inf",
+        });
+        return;
+    }
+    if f == f.trunc() && f.abs() < 1e16 {
+        let _ = write!(out, "{f:.1}");
+        return;
+    }
+    let start = out.len();
+    let _ = write!(out, "{f}");
+    if !out.as_bytes()[start..].iter().any(|&b| b == b'e' || b == b'.') {
+        out.push_str(".0");
+    }
 }
 
 /// Python `repr(float)`.
 pub fn py_float(f: f64) -> String {
-    if f.is_nan() {
-        return "nan".into();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 { "inf".into() } else { "-inf".into() };
-    }
-    if f == f.trunc() && f.abs() < 1e16 {
-        return format!("{f:.1}");
-    }
-    let s = format!("{f}");
-    if s.contains('e') || s.contains('.') {
-        s
-    } else {
-        format!("{s}.0")
-    }
+    let mut out = String::with_capacity(24);
+    write_py_float(&mut out, f, false);
+    out
 }
 
 /// Python `repr(s)` for a str: single quotes unless the text has a single quote and no
 /// double quote.
 pub fn py_repr_str(s: &str) -> String {
-    let q = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+    let q = if s.contains('\'') && !s.contains('"') { b'"' } else { b'\'' };
     let mut out = String::with_capacity(s.len() + 2);
-    out.push(q);
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
+    out.push(q as char);
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b >= 0x20 && b != 0x7f && b != b'\\' && b != q {
+            i += 1;
+            continue;
+        }
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
             c if c == q => {
                 out.push('\\');
-                out.push(c);
+                out.push(q as char);
             }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
+            c => write_x_escape(&mut out, c),
         }
+        i += 1;
+        start = i;
     }
-    out.push(q);
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
+    }
+    out.push(q as char);
     out
 }
 
@@ -150,41 +231,79 @@ pub fn py_repr(v: &Value) -> String {
     }
 }
 
+fn estimate_json_cap(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) => 8,
+        Value::Number(_) => 16,
+        Value::String(s) => s.len() + 2,
+        Value::Array(a) => {
+            let per = a.first().map_or(8, |x| match x {
+                Value::Object(m) => m.len() * 24 + 8,
+                Value::String(s) => s.len() + 4,
+                _ => 16,
+            });
+            2 + a.len().saturating_mul(per)
+        }
+        Value::Object(m) => {
+            let mut cap = 2 + m.len() * 24;
+            for val in m.values() {
+                match val {
+                    Value::String(s) => cap = cap.saturating_add(s.len()),
+                    Value::Array(a) => {
+                        let per = a.first().map_or(8, |x| match x {
+                            Value::Object(im) => im.len() * 24 + 8,
+                            Value::String(s) => s.len() + 4,
+                            _ => 16,
+                        });
+                        cap = cap.saturating_add(a.len().saturating_mul(per));
+                    }
+                    Value::Object(im) => cap = cap.saturating_add(im.len() * 24),
+                    _ => {}
+                }
+            }
+            cap
+        }
+    }
+}
+
 /// `json.dumps(v)` with Python's default separators (`", "`, `": "`) and
 /// `ensure_ascii=True`.
 pub fn dumps(v: &Value) -> String {
-    let mut s = String::new();
-    write_value(&mut s, v, true);
+    let mut s = String::with_capacity(estimate_json_cap(v));
+    write_value::<true>(&mut s, v);
     s
 }
 
 /// `json.dumps(v, ensure_ascii=False)` with Python's default separators.
 pub fn dumps_utf8(v: &Value) -> String {
-    let mut s = String::new();
-    write_value(&mut s, v, false);
+    let mut s = String::with_capacity(estimate_json_cap(v));
+    write_value::<false>(&mut s, v);
     s
 }
 
-fn write_value(out: &mut String, v: &Value, ascii: bool) {
+fn write_value<const ASCII: bool>(out: &mut String, v: &Value) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => {
             if n.is_f64() {
-                let f = n.as_f64().unwrap_or(0.0);
-                out.push_str(&py_float(f).replace("inf", "Infinity").replace("nan", "NaN"));
+                write_py_float(out, n.as_f64().unwrap_or(0.0), true);
+            } else if let Some(i) = n.as_i64() {
+                push_i64(out, i);
+            } else if let Some(u) = n.as_u64() {
+                push_u64(out, u);
             } else {
-                out.push_str(&n.to_string());
+                write_py_float(out, n.as_f64().unwrap_or(0.0), true);
             }
         }
-        Value::String(s) => write_str(out, s, ascii),
+        Value::String(s) => write_str::<ASCII>(out, s),
         Value::Array(a) => {
             out.push('[');
             for (i, x) in a.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_value(out, x, ascii);
+                write_value::<ASCII>(out, x);
             }
             out.push(']');
         }
@@ -194,35 +313,80 @@ fn write_value(out: &mut String, v: &Value, ascii: bool) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_str(out, k, ascii);
+                write_str::<ASCII>(out, k);
                 out.push_str(": ");
-                write_value(out, x, ascii);
+                write_value::<ASCII>(out, x);
             }
             out.push('}');
         }
     }
 }
 
-fn write_str(out: &mut String, s: &str, ascii: bool) {
+fn write_str<const ASCII: bool>(out: &mut String, s: &str) {
     out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c if ascii && (c as u32) > 0x7e => {
-                let mut buf = [0u16; 2];
-                for unit in c.encode_utf16(&mut buf) {
-                    out.push_str(&format!("\\u{:04x}", unit));
-                }
-            }
-            c => out.push(c),
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let safe = if ASCII {
+            b >= 0x20 && b <= 0x7e && b != b'"' && b != b'\\'
+        } else {
+            b >= 0x20 && b != b'"' && b != b'\\'
+        };
+        if safe {
+            i += 1;
+            continue;
         }
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        match b {
+            b'"' => {
+                out.push_str("\\\"");
+                i += 1;
+            }
+            b'\\' => {
+                out.push_str("\\\\");
+                i += 1;
+            }
+            b'\n' => {
+                out.push_str("\\n");
+                i += 1;
+            }
+            b'\r' => {
+                out.push_str("\\r");
+                i += 1;
+            }
+            b'\t' => {
+                out.push_str("\\t");
+                i += 1;
+            }
+            0x08 => {
+                out.push_str("\\b");
+                i += 1;
+            }
+            0x0c => {
+                out.push_str("\\f");
+                i += 1;
+            }
+            0x00..=0x1f | 0x7f => {
+                write_u_escape(out, b as u16);
+                i += 1;
+            }
+            _ => {
+                let ch = s[i..].chars().next().unwrap();
+                let mut buf = [0u16; 2];
+                for unit in ch.encode_utf16(&mut buf) {
+                    write_u_escape(out, *unit);
+                }
+                i += ch.len_utf8();
+            }
+        }
+        start = i;
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
     }
     out.push('"');
 }
@@ -252,5 +416,31 @@ mod tests {
         assert_eq!(py_repr_str("abc"), "'abc'");
         assert_eq!(py_float(1.0), "1.0");
         assert_eq!(py_float(0.65), "0.65");
+    }
+
+    #[test]
+    fn dumps_handles_escapes_surrogates_and_numbers() {
+        let v = json!({
+            "ctrl": "\u{0000}\u{0008}\u{000c}\n\r\t\u{001f}\u{007f}",
+            "quote": "\"\\",
+            "emoji": "🚀",
+            "ints": [-9223372036854775808i64, -1, 0, 42, 18446744073709551615u64],
+            "floats": [0.0, 1.0, -2.5, 1e20],
+        });
+        let ascii = dumps(&v);
+        assert!(ascii.contains(r#""ctrl": "\u0000\b\f\n\r\t\u001f\u007f""#), "{ascii}");
+        assert!(ascii.contains(r#""quote": "\"\\""#), "{ascii}");
+        assert!(ascii.contains(r#""emoji": "\ud83d\ude80""#), "{ascii}");
+        assert!(ascii.contains("-9223372036854775808"), "{ascii}");
+        assert!(ascii.contains("18446744073709551615"), "{ascii}");
+        assert!(ascii.contains("0.0, 1.0, -2.5"), "{ascii}");
+        // dumps_utf8 keeps UTF-8 and 0x7f unescaped like Python ensure_ascii=False.
+        let utf8 = dumps_utf8(&v);
+        assert!(utf8.contains("\"emoji\": \"🚀\""), "{utf8}");
+        assert!(utf8.contains("\u{007f}"), "{utf8}");
+        // Round-trips cleanly via serde_json.
+        let rt: Value = serde_json::from_str(&ascii).unwrap();
+        assert_eq!(rt["emoji"], json!("🚀"));
+        assert_eq!(rt["quote"], json!("\"\\"));
     }
 }

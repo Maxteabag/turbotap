@@ -479,6 +479,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "unicode-normalization",
+ "zune-jpeg",
 ]
 
 [[package]]
