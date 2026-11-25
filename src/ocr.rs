@@ -333,36 +333,69 @@ pub type RawWords = Vec<(String, i64, i64, i64, i64)>;
 /// Parse Tesseract TSV level-5 rows (conf > 30) grouped by (block, par, line), in
 /// first-seen order.
 pub fn parse_tsv(tsv: &str) -> Vec<RawWords> {
-    let mut order: Vec<(String, String, String)> = Vec::new();
-    let mut lines: HashMap<(String, String, String), RawWords> = HashMap::new();
+    let mut out: Vec<RawWords> = Vec::new();
+    let mut index: HashMap<(i32, i32, i32), usize> = HashMap::new();
+    let mut last_key: Option<(i32, i32, i32)> = None;
+    let mut last_idx: usize = 0;
     for row in tsv.lines() {
         if !row.starts_with("5\t") {
             continue;
         }
-        let p: Vec<&str> = row.split('\t').collect();
-        if p.len() != 12 {
+        let mut it = row.split('\t');
+        let _level = it.next();
+        let Some(_page) = it.next() else { continue };
+        let Some(block_s) = it.next() else { continue };
+        let Some(par_s) = it.next() else { continue };
+        let Some(line_s) = it.next() else { continue };
+        let Some(_word) = it.next() else { continue };
+        let Some(left_s) = it.next() else { continue };
+        let Some(top_s) = it.next() else { continue };
+        let Some(width_s) = it.next() else { continue };
+        let Some(height_s) = it.next() else { continue };
+        let Some(conf_s) = it.next() else { continue };
+        let Some(text_s) = it.next() else { continue };
+        if it.next().is_some() {
             continue;
         }
-        let txt = p[11].trim();
+        let txt = text_s.trim();
         if txt.is_empty() {
             continue;
         }
-        let Ok(conf) = p[10].trim().parse::<f64>() else { continue };
+        let Ok(conf) = conf_s.trim().parse::<f64>() else { continue };
         if conf <= 30.0 {
             continue;
         }
-        let ints: Vec<i64> = p[6..10].iter().filter_map(|v| v.trim().parse::<i64>().ok()).collect();
-        let [x0, y0, ww, hh] = ints[..] else { continue };
-        let key = (p[2].to_string(), p[3].to_string(), p[4].to_string());
-        lines
-            .entry(key.clone())
-            .or_insert_with(|| {
-                order.push(key);
-                Vec::new()
-            })
-            .push((txt.to_string(), x0, y0, x0 + ww, y0 + hh));
+        let (Ok(x0), Ok(y0), Ok(ww), Ok(hh)) = (
+            left_s.trim().parse::<i64>(),
+            top_s.trim().parse::<i64>(),
+            width_s.trim().parse::<i64>(),
+            height_s.trim().parse::<i64>(),
+        ) else {
+            continue;
+        };
+        let (Ok(blk), Ok(par), Ok(ln)) = (
+            block_s.trim().parse::<i32>(),
+            par_s.trim().parse::<i32>(),
+            line_s.trim().parse::<i32>(),
+        ) else {
+            continue;
+        };
+        let key = (blk, par, ln);
+        let idx = if last_key == Some(key) {
+            last_idx
+        } else {
+            let i = *index.entry(key).or_insert_with(|| {
+                let i = out.len();
+                out.push(Vec::new());
+                i
+            });
+            last_key = Some(key);
+            last_idx = i;
+            i
+        };
+        out[idx].push((txt.to_string(), x0, y0, x0 + ww, y0 + hh));
     }
-    order.into_iter().filter_map(|k| lines.remove(&k)).collect()
+    out
 }
 
 /// `WDA_OCR_WORKERS` or clamp(cpu count, 2, 6).
@@ -439,29 +472,60 @@ impl EnginePool {
         self.cv.notify_all();
     }
 
-    /// Create engines until `n` exist (Python `while count < workers: apis.put(...)`).
+    /// Create engines until `n` exist, initialising missing engines concurrently.
     pub fn fill(&self, n: usize) -> Result<()> {
-        {
+        let missing = {
             let mut st = self.lock();
             st.max = st.max.max(n);
-        }
-        loop {
-            {
-                let mut st = self.lock();
-                if st.count >= n {
-                    return Ok(());
-                }
-                st.count += 1;
+            if st.count >= n {
+                return Ok(());
             }
-            match (self.factory)(self.psm) {
-                Ok(api) => self.put(api),
-                Err(e) => {
-                    self.lock().count -= 1;
-                    self.cv.notify_all();
-                    return Err(e);
+            let m = n - st.count;
+            st.count = n;
+            m
+        };
+        let create_one = || -> Result<()> {
+            struct CountGuard<'a>(&'a EnginePool, bool);
+            impl Drop for CountGuard<'_> {
+                fn drop(&mut self) {
+                    if self.1 {
+                        self.0.lock().count -= 1;
+                        self.0.cv.notify_all();
+                    }
                 }
             }
+            let mut guard = CountGuard(self, true);
+            let api = (self.factory)(self.psm)?;
+            guard.1 = false;
+            self.put(api);
+            Ok(())
+        };
+        if missing == 1 {
+            return create_one();
         }
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (1..missing).map(|_| s.spawn(&create_one)).collect();
+            let mut first_err = create_one().err();
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                    Err(_) => {
+                        if first_err.is_none() {
+                            first_err = Some(Error::runtime("OCR engine init panicked"));
+                        }
+                    }
+                }
+            }
+            match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        })
     }
 
     /// Create one more engine when below the pool size (background warm-up).
@@ -633,22 +697,30 @@ pub struct ShotValidator {
     pub content_type: String,
 }
 
+/// Cached decoded+resized grayscale frame paired with a [`ShotValidator`] so HTTP 304
+/// hits skip redundant JPEG decoding and bilinear resizing.
+#[derive(Clone, Debug)]
+struct DecodedShot {
+    key: String,
+    etag: String,
+    out: (u32, u32),
+    raw_size: (u32, u32),
+    img: Frame,
+}
+
+enum ConditionalShot {
+    /// HTTP 304 matched `self.shot_validator` (already incremented `conditional_hits`).
+    NotModified,
+    /// Fresh HTTP response `(status, content_type, body)`.
+    Fresh(u16, String, Vec<u8>),
+}
+
 /// Test replacement for the `tesseract` call: `(raw, w, h, psm, sauvola) -> TSV`
 /// (Python `mock.patch("turbotap.cli.tesseract_tsv")` together with
 /// `_tess_lib -> None`: setting it forces the binary path).
 pub type TsvHook = Arc<dyn Fn(&[u8], u32, u32, i32, bool) -> Result<String> + Send + Sync>;
 /// Test replacement for `ocr_raw` (Python `mock.patch.object(reader, "_ocr_raw")`).
 pub type OcrRawHook = Arc<dyn Fn(&[u8], u32, u32, bool) -> Result<Vec<RawWords>> + Send + Sync>;
-
-const INVERT: [u8; 256] = {
-    let mut t = [0u8; 256];
-    let mut i = 0;
-    while i < 256 {
-        t[i] = 255 - i as u8;
-        i += 1;
-    }
-    t
-};
 
 /// Full-screen OCR for any app, no coordinates known in advance.
 ///
@@ -672,6 +744,7 @@ pub struct ScreenReader {
     /// Device downscale factor sent to fastScreenshot (scale/3, auto-corrected).
     pub dev: f64,
     pub shot_validator: Option<ShotValidator>,
+    shot_decoded: Option<DecodedShot>,
     pub conditional_hits: u64,
     pub tsv_hook: Option<TsvHook>,
     pub ocr_raw_hook: Option<OcrRawHook>,
@@ -705,6 +778,7 @@ impl ScreenReader {
             pt_from_cache: false,
             dev: scale / 3.0, // typical 3x iOS Retina; auto-corrected after 1st grab
             shot_validator: None,
+            shot_decoded: None,
             conditional_hits: 0,
             tsv_hook: None,
             ocr_raw_hook: None,
@@ -785,9 +859,17 @@ impl ScreenReader {
                     let end = (start + w).min(data.len());
                     let row = data.get(start..end).unwrap_or(&[]);
                     let (mut mn, mut mx) = (255u8, 0u8);
+                    let mut aborted = false;
                     for &v in row.iter().step_by(step) {
                         mn = mn.min(v);
                         mx = mx.max(v);
+                        if (mx - mn) as i64 >= best_score.0 {
+                            aborted = true;
+                            break;
+                        }
+                    }
+                    if aborted {
+                        continue;
                     }
                     let rng = if row.is_empty() { 0 } else { (mx - mn) as i64 };
                     let sc = (rng, off);
@@ -833,7 +915,8 @@ impl ScreenReader {
             if mean < 120.0 {
                 // Pre-invert dark-mode strips so LSTM succeeds on pass 1 instead of
                 // retrying via tessedit_do_invert (kept enabled for mixed-polarity UI).
-                inverted = Some(raw.iter().map(|&v| INVERT[v as usize]).collect());
+                // Bitwise `!v == 255 - v` auto-vectorizes cleanly to AVX2/SSE2 XOR.
+                inverted = Some(raw.iter().map(|&v| !v).collect());
             }
         }
         let raw: &[u8] = inverted.as_deref().unwrap_or(raw);
@@ -880,9 +963,29 @@ impl ScreenReader {
         req_timeout: Option<f64>,
         deadline: Option<f64>,
     ) -> (u16, String, Vec<u8>) {
+        match self.conditional_shot_inner(c, payload, req_timeout, deadline) {
+            ConditionalShot::NotModified => {
+                if let Some(v) = self.shot_validator.as_ref() {
+                    (200, v.content_type.clone(), v.body.clone())
+                } else {
+                    (0, String::new(), b"unpaired 304 Not Modified".to_vec())
+                }
+            }
+            ConditionalShot::Fresh(status, ct, body) => (status, ct, body),
+        }
+    }
+
+    fn conditional_shot_inner(
+        &mut self,
+        c: &mut WdaClient,
+        payload: &serde_json::Value,
+        req_timeout: Option<f64>,
+        deadline: Option<f64>,
+    ) -> ConditionalShot {
         let key = format!("{}\u{1f}{}\u{1f}{}", c.base_url, c.sid_str(), json::dumps(&sorted_keys(payload)));
         if self.shot_validator.as_ref().is_some_and(|v| v.key != key) {
             self.shot_validator = None;
+            self.shot_decoded = None;
         }
         let mut validator = self.shot_validator.clone();
         let mut req_timeout = req_timeout;
@@ -914,23 +1017,25 @@ impl ScreenReader {
                 if let Some(v) = validator.as_ref() {
                     if etag.as_deref() == Some(v.etag.as_str()) {
                         self.conditional_hits += 1;
-                        return (200, v.content_type.clone(), v.body.clone());
+                        return ConditionalShot::NotModified;
                     }
                 }
                 // A 304 we cannot pair with our own retained bytes: never guess a frame.
                 validator = None;
                 self.shot_validator = None;
+                self.shot_decoded = None;
                 if attempt == 0 {
                     if let Some(d) = deadline {
                         if clock::now() >= d {
-                            return (0, String::new(), b"deadline exceeded".to_vec());
+                            return ConditionalShot::Fresh(0, String::new(), b"deadline exceeded".to_vec());
                         }
                         req_timeout = Some((d - clock::now()).max(0.05));
                     }
                     continue;
                 }
-                return (0, String::new(), b"unpaired 304 Not Modified".to_vec());
+                return ConditionalShot::Fresh(0, String::new(), b"unpaired 304 Not Modified".to_vec());
             }
+            self.shot_decoded = None;
             if status == 200 && ct.to_lowercase().starts_with("image/") && !body.is_empty() {
                 match etag {
                     Some(t) if t.len() >= 3 && t.starts_with('"') && t.ends_with('"') => {
@@ -948,9 +1053,9 @@ impl ScreenReader {
             } else {
                 self.shot_validator = None;
             }
-            return (status, ct, body);
+            return ConditionalShot::Fresh(status, ct, body);
         }
-        (0, String::new(), b"conditional screenshot failed".to_vec())
+        ConditionalShot::Fresh(0, String::new(), b"conditional screenshot failed".to_vec())
     }
 }
 
@@ -1075,6 +1180,7 @@ impl Reader for ScreenReader {
             let (mut w, mut h) = get_pt!(false);
             let (mut y1_eff, mut out) = size_for(w, h, self.scale);
             let mut img: Option<GrayImage> = None;
+            let mut cacheable_raw_size: Option<(u32, u32)> = None;
             if c.turbo != Some(false) {
                 let mut payload = j!({"quality": 0.6, "scale": self.dev.min(1.0)});
                 if !full {
@@ -1088,37 +1194,70 @@ impl Reader for ScreenReader {
                 let use_raw = c.raw_shot != Some(false);
                 let mut raw_bytes: Option<Vec<u8>> = None;
                 let mut r: Option<Value> = None;
+                let mut used_conditional = false;
                 let req_timeout = rem()?;
                 if use_raw {
                     if let Value::Object(m) = &mut payload {
                         m.insert("raw".into(), Value::Bool(true));
                     }
-                    let (status, ct, body) = if self.conditional_ok(c) {
-                        self.conditional_shot(c, &payload, req_timeout, eff_deadline)
+                    let resp = if self.conditional_ok(c) {
+                        used_conditional = true;
+                        self.conditional_shot_inner(c, &payload, req_timeout, eff_deadline)
                     } else {
-                        c.req_raw(
+                        let (s, ct, b) = c.req_raw(
                             "POST",
                             "/wda/fastScreenshot",
                             Some(&payload),
                             req_timeout.unwrap_or(crate::wda::DEFAULT_TIMEOUT),
                             eff_deadline,
                             None,
-                        )
+                        );
+                        ConditionalShot::Fresh(s, ct, b)
                     };
-                    if status == 200 && ct.to_lowercase().starts_with("image/") && !body.is_empty() {
-                        c.turbo = Some(true);
-                        c.raw_shot = Some(true);
-                        raw_bytes = Some(body);
-                    } else if status == 200 && !body.is_empty() {
-                        // Older wda-turbo ignored "raw": true and returned JSON base64.
-                        c.raw_shot = Some(false);
-                        r = Some(serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| j!({"error": "invalid json"})));
-                    } else if status == 404 {
-                        r = Some(j!({"error": 404}));
-                    } else if status == 0 {
-                        r = Some(j!({"error": "connection failed"}));
-                    } else {
-                        r = Some(j!({"error": status}));
+                    match resp {
+                        ConditionalShot::NotModified => {
+                            c.turbo = Some(true);
+                            c.raw_shot = Some(true);
+                            if let (Some(v), Some(d)) = (self.shot_validator.as_ref(), self.shot_decoded.as_ref()) {
+                                let ratio_ok = !self.pt_from_cache
+                                    || d.raw_size.0 == 0
+                                    || d.raw_size.1 == 0
+                                    || ((d.raw_size.0 as f64 / d.raw_size.1 as f64)
+                                        - (out.0 as f64 / out.1 as f64))
+                                        .abs()
+                                        <= 0.03;
+                                if v.key == d.key && v.etag == d.etag && d.out == out && ratio_ok {
+                                    if d.raw_size.0 > 0 && (d.raw_size.0 as i64 - out.0 as i64).abs() > 2 {
+                                        self.dev *= out.0 as f64 / d.raw_size.0 as f64;
+                                    }
+                                    // Always return a fresh Arc address (!Arc::ptr_eq with previous
+                                    // grabs) because sense.rs compares Arc::ptr_eq to detect distinct grabs.
+                                    return Ok(Arc::new((*d.img).clone()));
+                                }
+                            }
+                            if let Some(v) = self.shot_validator.as_ref() {
+                                if v.content_type.to_lowercase().starts_with("image/") && !v.body.is_empty() {
+                                    raw_bytes = Some(v.body.clone());
+                                }
+                            }
+                        }
+                        ConditionalShot::Fresh(status, ct, body) => {
+                            if status == 200 && ct.to_lowercase().starts_with("image/") && !body.is_empty() {
+                                c.turbo = Some(true);
+                                c.raw_shot = Some(true);
+                                raw_bytes = Some(body);
+                            } else if status == 200 && !body.is_empty() {
+                                // Older wda-turbo ignored "raw": true and returned JSON base64.
+                                c.raw_shot = Some(false);
+                                r = Some(serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| j!({"error": "invalid json"})));
+                            } else if status == 404 {
+                                r = Some(j!({"error": 404}));
+                            } else if status == 0 {
+                                r = Some(j!({"error": "connection failed"}));
+                            } else {
+                                r = Some(j!({"error": status}));
+                            }
+                        }
                     }
                 } else {
                     r = Some(match eff_deadline {
@@ -1160,6 +1299,7 @@ impl Reader for ScreenReader {
                 }
                 if let Some(bytes) = raw_bytes {
                     let decoded = GrayImage::decode_draft(&bytes, out)?;
+                    let raw_size = (decoded.w, decoded.h);
                     if decoded.w > 0 && decoded.h > 0 {
                         let got_ratio = decoded.w as f64 / decoded.h as f64;
                         let exp_ratio = out.0 as f64 / out.1 as f64;
@@ -1174,6 +1314,9 @@ impl Reader for ScreenReader {
                         if (decoded.w as i64 - out.0 as i64).abs() > 2 {
                             self.dev *= out.0 as f64 / decoded.w as f64;
                         }
+                    }
+                    if used_conditional {
+                        cacheable_raw_size = Some(raw_size);
                     }
                     img = Some(decoded);
                 }
@@ -1208,7 +1351,17 @@ impl Reader for ScreenReader {
                 }
             };
             let img = if img.size() != out { img.resize_bilinear(out.0, out.1) } else { img };
-            return Ok(Arc::new(img));
+            let frame = Arc::new(img);
+            if let (Some(v), Some(raw_size)) = (self.shot_validator.as_ref(), cacheable_raw_size) {
+                self.shot_decoded = Some(DecodedShot {
+                    key: v.key.clone(),
+                    etag: v.etag.clone(),
+                    out,
+                    raw_size,
+                    img: Arc::clone(&frame),
+                });
+            }
+            return Ok(frame);
         }
         Err(Error::runtime("Empty screenshot response"))
     }
@@ -1347,4 +1500,180 @@ pub fn cmd_ocr(client: &mut WdaClient, scale: f64, y0: i64, y1: Option<i64>) -> 
         crate::outln!("({:3}, {:3})  {}", x, y, ln.text);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ocr_opt_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn parse_tsv_groups_lines_in_first_seen_order_and_filters_conf() {
+        let tsv = concat!(
+            "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n",
+            "4\t1\t2\t1\t1\t0\t0\t0\t100\t20\t-1\t\n",
+            "5\t1\t2\t1\t1\t1\t10\t20\t30\t12\t92.5\tHello\n",
+            "5\t1\t2\t1\t1\t2\t45\t20\t35\t12\t30.0\tLowConf\n",
+            "5\t1\t2\t1\t1\t3\t85\t20\t25\t12\t30.1\tWorld\n",
+            "5\t1\t1\t1\t1\t1\t5\t5\t20\t10\t88\tFirst\n",
+            "5\t1\t2\t1\t1\t4\t120\t20\t15\t12\t99\t!\n",
+            "5\t1\t3\t1\t1\t1\t10\t40\t20\t10\t95\t   \n",
+            "5\t1\t3\t1\t1\t2\tbad\t40\t20\t10\t95\tBadCoord\n",
+            "5\t1\t3\t1\t1\t3\t10\t40\t20\t10\t95\tExtra\tCol\n",
+        );
+        let parsed = parse_tsv(tsv);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0],
+            vec![
+                ("Hello".into(), 10, 20, 40, 32),
+                ("World".into(), 85, 20, 110, 32),
+                ("!".into(), 120, 20, 135, 32),
+            ]
+        );
+        assert_eq!(parsed[1], vec![("First".into(), 5, 5, 25, 15)]);
+    }
+
+    #[test]
+    fn engine_pool_fill_runs_concurrently_and_accounts_for_errors() {
+        // 4 engines each sleeping 45 ms must finish well under 4 * 45 = 180 ms.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let warm = WarmOcr::with_factory(move |psm| {
+            let id = c2.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(45));
+            Ok(TessApi::fake(format!("e-{psm}-{id}")))
+        });
+        let t0 = Instant::now();
+        let pool = warm.lease(11, 4).unwrap();
+        let dt = t0.elapsed();
+        assert_eq!(pool.count(), 4);
+        assert_eq!(pool.free_count(), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(dt < Duration::from_millis(140), "fill(4) took {dt:?}; expected parallel execution");
+
+        // Partial failure decrements count for failed slots while keeping succeeded engines.
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let pool_err = EnginePool::new(
+            11,
+            4,
+            Arc::new(move |_| {
+                let k = n2.fetch_add(1, Ordering::SeqCst);
+                if k % 2 == 0 {
+                    Ok(TessApi::fake(format!("ok-{k}")))
+                } else {
+                    Err(Error::runtime("init failed"))
+                }
+            }),
+        );
+        assert!(pool_err.fill(4).is_err());
+        assert_eq!(pool_err.count(), 2);
+        assert_eq!(pool_err.free_count(), 2);
+    }
+
+    #[test]
+    fn conditional_304_reuses_decoded_frame_without_redecoding_and_returns_fresh_arc() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::AtomicBool;
+
+        let _env = crate::testutil::set_env(&[]);
+        let _c = crate::testutil::isolated_cache();
+        let body = crate::testutil::encode_image_bytes(&crate::testutil::solid_img(180, (430, 932)), "JPEG", 80);
+        let etag = "\"test-304-cache\"".to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let b2 = body.clone();
+        let e2 = etag.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if stop2.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Ok(stream) = conn {
+                    let b3 = b2.clone();
+                    let e3 = e2.clone();
+                    std::thread::spawn(move || {
+                        let Ok(mut w) = stream.try_clone() else { return };
+                        let mut r = BufReader::new(stream);
+                        loop {
+                            let mut line = String::new();
+                            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let mut it = line.split_whitespace();
+                            let method = it.next().unwrap_or("").to_string();
+                            let path = it.next().unwrap_or("").to_string();
+                            let mut hdrs = HashMap::new();
+                            loop {
+                                let mut h = String::new();
+                                if r.read_line(&mut h).unwrap_or(0) == 0 {
+                                    return;
+                                }
+                                let h = h.trim_end();
+                                if h.is_empty() {
+                                    break;
+                                }
+                                if let Some((k, v)) = h.split_once(':') {
+                                    hdrs.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                }
+                            }
+                            let len: usize = hdrs.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+                            let mut req_body = vec![0u8; len];
+                            if r.read_exact(&mut req_body).is_err() {
+                                return;
+                            }
+                            let ok = if method == "GET" && path.ends_with("/window/size") {
+                                let resp = br#"{"value":{"width":430,"height":932}}"#;
+                                write!(
+                                    w,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                                    resp.len()
+                                )
+                                .and_then(|_| w.write_all(resp))
+                            } else if hdrs.get("if-none-match").map(|s| s.as_str()) == Some(e3.as_str()) {
+                                write!(
+                                    w,
+                                    "HTTP/1.1 304 Not Modified\r\nContent-Type: image/jpeg\r\nETag: {e3}\r\nContent-Length: 0\r\n\r\n"
+                                )
+                            } else {
+                                write!(
+                                    w,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nETag: {e3}\r\nContent-Length: {}\r\n\r\n",
+                                    b3.len()
+                                )
+                                .and_then(|_| w.write_all(&b3))
+                            };
+                            if ok.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        let mut client = WdaClient::new(&format!("http://127.0.0.1:{port}"), crate::testutil::TEST_UDID, None);
+        client.sid = Some("sid-cache".into());
+        let mut reader = ScreenReader::new(1.0, None, 11, false);
+        let first = reader.grab(&mut client, 0, None, None, None).unwrap();
+        assert!(reader.shot_decoded.is_some());
+        // Corrupt raw bytes in validator to prove the 304 path uses the decoded cache
+        // instead of re-decoding JPEG bytes.
+        reader.shot_validator.as_mut().unwrap().body = b"corrupted-jpeg-bytes".to_vec();
+        let second = reader.grab(&mut client, 0, None, None, None).unwrap();
+        let third = reader.grab(&mut client, 0, None, None, None).unwrap();
+        assert_eq!(reader.conditional_hits, 2);
+        assert_eq!(first.data, second.data);
+        assert_eq!(second.data, third.data);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&second, &third));
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", port));
+    }
 }
