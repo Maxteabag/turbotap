@@ -100,7 +100,7 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 
 | Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
-| CLI startup (`--help` / UI-only) | ~150-210ms (v0.x Python) | **~1ms** | One native Rust binary; UI-only flows never load Tesseract (offline microbenchmark) |
+| CLI startup (`--help` / UI-only) | ~43ms (v0.10 Python) | **~1.3ms** | One native Rust binary; UI-only flows never load Tesseract (offline microbenchmark) |
 | Session startup | ~88ms (uncached) | ~14ms | Caches fast settings & screen size per device |
 | Tap | 740-1200ms | ~260ms | Instant-wake `CFRunLoopStop` touch synthesis (`0.02s`) |
 | Type text (27 chars) | ~725ms | **~350ms** (opt-in `240/s`) | `/wda/fastKeys` keeps legacy pace by default; set `TURBOTAP_TYPING_FREQ=240` for turbo |
@@ -120,6 +120,8 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 | Hard-to-read text (`read:vision`) | 12/72 words (host OCR) | **72/72 words, ~235ms** | v6 on-device Apple Vision OCR (`/wda/fastOCR`) |
 
 The last five rows were measured on an iPhone 17 during the overnight lab in [PR #8](https://github.com/Maxteabag/turbotap/pull/8). Those workloads were small: Calculator, Settings and one multilingual test page. Expect different numbers on other screens.
+
+**Host-side Rust vs Python `v0.10.0` overhead (offline mock-WDA benchmarks, separate from the iPhone 17 numbers above):** moving to the optimized Rust binary cut CLI startup from ~43ms to **~1.3ms**, `daemon start` from ~409ms (Python) / ~326ms (`v1.0.0`) to **~3.9ms** (async OCR warm-up overlapping socket readiness), non-OCR flows (`ui`, `read:vision`, `shot`, `settle`) to **~2–6ms** and **~12 MB RSS** (-97% vs ~414 MB), warm daemon request overhead to **~1.9–2.1ms**, and warm daemon OCR to **~24–28ms** (~2.2× faster than Python `v0.10.0`).
 
 ### Warm daemon (optional)
 
