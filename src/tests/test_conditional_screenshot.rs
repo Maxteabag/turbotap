@@ -2,8 +2,7 @@
 //! (ETag + HTTP 304) in `ScreenReader::grab` over real sockets.
 use crate::image::GrayImage;
 use crate::ocr::{Reader, ScreenReader};
-use crate::testutil::env::{env_lock, EnvVar};
-use crate::testutil::{encode_image_bytes, isolated_cache, solid_img, TEST_UDID};
+use crate::testutil::{encode_image_bytes, isolated_cache, set_env, solid_img, TEST_UDID};
 use crate::wda::WdaClient;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -183,7 +182,7 @@ fn px(img: &GrayImage) -> u8 {
 
 #[test]
 fn unchanged_frames_reuse_retained_bytes_on_304() {
-    let _env = env_lock();
+    let _env = set_env(&[]); // hold the env lock: the opt-out test sets WDA_CONDITIONAL_SHOT
     let _c = isolated_cache();
     let frames = Arc::new(Mutex::new(jpeg_full(200)));
     let srv = Server::start(v6_router(frames.clone()));
@@ -207,7 +206,7 @@ fn unchanged_frames_reuse_retained_bytes_on_304() {
 
 #[test]
 fn changed_frame_is_delivered_and_replaces_the_validator() {
-    let _env = env_lock();
+    let _env = set_env(&[]); // hold the env lock: the opt-out test sets WDA_CONDITIONAL_SHOT
     let _c = isolated_cache();
     let frames = Arc::new(Mutex::new(jpeg_full(200)));
     let srv = Server::start(v6_router(frames.clone()));
@@ -224,7 +223,7 @@ fn changed_frame_is_delivered_and_replaces_the_validator() {
 
 #[test]
 fn region_change_never_sends_the_full_frame_validator() {
-    let _env = env_lock();
+    let _env = set_env(&[]); // hold the env lock: the opt-out test sets WDA_CONDITIONAL_SHOT
     let _c = isolated_cache();
     let frames = Arc::new(Mutex::new(jpeg_full(200)));
     let srv = Server::start(v6_router(frames.clone()));
@@ -247,7 +246,7 @@ fn region_change_never_sends_the_full_frame_validator() {
 
 #[test]
 fn validators_are_per_reader_and_per_session() {
-    let _env = env_lock();
+    let _env = set_env(&[]); // hold the env lock: the opt-out test sets WDA_CONDITIONAL_SHOT
     let _c = isolated_cache();
     let frames = Arc::new(Mutex::new(jpeg_full(200)));
     let srv = Server::start(v6_router(frames));
@@ -263,7 +262,7 @@ fn validators_are_per_reader_and_per_session() {
 
 #[test]
 fn runner_without_etag_support_keeps_plain_raw_frames() {
-    let _env = env_lock();
+    let _env = set_env(&[]); // hold the env lock: the opt-out test sets WDA_CONDITIONAL_SHOT
     let _c = isolated_cache();
     let body = jpeg_full(200);
     let srv = Server::start(move |_| (200, jpeg_hdrs(None), body.clone()));
@@ -280,7 +279,7 @@ fn runner_without_etag_support_keeps_plain_raw_frames() {
 
 #[test]
 fn unpaired_or_mismatched_304_is_refetched_not_guessed() {
-    let _env = env_lock();
+    let _env = set_env(&[]); // hold the env lock: the opt-out test sets WDA_CONDITIONAL_SHOT
     let _c = isolated_cache();
     let (first, second) = (jpeg_full(200), jpeg_full(60));
     let mut n = 0;
@@ -303,7 +302,7 @@ fn unpaired_or_mismatched_304_is_refetched_not_guessed() {
 
 #[test]
 fn headerless_304_is_refetched_unconditionally() {
-    let _env = env_lock();
+    let _env = set_env(&[]); // hold the env lock: the opt-out test sets WDA_CONDITIONAL_SHOT
     let _c = isolated_cache();
     let (first, second) = (jpeg_full(200), jpeg_full(60));
     let (t1, t2) = (tag(&first), tag(&second));
@@ -330,7 +329,7 @@ fn headerless_304_is_refetched_unconditionally() {
 
 #[test]
 fn error_response_drops_the_validator() {
-    let _env = env_lock();
+    let _env = set_env(&[]); // hold the env lock: the opt-out test sets WDA_CONDITIONAL_SHOT
     let _c = isolated_cache();
     let body = jpeg_full(200);
     let fail = Arc::new(AtomicBool::new(false));
@@ -359,13 +358,12 @@ fn error_response_drops_the_validator() {
 fn opt_out_env_and_test_doubles_use_the_plain_path() {
     // Python also covered MockWDAClient-style doubles without the real transport;
     // every Rust client is the real transport, so only the env opt-out remains.
-    let _env = env_lock();
     let _c = isolated_cache();
     let frames = Arc::new(Mutex::new(jpeg_full(200)));
     let srv = Server::start(v6_router(frames));
     let (mut r, mut c) = reader(&srv.url);
     {
-        let _v = EnvVar::set("WDA_CONDITIONAL_SHOT", Some("0"));
+        let _env = set_env(&[("WDA_CONDITIONAL_SHOT", Some("0"))]);
         grab(&mut r, &mut c);
         grab(&mut r, &mut c);
     }
