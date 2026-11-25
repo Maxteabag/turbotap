@@ -1148,7 +1148,11 @@ fn test_overrides_resolve_endpoint_udid_key_and_policy_from_one_record() {
     let b = MockWda::start(state_with_app(json!(B_APP3)));
     let e = cli_env(&a.url, &[]);
     two_phone_config(&e, &a, &b, None);
-    let t = |u: Option<&str>, d: Option<&str>, id: Option<&str>| crate::config::resolve_target(u, d, id);
+    // The CLI reloads config.json before resolving; do the same here.
+    let t = |u: Option<&str>, d: Option<&str>, id: Option<&str>| {
+        crate::config::reload();
+        crate::config::resolve_target(u, d, id)
+    };
     // URL-only override for B: B's endpoint, B's UDID and key.
     let tb = t(Some(b.url.as_str()), None, None);
     assert_eq!(
