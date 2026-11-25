@@ -1,0 +1,97 @@
+diff --git a/WebDriverAgentLib/Commands/FBScreenshotCommands.m b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
+index f647625..ba9a3fa 100644
+--- a/WebDriverAgentLib/Commands/FBScreenshotCommands.m
++++ b/WebDriverAgentLib/Commands/FBScreenshotCommands.m
+@@ -11,6 +11,8 @@
+ #import "XCUIDevice+FBHelpers.h"
+ #import <ImageIO/ImageIO.h>
+ #import <math.h>
++#import <CommonCrypto/CommonDigest.h>
++#import "RouteResponse.h"
+ #import "FBScreenshot.h"
+ #import "FBCommandStatus.h"
+ #import "FBRouteRequest.h"
+@@ -61,6 +63,46 @@ static NSData *FBScaleImageDataFast(NSData *srcData, CGFloat scale, CGFloat qual
+   return ok ? out : srcData;
+ }
+ 
++// Per-response state only. Both benchmark modes take the same fresh capture path.
++@interface FBMeasuredJPEG : NSObject <FBResponsePayload>
++@property (nonatomic, copy) NSData *body;
++@property (nonatomic, copy) NSString *tag;
++@property (nonatomic) double captureMs;
++@property (nonatomic) double hashMs;
++@property (nonatomic) NSUInteger jpegBytes;
++@end
++
++@implementation FBMeasuredJPEG
++- (void)dispatchWithResponse:(RouteResponse *)response
++{
++  [response setHeader:@"Cache-Control" value:@"no-store"];
++  [response setHeader:@"Content-Type" value:self.body.length ? @"image/jpeg" : @"application/octet-stream"];
++  [response setHeader:@"X-Capture-Ms" value:[NSString stringWithFormat:@"%.6f", self.captureMs]];
++  [response setHeader:@"X-Hash-Ms" value:[NSString stringWithFormat:@"%.6f", self.hashMs]];
++  [response setHeader:@"X-JPEG-Bytes" value:@(self.jpegBytes).stringValue];
++  if (self.tag != nil) {
++    [response setHeader:@"ETag" value:self.tag];
++  }
++  [response respondWithData:self.body];
++}
++@end
++
++static NSString *FBJPEGTag(NSData *data)
++{
++  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
++  CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
++  static const char hex[] = "0123456789abcdef";
++  char tag[2 * CC_SHA256_DIGEST_LENGTH + 3];
++  tag[0] = '"';
++  for (NSUInteger i = 0; i < sizeof(digest); ++i) {
++    tag[1 + 2*i] = hex[digest[i] >> 4];
++    tag[2 + 2*i] = hex[digest[i] & 15];
++  }
++  tag[sizeof(tag)-2] = '"';
++  tag[sizeof(tag)-1] = 0;
++  return [NSString stringWithUTF8String:tag];
++}
++
+ @implementation FBScreenshotCommands
+ 
+ #pragma mark - <FBCommandHandler>
+@@ -107,6 +149,12 @@ static NSData *FBScaleImageDataFast(NSData *srcData, CGFloat scale, CGFloat qual
+   CGFloat quality = nil == a[@"quality"] ? (CGFloat)0.8 : (CGFloat)[a[@"quality"] doubleValue];
+   UTType *uti = [@"png" isEqualToString:a[@"format"]] ? UTTypePNG : UTTypeJPEG;
+   NSError *error = nil;
++  BOOL conditional = [@"conditional" isEqual:a[@"jpegProbe"]];
++  BOOL measure = conditional || [@"baseline" isEqual:a[@"jpegProbe"]];
++  if (measure && (![@YES isEqual:a[@"raw"]] || ![uti isEqual:UTTypeJPEG])) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"jpegProbe requires raw JPEG" traceback:nil]);
++  }
++  double start = measure ? NSProcessInfo.processInfo.systemUptime : 0;
+   NSData *data = [FBScreenshot takeWithRect:rect compressionQuality:quality uti:uti error:&error];
+   if (nil == data) {
+     return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:error.description traceback:nil]);
+@@ -115,6 +163,23 @@ static NSData *FBScaleImageDataFast(NSData *srcData, CGFloat scale, CGFloat qual
+   if (scale > 0.0 && scale < 1.0) {
+     data = FBScaleImageDataFast(data, scale, quality, uti);
+   }
++  if (measure) {
++    double captured = NSProcessInfo.processInfo.systemUptime;
++    if (data.length == 0 || data.length > UINT32_MAX) {
++      return FBResponseWithUnknownErrorFormat(@"Unexpected JPEG size");
++    }
++    FBMeasuredJPEG *payload = [FBMeasuredJPEG new];
++    payload.captureMs = (captured - start) * 1000;
++    payload.jpegBytes = data.length;
++    if (conditional) {
++      double hashStart = NSProcessInfo.processInfo.systemUptime;
++      payload.tag = FBJPEGTag(data);
++      payload.hashMs = (NSProcessInfo.processInfo.systemUptime - hashStart) * 1000;
++    }
++    BOOL match = conditional && [payload.tag isEqual:a[@"previousETag"]];
++    payload.body = match ? [NSData data] : data;
++    return payload;
++  }
+   id rawArg = a[@"raw"];
+   if ([rawArg respondsToSelector:@selector(boolValue)] && [rawArg boolValue]) {
+     NSString *ct = [uti conformsToType:UTTypePNG] ? @"image/png" : @"image/jpeg";
