@@ -27,6 +27,19 @@ pub use worker::{ProbeSnapshot, UiWorker};
 
 pub const DENY_DEFAULT: &str = r"cancel booking|cancel appointment|delete account|erase all|reset all|confirm purchase|\bbuy\b|\bpay\b|\bsubscribe\b|start (audio|video) call|\bsend\b|record voice|delete|unsend|remove|^(accept|decline|maybe)$";
 
+/// The only labels the built-in [`DENY_DEFAULT`] lets through, and only while the app
+/// guard confirms (live) that an allowlisted app is in front: exactly `Send` or
+/// `Send message` (case, surrounding and repeated whitespace ignored). Anything else
+/// containing "send" (`Send payment`, `Send all funds`, `Send attachment`, ...) stays
+/// refused like every other default entry.
+pub const PLAIN_SEND_LABELS: &[&str] = &["send", "send message"];
+
+/// True when `label`, normalized, is exactly one of [`PLAIN_SEND_LABELS`].
+pub fn is_plain_send(label: &str) -> bool {
+    let norm = label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    PLAIN_SEND_LABELS.contains(&norm.as_str())
+}
+
 pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
@@ -105,6 +118,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
 taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.
+with the built-in --deny only, a control labelled exactly Send or Send message is allowed while a live check confirms an
+allowlisted app (allowed_apps) is in front; every other label (Send payment, pay, delete, ...) stays refused.
 with allowed_apps in config.json (or TURBOTAP_ALLOWED_APPS / --allow-app), every input step is refused unless
 the live foreground app is on that list; open:/launch: check the target app, url: is refused (iOS picks the receiving app).
 --no-deny never disables this app guard. while a configured stop_file (or TURBOTAP_STOP_FILE) exists,
@@ -347,8 +362,19 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// Refuse taps on text matching `--deny`.
-    pub fn guard(&self, text: &str, action: &str) -> Result<()> {
+    /// Refuse taps on text matching `--deny`. `text` must be the actual target's text
+    /// (the matched OCR line or control label); see [`Flow::guard_with`].
+    pub fn guard(&mut self, text: &str, action: &str) -> Result<()> {
+        self.guard_with(text, action, true)
+    }
+
+    /// [`Flow::guard`]. With the built-in default only, and only when `may_relax` (the
+    /// caller verified `text` is the target's own label): a label that is exactly a
+    /// [`PLAIN_SEND_LABELS`] entry is allowed while the app guard is on and a live
+    /// `/wda/activeAppInfo` confirms an allowlisted app in front. An explicit
+    /// `--deny`, no allowlist, an unconfirmed foreground app or any other label stays
+    /// refused.
+    pub fn guard_with(&mut self, text: &str, action: &str, may_relax: bool) -> Result<()> {
         if let Some(guard) = self.deny.as_ref() {
             if text.is_empty() {
                 return Ok(());
@@ -356,6 +382,10 @@ impl<R: Reader> Flow<R> {
             match guard.regex().is_match(text) {
                 Ok(false) => {}
                 Ok(true) => {
+                    let eligible = may_relax && matches!(guard, DenyGuard::Default) && is_plain_send(text);
+                    if eligible && self.c.foreground_confirmed_allowed() {
+                        return Ok(());
+                    }
                     return Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text))));
                 }
                 // An evaluation error (e.g. backtrack limit) is an unverified result, not a
@@ -1190,7 +1220,7 @@ mod unit {
     #[test]
     fn deny_default_is_lazy_and_cached_while_custom_invalid_regex_errors_eagerly() {
         let c = WdaClient::new("http://127.0.0.1:9", "", None);
-        let flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+        let mut flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
         assert!(flow.guard("Delete Account", "tap").is_err());
         assert!(flow.guard("Settings", "tap").is_ok());
 

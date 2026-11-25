@@ -100,6 +100,27 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+
+/// An element attribute as read from WDA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ElAttr {
+    /// Read successfully, non-empty.
+    Value(String),
+    /// Read successfully: null or empty.
+    Empty,
+    /// The request failed or the answer was not a string.
+    Failed,
+}
+
+impl ElAttr {
+    fn value(&self) -> Option<&str> {
+        match self {
+            ElAttr::Value(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 impl<R: Reader> Flow<R> {
     /// `self.controls()` / `self.controls(deadline=deadline)` from the tap code.
     fn tap_ctl(&mut self, deadline: Option<f64>) -> Result<Vec<Control>> {
@@ -145,7 +166,13 @@ impl<R: Reader> Flow<R> {
 
     /// L3134.
     pub fn tap_point(&mut self, x: i64, y: i64, text: &str, deadline: Option<f64>) -> Result<()> {
-        self.guard(text, "tap")?;
+        self.tap_point_with(x, y, text, deadline, true)
+    }
+
+    /// [`Flow::tap_point`]; `may_relax` false when `text` is not verified to be the
+    /// target's own label (see [`Flow::guard_with`]).
+    pub fn tap_point_with(&mut self, x: i64, y: i64, text: &str, deadline: Option<f64>, may_relax: bool) -> Result<()> {
+        self.guard_with(text, "tap", may_relax)?;
         if let Some(d) = deadline {
             if clock::now() >= d {
                 return Err(Error::DeadlineExceeded("tap deadline exceeded".into()));
@@ -1009,6 +1036,20 @@ impl<R: Reader> Flow<R> {
     }
 
     /// L3760. Returns the tapped point (the `tapel:` step result is `[x, y]`).
+    /// One accessibility attribute of element `eid`, keeping a failed lookup apart
+    /// from a successful empty one.
+    fn element_attr(&mut self, eid: &str, attr: &str) -> ElAttr {
+        // Same strict success envelope as the foreground check: HTTP 2xx, no error,
+        // status absent or 0, `value` present. Only then is null/"" a real empty.
+        let p = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
+        match self.c.strict_get_value(&p) {
+            Ok(Value::Null) => ElAttr::Empty,
+            Ok(Value::String(s)) if s.trim().is_empty() => ElAttr::Empty,
+            Ok(Value::String(s)) => ElAttr::Value(s.trim().to_string()),
+            _ => ElAttr::Failed,
+        }
+    }
+
     pub fn tap_el(&mut self, label: &str, timeout: Option<f64>) -> Result<(i64, i64)> {
         self.wait_active_app(1.5, 0.03, None);
         let q = json::dumps(&Value::String(label.to_string()));
@@ -1034,7 +1075,27 @@ impl<R: Reader> Flow<R> {
                         let f = |k: &str| json::get(rect, k).as_f64().unwrap_or(0.0);
                         let x = (f("x") + f("width") / 2.0).trunc() as i64;
                         let y = (f("y") + f("height") / 2.0).trunc() as i64;
-                        self.tap_point(x, y, label, None)?;
+                        if self.deny.is_none() {
+                            self.tap_point(x, y, label, None)?;
+                            return Ok((x, y));
+                        }
+                        // The element may have been found by a substring or by its name:
+                        // check what it actually is, not only the query.
+                        let (el_label, el_name) = (self.element_attr(&eid, "label"), self.element_attr(&eid, "name"));
+                        let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                        // The exception needs a successfully read label that is exactly a
+                        // plain Send, and a name that was read too and is empty or the
+                        // same. Unreadable or disagreeing attributes: no exception.
+                        let own: Option<String> = match (&el_label, &el_name) {
+                            (ElAttr::Value(l), ElAttr::Empty) => Some(l.clone()),
+                            (ElAttr::Value(l), ElAttr::Value(n)) if fold(l) == fold(n) => Some(l.clone()),
+                            _ => None,
+                        };
+                        let may_relax = own.as_deref().is_some_and(super::is_plain_send);
+                        for t in [Some(label), el_label.value(), el_name.value()].into_iter().flatten() {
+                            self.guard_with(t, "tap", may_relax)?;
+                        }
+                        self.tap_point_with(x, y, own.as_deref().unwrap_or(label), None, may_relax)?;
                         return Ok((x, y));
                     }
                 }
