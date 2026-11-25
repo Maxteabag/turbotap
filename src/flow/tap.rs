@@ -111,20 +111,20 @@ impl<R: Reader> Flow<R> {
         self.controls(false, None, deadline, false, false)
     }
 
-    fn grab_frame(&mut self) -> Result<Frame> {
+    fn tap_grab(&mut self) -> Result<Frame> {
         self.r.grab(&mut self.c, 0, None, None, None)
     }
 
-    fn read_img(&mut self, f: Frame) -> Result<Vec<Line>> {
+    fn tap_read_img(&mut self, f: Frame) -> Result<Vec<Line>> {
         self.r.read(&mut self.c, ReadOpts::img(f))
     }
 
-    fn pt(&mut self) -> Result<(i64, i64)> {
+    fn tap_pt(&mut self) -> Result<(i64, i64)> {
         self.r.pt_size(&mut self.c, false, None)
     }
 
     /// `self._fresh_lines() or self.lines()`.
-    fn fresh_or_lines(&mut self) -> Result<Vec<Line>> {
+    fn tap_fresh_or_lines(&mut self) -> Result<Vec<Line>> {
         match self.fresh_lines(0.15)? {
             Some(l) if !l.is_empty() => Ok(l),
             _ => self.lines(None, None),
@@ -132,12 +132,12 @@ impl<R: Reader> Flow<R> {
     }
 
     /// `getattr(self.r, "last_lines", None)` else `self.r.read(img=self.r.last)` else [].
-    fn current_lines_or_read(&mut self) -> Result<Vec<Line>> {
+    fn tap_current_lines(&mut self) -> Result<Vec<Line>> {
         if let Some(l) = self.r.last_lines() {
             return Ok(l);
         }
         match self.r.last() {
-            Some(f) => self.read_img(f),
+            Some(f) => self.tap_read_img(f),
             None => Ok(vec![]),
         }
     }
@@ -242,7 +242,7 @@ impl<R: Reader> Flow<R> {
         let cur_img: Frame = match self.r.last() {
             Some(l) if last_ts >= self.last_action_ts && (now - last_ts) < 0.25 => l,
             _ => {
-                let g = self.grab_frame()?;
+                let g = self.tap_grab()?;
                 self.r.set_last(Some(g.clone()), None, None);
                 g
             }
@@ -289,7 +289,7 @@ impl<R: Reader> Flow<R> {
             // The nav-bar chevron OCRs as a lone '<' (Spotify, Messenger): tapping it
             // skips a /source fetch (2.1 s on a long Spotify playlist). y > 55 skips the
             // status bar's '< AppName' return link.
-            let lines = self.fresh_or_lines()?;
+            let lines = self.tap_fresh_or_lines()?;
             let chev = lines
                 .iter()
                 .find(|l| ["<", "\u{2039}", "\u{3008}", "\u{ab}"].contains(&l.text.trim()) && l.x() < 70 && 55 < l.y() && l.y() < 130)
@@ -325,7 +325,7 @@ impl<R: Reader> Flow<R> {
         {
             let (settled_prev, settled_img) = self.settle_transition(0.5, 1.2)?;
             if let Some(si) = settled_img.clone() {
-                let fl = self.read_img(si.clone())?;
+                let fl = self.tap_read_img(si.clone())?;
                 self.r.set_last(Some(si.clone()), Some(fl.clone()), None);
                 m0 = find_text(&fl, &base, DEFAULT_FUZZY, wh);
                 if let (Some(m), Some(sp)) = (m0.as_ref(), settled_prev.as_ref()) {
@@ -362,7 +362,7 @@ impl<R: Reader> Flow<R> {
             // Frame 1 already rendered page content below the status bar (e.g. Safari
             // before tapping accessibility-only TextField:Adresse), go straight to
             // controls() instead of burning a redundant 2nd full OCR pass.
-            let (_, sh) = self.pt()?;
+            let (_, sh) = self.tap_pt()?;
             let status_y = (sh as f64 * 0.06) as i64;
             let skip_second_ocr =
                 app_confirmed && first_lines.as_ref().is_some_and(|fl| fl.iter().any(|l| l.y() >= status_y));
@@ -451,7 +451,7 @@ impl<R: Reader> Flow<R> {
                 Err(e) => return Err(e),
             },
         };
-        let (_, h) = self.pt()?;
+        let (_, h) = self.tap_pt()?;
         let near_bottom_tab = m.line.is_some() && m.y > h - 55;
         let is_form_label = base.trim_end().ends_with(':');
         let mut resolved_ctl: Option<Vec<Control>> = None;
@@ -465,7 +465,7 @@ impl<R: Reader> Flow<R> {
             //    where OCR matches the left-aligned label text, but the focusable input
             //    (TextField/TextView/SearchField) spans the row and should be tapped at
             //    its centre.
-            let cur_lines = self.current_lines_or_read()?;
+            let cur_lines = self.tap_current_lines()?;
             let rc = self.tap_ctl(None)?;
             let ctl = controls_in_region(&rc, &cur_lines, wh);
             resolved_ctl = Some(rc);
@@ -483,7 +483,7 @@ impl<R: Reader> Flow<R> {
         // Take a fresh pre-tap baseline when m came from wait()'s UI fallback so
         // changed_since() measures the tap cleanly (used for switch/input companion
         // resolution and cache invalidation; never replays an acknowledged tap).
-        let before: Option<Frame> = if m.line.is_none() { Some(self.grab_frame()?) } else { self.r.last() };
+        let before: Option<Frame> = if m.line.is_none() { Some(self.tap_grab()?) } else { self.r.last() };
         self.tap_point(m.x, m.y, &m.text, None)?;
         if !self.changed_since(before.clone(), 0.45, Some(m.x), Some(m.y))? {
             self.invalidate_ctl_cache();
@@ -495,7 +495,7 @@ impl<R: Reader> Flow<R> {
             };
             if let Some(sw) = self.switch_near(&base, &m, Some(&ctl))? {
                 if (sw.x - m.x).abs() > 12 || (sw.y - m.y).abs() > 12 {
-                    let now_img = self.grab_frame()?;
+                    let now_img = self.tap_grab()?;
                     if box_diff(img(&before), Some(&now_img), sw.x as f64, sw.y as f64, self.r.scale(), 30.0, 18.0, 0) < 4.0 {
                         return self.tap_control(&sw, None);
                     }
@@ -1086,7 +1086,7 @@ impl<R: Reader> Flow<R> {
             Err(e) => return Err(e),
         };
         if m.line.is_some() && m.rank != 0 && !base.starts_with("re:") {
-            let cur_lines = self.current_lines_or_read()?;
+            let cur_lines = self.tap_current_lines()?;
             let rc = self.tap_ctl(None)?;
             let ctl = controls_in_region(&rc, &cur_lines, wh);
             if let Some(c) = exact_control(&ctl, &base, TAP_FORM_TYPES, false) {
@@ -1188,7 +1188,7 @@ impl<R: Reader> Flow<R> {
             };
             (coord(parts[0])?, coord(parts[1])?)
         } else {
-            let (w, h) = self.pt()?;
+            let (w, h) = self.tap_pt()?;
             (w.div_euclid(2), h.div_euclid(2))
         };
         self.mark_action(false, false);
@@ -1252,7 +1252,7 @@ impl<R: Reader> Flow<R> {
             }
         }
         let needs_lines = parsed.iter().any(|(_, w)| w.as_deref().is_some_and(|w| !w.starts_with('y')));
-        let lines = if needs_lines { self.fresh_or_lines()? } else { vec![] };
+        let lines = if needs_lines { self.tap_fresh_or_lines()? } else { vec![] };
         let disabled = |b: &str| Error::flow(format!("{} is disabled", json::py_repr_str(b)));
         let mut targets: Vec<Control> = Vec::new();
         for (base, wh) in &parsed {
@@ -1298,7 +1298,7 @@ impl<R: Reader> Flow<R> {
                 };
                 let before_step = match self.r.last() {
                     Some(l) => l,
-                    None => self.grab_frame()?,
+                    None => self.tap_grab()?,
                 };
                 self.tap_control(&c, None)?;
                 self.changed_since(Some(before_step), 0.35, Some(c.x), Some(c.y))?;
@@ -1308,7 +1308,7 @@ impl<R: Reader> Flow<R> {
         }
         let before = match self.r.last() {
             Some(l) => l,
-            None => self.grab_frame()?,
+            None => self.tap_grab()?,
         };
         if self.ctl_cache.is_none() {
             self.store_ctl_cache(&raw_ctl, Some(before.clone()));
