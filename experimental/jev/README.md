@@ -30,14 +30,26 @@ Each arm clears the current Calculator entry, checks for a single zero readout, 
 
 Each arm prints its receipt only after observing exactly 11 in the numeric readout above the keypad, at the same vertical position as the verified zero. Unrecognized locales, inaccessible or ambiguous readouts, and model disagreement stop the run. Elapsed time covers selection, taps and final verification after reset. This runner requires the parent to perform device validation.
 
-## Four-checkpoint conventional LLM comparison
+## Four direct Codex CLI turns
 
-From the worktree root, inspect the recorded choices and timings offline or rerun the four Codex turns using the existing ChatGPT login:
+Run from the worktree root using the installed CLI and an existing file-backed ChatGPT login:
 
 ```sh
-cat experimental/jev/comparison.jsonl
 python3 experimental/jev/compare_cli.py
+cat experimental/jev/direct_comparison.json
 ```
+
+Each checkpoint starts a fresh native `codex exec --ephemeral --json --sandbox read-only --model gpt-6.2-astra` process with low reasoning effort in an empty directory. All four share a temporary Codex home with access to the existing login. The CLI constructs and sends its ordinary request. The prompt supplies the same synthetic task, history and option map as the corresponding Jev checkpoint and instructs the model to return one ID without tools.
+
+The runner audits stdout JSONL in memory. An accepted turn requires the normal thread and turn lifecycle, one final agent message and only reasoning or agent-message items. Any tool item or unrecognized event rejects that trial. A wrong or malformed answer on an otherwise accepted trial scores zero. The receipt contains aggregate counts, token usage and wall times. CLI process timing includes startup through exit. Loop timing also includes per-checkpoint setup and auditing. Both exclude the one-time login and version preflight. Cached input tokens, when reported, are part of input tokens.
+
+Jev timings come from prior live receipts and include a fresh HTTPS connection per request. The Jev benchmark did not measure Python process startup. The four cases include a known Jev abstention failure.
+
+The recorded direct run attempted all four checkpoints. Every CLI process failed with a diagnostic containing `model_not_found`. No native answer or usage was available to score. The four failed processes took 11.73228 seconds in total, and the loop took 11.73265 seconds. An earlier single-checkpoint attempt and a catalog-seeding diagnostic retry also failed and are excluded from those timings.
+
+## Historical relay experiment
+
+`comparison.jsonl` preserves the original relay measurements. The relay replaced the CLI-generated request, which limits those numbers to that experiment. Use `direct_comparison.json` for ordinary native CLI turns.
 
 The first digit, multiplication operator, completed task and missing square-root key use identical task text, correct prior key histories and option maps in both arms. Codex CLI 0.164.0 started a new process for each turn. Its one-use local relay replaced the CLI-generated request with the synthetic prompt, empty tools and explicit no-tool choice, and streamed the response from the fixed ChatGPT endpoint back to the CLI. All four responses named gpt-6.2-astra, low effort was requested, and all four processes exited zero.
 
