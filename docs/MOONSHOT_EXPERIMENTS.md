@@ -43,7 +43,7 @@ Two open connections in an ABBA comparison. First frame median 132.22 ms (n=2), 
 
 ### Synthetic Safari fixture attempt
 
-The iPhone did not request the ephemeral fixture within eight seconds. The attempt yielded no OCR data. A data URL probe returned HTTP 500. Calculator foreground was independently verified after restoration. Treat the web fixture as pending until it has a positive render check.
+The iPhone did not request the ephemeral fixture within eight seconds. The attempt yielded no OCR data. A data URL probe returned HTTP 500. Calculator foreground was independently verified after restoration. The later on-device loopback route verified the rendered fixture and produced the multilingual results below.
 
 ### OCR scale vs accessibility digit anchors
 
@@ -226,7 +226,7 @@ All three taps changed the display region. Each conditional response matched bot
 
 ## Conventional model per turn
 
-Four synthetic checkpoints used the same option maps and correct prior key histories. Fresh Codex CLI processes took 11.60 s summed and made four correct choices, including abstention when the square-root key was absent. Jev took 0.86 s summed across the four recorded requests and made three correct choices. The fourth checkpoint was selected because Jev had failed it. The comparison illustrates latency and that failure mode. Four selected cases cannot estimate either model’s general accuracy. The full receipts and environment details are in experimental/jev/.
+A direct native CLI trial on four synthetic checkpoints returned `model_not_found` four times, so it yielded no ordinary per-turn success latency. In a separate relay trial, the relay replaced the CLI-generated request with a tool-free prompt. Those four processes took 11.60 s summed and returned four correct choices, including abstention when the square-root key was absent. Jev took 0.86 s summed across the four recorded requests and made three correct choices. The fourth checkpoint was selected because Jev had failed it. The comparison illustrates latency and that failure mode. Four selected cases cannot estimate either model’s general accuracy. The full receipts and environment details are in experimental/jev/.
 
 ## Preflight under rotation and lock
 
