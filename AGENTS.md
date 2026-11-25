@@ -14,17 +14,18 @@ name and the same personal email as the Git author email. Never use an ECIT work
 email for either a local commit or a GitHub squash merge. Verify both identities
 from the resulting commits.
 
-## Build host
+## Rust build host
 
-Run every Cargo build and test on the ECIT build VM through `buildbox-cargo`,
-including review and release verification:
+Run all Rust builds and Cargo tests on `ai-swarm` through `buildbox-cargo`.
+This applies to development, review and release verification:
 
 ```sh
 buildbox-cargo <checkout> test
 buildbox-cargo <checkout> build --release
 ```
 
-Never run Cargo on the EliteBook, laptopstudio or xps15 (Peter, 25 Nov 2026).
+Keep heavy work off EliteBook, laptopstudio and xps15. If the buildbox is
+unavailable, use a durable continuation or report the blocker.
 
 ## Agent instruction files
 
