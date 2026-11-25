@@ -1,0 +1,13 @@
+//! Ported Python test suite (`tests/*.py`), one module per Python file.
+mod test_conditional_screenshot;
+mod test_daemon;
+mod test_flow_runner;
+mod test_ocr_and_matching;
+mod test_packaging_and_assets;
+mod test_pr3_review_fixes;
+mod test_preflight;
+mod test_read_full_parallel;
+mod test_review_pr9;
+mod test_ui_parsing;
+mod test_vision_ocr;
+mod test_wda_client;
