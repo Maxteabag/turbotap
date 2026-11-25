@@ -30,17 +30,44 @@ On a fused read, the runner captures the screenshot, collects the same AX payloa
 
 ## Enable Vision from an installed Python package
 
-Use the Linux control host and Python environment where TurboTap is installed. The commands below
+Use the Linux control host where TurboTap is installed. The commands below
 assume a configured device with a working TurboTap runner and its previous build still on the Mac.
 Keep the previous device, signing, source and DerivedData settings for rollback. Run one deployment
 at a time because the deploy script uses a shared patch staging path on the Mac.
 
-From Bash, combine the two installed patches against the pinned upstream revision. The source
-checkout in this step is disposable and local to the control host.
+From Bash, resolve the installed executable (including the symlink created by `uv tool install`).
+Use its environment’s interpreter in isolated mode. Verify that the launcher belongs to that
+interpreter’s scripts directory and that the installed distribution owns both patches.
+Then combine those assets in a disposable checkout of the pinned upstream revision.
 
 ```bash
 set -euo pipefail
-assets=$(python -c 'from turbotap.cli import asset_dir; print(asset_dir("patches"))')
+launcher=$(realpath "$(type -P turbotap)")
+IFS= read -r shebang < "$launcher"
+tool_python=${shebang#\#!}
+[[ "$tool_python" = /* && -x "$tool_python" ]] || {
+  echo "Expected a Python console script with an absolute interpreter path: $launcher" >&2
+  exit 1
+}
+assets=$("$tool_python" -I - "$launcher" <<'PYTHON'
+from importlib.metadata import distribution
+from pathlib import Path
+import sys
+import sysconfig
+from turbotap.cli import asset_dir
+
+launcher = Path(sys.argv[1])
+assert launcher.samefile(Path(sysconfig.get_path("scripts")) / "turbotap")
+dist = distribution("turbotap")
+owned = {dist.locate_file(f).resolve() for f in dist.files or ()}
+patches = Path(asset_dir("patches")).resolve()
+for name in ("wda-turbo.patch", "wda-vision.patch"):
+    patch = patches / name
+    assert patch in owned and patch.is_file(), f"missing installed asset: {patch}"
+print(patches)
+PYTHON
+)
+"$launcher" vision-ocr --help | grep -F -- '--scale'
 pin=d17782422d55ff1e5e0ceb74eb1fd509cc0c35b6
 scratch=$(mktemp -d)
 git clone -q --no-checkout https://github.com/appium/WebDriverAgent.git "$scratch/source"
@@ -57,8 +84,8 @@ replaces the running WDA session. The environment overrides apply only to this d
 run=$(basename "$scratch")
 WDA_REF="$pin" WDA_PATCH="$scratch/vision.patch" \
   WDA_SRC="/var/tmp/wda-vision-src-$run" WDA_DD="/var/tmp/wda-vision-dd-$run" \
-  python -m turbotap deploy
-python -m turbotap vision-ocr --mode accurate --scale 0.5
+  "$launcher" deploy
+"$launcher" vision-ocr --mode accurate --scale 0.5
 ```
 
 The last command verifies that the runner confirms direct CGImage input at half width and
@@ -68,11 +95,23 @@ at half size recovered 72 of 72 expected matches, compared with 66 at full size.
 scale based on the text size and content of your screens.
 
 To restore the previous TurboTap runner, use its original environment and the preserved build.
-Verify a read on the same device.
+Require both a successful stock read with session and screen dimensions and the specific
+unsupported-route error from the same device. Connection failures and recognition errors
+fail this check.
 
 ```bash
-python -m turbotap deploy --no-build
-python -m turbotap preflight
+"$launcher" deploy --no-build
+"$launcher" preflight | "$tool_python" -I -c '
+import json, sys
+r = json.load(sys.stdin)
+assert r["ok"] and r["session_id"] and len(r["screen_pt"]) == 2
+assert all(n > 0 for n in r["screen_pt"])
+'
+if "$launcher" vision-ocr > /dev/null 2>"$scratch/rollback.err"; then
+  echo "Rollback failed: Vision OCR is still available" >&2
+  exit 1
+fi
+grep -F 'WDA lacks /wda/fastOCR.' "$scratch/rollback.err"
 ```
 
 ## Build without signing or running

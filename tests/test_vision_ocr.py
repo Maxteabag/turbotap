@@ -38,11 +38,20 @@ class VisionOCRTests(unittest.TestCase):
                 self.assertEqual(self.invoke({"value": value}, mode), value)
 
     def test_direct_capture_preserves_normalized_boxes(self):
-        for scale in (0.5, 1):
+        for scale, dimensions in ((0.5, [51, 201]), (1, [101, 401]), (0.001, [1, 1])):
             with self.subTest(scale=scale):
                 result = {"mode": "accurate", "lines": [self.line]}
-                value = dict(result, image={"scale": scale, "capture": "cgimage"})
+                value = dict(result, image={"scale": scale, "capture": "cgimage",
+                                            "sourcePixels": [101, 401], "inputPixels": dimensions})
                 self.assertEqual(self.invoke({"value": value}, scale=scale), result)
+
+    def test_echoed_scale_with_wrong_input_dimensions_fails(self):
+        for source, actual in (([200, 400], [200, 400]), ([200, 400], [200, 100]),
+                               (None, [100, 200]), ([1, 2], [True, 1])):
+            image = {"capture": "cgimage", "scale": 0.5, "sourcePixels": source, "inputPixels": actual}
+            with self.subTest(image=image), self.assertRaisesRegex(SystemExit, "inputPixels|dimensions"):
+                self.invoke({"value": {"mode": "accurate", "lines": [], "image": image}}, scale=0.5)
+            self.assertEqual(self.output.getvalue(), "")
 
     def test_scaled_capture_requires_confirmation(self):
         for image in (None, {"scale": True, "capture": "cgimage"}, {"scale": 0.5, "capture": "cgimage"},

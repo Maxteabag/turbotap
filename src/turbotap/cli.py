@@ -5277,6 +5277,21 @@ def cmd_vision_ocr(client, args):
         if (not isinstance(image, dict) or image.get("capture") != "cgimage"
                 or type(image.get("scale")) not in (int, float) or image["scale"] != args.scale):
             raise RuntimeError("WDA did not confirm scaled CGImage capture. Update the Vision patch or omit --scale.")
+        source = image.get("sourcePixels")
+        actual = image.get("inputPixels")
+        for size in (source, actual):
+            if (not isinstance(size, list) or len(size) != 2
+                    or not all(type(n) in (int, float) and 0 < n <= 2**32 - 1 and n == int(n) for n in size)):
+                raise RuntimeError("Invalid /wda/fastOCR image dimensions")
+        # The runner uses C round() for positive dimensions, with a one-pixel minimum.
+        expected = []
+        for dimension in source:
+            scaled = dimension * args.scale
+            whole = int(scaled)
+            rounded = whole + 1 if scaled - whole >= 0.5 else whole
+            expected.append(max(1, rounded))
+        if actual != expected:
+            raise RuntimeError(f"WDA reported inputPixels {actual}, expected {expected} for scale {args.scale}")
     lines = []
     fields = ("x", "y", "width", "height", "confidence")
     for i, line in enumerate(value["lines"]):
