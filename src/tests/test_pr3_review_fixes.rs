@@ -268,7 +268,6 @@ fn test_acknowledged_tap_on_unchanged_frame_sends_exactly_one_tap() {
 
 // 4. Low-contrast text (12 grayscale levels) is NOT skipped by blank-strip shortcut
 #[test]
-#[ignore = "needs an ocr.rs seam to observe whether ocr_raw reached the OCR engine (Python patched tesseract_tsv)"]
 fn test_low_contrast_12_level_strip_is_not_skipped() {
     // Synthetic strip with 12-level contrast (e.g. bg=200, fg=188)
     let mut raw: Vec<u8> = Vec::new();
@@ -276,10 +275,18 @@ fn test_low_contrast_12_level_strip_is_not_skipped() {
         raw.extend(std::iter::repeat(200u8).take(19));
         raw.extend(std::iter::repeat(188u8).take(19));
     }
-    let sr = ScreenReader::new(1.5, Some(1), 11, false);
-    // Both binarizations must reach OCR (not return the uniform-strip shortcut).
-    assert!(sr.ocr_raw(&raw, 38, 10, false).is_ok());
-    assert!(sr.ocr_raw(&raw, 38, 10, true).is_ok());
+    let mut sr = ScreenReader::new(1.5, Some(1), 11, false);
+    // Python patched _tess_lib -> None and tesseract_tsv; tsv_hook replaces both and
+    // records which binarization reached the engine.
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<bool>>> = Default::default();
+    let seen2 = seen.clone();
+    sr.tsv_hook = Some(std::sync::Arc::new(move |_raw: &[u8], _w: u32, _h: u32, _psm: i32, sauvola: bool| {
+        seen2.lock().unwrap().push(sauvola);
+        Ok("level\tpage\tblock\tpar\tline\tword\tleft\ttop\twidth\theight\tconf\ttext\n".to_string())
+    }));
+    sr.ocr_raw(&raw, 38, 10, false).unwrap();
+    sr.ocr_raw(&raw, 38, 10, true).unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![false, true]);
 }
 
 // 5a. tapif skips OCR matches that correspond to explicitly disabled controls
