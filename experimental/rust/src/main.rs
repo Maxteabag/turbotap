@@ -1,4 +1,6 @@
 mod live;
+#[cfg(feature = "tess")]
+mod ocr;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::GrayImage;
@@ -6,7 +8,7 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, env, error::Error, fs, io::Write, path::Path, process::Command};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-const USAGE: &str = "turbotap-replay cold | <preflight|screenshot|decode|cuts|fastUI|diff|ocr|flow> FIXTURE_DIR [--raw (screenshot only)] | live <preflight|screenshot|fastUI|flow>";
+const USAGE: &str = "turbotap-replay cold | <preflight|screenshot|decode|cuts|fastUI|diff|ocr|flow> FIXTURE_DIR [--raw (screenshot only)] | live <preflight|screenshot|fastUI|flow|turbo|turbo-diff|turbo-ocr>";
 
 fn read_json(dir: &Path, name: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(dir.join(name))?)?)

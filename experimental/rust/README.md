@@ -68,8 +68,7 @@ cargo build --release --locked
 ```
 
 Each timed command starts a fresh process. The fixed flow runs preflight,
-screenshot and fastUI in order on a reusable HTTP connection. Both clients
-use GET only. Preflight uses the existing status session and window size.
+screenshot and fastUI in order on a reusable HTTP connection. These four commands use GET only. Preflight uses the existing status session and window size.
 Screenshot decodes base64 in memory and reports its byte length. fastUI
 reports the same deduplicated control count in both implementations. Successful
 output contains only metric names and integers. Failures discard the entire
@@ -83,3 +82,53 @@ app. Use an isolated Calculator session when running live.
 
 Run `python check_http.py` after the build for the synthetic loopback check.
 It overrides WDA_URL for every child process and closes the server on exit.
+
+### Raw JPEG, frame difference and optional native OCR
+
+For a parent-operated live comparison from `experimental/rust`, reuse the
+unlocked Calculator and exported HTTP origin described above:
+
+```bash
+(
+  set -eu
+  : "${WDA_URL:?export the WDA HTTP origin first}"
+  export OMP_THREAD_LIMIT=1
+  cargo build --release --locked --features tess
+  for op in turbo turbo-diff turbo-ocr; do
+    echo "Rust $op"
+    time -p ./target/release/turbotap-replay live "$op"
+    echo "Python $op"
+    time -p python compare.py live "$op"
+  done
+)
+```
+
+The default build supports `turbo` and `turbo-diff`. The Linux `tess`
+feature links libtesseract and enables Rust `turbo-ocr`; install English
+trained data for OCR. For a loopback-only check of the feature build use
+`OMP_THREAD_LIMIT=1 python check_http.py --ocr`.
+
+Each capture sends exactly one POST to `/wda/fastScreenshot` with
+`{"quality":0.6,"scale":0.5,"raw":true}`. Both clients require an
+image/jpeg response and apply the Calculator guards around each capture.
+They discard the compressed bytes and decoded pixels in memory after use.
+A/B on a device samples separate frames. The mock supplies identical JPEGs
+to both clients.
+
+* `turbo` reports bytes, width, height, HTTP transfer time and JPEG decode
+  through 8-bit grayscale conversion. Rust uses the image crate and Pillow's
+  luma coefficients. Different JPEG decoders can round individual samples
+  differently. The first Python decode can include Pillow plugin discovery.
+* `turbo-diff` captures twice and counts unequal grayscale pixels across
+  equal-sized frames. `diff_us` covers the comparison only. This is an exact
+  changed-pixel metric and is sensitive to JPEG noise.
+* `turbo-ocr` recognizes the full first frame with English LSTM and PSM 6.
+  Rust measures fresh native engine initialization and recognition separately.
+  Python measures PGM serialization, a fresh Tesseract subprocess and output
+  collection together. Neither path caches an engine or splits into strips.
+  Both return only a word count. The six-word synthetic fixture established
+  count agreement; character, line and bounding-box parity are unverified.
+
+All phase timings are integer microseconds. HTTP timing excludes the
+before/after provenance checks; use shell elapsed time for the complete
+guarded invocation including process startup and cleanup.
