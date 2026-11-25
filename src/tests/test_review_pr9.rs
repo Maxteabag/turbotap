@@ -137,10 +137,9 @@ fn test_busy_connection_is_never_pooled_or_detached() {
 // These use ocr.rs API from feat/rust-v1-ocr (WarmOcr::with_factory/lease,
 // TessApi::fake, EnginePool, ScreenReader::tsv_hook, testutil::set_env) that is not
 // on feat/rust-v1 yet. Verified passing in a trial merge of feat/rust-v1-ocr; the
-// lead removes `#[cfg(any())]` when merging ocr.
+// (enabled after the ocr merge)
 // ---------------------------------------------------------------------------
 
-#[cfg(any())]
 mod needs_ocr_merge {
     use crate::ocr::{self, ReadOpts, Reader, ScreenReader, TessApi, WarmOcr};
     use crate::testutil::{box_img, set_env};
