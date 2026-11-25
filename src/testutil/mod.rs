@@ -5,12 +5,14 @@
 //!   against it.
 //! - [`fake_reader::FakeReader`]: deterministic `Reader` double (Python `FakeReader`).
 //! - image helpers (`solid_img`, `box_img`, `encode_image_bytes`) and `make_line`.
+pub mod as_bin;
 pub mod capture;
 pub mod fake_reader;
+pub mod loopback;
 pub mod mock_wda;
 
 pub use fake_reader::FakeReader;
-pub use mock_wda::{ekey, Dyn, MockState, MockWda, Seq};
+pub use mock_wda::{ekey, router_json, Dyn, MockState, MockWda, RouterReply, RouterServer, Seq};
 
 use crate::image::{Frame, GrayImage};
 use crate::text::{Line, Word};
