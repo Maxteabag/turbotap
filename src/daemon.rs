@@ -547,8 +547,12 @@ impl Server {
             crate::wda::set_pool_enabled(false);
             self.warmed = false;
         }
-        // Closing the file releases the flock.
-        self.lock_file = None;
+        // Explicitly unlock before closing so a concurrent fork() between open and
+        // exec cannot keep the flock held on the duplicated open file description.
+        if let Some(file) = self.lock_file.take() {
+            // SAFETY: valid open fd owned by `file`.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 
     pub fn serve_forever(&mut self) {
