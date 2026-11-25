@@ -81,9 +81,10 @@ fn test_failed_frame_waits_for_delayed_ui_before_recycling_connections() {
     // Python `_recycle_request_conns()`: park every idle connection the request's
     // clients opened (the side client was parked by close()).
     flow.c.release_conn();
-    assert!(wda::pool_len() > 0);
+    let pooled = wda::pool_len_for("127.0.0.1", srv.port());
+    assert!(pooled > 0);
     // Request 2: every pooled connection must answer its own request.
-    for _ in 0..wda::pool_len() + 1 {
+    for _ in 0..pooled + 1 {
         let mut fresh = WdaClient::new(&srv.url, "", None);
         assert_eq!(fresh.get("/status")["value"]["who"], json!("status"));
         fresh.release_conn();
@@ -115,11 +116,12 @@ fn test_busy_connection_is_never_pooled_or_detached() {
     while srv.requests().is_empty() {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(wda::pool_len(), 0);
+    let port = srv.port();
+    assert_eq!(wda::pool_len_for("127.0.0.1", port), 0);
     worker.close();
     assert!(done.load(Ordering::SeqCst));
     assert!(rx.recv().is_ok());
-    assert_eq!(wda::pool_len(), 1);
+    assert_eq!(wda::pool_len_for("127.0.0.1", port), 1);
 }
 
 // ---------------------------------------------------------------------------

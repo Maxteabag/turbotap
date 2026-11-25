@@ -759,6 +759,10 @@ impl RouterServer {
         RouterServer { url: format!("http://127.0.0.1:{port}"), port, stop, requests }
     }
 
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     pub fn requests(&self) -> Vec<(String, String)> {
         self.requests.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
