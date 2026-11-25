@@ -8,7 +8,7 @@
 //! `walk_accessible` (L5714), `_parse_switch_state` and `_is_wda_disabled_value`.
 use crate::clock;
 use crate::json;
-use crate::text::{casefold, clean_text, compile_icase, norm, norm_into, Match};
+use crate::text::{casefold, casefold_into, clean_text, compile_icase, norm, norm_into, Match};
 use crate::wda::{TypedHttpResult, WdaClient};
 use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Serialize;
@@ -365,13 +365,12 @@ fn push_dedup(out: &mut Vec<Control>, seen: &mut HashMap<(i64, i64), DedupBucket
         }
         Some(idx) => {
             let prev = &out[idx];
-            if prev.is_disabled() && !item.is_disabled() {
-                out[idx] = item;
-            } else if prev.kind == "Cell"
+            let upgrade_enabled = prev.is_disabled() && !item.is_disabled();
+            let upgrade_cell = prev.kind == "Cell"
                 && is_input_like(&item.kind)
                 && prev.value.as_deref().unwrap_or("").is_empty()
-                && !(!prev.is_disabled() && item.is_disabled())
-            {
+                && !(!prev.is_disabled() && item.is_disabled());
+            if upgrade_enabled || upgrade_cell {
                 out[idx] = item;
             }
         }
@@ -1621,10 +1620,12 @@ fn parse_source_bytes(bytes: &[u8], screen: (i64, i64), text: bool) -> Result<Op
         let mut t = n.kind.as_deref().unwrap_or("");
         let rc = &n.rect;
         let (sw, sh) = (cx.screen.0 as f64, cx.screen.1 as f64);
-        if t == "Cell" && rc.w_truthy && rc.h_truthy {
-            if rc.x >= sw || rc.x + rc.width <= 0.0 || rc.y >= sh || rc.y + rc.height <= 0.0 {
-                return;
-            }
+        if t == "Cell"
+            && rc.w_truthy
+            && rc.h_truthy
+            && (rc.x >= sw || rc.x + rc.width <= 0.0 || rc.y >= sh || rc.y + rc.height <= 0.0)
+        {
+            return;
         }
         let kb = in_keyboard || t == "Keyboard";
         let al = in_alert || t == "Alert";
@@ -1817,73 +1818,153 @@ pub fn is_springboard_ui(app_name: &str, bundle_id: &str) -> bool {
 }
 
 
+#[inline]
+fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
+    let nb = needle_lower.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    let hb = haystack.as_bytes();
+    if nb.len() > hb.len() {
+        return false;
+    }
+    let first_lo = nb[0];
+    let first_hi = first_lo.to_ascii_uppercase();
+    let end = hb.len() - nb.len();
+    for i in 0..=end {
+        let b = hb[i];
+        if (b == first_lo || b == first_hi) && hb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The control whose label equals `label` (case-insensitive), preferring enabled
 /// controls, then type order in `types` (Button/Key/Link over Switch/Tab/Cell), then
 /// the topmost.
 pub fn exact_control<'a>(controls: &'a [Control], label: &str, types: &[&str], allow_disabled: bool) -> Option<&'a Control> {
     let want = casefold(&clean_text(label));
-    controls
-        .iter()
-        .filter(|c| {
-            types.contains(&c.kind.as_str()) && casefold(&c.label) == want && (allow_disabled || !c.is_disabled())
-        })
-        .min_by_key(|c| (c.is_disabled(), types.iter().position(|t| *t == c.kind).unwrap_or(usize::MAX), c.y, c.x))
+    let want_ascii = want.is_ascii();
+    let mut low_buf = String::new();
+    let mut best: Option<((bool, usize, i64, i64), &'a Control)> = None;
+    for c in controls {
+        if !allow_disabled && c.is_disabled() {
+            continue;
+        }
+        let Some(type_idx) = types.iter().position(|t| *t == c.kind) else { continue };
+        let eq = if want_ascii && c.label.is_ascii() {
+            c.label.eq_ignore_ascii_case(&want)
+        } else {
+            casefold_into(&c.label, &mut low_buf);
+            low_buf == want
+        };
+        if !eq {
+            continue;
+        }
+        let key = (c.is_disabled(), type_idx, c.y, c.x);
+        if best.as_ref().is_none_or(|(bk, _)| key < *bk) {
+            best = Some((key, c));
+        }
+    }
+    best.map(|(_, c)| c)
 }
 
 /// Exact label > starts with > contains (case-insensitive); enabled and topmost win.
 /// `types` None (or empty) = any.
 pub fn find_control<'a>(controls: &'a [Control], label: &str, types: Option<&[&str]>, allow_disabled: bool) -> Option<&'a Control> {
     let want = casefold(label);
-    let tests: [&dyn Fn(&str) -> bool; 3] =
-        [&|l: &str| l == want, &|l: &str| l.starts_with(&want), &|l: &str| l.contains(&want)];
-    for test in tests {
-        let hit = controls
-            .iter()
-            .filter(|c| {
-                test(&casefold(&c.label))
-                    && types.is_none_or(|ts| ts.is_empty() || ts.contains(&c.kind.as_str()))
-                    && (allow_disabled || !c.is_disabled())
-            })
-            .min_by_key(|c| (c.is_disabled(), c.y, c.x));
-        if hit.is_some() {
-            return hit;
+    let want_ascii = want.is_ascii();
+    let mut low_buf = String::new();
+    let mut best: Option<((u8, bool, i64, i64), &'a Control)> = None;
+    for c in controls {
+        if !allow_disabled && c.is_disabled() {
+            continue;
+        }
+        if let Some(ts) = types {
+            if !ts.is_empty() && !ts.contains(&c.kind.as_str()) {
+                continue;
+            }
+        }
+        let tier: u8 = if want_ascii && c.label.is_ascii() {
+            let lab = &c.label;
+            if lab.eq_ignore_ascii_case(&want) {
+                0
+            } else if lab.len() >= want.len() && lab.as_bytes()[..want.len()].eq_ignore_ascii_case(want.as_bytes()) {
+                1
+            } else if contains_ignore_ascii_case(lab, &want) {
+                2
+            } else {
+                continue;
+            }
+        } else {
+            casefold_into(&c.label, &mut low_buf);
+            if low_buf == want {
+                0
+            } else if low_buf.starts_with(&want) {
+                1
+            } else if low_buf.contains(&want) {
+                2
+            } else {
+                continue;
+            }
+        };
+        let key = (tier, c.is_disabled(), c.y, c.x);
+        if best.as_ref().is_none_or(|(bk, _)| key < *bk) {
+            best = Some((key, c));
         }
     }
-    None
+    best.map(|(_, c)| c)
 }
 
 /// Match label (or `re:REGEX`) against controls -> `Match(x, y, label, None, rank)`.
 /// Python defaults: `types=WAIT_UI_TYPES`, `allow_disabled=True`; `types` None = any.
 /// An invalid `re:` regex never matches.
 pub fn find_control_match(controls: &[Control], label: &str, types: Option<&[&str]>, allow_disabled: bool) -> Option<Match> {
-    let want = casefold(&clean_text(label));
     let rx = match label.strip_prefix("re:") {
         Some(p) => Some(compile_icase(p)?),
         None => None,
     };
+    let want = if rx.is_none() { casefold(&clean_text(label)) } else { String::new() };
+    let want_ascii = want.is_ascii();
+    let mut low_buf = String::new();
     let mut best: Option<((bool, u8, i64, i64), Match)> = None;
     for c in controls {
+        if !allow_disabled && c.is_disabled() {
+            continue;
+        }
         if let Some(ts) = types {
             if !ts.is_empty() && !ts.contains(&c.kind.as_str()) {
                 continue;
             }
-        }
-        if !allow_disabled && c.is_disabled() {
-            continue;
         }
         let lab = &c.label;
         let rank;
         if let Some(rx) = &rx {
             let Some(hit) = rx.find(lab).ok().flatten() else { continue };
             rank = if hit.as_str() == lab { 0 } else { 2 };
-        } else {
-            let low = casefold(lab);
-            if !low.contains(&want) {
+        } else if want_ascii && lab.is_ascii() {
+            let lb = lab.as_bytes();
+            let wb = want.as_bytes();
+            if lb.eq_ignore_ascii_case(wb) {
+                rank = 0;
+            } else if lb.len() >= wb.len()
+                && (lb[..wb.len()].eq_ignore_ascii_case(wb) || lb[lb.len() - wb.len()..].eq_ignore_ascii_case(wb))
+            {
+                rank = 1;
+            } else if contains_ignore_ascii_case(lab, &want) {
+                rank = 2;
+            } else {
                 continue;
             }
-            rank = if low == want {
+        } else {
+            casefold_into(lab, &mut low_buf);
+            if !low_buf.contains(&want) {
+                continue;
+            }
+            rank = if low_buf == want {
                 0
-            } else if low.starts_with(&want) || low.ends_with(&want) {
+            } else if low_buf.starts_with(&want) || low_buf.ends_with(&want) {
                 1
             } else {
                 2

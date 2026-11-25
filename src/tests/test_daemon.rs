@@ -127,6 +127,24 @@ impl DaemonHome {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    fn run_in_dir(&self, dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new(exe())
+            .args(args)
+            .env_clear()
+            .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "turbotap {args:?} in {} failed ({:?}): {}",
+            dir.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     fn forward_fp(&self, argv: &[&str], extra_env: &[(&str, &str)], cwd: Option<&Path>, fp: &str) -> (Option<i32>, String, String) {
         let mut env = self.env.clone();
         for (k, v) in extra_env {
@@ -302,6 +320,117 @@ fn test_warm_daemon_reloads_config_after_inplace_mtime_preserved_overwrite_and_c
     let (c2, o2, e2) = home.forward(&["preflight"], &[("WDA_CONFIG", "rel.json")], Some(&dir_b));
     assert_eq!(c2, Some(0), "stderr={e2}");
     assert_eq!(doc(&o2)["active_app"], json!("com.example.endpoint-b"));
+}
+
+/// PR #12 review: renaming the daemon's startup directory and reusing its old pathname
+/// must keep the daemon anchored to the original directory identity (via `fchdir`),
+/// never silently switching to the replacement directory.
+#[test]
+fn test_daemon_restores_original_cwd_identity_after_rename_and_reuse() {
+    use std::os::unix::fs::MetadataExt;
+    let home = DaemonHome::new();
+    let orig = home.tmp.path().join("daemon-start-dir");
+    let renamed = home.tmp.path().join("daemon-start-renamed");
+    let caller = home.tmp.path().join("caller-dir");
+    std::fs::create_dir_all(&orig).unwrap();
+    std::fs::create_dir_all(&caller).unwrap();
+    let orig_meta = std::fs::metadata(&orig).unwrap();
+
+    let start_doc = doc(&home.run_in_dir(&orig, &["daemon", "start", "--idle", "120"]));
+    let pid = start_doc["pid"].as_u64().expect("daemon pid");
+
+    // Request 1 warms BaselineState and runs in caller's directory.
+    let (code1, _, err1) = home.forward(&["preflight", "--help"], &[], Some(&caller));
+    assert_eq!(code1, Some(0), "req 1 stderr={err1}");
+
+    // Rename startup dir and create a brand-new directory at the old pathname.
+    std::fs::rename(&orig, &renamed).unwrap();
+    std::fs::create_dir(&orig).unwrap();
+    let replacement_meta = std::fs::metadata(&orig).unwrap();
+    assert_ne!(
+        (orig_meta.dev(), orig_meta.ino()),
+        (replacement_meta.dev(), replacement_meta.ino()),
+        "replacement dir must have a distinct inode"
+    );
+
+    // Request 2 runs in caller's directory; restore must fchdir back to the renamed original.
+    let (code2, _, err2) = home.forward(&["preflight", "--help"], &[], Some(&caller));
+    assert_eq!(code2, Some(0), "req 2 stderr={err2}");
+
+    let status = doc(&home.run(&["daemon", "status"]));
+    assert_eq!(status["pid"], json!(pid));
+    assert_eq!(status["requests"], json!(2));
+
+    #[cfg(target_os = "linux")]
+    {
+        let proc_cwd = PathBuf::from(format!("/proc/{pid}/cwd"));
+        let daemon_cwd_meta = std::fs::metadata(&proc_cwd).expect("stat /proc/<pid>/cwd");
+        let renamed_meta = std::fs::metadata(&renamed).unwrap();
+        assert_eq!(
+            (daemon_cwd_meta.dev(), daemon_cwd_meta.ino()),
+            (renamed_meta.dev(), renamed_meta.ino()),
+            "daemon cwd switched away from original directory identity (link={:?})",
+            std::fs::read_link(&proc_cwd)
+        );
+        assert_ne!(
+            (daemon_cwd_meta.dev(), daemon_cwd_meta.ino()),
+            (replacement_meta.dev(), replacement_meta.ino()),
+            "daemon cwd switched into the replacement directory at the old path"
+        );
+    }
+}
+
+/// PR #12 review: starting the daemon in a search-only (`0111`, unreadable) directory
+/// must capture the baseline handle (`O_PATH | O_DIRECTORY` on Linux, `O_SEARCH` on
+/// macOS), stay up, and handle repeated forwarded requests from another working directory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_daemon_stays_up_in_search_only_0111_directory() {
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::MetadataExt;
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let home = DaemonHome::new();
+    let search_only = home.tmp.path().join("search-only-dir");
+    let caller = home.tmp.path().join("caller-dir");
+    std::fs::create_dir_all(&search_only).unwrap();
+    std::fs::create_dir_all(&caller).unwrap();
+    std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let _restore_perm = RestoreMode(search_only.clone());
+    // Confirm listing fails (when not running as root with CAP_DAC_OVERRIDE).
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(std::fs::read_dir(&search_only).is_err(), "expected 0111 dir listing to fail");
+    }
+    #[cfg(target_os = "linux")]
+    let search_meta = std::fs::metadata(&search_only).unwrap();
+
+    let start_doc = doc(&home.run_in_dir(&search_only, &["daemon", "start", "--idle", "120"]));
+    let pid = start_doc["pid"].as_u64().expect("daemon pid");
+
+    let (c1, _, e1) = home.forward(&["preflight", "--help"], &[], Some(&caller));
+    assert_eq!(c1, Some(0), "req 1 stderr={e1}");
+    let (c2, _, e2) = home.forward(&["preflight", "--help"], &[], Some(&caller));
+    assert_eq!(c2, Some(0), "req 2 stderr={e2}");
+
+    let status = doc(&home.run(&["daemon", "status"]));
+    assert_eq!(status["running"], json!(true));
+    assert_eq!(status["pid"], json!(pid));
+    assert_eq!(status["requests"], json!(2));
+
+    #[cfg(target_os = "linux")]
+    {
+        let proc_cwd = PathBuf::from(format!("/proc/{pid}/cwd"));
+        let daemon_cwd_meta = std::fs::metadata(&proc_cwd).expect("stat /proc/<pid>/cwd");
+        assert_eq!(
+            (daemon_cwd_meta.dev(), daemon_cwd_meta.ino()),
+            (search_meta.dev(), search_meta.ino()),
+            "daemon cwd did not restore back to search-only startup dir"
+        );
+    }
 }
 
 #[test]

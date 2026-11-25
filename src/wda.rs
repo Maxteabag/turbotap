@@ -14,8 +14,8 @@ use serde_json::{json as j, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 pub const DEFAULT_TIMEOUT: f64 = 25.0;
@@ -554,6 +554,19 @@ pub fn release_conn(conn: Conn) {
     }
 }
 
+struct CachedSession {
+    stamp: crate::config::FileStamp,
+    map: Arc<serde_json::Map<String, Value>>,
+}
+
+static SESSION_CACHE: RwLock<Option<HashMap<PathBuf, CachedSession>>> = RwLock::new(None);
+
+fn remove_session_cache_entry(key: &Path) {
+    if let Some(cache) = SESSION_CACHE.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        cache.remove(key);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WDA client
 // ---------------------------------------------------------------------------
@@ -678,28 +691,70 @@ impl WdaClient {
         session_cache_path(&self.cache_dir, &self.base_url, &self.udid)
     }
 
+    fn load_session_cache_arc(&self) -> Arc<serde_json::Map<String, Value>> {
+        let path = self.session_cache_file();
+        let key = crate::skills::abspath(&path);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            remove_session_cache_entry(&key);
+            return Arc::new(serde_json::Map::new());
+        };
+        let lookup_stamp = crate::config::FileStamp::from_meta(&path, &meta);
+        {
+            let guard = SESSION_CACHE.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.as_ref().and_then(|c| c.get(&key)) {
+                if entry.stamp == lookup_stamp {
+                    return entry.map.clone();
+                }
+            }
+        }
+        let Ok((s, stable_stamp)) = crate::config::read_to_string_stamped(&path) else {
+            remove_session_cache_entry(&key);
+            return Arc::new(serde_json::Map::new());
+        };
+        let Some(map) = serde_json::from_str::<Value>(&s).ok().and_then(|v| match v {
+            Value::Object(m) => Some(m),
+            _ => None,
+        }) else {
+            remove_session_cache_entry(&key);
+            return Arc::new(serde_json::Map::new());
+        };
+        let arc = Arc::new(map);
+        if let Some(stamp) = stable_stamp {
+            let mut guard = SESSION_CACHE.write().unwrap_or_else(|e| e.into_inner());
+            let cache = guard.get_or_insert_with(HashMap::new);
+            if let Some(entry) = cache.get(&key) {
+                if entry.stamp == stamp {
+                    return entry.map.clone();
+                }
+            }
+            if cache.len() >= 64 && !cache.contains_key(&key) {
+                cache.clear();
+            }
+            cache.insert(key, CachedSession { stamp, map: arc.clone() });
+        }
+        arc
+    }
+
     pub fn load_session_cache(&self) -> serde_json::Map<String, Value> {
-        std::fs::read_to_string(self.session_cache_file())
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| match v {
-                Value::Object(m) => Some(m),
-                _ => None,
-            })
-            .unwrap_or_default()
+        (*self.load_session_cache_arc()).clone()
     }
 
     fn write_session_cache(&self, cur: &serde_json::Map<String, Value>) {
         let path = self.session_cache_file();
+        let key = crate::skills::abspath(&path);
         if let Some(dir) = path.parent() {
             if std::fs::create_dir_all(dir).is_err() {
                 return;
             }
         }
+        let body = json::dumps(&Value::Object(cur.clone()));
         let tmp = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
-        if std::fs::write(&tmp, json::dumps(&Value::Object(cur.clone()))).is_ok() {
+        if std::fs::write(&tmp, &body).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
+        // Always invalidate after writing rather than pinning a post-write stat;
+        // the next stable read populates SESSION_CACHE from verified on-disk bytes.
+        remove_session_cache_entry(&key);
     }
 
     pub fn save_session_cache(&self, updates: serde_json::Map<String, Value>) {
@@ -725,9 +780,11 @@ impl WdaClient {
     /// Drop one field (or the whole file when `field` is None).
     pub fn invalidate_session_cache(&self, field: Option<&str>) {
         let path = self.session_cache_file();
+        let key = crate::skills::abspath(&path);
         match field {
             None => {
-                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(&path);
+                remove_session_cache_entry(&key);
             }
             Some(f) => {
                 let mut cur = self.load_session_cache();
@@ -908,6 +965,30 @@ impl WdaClient {
         self.req(method, path, data, eff, Some(d))
     }
 
+    /// POST raw JSON bytes without allocating a response header map (for typed parsers like Vision OCR).
+    pub(crate) fn req_post_bytes(
+        &mut self,
+        path: &str,
+        body: &[u8],
+        timeout: f64,
+        deadline: Option<f64>,
+    ) -> (u16, Vec<u8>) {
+        match self.exchange_with(
+            "POST",
+            path,
+            Some(body),
+            &[("Content-Type", "application/json")],
+            timeout,
+            deadline,
+            false,
+            |_| Ok(Some(())),
+        ) {
+            Ok(None) => (0, b"deadline exceeded".to_vec()),
+            Ok(Some((resp, _))) => (resp.status, resp.body),
+            Err(msg) => (0, msg.into_bytes()),
+        }
+    }
+
     /// Raw request: `(status, content_type, body)`; status 0 on transport failure
     /// (body = message) or an expired deadline (body = "deadline exceeded"). The
     /// answer's headers are kept in `last_response_headers`.
@@ -1057,7 +1138,7 @@ impl WdaClient {
             self.sid = sid.as_str().map(String::from);
         }
         if apply_fast_settings && sid_is_set(&self.sid) {
-            let cached = self.load_session_cache();
+            let cached = self.load_session_cache_arc();
             let g = |k: &str| cached.get(k).unwrap_or(&json::NULL);
             let settings_fresh = g("base_url").as_str() == Some(self.base_url.as_str())
                 && g("sid").as_str() == self.sid.as_deref()
@@ -1622,7 +1703,7 @@ pub fn is_unsupported_route(res: &Value) -> bool {
 /// /wda/fastPreflight`, or None so the caller re-reads all three with the stock
 /// endpoints. A definitively missing route is remembered for this WDA session.
 pub fn fast_preflight(client: &mut WdaClient, sid: &str) -> Option<(bool, String, Value)> {
-    let cached = client.load_session_cache();
+    let cached = client.load_session_cache_arc();
     if cached.get("base_url").and_then(Value::as_str) == Some(client.base_url.as_str())
         && cached.get("sid").and_then(Value::as_str) == Some(sid)
         && cached.get("fast_preflight") == Some(&Value::Bool(false))
@@ -1859,5 +1940,80 @@ mod transport_tests {
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
         assert!(elapsed_ms < 150.0, "delayed-ACK stall detected: 6 requests took {elapsed_ms:.1} ms");
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn session_cache_reuses_arc_and_invalidates_on_save_delete_and_disk_edit() {
+        let dir = crate::testutil::TempDir::new("tt-sess-cache-");
+        let mut c = WdaClient::new("http://127.0.0.1:8100", "udid-sess-cache", None);
+        c.cache_dir = dir.path().to_path_buf();
+        c.sid = Some("sid-1".into());
+
+        // Missing file -> empty map, not cached across reloads.
+        let m0 = c.load_session_cache_arc();
+        assert!(m0.is_empty());
+        assert!(!Arc::ptr_eq(&m0, &c.load_session_cache_arc()));
+
+        // save_session_cache writes to disk and invalidates in-process cache;
+        // subsequent stable reads populate and reuse Arc<Map>.
+        let mut upd = serde_json::Map::new();
+        upd.insert("screen_pt".into(), j!([430, 932]));
+        c.save_session_cache(upd);
+        let key = crate::skills::abspath(&c.session_cache_file());
+        assert!(
+            SESSION_CACHE
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .is_none(),
+            "post-write save_session_cache must not pin an unverified post-write stat"
+        );
+        let m1 = c.load_session_cache_arc();
+        let m2 = c.load_session_cache_arc();
+        assert!(Arc::ptr_eq(&m1, &m2), "unchanged session cache file should reuse Arc");
+        assert_eq!(m1.get("screen_pt"), Some(&j!([430, 932])));
+
+        // External in-place overwrite with identical inode, length, and nanosecond mtime invalidates cache.
+        let path = c.session_cache_file();
+        let body_a = r#"{"base_url":"http://127.0.0.1:8100","sid":"sid-1","screen_pt":[390,844],"extra":true}"#;
+        let body_b = r#"{"base_url":"http://127.0.0.1:8100","sid":"sid-2","screen_pt":[430,932],"extra":true}"#;
+        assert_eq!(body_a.len(), body_b.len());
+        std::fs::write(&path, body_a).unwrap();
+        let m3 = c.load_session_cache_arc();
+        assert!(!Arc::ptr_eq(&m1, &m3));
+        assert_eq!(m3.get("sid"), Some(&j!("sid-1")));
+        assert_eq!(m3.get("screen_pt"), Some(&j!([390, 844])));
+        crate::config::overwrite_preserving_inode_and_mtime(&path, body_b);
+        let m3b = c.load_session_cache_arc();
+        assert!(!Arc::ptr_eq(&m3, &m3b));
+        assert_eq!(m3b.get("sid"), Some(&j!("sid-2")));
+        assert_eq!(m3b.get("screen_pt"), Some(&j!([430, 932])));
+
+        // Corrupt JSON evicts stale entry and is never cached.
+        let corrupt = "{".repeat(body_a.len());
+        crate::config::overwrite_preserving_inode_and_mtime(&path, &corrupt);
+        assert!(c.load_session_cache_arc().is_empty());
+        crate::config::overwrite_preserving_inode_and_mtime(&path, body_a);
+        assert_eq!(c.load_session_cache_arc().get("sid"), Some(&j!("sid-1")));
+
+        // Partial invalidation drops one field and keeps cache fresh.
+        c.invalidate_session_cache(Some("screen_pt"));
+        let m4 = c.load_session_cache_arc();
+        assert!(m4.get("screen_pt").is_none());
+        assert_eq!(m4.get("extra"), Some(&j!(true)));
+
+        // External deletion on disk invalidates cache immediately.
+        std::fs::remove_file(&path).unwrap();
+        let m5 = c.load_session_cache_arc();
+        assert!(m5.is_empty());
+
+        // Full invalidation removes file and cache entry.
+        let mut upd2 = serde_json::Map::new();
+        upd2.insert("settings_applied".into(), j!(true));
+        c.save_session_cache(upd2);
+        assert_eq!(c.load_session_cache_arc().get("settings_applied"), Some(&j!(true)));
+        c.invalidate_session_cache(None);
+        assert!(c.load_session_cache().is_empty());
     }
 }
