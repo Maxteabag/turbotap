@@ -336,7 +336,18 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         "screenshot" => cmd_screenshot(&mut client, s(sm, "out").unwrap_or(""))?,
         "flow" => {
             let steps: Vec<String> = sm.get_many::<String>("steps").map(|v| v.cloned().collect()).unwrap_or_default();
-            let deny = if b(sm, "no-deny") { None } else { Some(s(sm, "deny").unwrap_or(crate::flow::DENY_DEFAULT)) };
+            // An explicit --deny is never relaxed, even when it spells the built-in
+            // pattern: wrap it so it is compiled as a custom pattern.
+            let explicit_default = format!("(?:{})", crate::flow::DENY_DEFAULT);
+            let deny = if b(sm, "no-deny") {
+                None
+            } else {
+                match s(sm, "deny") {
+                    Some(d) if d == crate::flow::DENY_DEFAULT => Some(explicit_default.as_str()),
+                    Some(d) => Some(d),
+                    None => Some(crate::flow::DENY_DEFAULT),
+                }
+            };
             return crate::flow::cmd_flow(
                 client,
                 &steps,

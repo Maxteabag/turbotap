@@ -27,6 +27,12 @@ pub use worker::{ProbeSnapshot, UiWorker};
 
 pub const DENY_DEFAULT: &str = r"cancel booking|cancel appointment|delete account|erase all|reset all|confirm purchase|\bbuy\b|\bpay\b|\bsubscribe\b|start (audio|video) call|\bsend\b|record voice|delete|unsend|remove|^(accept|decline|maybe)$";
 
+/// [`DENY_DEFAULT`] while the app guard has confirmed, live, that an allowlisted app is
+/// in front: plain `Send` (a message) is allowed there, but sending money still is
+/// not, and every other default entry (pay, buy, delete, cancel booking, calls, ...)
+/// stays. Never used with an explicit `--deny` pattern or without an allowlist.
+pub const DENY_DEFAULT_IN_ALLOWED_APP: &str = r"cancel booking|cancel appointment|delete account|erase all|reset all|confirm purchase|\bbuy\b|\bpay\b|\bsubscribe\b|start (audio|video) call|\bsend\s+(?:money|payment|funds|cash)\b|record voice|delete|unsend|remove|^(accept|decline|maybe)$";
+
 pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
@@ -105,6 +111,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
 taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.
+with the built-in --deny only, a plain Send is allowed while a live check confirms an allowlisted app (allowed_apps) is in
+front; pay, buy, delete, cancel booking, calls and sending money stay refused.
 with allowed_apps in config.json (or TURBOTAP_ALLOWED_APPS / --allow-app), every input step is refused unless
 the live foreground app is on that list; open:/launch: check the target app, url: is refused (iOS picks the receiving app).
 --no-deny never disables this app guard. while a configured stop_file (or TURBOTAP_STOP_FILE) exists,
@@ -220,6 +228,20 @@ impl DenyGuard {
                 DEFAULT_RX.get_or_init(|| crate::text::compile_icase(DENY_DEFAULT).expect("DENY_DEFAULT regex is valid"))
             }
             DenyGuard::Custom(rx) => rx,
+        }
+    }
+
+    /// The relaxed default for a confirmed allowlisted foreground app (None for an
+    /// explicit `--deny`, which is never relaxed).
+    fn in_allowed_app_regex(&self) -> Option<&'static fancy_regex::Regex> {
+        match self {
+            DenyGuard::Default => {
+                static RX: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+                Some(RX.get_or_init(|| {
+                    crate::text::compile_icase(DENY_DEFAULT_IN_ALLOWED_APP).expect("DENY_DEFAULT_IN_ALLOWED_APP regex is valid")
+                }))
+            }
+            DenyGuard::Custom(_) => None,
         }
     }
 }
@@ -348,7 +370,13 @@ impl<R: Reader> Flow<R> {
     }
 
     /// Refuse taps on text matching `--deny`.
-    pub fn guard(&self, text: &str, action: &str) -> Result<()> {
+    ///
+    /// With the built-in default only: when the app guard is on and a live
+    /// `/wda/activeAppInfo` confirms an allowlisted app in front, text that only the
+    /// plain `send` entry matched is allowed ([`DENY_DEFAULT_IN_ALLOWED_APP`]). An
+    /// explicit `--deny`, no allowlist, or an unconfirmed foreground app keeps it
+    /// refused.
+    pub fn guard(&mut self, text: &str, action: &str) -> Result<()> {
         if let Some(guard) = self.deny.as_ref() {
             if text.is_empty() {
                 return Ok(());
@@ -356,6 +384,10 @@ impl<R: Reader> Flow<R> {
             match guard.regex().is_match(text) {
                 Ok(false) => {}
                 Ok(true) => {
+                    let relaxed_ok = guard.in_allowed_app_regex().is_some_and(|rx| rx.is_match(text) == Ok(false));
+                    if relaxed_ok && self.c.foreground_confirmed_allowed() {
+                        return Ok(());
+                    }
                     return Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text))));
                 }
                 // An evaluation error (e.g. backtrack limit) is an unverified result, not a
@@ -1190,7 +1222,7 @@ mod unit {
     #[test]
     fn deny_default_is_lazy_and_cached_while_custom_invalid_regex_errors_eagerly() {
         let c = WdaClient::new("http://127.0.0.1:9", "", None);
-        let flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+        let mut flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
         assert!(flow.guard("Delete Account", "tap").is_err());
         assert!(flow.guard("Settings", "tap").is_ok());
 

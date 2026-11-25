@@ -1510,3 +1510,129 @@ fn test_unresolved_configured_host_is_never_treated_as_a_different_endpoint() {
     let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "flow", "--quiet", "home"]);
     assert_eq!(code, 0, "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// v1.4.1: plain Send allowed by the default --deny in a confirmed allowlisted app
+// ---------------------------------------------------------------------------
+
+/// A mock whose accessibility tree has one element per label (for `tapel:`).
+fn mock_with_elements(app: &str, labels: &[&str]) -> MockWda {
+    let mut st = state_with_app(json!(app));
+    for (i, l) in labels.iter().enumerate() {
+        let q = serde_json::to_string(l).unwrap();
+        let eid = format!("el-{i}");
+        st.element_map.insert(format!("(label == {q} OR name == {q}) AND enabled == 1"), Dyn::one(json!({"ELEMENT": eid})));
+        st.element_rects.insert(eid, json!({"x": 10 + i as i64 * 40, "y": 700, "width": 30, "height": 20}));
+    }
+    MockWda::start(st)
+}
+
+const SEND_LABELS: [&str; 3] = ["Send", "Send message", "Submit"];
+const STILL_DENIED: [&str; 8] =
+    ["Delete", "Pay", "Buy now", "Cancel booking", "Start video call", "Send money", "Unsend", "Confirm purchase"];
+
+#[test]
+fn test_relaxed_default_deny_only_drops_plain_send() {
+    use crate::flow::{DENY_DEFAULT, DENY_DEFAULT_IN_ALLOWED_APP};
+    assert_eq!(
+        DENY_DEFAULT_IN_ALLOWED_APP,
+        DENY_DEFAULT.replace(r"|\bsend\b|", r"|\bsend\s+(?:money|payment|funds|cash)\b|")
+    );
+    let full = crate::text::compile_icase(DENY_DEFAULT).unwrap();
+    let relaxed = crate::text::compile_icase(DENY_DEFAULT_IN_ALLOWED_APP).unwrap();
+    for t in ["Send", "Send message", "SEND"] {
+        assert!(full.is_match(t).unwrap() && !relaxed.is_match(t).unwrap(), "{t}");
+    }
+    for t in STILL_DENIED {
+        assert!(relaxed.is_match(t).unwrap(), "{t} must stay denied in allowlisted apps");
+    }
+    assert!(!full.is_match("Submit").unwrap(), "Submit was never in the default list");
+}
+
+#[test]
+fn test_allowlisted_foreground_allows_send_but_not_pay_or_delete_without_no_deny() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mut labels: Vec<&str> = SEND_LABELS.to_vec();
+    labels.extend_from_slice(&STILL_DENIED);
+    let mock = mock_with_elements(ALLOWED, &labels);
+    let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+    for l in SEND_LABELS {
+        flow.step(&format!("tapel:{l}")).unwrap_or_else(|e| panic!("{l}: {e:?}"));
+    }
+    assert_eq!(mock.tapped_points().len(), SEND_LABELS.len());
+    for l in STILL_DENIED {
+        match flow.step(&format!("tapel:{l}")) {
+            Err(Error::Flow(m)) => assert!(m.contains("matches --deny"), "{l}: {m}"),
+            other => panic!("{l}: expected --deny refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(mock.tapped_points().len(), SEND_LABELS.len(), "a denied label was tapped");
+    flow.close();
+}
+
+#[test]
+fn test_send_stays_denied_without_allowlist_or_confirmed_foreground() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // No allowlist: exactly as before, and no extra activeAppInfo request.
+    let mock = mock_with_elements(ALLOWED, &["Send message"]);
+    let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[]);
+    match flow.step("tapel:Send message") {
+        Err(Error::Flow(m)) => assert!(m.contains("matches --deny"), "{m}"),
+        other => panic!("expected --deny refusal, got {other:?}"),
+    }
+    assert!(mock.tapped_points().is_empty());
+    assert_eq!(active_app_calls(&mock), 0);
+    flow.close();
+    // Allowlist on, but another app in front: the app guard refuses first.
+    let mock = mock_with_elements(OTHER, &["Send message"]);
+    let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+    expect_guard_err(flow.step("tapel:Send message"), "foreground app 'com.example.other'");
+    assert!(input_posts(&mock).is_empty());
+    flow.close();
+    // The confirmation itself must be a live, unambiguous answer: errors keep it denied.
+    for resp in [json!({"error": 500, "body": "boom"}), json!({"value": {"bundleId": ""}}), json!(OTHER)] {
+        let mock = MockWda::start(state_with_app(resp.clone()));
+        let mut c = mock.client();
+        c.set_allowed_apps(strs(&[ALLOWED]));
+        let mut flow = Flow::new(c, blank_reader(), 1.0, Some(DENY_DEFAULT), false).unwrap();
+        assert!(flow.guard("Send message", "tap").is_err(), "{resp}");
+        flow.close();
+    }
+    let mock = MockWda::start(state_with_app(json!(ALLOWED)));
+    let mut c = mock.client();
+    c.set_allowed_apps(strs(&[ALLOWED]));
+    let mut flow = Flow::new(c, blank_reader(), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    assert!(flow.guard("Send message", "tap").is_ok());
+    assert_eq!(active_app_calls(&mock), 1, "the confirmation must be a live request");
+    assert!(flow.guard("Delete", "tap").is_err());
+    flow.close();
+}
+
+#[test]
+fn test_explicit_deny_is_never_relaxed() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mock = mock_with_elements(ALLOWED, &["Send message"]);
+    let _e = cli_env(&mock.url, &[]);
+    let flow = |deny: Option<&str>| {
+        let mut v = vec!["--no-daemon", "flow", "--quiet"];
+        if let Some(d) = deny {
+            v.extend_from_slice(&["--deny", d]);
+        }
+        v.push("tapel:Send message");
+        run(&v)
+    };
+    // Built-in default, allowlisted app in front: allowed without --no-deny.
+    let (code, out, err) = flow(None);
+    assert_eq!(code, 0, "{out} {err}");
+    assert_eq!(mock.tapped_points().len(), 1);
+    // A user pattern, or the built-in pattern passed explicitly, is applied as given.
+    for d in [r"\bsend\b", crate::flow::DENY_DEFAULT] {
+        let (code, out, _) = flow(Some(d));
+        assert_eq!(code, 1, "{d}: {out}");
+        assert!(out.contains("matches --deny"), "{d}: {out}");
+    }
+    assert_eq!(mock.tapped_points().len(), 1);
+}

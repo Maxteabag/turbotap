@@ -802,6 +802,19 @@ impl WdaClient {
         }
     }
 
+    /// True only when the app guard is on (a non-empty allowlist, no policy error,
+    /// no earlier refusal) and a live `/wda/activeAppInfo` right now names an
+    /// allowlisted app. Never refuses or records anything itself.
+    pub fn foreground_confirmed_allowed(&mut self) -> bool {
+        if self.allowed_apps.is_empty() || self.guard_policy_error.is_some() || self.guard_refusal.is_some() {
+            return false;
+        }
+        match self.live_foreground_app(None) {
+            Ok(b) => self.allowed_apps.iter().any(|a| a == &b),
+            Err(_) => false,
+        }
+    }
+
     /// Refuse `action` unless the app in front right now (live `/wda/activeAppInfo`)
     /// is in the allowlist. Fails closed when the answer is missing. No-op when the
     /// guard is off.
