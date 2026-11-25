@@ -293,9 +293,13 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     crate::config::reload();
     crate::skills::sync_skills_if_stale();
     let (url, udid, dev_key) = crate::config::resolve_device_settings(s(&m, "url"), s(&m, "device"), s(&m, "udid"))?;
-    let allowed = crate::guard::resolve_allowlist(dev_key.as_deref(), &allow_app_values(&m, sm))?;
+    let allowed = crate::guard::resolve_allowlist(dev_key.as_deref(), &allow_app_values(&m, sm));
     let mut client = WdaClient::new(&url, &udid, dev_key.as_deref());
-    client.set_allowed_apps(allowed);
+    match allowed {
+        Ok(list) => client.set_allowed_apps(list),
+        // A config.json that exists but could not be loaded never means "no guard".
+        Err(reason) => client.set_guard_policy_error(reason),
+    }
     match cmd {
         "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock"))?,
         "unlock" => crate::wda::cmd_unlock(&mut client)?,

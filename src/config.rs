@@ -51,6 +51,10 @@ pub struct Config {
     pub mac_host: String,
     /// `app_prefer` with casefolded keys.
     pub app_prefer: HashMap<String, String>,
+    /// Why config.json exists but could not be used (unreadable, not a JSON object,
+    /// or changing while read). None when it loaded or is genuinely absent. The app
+    /// guard fails every input closed while this is set.
+    pub load_error: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -113,40 +117,80 @@ pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Op
     Ok((s, stamp))
 }
 
-fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>) {
+/// Where config.json is: `(path, metadata, stat error)`. Metadata None and no error
+/// means genuinely absent (NotFound); a stat error other than NotFound (permissions,
+/// I/O) is reported so the file is never mistaken for "no config".
+fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>, Option<String>) {
+    fn stat(p: &Path) -> std::result::Result<Option<std::fs::Metadata>, String> {
+        match std::fs::metadata(p) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot stat {}: {e}", p.display())),
+        }
+    }
     if let Some(p) = env_nonempty("WDA_CONFIG") {
         let ep = expanduser(&p);
-        let meta = std::fs::metadata(&ep).ok();
-        return (ep, meta);
+        return match stat(&ep) {
+            Ok(m) => (ep, m, None),
+            Err(e) => (ep, None, Some(e)),
+        };
     }
     let h = home();
     let primary = h.join(".config/turbotap/config.json");
-    if let Ok(m) = std::fs::metadata(&primary) {
-        return (primary, Some(m));
+    match stat(&primary) {
+        Ok(Some(m)) => return (primary, Some(m), None),
+        Ok(None) => {}
+        Err(e) => return (primary, None, Some(e)),
     }
     let legacy = h.join(".config/iphone-wda/config.json");
-    if let Ok(m) = std::fs::metadata(&legacy) {
-        return (legacy, Some(m));
+    match stat(&legacy) {
+        Ok(Some(m)) => return (legacy, Some(m), None),
+        Ok(None) => {}
+        Err(e) => return (legacy, None, Some(e)),
     }
-    (primary, None)
+    (primary, None, None)
+}
+
+/// Read and parse config.json, retrying a read that raced a writer. Ok(Some(stamp))
+/// only for a stable read.
+fn read_config_object(path: &Path) -> std::result::Result<(Value, Option<FileStamp>), String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let (text, stamp) = read_to_string_stamped(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if stamp.is_none() {
+            last = format!("{} changed while being read", path.display());
+            continue;
+        }
+        return match serde_json::from_str::<Value>(&text) {
+            Ok(v) if v.is_object() => Ok((v, stamp)),
+            Ok(_) => Err(format!("{} is not a JSON object", path.display())),
+            Err(e) => Err(format!("{} is not valid JSON: {e}", path.display())),
+        };
+    }
+    Err(last)
 }
 
 fn load_config_from(
     path: PathBuf,
     exists: bool,
+    stat_error: Option<String>,
     mac_host_env: Option<&str>,
 ) -> (Config, Option<String>, Option<FileStamp>) {
     let mut cache_stamp = None;
-    let raw = if exists {
-        match read_to_string_stamped(&path) {
-            Ok((s, stable_stamp)) => match serde_json::from_str::<Value>(&s) {
-                Ok(v) if v.is_object() => {
-                    cache_stamp = stable_stamp;
-                    v
-                }
-                _ => Value::Object(Default::default()),
-            },
-            Err(_) => Value::Object(Default::default()),
+    let mut load_error = stat_error;
+    let raw = if exists && load_error.is_none() {
+        match read_config_object(&path) {
+            Ok((v, stamp)) => {
+                cache_stamp = stamp;
+                v
+            }
+            Err(e) => {
+                load_error = Some(e);
+                Value::Object(Default::default())
+            }
         }
     } else {
         Value::Object(Default::default())
@@ -164,14 +208,14 @@ fn load_config_from(
             }
         }
     }
-    (Config { path, raw, mac_host, app_prefer }, file_mac_host, cache_stamp)
+    (Config { path, raw, mac_host, app_prefer, load_error }, file_mac_host, cache_stamp)
 }
 
 impl Config {
     pub fn load() -> Config {
-        let (path, meta) = resolve_config_path_and_meta();
+        let (path, meta, stat_error) = resolve_config_path_and_meta();
         let mac_host_env = env_nonempty("WDA_MAC_HOST");
-        load_config_from(path, meta.is_some(), mac_host_env.as_deref()).0
+        load_config_from(path, meta.is_some(), stat_error, mac_host_env.as_deref()).0
     }
 
     pub fn get(&self, key: &str) -> &Value {
@@ -207,7 +251,7 @@ pub fn current() -> Arc<Config> {
 /// Skips re-reading and re-parsing `config.json` only when the resolved path and
 /// `(dev, ino, ctime, mtime, len)` match a previously verified stable read.
 pub fn reload() -> Arc<Config> {
-    let (path, meta) = resolve_config_path_and_meta();
+    let (path, meta, stat_error) = resolve_config_path_and_meta();
     let lookup_stamp = meta.as_ref().map(|m| FileStamp::from_meta(&path, m));
     let mac_host_env = env_nonempty("WDA_MAC_HOST");
     if let Some(ref cur_stamp) = lookup_stamp {
@@ -239,7 +283,7 @@ pub fn reload() -> Arc<Config> {
             }
         }
     }
-    let (cfg, file_mac_host, cache_stamp) = load_config_from(path, meta.is_some(), mac_host_env.as_deref());
+    let (cfg, file_mac_host, cache_stamp) = load_config_from(path, meta.is_some(), stat_error, mac_host_env.as_deref());
     let mut guard = CURRENT.write().unwrap_or_else(|e| e.into_inner());
     if let (Some(ref stamp), Some(cached)) = (&cache_stamp, guard.as_ref()) {
         if cached.stamp.as_ref() == Some(stamp)

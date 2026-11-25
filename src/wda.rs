@@ -668,6 +668,12 @@ pub struct WdaClient {
     pub guard_action: Option<String>,
     /// Set while `unlock_phone` runs: SpringBoard may receive the passcode taps.
     guard_unlock_scope: bool,
+    /// Set when the guard policy could not be read (invalid, unreadable or unstable
+    /// config.json): every input is refused with this reason; reads still work.
+    pub guard_policy_error: Option<String>,
+    /// Test seam: fail this many upcoming POST attempts before anything is sent.
+    #[cfg(test)]
+    pub(crate) test_fail_post_presend: u32,
     host: String,
     port: u16,
     conn: Option<Conn>,
@@ -710,6 +716,9 @@ impl WdaClient {
             guard_refusal: None,
             guard_action: None,
             guard_unlock_scope: false,
+            guard_policy_error: None,
+            #[cfg(test)]
+            test_fail_post_presend: 0,
             host,
             port,
             conn: None,
@@ -723,8 +732,13 @@ impl WdaClient {
         self.allowed_apps = apps;
     }
 
+    /// Fail every input closed with `reason` (the guard policy could not be loaded).
+    pub fn set_guard_policy_error(&mut self, reason: String) {
+        self.guard_policy_error = Some(reason);
+    }
+
     pub fn app_guard_active(&self) -> bool {
-        !self.allowed_apps.is_empty()
+        !self.allowed_apps.is_empty() || self.guard_policy_error.is_some()
     }
 
     fn guard_refuse(&mut self, msg: String) -> Error {
@@ -741,6 +755,15 @@ impl WdaClient {
         }
     }
 
+    /// Sticky refusal, or a refusal because the policy itself is unavailable.
+    fn guard_precheck(&mut self, action: &str) -> Result<()> {
+        self.guard_sticky()?;
+        if let Some(reason) = self.guard_policy_error.clone() {
+            return Err(self.guard_refuse(crate::guard::refuse_policy(action, &reason)));
+        }
+        Ok(())
+    }
+
     /// `r`, unless the app guard refused something meanwhile (then that refusal), so
     /// callers that swallow request errors still stop.
     pub fn guard_result<T>(&self, r: Result<T>) -> Result<T> {
@@ -751,16 +774,8 @@ impl WdaClient {
     /// Live foreground bundle ID from `GET /wda/activeAppInfo` (never cached).
     /// Err(reason) when the request fails or the answer has no bundle ID.
     pub fn live_foreground_app(&mut self, deadline: Option<f64>) -> std::result::Result<String, String> {
-        match self.req_typed_with_deadline("GET", "/wda/activeAppInfo", 5.0, deadline, |b| {
-            serde_json::from_slice::<RawActiveAppResp>(b)
-        }) {
-            TypedHttpResult::Ok(RawActiveAppResp { is_object: true, has_err: false, bundle_id }) => {
-                match bundle_id.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                    Some(b) => Ok(b.to_string()),
-                    None => Err("activeAppInfo returned no bundleId".into()),
-                }
-            }
-            TypedHttpResult::Ok(_) => Err("activeAppInfo failed".into()),
+        match self.req_typed_with_deadline("GET", "/wda/activeAppInfo", 5.0, deadline, |b| serde_json::from_slice::<Value>(b)) {
+            TypedHttpResult::Ok(v) => crate::guard::foreground_from_envelope(&v),
             TypedHttpResult::HttpError { status } => Err(format!("activeAppInfo failed: HTTP {status}")),
             TypedHttpResult::TransportError(_) => Err("activeAppInfo failed".into()),
             TypedHttpResult::DeadlineExceeded => Err("activeAppInfo failed: deadline exceeded".into()),
@@ -784,7 +799,7 @@ impl WdaClient {
     /// Live foreground check: Ok(true) allowed, Ok(false) `deadline` ran out first
     /// (nothing decided), Err refusal (sticky).
     fn check_foreground(&mut self, action: &str, deadline: Option<f64>) -> Result<bool> {
-        self.guard_sticky()?;
+        self.guard_precheck(action)?;
         let expired = |d: Option<f64>| d.is_some_and(|d| clock::now() >= d);
         if expired(deadline) {
             return Ok(false);
@@ -804,7 +819,7 @@ impl WdaClient {
         if !self.app_guard_active() {
             return Ok(());
         }
-        self.guard_sticky()?;
+        self.guard_precheck(action)?;
         match target {
             Some(t) if self.allowed_apps.iter().any(|a| a == t) => Ok(()),
             _ => Err(self.guard_refuse(crate::guard::refuse_target(action, target, &self.allowed_apps))),
@@ -812,14 +827,14 @@ impl WdaClient {
     }
 
     /// Refuse `url:` unless Safari is in the allowlist.
+    /// `url:` is refused whenever the guard is on: WDA's `/url` hands the URL to iOS,
+    /// which picks the receiving app (any scheme, and https universal links), so no
+    /// allowlist entry can vouch for where the input lands.
     pub fn ensure_url_allowed(&mut self, action: &str) -> Result<()> {
         if !self.app_guard_active() {
             return Ok(());
         }
-        self.guard_sticky()?;
-        if self.allowed_apps.iter().any(|a| a == crate::guard::SAFARI) {
-            return Ok(());
-        }
+        self.guard_precheck(action)?;
         Err(self.guard_refuse(crate::guard::refuse_url(action, &self.allowed_apps)))
     }
 
@@ -863,6 +878,7 @@ impl WdaClient {
         let mut side = WdaClient::new(&self.base_url, &self.udid, self.device_key.as_deref());
         side.cache_dir = self.cache_dir.clone();
         side.allowed_apps = self.allowed_apps.clone();
+        side.guard_policy_error = self.guard_policy_error.clone();
         side.copy_probes_from(self);
         side
     }
@@ -1045,11 +1061,13 @@ impl WdaClient {
     where
         F: FnMut(&[u8]) -> std::result::Result<Option<T>, String>,
     {
-        if !self.guard_request(method, path, body, deadline)? {
-            return Ok(None);
-        }
         let idempotent = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
         for attempt in 0..2 {
+            // The app guard runs inside every attempt: a retry after a failed pre-send
+            // connect asks for the foreground app again instead of reusing the answer.
+            if !self.guard_request(method, path, body, deadline)? {
+                return Ok(None);
+            }
             let mut eff_timeout = timeout;
             if let Some(d) = deadline {
                 let rem = d - clock::now();
@@ -1061,6 +1079,11 @@ impl WdaClient {
             let mut sent = false;
             let res: std::io::Result<(u16, Option<T>, Option<String>)> = (|| {
                 self.ensure_conn(eff_timeout)?;
+                #[cfg(test)]
+                if self.test_fail_post_presend > 0 && method.eq_ignore_ascii_case("POST") {
+                    self.test_fail_post_presend -= 1;
+                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test: connect failed before send"));
+                }
                 if let Some(d) = deadline {
                     if clock::now() >= d {
                         return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "__deadline__"));
@@ -1106,11 +1129,13 @@ impl WdaClient {
     where
         F: FnMut(&[u8]) -> std::result::Result<Option<T>, String>,
     {
-        if !self.guard_request(method, path, body, deadline)? {
-            return Ok(None);
-        }
         let idempotent = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
         for attempt in 0..2 {
+            // The app guard runs inside every attempt: a retry after a failed pre-send
+            // connect asks for the foreground app again instead of reusing the answer.
+            if !self.guard_request(method, path, body, deadline)? {
+                return Ok(None);
+            }
             let mut eff_timeout = timeout;
             if let Some(d) = deadline {
                 let rem = d - clock::now();
@@ -1122,6 +1147,11 @@ impl WdaClient {
             let mut sent = false;
             let res: std::io::Result<(HttpResponse, Option<T>)> = (|| {
                 self.ensure_conn(eff_timeout)?;
+                #[cfg(test)]
+                if self.test_fail_post_presend > 0 && method.eq_ignore_ascii_case("POST") {
+                    self.test_fail_post_presend -= 1;
+                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test: connect failed before send"));
+                }
                 if let Some(d) = deadline {
                     if clock::now() >= d {
                         return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "__deadline__"));
@@ -2473,7 +2503,10 @@ impl WdaClient {
         }
         let pts: Vec<Value> = points.iter().map(|&(px, py)| j!([px, py])).collect();
         let body = j!({"points": pts, "interval": interval, "duration": duration});
-        if self.turbo != Some(false) && self.fast_tap_batch != Some(false) {
+        // One /wda/fastTapBatch request carries several delayed touches; the first one
+        // can switch apps before the rest land. With the app guard on, tap one point at
+        // a time so the foreground app is checked again before every touch.
+        if !self.app_guard_active() && self.turbo != Some(false) && self.fast_tap_batch != Some(false) {
             let r = self.post("/wda/fastTapBatch", &body);
             if r.is_object() {
                 if !json::has_err(&r) {

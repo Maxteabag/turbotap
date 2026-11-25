@@ -106,7 +106,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   shot:PATH             save a fresh screenshot as PNG
 taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.
 with allowed_apps in config.json (or TURBOTAP_ALLOWED_APPS / --allow-app), every input step is refused unless
-the live foreground app is on that list; open:/launch: check the target app, url: needs com.apple.mobilesafari.
+the live foreground app is on that list; open:/launch: check the target app, url: is refused (iOS picks the receiving app).
 --no-deny never disables this app guard.";
 
 /// Verbs that run host Tesseract OCR (the CLI warms libtesseract engines only for these).
@@ -406,7 +406,7 @@ impl<R: Reader> Flow<R> {
     /// Run one step; returns its result (string, number) or None.
     ///
     /// With the app guard on ([`crate::guard`]), an input step first checks the live
-    /// foreground app, `url:` needs Safari allowed, and any refusal during the step
+    /// foreground app, `url:` is refused, and any refusal during the step
     /// (even one a step swallowed, like `tapif:`) fails it with
     /// [`Error::AppGuard`].
     pub fn step(&mut self, spec: &str) -> Result<Option<Value>> {

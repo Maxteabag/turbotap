@@ -332,19 +332,199 @@ fn test_open_and_launch_check_the_target_not_the_foreground() {
 }
 
 #[test]
-fn test_url_needs_safari_in_the_allowlist() {
+fn test_url_is_refused_while_the_guard_is_on_even_with_safari_listed() {
+    let _c = isolated_cache();
+    const SAFARI: &str = "com.apple.mobilesafari";
+    // Safari-only policy, Safari in front; the "https" URL is a universal link that iOS
+    // would hand to an unknown app. Nothing may reach /url.
+    let mock = MockWda::start(state_with_app(json!(SAFARI)));
+    let opened_by = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    {
+        let o = opened_by.clone();
+        mock.set_custom_handler(move |st, m, p, d| {
+            if m == "POST" && p.ends_with("/url") {
+                o.lock().unwrap().push(crate::json::py_str(crate::json::get(d, "url")));
+                st.active_app = Seq::one(json!("com.example.unknown-universal-link-target"));
+                return Some(json!({"value": null}));
+            }
+            None
+        });
+    }
+    for spec in ["url:https://links.example.com/open/123", "url:example-scheme://compose?text=hi", "url:sms:+0000"] {
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[SAFARI]);
+        let m = expect_guard_err(flow.step(spec), "iOS chooses which app opens a URL");
+        assert!(m.starts_with("app guard refused url:"), "{m}");
+        flow.close();
+        // The request level refuses too (a direct POST, not through the flow step).
+        let mut c = mock.client();
+        c.set_allowed_apps(strs(&[SAFARI, ALLOWED]));
+        let p = c.spath("/url");
+        let r = c.post(&p, &json!({"url": "https://links.example.com/x"}));
+        assert!(crate::json::py_str(crate::json::get(&r, "error")).contains("app guard refused"), "{r}");
+    }
+    assert!(opened_by.lock().unwrap().is_empty(), "{:?}", opened_by.lock().unwrap());
+    assert!(input_posts(&mock).is_empty());
+    // Without an allowlist url: works as before.
+    let mut flow = guarded_flow(&mock, &blank_reader(), None, &[]);
+    flow.step("url:https://example.com").unwrap();
+    assert_eq!(opened_by.lock().unwrap().len(), 1);
+    flow.close();
+}
+
+// ---------------------------------------------------------------------------
+// Strict activeAppInfo envelope
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_error_envelopes_carrying_an_allowed_bundle_are_not_proof_of_foreground() {
+    let _c = isolated_cache();
+    let cases = [
+        json!({"value": {"bundleId": ALLOWED, "error": "no such window", "message": "x"}}),
+        json!({"status": 13, "value": {"bundleId": ALLOWED}}),
+        json!({"status": 7, "sessionId": "s", "value": {"bundleId": ALLOWED}}),
+        json!({"error": "unknown error", "value": {"bundleId": ALLOWED}}),
+        json!({"value": ALLOWED}),
+    ];
+    for resp in cases {
+        let mock = MockWda::start(state_with_app(resp.clone()));
+        let _e = cli_env(&mock.url, &[]);
+        let (code, out, err) = run(&["--no-daemon", "flow", "--no-deny", "tapxy:10,20", "type:hello"]);
+        assert_eq!(code, 1, "{resp}: stdout={out} stderr={err}");
+        assert!(err.contains("app guard refused tapxy:10,20: foreground app unknown"), "{resp}: {err}");
+        assert!(input_posts(&mock).is_empty(), "{resp}: {:?}", input_posts(&mock));
+        drop(_e);
+        // Same at the request level.
+        let mut c = mock.client();
+        c.set_allowed_apps(strs(&[ALLOWED]));
+        let r = c.fast_tap(1, 2, None, None);
+        assert!(crate::json::has_err(&r), "{resp}: {r}");
+        assert!(mock.tapped_points().is_empty(), "{resp}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invalid config.json fails closed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_invalid_or_unreadable_config_blocks_input_but_not_reads() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mock = MockWda::start(state_with_app(json!(OTHER)));
+    let e = cli_env(&mock.url, &[]);
+    let url = mock.url.clone();
+    let bad: [(&str, Option<&str>); 4] = [
+        ("not valid JSON", Some(r#"{"default_device": "d", "devices": {"d": {"allowed_apps": ["#)),
+        ("not a JSON object", Some(r#"["com.example.allowed"]"#)),
+        ("is not valid JSON", Some("")),
+        ("cannot read", None), // a directory where the file should be
+    ];
+    for (needle, body) in bad {
+        let _ = std::fs::remove_file(&e.cfg);
+        let _ = std::fs::remove_dir(&e.cfg);
+        match body {
+            Some(b) => std::fs::write(&e.cfg, b).unwrap(),
+            None => std::fs::create_dir(&e.cfg).unwrap(),
+        }
+        // The WDA URL still comes from --url, and --allow-app cannot unlock input.
+        for extra in [&[][..], &["--allow-app", OTHER][..]] {
+            let mut a = vec!["--no-daemon", "--url", url.as_str()];
+            a.extend_from_slice(extra);
+            a.extend_from_slice(&["flow", "--no-deny", "--quiet", "tapxy:1,2", "type:x"]);
+            let (code, _, err) = run(&a);
+            assert_eq!(code, 1, "{needle}: {err}");
+            assert!(err.contains("app guard policy unavailable"), "{needle}: {err}");
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        // Read-only work still runs.
+        let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "flow", "--quiet", "clipboard"]);
+        assert_eq!(code, 0, "{needle}: {err}");
+    }
+    assert!(input_posts(&mock).is_empty(), "{:?}", input_posts(&mock));
+    // A genuinely absent config.json means no policy (guard off), as before.
+    let _ = std::fs::remove_dir(&e.cfg);
+    let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "flow", "--quiet", "tapxy:1,2"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(mock.tapped_points().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// One authorization per physical touch; retries re-check
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixed_tap_batch_checks_foreground_before_every_touch() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let ui = json!([
+        {"type": "Key", "label": "1", "x": 50, "y": 100},
+        {"type": "Key", "label": "2", "x": 150, "y": 100},
+        {"type": "Key", "label": "3", "x": 250, "y": 100},
+    ]);
+    let mock = MockWda::start(MockState::default().with_fast_ui(fast_ui(ui, "Allowed", ALLOWED)));
+    let switched = Arc::new(AtomicBool::new(false));
+    {
+        // The first touch opens another app.
+        let s = switched.clone();
+        mock.set_on_action(move |_, kind, _| {
+            if kind == "tap" || kind == "tap_batch" {
+                s.store(true, Ordering::SeqCst);
+            }
+        });
+        let s = switched.clone();
+        mock.set_custom_handler(move |_, _, p, _| {
+            (p == "/wda/activeAppInfo")
+                .then(|| json!({"value": {"bundleId": if s.load(Ordering::SeqCst) { OTHER } else { ALLOWED }}}))
+        });
+    }
+    let mut flow = guarded_flow(&mock, &blank_reader(), None, &[ALLOWED]);
+    expect_guard_err(flow.step("tapbatch:fixed:1,2,3"), "foreground app 'com.example.other'");
+    assert!(mock.calls_to("/wda/fastTapBatch").is_empty(), "multi-touch batch sent under the guard");
+    assert_eq!(mock.tapped_points().len(), 1, "touches after the app switch went out");
+    flow.close();
+    // pintap goes through the same per-touch path.
+    switched.store(false, Ordering::SeqCst);
+    mock.clear_calls();
+    mock.state().tapped_points.clear();
+    let mut c = mock.client();
+    c.set_allowed_apps(strs(&[ALLOWED]));
+    let r = c.fast_tap_batch(&[(1, 1), (2, 2), (3, 3)], 0.05, 0.02);
+    assert!(crate::json::has_err(&r), "{r}");
+    assert_eq!(mock.tapped_points().len(), 1);
+    assert!(mock.calls_to("/wda/fastTapBatch").is_empty());
+}
+
+#[test]
+fn test_retry_after_failed_presend_connect_rechecks_the_foreground() {
     let _c = isolated_cache();
     let mock = MockWda::start(state_with_app(json!(ALLOWED)));
-    let mut flow = guarded_flow(&mock, &blank_reader(), None, &[ALLOWED]);
-    expect_guard_err(flow.step("url:https://example.com"), "com.apple.mobilesafari");
-    assert!(mock.state().opened_urls.is_empty());
-    assert!(mock.calls_to("/session/test-session-1/url").is_empty());
-    flow.close();
-    let mock = MockWda::start(state_with_app(json!(ALLOWED)));
-    let mut flow = guarded_flow(&mock, &blank_reader(), None, &[ALLOWED, crate::guard::SAFARI]);
-    flow.step("url:https://example.com").unwrap();
-    assert_eq!(mock.state().opened_urls, vec![json!("https://example.com")]);
-    flow.close();
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        // Allowed for the first check only; the app has switched by the retry.
+        let n = n.clone();
+        mock.set_custom_handler(move |_, _, p, _| {
+            (p == "/wda/activeAppInfo").then(|| {
+                let k = n.fetch_add(1, Ordering::SeqCst);
+                json!({"value": {"bundleId": if k == 0 { ALLOWED } else { OTHER }}})
+            })
+        });
+    }
+    let mut c = mock.client();
+    c.set_allowed_apps(strs(&[ALLOWED]));
+    c.test_fail_post_presend = 1;
+    let r = c.fast_tap(5, 6, None, None);
+    assert!(crate::json::py_str(crate::json::get(&r, "error")).contains("foreground app 'com.example.other'"), "{r}");
+    assert_eq!(n.load(Ordering::SeqCst), 2, "the retry did not ask for the foreground app again");
+    assert!(mock.tapped_points().is_empty());
+    // Control: when the app stays allowed, the retry goes through.
+    let mock2 = MockWda::start(state_with_app(json!(ALLOWED)));
+    let mut c2 = mock2.client();
+    c2.set_allowed_apps(strs(&[ALLOWED]));
+    c2.test_fail_post_presend = 1;
+    let r2 = c2.fast_tap(5, 6, None, None);
+    assert!(!crate::json::has_err(&r2), "{r2}");
+    assert_eq!(mock2.tapped_points().len(), 1);
+    assert_eq!(active_app_calls(&mock2), 2);
 }
 
 #[test]
@@ -682,6 +862,24 @@ fn test_daemon_applies_allowlist_per_request_without_leaking() {
     let (code, err) = forward(&tap, &[]);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(taps(), 4);
+
+    // A broken or half-written config.json after a working policy: the same WDA URL
+    // (now from --url) gets zero input until the file is valid again.
+    let mut with_url = vec!["--url", srv.url.as_str()];
+    with_url.extend_from_slice(&tap);
+    for broken in [r#"{"default_device": "d", "devices": {"d": {"url": "#, "not json", "[]"] {
+        std::fs::write(&cfg, broken).unwrap();
+        let (code, err) = forward(&with_url, &[]);
+        assert_eq!(code, Some(1), "{broken}: {err}");
+        assert!(err.contains("app guard policy unavailable"), "{broken}: {err}");
+        let (code, err) = forward(&with_url, &[("TURBOTAP_ALLOWED_APPS", ALLOWED)]);
+        assert_eq!(code, Some(1), "{broken}: {err}");
+        assert_eq!(taps(), 4, "{broken}");
+    }
+    write_cfg(&[ALLOWED]);
+    let (code, err) = forward(&with_url, &[]);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(taps(), 5);
 }
 
 #[test]

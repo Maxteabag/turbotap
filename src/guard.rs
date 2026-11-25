@@ -10,7 +10,8 @@
 //! - `open:`/`launch:` (`/wda/apps/*`, `/wda/fastLaunch`, `/session` with a
 //!   `bundleId`) need the TARGET bundle ID in the allowlist, whatever is in front now,
 //!   so a flow can bring its allowed app forward from the Home Screen;
-//! - `url:` (`/url`) needs [`SAFARI`] in the allowlist (a URL can open any app);
+//! - `url:` (`/url`) is always refused: iOS picks the app that receives a URL (any
+//!   scheme, and https universal links), so nothing can vouch for the destination;
 //! - pressing Home and read-only POSTs (element lookups, screenshots, Vision OCR,
 //!   pasteboard reads, settings) pass;
 //! - `unlock` may type the passcode while SpringBoard is in front.
@@ -22,12 +23,16 @@
 //!
 //! The allowlist comes from `config.json` (`devices.<name>.allowed_apps`, else the
 //! top-level `allowed_apps`), extended by `TURBOTAP_ALLOWED_APPS` (comma-separated)
-//! and by `--allow-app` for one invocation. Nothing can remove an entry.
+//! and by `--allow-app` for one invocation. Nothing can remove an entry. A
+//! config.json that exists but cannot be read, parsed or read consistently makes
+//! every input fail closed (reads still work) until a valid file is back.
+//!
+//! Only an unambiguous `/wda/activeAppInfo` success counts as proof: HTTP 2xx, a
+//! JSON object without `error`, `status` absent or 0, and a `value` object without
+//! `error` carrying a non-empty `bundleId`.
 use crate::error::{Error, Result};
 use serde_json::Value;
 
-/// Bundle ID that must be allowed before `url:` may open anything.
-pub const SAFARI: &str = "com.apple.mobilesafari";
 
 /// Env var with extra comma-separated bundle IDs.
 pub const ENV_ALLOWED_APPS: &str = "TURBOTAP_ALLOWED_APPS";
@@ -135,6 +140,34 @@ pub fn classify(path: &str, body: Option<&[u8]>) -> RequestKind {
     RequestKind::Input
 }
 
+/// The foreground bundle ID from a `/wda/activeAppInfo` body, accepted only from an
+/// unambiguous success envelope (see the module docs); Err(reason) otherwise.
+pub fn foreground_from_envelope(v: &Value) -> std::result::Result<String, String> {
+    use crate::json::get;
+    if !v.is_object() {
+        return Err("activeAppInfo failed: not a JSON object".into());
+    }
+    if !get(v, "error").is_null() {
+        return Err("activeAppInfo failed: error in response".into());
+    }
+    match get(v, "status") {
+        Value::Null => {}
+        s if s.as_i64() == Some(0) => {}
+        _ => return Err("activeAppInfo failed: nonzero protocol status".into()),
+    }
+    let value = get(v, "value");
+    if !value.is_object() {
+        return Err("activeAppInfo returned no bundleId".into());
+    }
+    if !get(value, "error").is_null() {
+        return Err("activeAppInfo failed: error in response value".into());
+    }
+    match get(value, "bundleId").as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => Ok(b.to_string()),
+        None => Err("activeAppInfo returned no bundleId".into()),
+    }
+}
+
 /// Trimmed, non-empty, de-duplicated (first occurrence wins).
 fn push_unique(out: &mut Vec<String>, id: &str) {
     let id = id.trim();
@@ -187,9 +220,14 @@ pub fn effective_allowlist(cfg: &Value, device_key: Option<&str>, env_value: Opt
 }
 
 /// [`effective_allowlist`] from the loaded config and the process environment.
-pub fn resolve_allowlist(device_key: Option<&str>, cli: &[String]) -> Result<Vec<String>> {
+/// Err(reason) when config.json exists but could not be loaded, or its allowlist is
+/// malformed: the caller must then fail every input closed.
+pub fn resolve_allowlist(device_key: Option<&str>, cli: &[String]) -> std::result::Result<Vec<String>, String> {
     let cfg = crate::config::current();
-    effective_allowlist(&cfg.raw, device_key, crate::config::env(ENV_ALLOWED_APPS).as_deref(), cli)
+    if let Some(e) = cfg.load_error.as_ref() {
+        return Err(e.clone());
+    }
+    effective_allowlist(&cfg.raw, device_key, crate::config::env(ENV_ALLOWED_APPS).as_deref(), cli).map_err(|e| e.to_string())
 }
 
 const HINT: &str = "(use --allow-app <bundle_id> for this run)";
@@ -211,9 +249,13 @@ pub fn refuse_target(action: &str, target: Option<&str>, allowed: &[String]) -> 
 
 pub fn refuse_url(action: &str, allowed: &[String]) -> String {
     format!(
-        "app guard refused {action}: url: can open any app, so it needs '{SAFARI}' in allowlist [{}] {HINT}",
+        "app guard refused {action}: iOS chooses which app opens a URL, so url: is off while the app guard is on (allowlist [{}]); use open:<bundle_id> and navigate in the app",
         allowed.join(", ")
     )
+}
+
+pub fn refuse_policy(action: &str, reason: &str) -> String {
+    format!("app guard refused {action}: app guard policy unavailable ({reason}); input stays blocked until config.json is valid")
 }
 
 /// Flow verbs that send input to the foreground app (checked live before the step
@@ -314,6 +356,27 @@ mod unit {
         // A malformed list fails closed instead of turning the guard off.
         assert!(effective_allowlist(&json!({"allowed_apps": "com.example.top"}), None, None, &[]).is_err());
         assert!(effective_allowlist(&json!({"devices": {"a": {"allowed_apps": [1]}}}), Some("a"), None, &[]).is_err());
+    }
+
+    #[test]
+    fn foreground_needs_an_unambiguous_success_envelope() {
+        let ok = |v: Value| foreground_from_envelope(&v);
+        assert_eq!(ok(json!({"value": {"bundleId": "com.example.a"}, "sessionId": "s"})), Ok("com.example.a".into()));
+        assert_eq!(ok(json!({"status": 0, "value": {"bundleId": " com.example.a "}})), Ok("com.example.a".into()));
+        for bad in [
+            json!({"value": {"bundleId": "com.example.a", "error": "no such window"}}),
+            json!({"status": 13, "value": {"bundleId": "com.example.a"}}),
+            json!({"status": "13", "value": {"bundleId": "com.example.a"}}),
+            json!({"error": "unknown error", "value": {"bundleId": "com.example.a"}}),
+            json!({"value": {"bundleId": ""}}),
+            json!({"value": {"bundleId": 7}}),
+            json!({"value": "com.example.a"}),
+            json!({"value": null}),
+            json!(["com.example.a"]),
+            json!("com.example.a"),
+        ] {
+            assert!(ok(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]
