@@ -89,8 +89,17 @@ pub(crate) fn daemon_requested_env(argv: &[String], turbotap_daemon: Option<&str
     }
 }
 
+/// argparse treats `-1` / `-.5` as values (not options) because no turbotap option
+/// looks like a negative number; clap needs that spelled out per argument. Float
+/// options take any hyphen value (clap's negative-number check misses `-.5`); a
+/// non-number such as `--scale --quiet` is still a usage error (exit 2) from
+/// `parse_py_float`, as in argparse.
 fn float_arg(name: &'static str) -> Arg {
-    Arg::new(name).long(name).value_parser(parse_py_float).action(ArgAction::Set)
+    Arg::new(name).long(name).value_parser(parse_py_float).action(ArgAction::Set).allow_hyphen_values(true)
+}
+
+fn int_arg(name: &'static str) -> Arg {
+    Arg::new(name).long(name).value_parser(parse_py_int).allow_negative_numbers(true)
 }
 
 /// Python `float()`: surrounding whitespace allowed, `inf`/`nan` accepted.
@@ -167,8 +176,8 @@ pub fn build_command() -> Command {
         .subcommand(
             Command::new("ocr")
                 .arg(float_arg("scale").default_value("1.5").help("OCR px per point"))
-                .arg(Arg::new("y0").long("y0").value_parser(parse_py_int).default_value("0").help("crop band top (pt)"))
-                .arg(Arg::new("y1").long("y1").value_parser(parse_py_int).help("crop band bottom (pt), default screen bottom")),
+                .arg(int_arg("y0").default_value("0").help("crop band top (pt)"))
+                .arg(int_arg("y1").help("crop band bottom (pt), default screen bottom")),
         )
         .subcommand(
             Command::new("vision-ocr")
@@ -189,7 +198,7 @@ pub fn build_command() -> Command {
             Command::new("flow")
                 .about("run many UI steps in one process")
                 .after_help(crate::flow::FLOW_HELP)
-                .arg(Arg::new("steps").value_name("STEP").required(true).num_args(1..).action(ArgAction::Append))
+                .arg(Arg::new("steps").value_name("STEP").required(true).num_args(1..).action(ArgAction::Append).allow_negative_numbers(true))
                 .arg(float_arg("timeout").default_value("8.0").help("per waiting step (s)"))
                 .arg(float_arg("scale").default_value("1.5").help("OCR px per point"))
                 .arg(Arg::new("deny").long("deny").help("regex of tap labels to refuse"))
@@ -200,7 +209,7 @@ pub fn build_command() -> Command {
             Command::new("otp-type")
                 .arg(Arg::new("code").long("code"))
                 .arg(Arg::new("pattern").long("pattern").default_value("%code%"))
-                .arg(Arg::new("after-rowid").long("after-rowid").value_parser(parse_py_int).default_value("0"))
+                .arg(int_arg("after-rowid").default_value("0"))
                 .arg(float_arg("timeout").default_value("20.0"))
                 .arg(Arg::new("mac-host").long("mac-host")),
         )
