@@ -3193,6 +3193,7 @@ mod transport_tests {
                 .is_none(),
             "post-write save_session_cache must not pin an unverified post-write stat"
         );
+        crate::config::settle_racy_window();
         let m1 = c.load_session_cache_arc();
         let m2 = c.load_session_cache_arc();
         assert!(Arc::ptr_eq(&m1, &m2), "unchanged session cache file should reuse Arc");

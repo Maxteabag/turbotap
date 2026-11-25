@@ -307,6 +307,7 @@ mod unit {
             r#"[{"name":"Spotify","bundleIdentifier":"com.spotify.client"},{"name":"Notes","bundleIdentifier":"com.apple.mobilenotes"}]"#,
         )
         .unwrap();
+        crate::config::settle_racy_window();
         let a1 = load_apps_indexed(false, "udid-cache-test", "http://127.0.0.1:8100", tmp.path()).unwrap();
         let a2 = load_apps_indexed(false, "udid-cache-test", "http://127.0.0.1:8100", tmp.path()).unwrap();
         assert!(Arc::ptr_eq(&a1, &a2), "unchanged apps cache should reuse Arc<Vec<IndexedApp>>");

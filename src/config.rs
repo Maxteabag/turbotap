@@ -97,11 +97,18 @@ impl FileStamp {
     }
 }
 
-/// Read a UTF-8 file and return `(contents, Some(stamp))` only when the path
-/// resolves to the same `(dev, ino, ctime, mtime, len)` before and after reading
-/// and the byte count matches `len`. If the file changed mid-read, returns
-/// `Ok((contents, None))` so callers never cache an unstable snapshot.
-pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Option<FileStamp>)> {
+/// How a read relates to concurrent changes of the file.
+pub(crate) enum ReadStability {
+    /// Same `(dev, ino, ctime, mtime, len)` before and after, old enough to cache.
+    Stable(FileStamp),
+    /// Unchanged during the read, but too recent to cache (see [`RACY_WINDOW`]).
+    Racy,
+    /// The file changed while it was read.
+    Changed,
+}
+
+/// Read a UTF-8 file and say whether the contents are a consistent snapshot.
+pub(crate) fn read_to_string_checked(path: &Path) -> std::io::Result<(String, ReadStability)> {
     use std::io::Read;
     let abs = crate::skills::abspath(path);
     let mut f = std::fs::File::open(path)?;
@@ -109,12 +116,47 @@ pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Op
     let mut s = String::new();
     f.read_to_string(&mut s)?;
     let after = std::fs::metadata(path).ok().map(|m| FileMetaStamp::from(&m));
-    let stamp = if after.as_ref() == Some(&before) && s.len() as u64 == before.len {
-        Some(FileStamp { path: abs, meta: before })
+    let st = if after.as_ref() != Some(&before) || s.len() as u64 != before.len {
+        ReadStability::Changed
+    } else if before.is_racy() {
+        ReadStability::Racy
     } else {
-        None
+        ReadStability::Stable(FileStamp { path: abs, meta: before })
     };
-    Ok((s, stamp))
+    Ok((s, st))
+}
+
+/// Read a UTF-8 file and return `(contents, Some(stamp))` only when the path
+/// resolves to the same `(dev, ino, ctime, mtime, len)` before and after reading,
+/// the byte count matches `len`, and the stamp is not racy. Otherwise
+/// `Ok((contents, None))` so callers never cache an unstable or ambiguous snapshot.
+pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Option<FileStamp>)> {
+    let (s, st) = read_to_string_checked(path)?;
+    Ok((s, if let ReadStability::Stable(stamp) = st { Some(stamp) } else { None }))
+}
+
+/// A stamp younger than this cannot be trusted: file timestamps come from a coarse
+/// kernel clock (a few ms), so a same-length rewrite within the same tick would keep
+/// an identical `(ctime, mtime, len)` and a cache would serve the old contents
+/// forever (git's "racy" files). Such reads are used but never cached.
+pub(crate) const RACY_WINDOW: f64 = 0.05;
+
+impl FileMetaStamp {
+    fn is_racy(&self) -> bool {
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs_f64(),
+            Err(_) => return true,
+        };
+        let t = |secs: i64, nsec: i64| secs as f64 + nsec as f64 / 1e9;
+        let newest = t(self.ctime, self.ctime_nsec).max(t(self.mtime, self.mtime_nsec));
+        now - newest <= RACY_WINDOW
+    }
+}
+
+/// Test helper: wait until files written so far are old enough to be cached.
+#[cfg(test)]
+pub(crate) fn settle_racy_window() {
+    std::thread::sleep(std::time::Duration::from_secs_f64(RACY_WINDOW + 0.03));
 }
 
 /// An existing symlink among `p`'s ancestors whose target cannot be resolved.
@@ -179,11 +221,16 @@ fn read_config_object(path: &Path) -> std::result::Result<(Value, Option<FileSta
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
-        let (text, stamp) = read_to_string_stamped(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if stamp.is_none() {
-            last = format!("{} changed while being read", path.display());
-            continue;
-        }
+        let (text, st) = read_to_string_checked(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let stamp = match st {
+            ReadStability::Stable(stamp) => Some(stamp),
+            // A consistent but very recent snapshot: use it, never cache it.
+            ReadStability::Racy => None,
+            ReadStability::Changed => {
+                last = format!("{} changed while being read", path.display());
+                continue;
+            }
+        };
         return match serde_json::from_str::<Value>(&text) {
             Ok(v) if v.is_object() => Ok((v, stamp)),
             Ok(_) => Err(format!("{} is not a JSON object", path.display())),
@@ -523,6 +570,10 @@ mod unit {
         std::fs::write(&cfg_path, r#"{"mac_host":"mini-1","app_prefer":{"Mail":"com.apple.mobilemail"}}"#).unwrap();
         let p = cfg_path.to_string_lossy().into_owned();
         let _e = set_env(&[("WDA_CONFIG", Some(p.as_str())), ("WDA_MAC_HOST", None)]);
+        // A just-written file is never cached (racy stamp); once it is older, it is.
+        let c0 = reload();
+        assert!(!Arc::ptr_eq(&c0, &reload()), "a just-written config.json must not be cached");
+        settle_racy_window();
         let c1 = reload();
         let c2 = reload();
         assert!(Arc::ptr_eq(&c1, &c2), "unchanged config.json should reuse cached Arc<Config>");
