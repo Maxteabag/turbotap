@@ -380,6 +380,54 @@ fn test_daemon_restores_original_cwd_identity_after_rename_and_reuse() {
     }
 }
 
+/// PR #12 review: starting the daemon in a search-only (`0111`, unreadable) directory
+/// must capture the baseline handle (via `O_PATH | O_DIRECTORY` on Linux), stay up,
+/// and handle repeated forwarded requests from another working directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_daemon_stays_up_in_search_only_0111_directory() {
+    use std::os::unix::fs::MetadataExt;
+    struct RestoreMode(PathBuf);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let home = DaemonHome::new();
+    let search_only = home.tmp.path().join("search-only-dir");
+    let caller = home.tmp.path().join("caller-dir");
+    std::fs::create_dir_all(&search_only).unwrap();
+    std::fs::create_dir_all(&caller).unwrap();
+    std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let _restore_perm = RestoreMode(search_only.clone());
+    // Confirm listing fails (when not running as root with CAP_DAC_OVERRIDE).
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(std::fs::read_dir(&search_only).is_err(), "expected 0111 dir listing to fail");
+    }
+    let search_meta = std::fs::metadata(&search_only).unwrap();
+
+    let start_doc = doc(&home.run_in_dir(&search_only, &["daemon", "start", "--idle", "120"]));
+    let pid = start_doc["pid"].as_u64().expect("daemon pid");
+
+    let (c1, _, e1) = home.forward(&["preflight", "--help"], &[], Some(&caller));
+    assert_eq!(c1, Some(0), "req 1 stderr={e1}");
+    let (c2, _, e2) = home.forward(&["preflight", "--help"], &[], Some(&caller));
+    assert_eq!(c2, Some(0), "req 2 stderr={e2}");
+
+    let status = doc(&home.run(&["daemon", "status"]));
+    assert_eq!(status["running"], json!(true));
+    assert_eq!(status["pid"], json!(pid));
+    assert_eq!(status["requests"], json!(2));
+
+    let proc_cwd = PathBuf::from(format!("/proc/{pid}/cwd"));
+    let daemon_cwd_meta = std::fs::metadata(&proc_cwd).expect("stat /proc/<pid>/cwd");
+    assert_eq!(
+        (daemon_cwd_meta.dev(), daemon_cwd_meta.ino()),
+        (search_meta.dev(), search_meta.ino()),
+        "daemon cwd did not restore back to search-only startup dir"
+    );
+}
+
 #[test]
 fn test_errors_keep_exit_codes_and_stderr() {
     let (home, _) = DaemonHome::started("120");

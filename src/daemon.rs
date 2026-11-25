@@ -535,8 +535,13 @@ impl crate::out::Sink for StreamSink {
 }
 
 fn open_cwd_dir() -> std::io::Result<std::fs::File> {
+    // On Linux, O_PATH|O_DIRECTORY works in search-only (0111) directories and supports fchdir(2).
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: "." is NUL-terminated; O_CLOEXEC prevents leaking the handle to child processes.
-    let fd = unsafe { libc::open(c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::open(c".".as_ptr(), flags) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -556,14 +561,11 @@ fn restore_cwd_dir(dir: &std::fs::File) -> std::io::Result<()> {
 
 struct BaselineState {
     env: HashMap<OsString, OsString>,
-    /// Owned handle to the daemon's startup working directory (restored via `fchdir`,
-    /// preserving directory identity even if the directory is renamed or its old path is reused).
-    cwd_dir: Option<std::fs::File>,
 }
 
 impl BaselineState {
     fn capture() -> BaselineState {
-        BaselineState { env: std::env::vars_os().collect(), cwd_dir: open_cwd_dir().ok() }
+        BaselineState { env: std::env::vars_os().collect() }
     }
 }
 
@@ -579,6 +581,9 @@ struct Inner {
     started: f64,
     fingerprint: String,
     stopping: AtomicBool,
+    /// Owned directory handle captured at daemon startup (before binding the socket)
+    /// so `fchdir` restores the original directory identity even after renames or in 0111 dirs.
+    cwd_dir: std::sync::OnceLock<std::fs::File>,
     exec_lock: Mutex<Option<BaselineState>>,
     state: Mutex<State>,
 }
@@ -601,6 +606,7 @@ impl Server {
                 started: crate::clock::wall(),
                 fingerprint: code_fingerprint(),
                 stopping: AtomicBool::new(false),
+                cwd_dir: std::sync::OnceLock::new(),
                 exec_lock: Mutex::new(None),
                 state: Mutex::new(State { last_activity: crate::clock::now(), requests: 0, busy: 0 }),
             }),
@@ -619,6 +625,8 @@ impl Server {
     // -- lifecycle ----------------------------------------------------------
 
     pub fn bind(&mut self) -> Result<()> {
+        let cwd_dir = open_cwd_dir().map_err(|e| Error::Os(format!("cannot open daemon working directory: {e}")))?;
+        let _ = self.inner.cwd_dir.set(cwd_dir);
         let directory = self.inner.path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
         make_private_dir(&directory)?;
         let file = std::fs::OpenOptions::new()
@@ -1120,7 +1128,7 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, req: ServerReq) -> 
         conn.set_read_timeout(None)?;
         conn.set_write_timeout(None)?;
         let baseline = exec_guard.get_or_insert_with(BaselineState::capture);
-        let code = execute(conn, &argv, &env, &cwd, baseline, &inner.stopping);
+        let code = execute(conn, &argv, &env, &cwd, baseline, inner.cwd_dir.get(), &inner.stopping);
         inner.state.lock().unwrap_or_else(|e| e.into_inner()).requests += 1;
         let _ = send_bytes(conn, format!("{{\"exit\":{code}}}\n").as_bytes());
         Ok(())
@@ -1164,6 +1172,7 @@ fn is_config_env_key(k: &OsStr) -> bool {
 /// `baseline.env` so any unexpected mutation is still completely reverted.
 struct RequestStateGuard<'a> {
     baseline: &'a BaselineState,
+    cwd_dir: Option<&'a std::fs::File>,
     stopping: &'a AtomicBool,
     deltas: Vec<(OsString, Option<OsString>)>,
     cwd_changed: bool,
@@ -1172,9 +1181,14 @@ struct RequestStateGuard<'a> {
 }
 
 impl<'a> RequestStateGuard<'a> {
-    fn new(baseline: &'a BaselineState, stopping: &'a AtomicBool) -> RequestStateGuard<'a> {
+    fn new(
+        baseline: &'a BaselineState,
+        cwd_dir: Option<&'a std::fs::File>,
+        stopping: &'a AtomicBool,
+    ) -> RequestStateGuard<'a> {
         RequestStateGuard {
             baseline,
+            cwd_dir,
             stopping,
             deltas: Vec::new(),
             cwd_changed: false,
@@ -1202,7 +1216,7 @@ impl Drop for RequestStateGuard<'_> {
             }
         }
         if self.cwd_changed || panicking {
-            match self.baseline.cwd_dir.as_ref() {
+            match self.cwd_dir {
                 Some(dir) => {
                     if let Err(e) = restore_cwd_dir(dir) {
                         self.stopping.store(true, Ordering::SeqCst);
@@ -1231,6 +1245,7 @@ fn execute(
     env: &HashMap<String, String>,
     cwd: &str,
     baseline: &BaselineState,
+    cwd_dir: Option<&std::fs::File>,
     stopping: &AtomicBool,
 ) -> i32 {
     let sink = match conn.try_clone() {
@@ -1242,7 +1257,7 @@ fn execute(
         Err(_) => return 1,
     };
     // Installed before any process state changes; restores it on every exit path.
-    let mut restore = RequestStateGuard::new(baseline, stopping);
+    let mut restore = RequestStateGuard::new(baseline, cwd_dir, stopping);
     crate::out::set_sink(Some(sink.clone()));
     restore.config_env_changed = apply_request_env(&baseline.env, env, &mut restore.deltas);
     let code = match std::env::set_current_dir(cwd) {
@@ -1510,9 +1525,10 @@ mod unit {
             target
         };
         let stopping = AtomicBool::new(false);
+        let cwd_dir = open_cwd_dir().unwrap();
         // Normal delta-replay restoration path (zero vars_os() scan).
         {
-            let mut guard = RequestStateGuard::new(&baseline, &stopping);
+            let mut guard = RequestStateGuard::new(&baseline, Some(&cwd_dir), &stopping);
             let target = make_target();
             apply_request_env(&baseline.env, &target, &mut guard.deltas);
             assert_eq!(std::env::var("TT_DIFF_KEEP").ok(), None);
@@ -1526,7 +1542,7 @@ mod unit {
 
         // Panic fallback path reverts unexpected mid-request mutations too.
         {
-            let mut guard = RequestStateGuard::new(&baseline, &stopping);
+            let mut guard = RequestStateGuard::new(&baseline, Some(&cwd_dir), &stopping);
             let target = make_target();
             apply_request_env(&baseline.env, &target, &mut guard.deltas);
             std::env::set_var("TT_DIFF_EXTRA", "mutated");
@@ -1539,9 +1555,8 @@ mod unit {
         assert_eq!(std::env::var("TT_DIFF_EXTRA").ok(), None);
 
         // Failed cwd restoration retires the daemon before accepting another request.
-        let broken_baseline = BaselineState { env: baseline.env.clone(), cwd_dir: None };
         {
-            let mut guard = RequestStateGuard::new(&broken_baseline, &stopping);
+            let mut guard = RequestStateGuard::new(&baseline, None, &stopping);
             guard.cwd_changed = true;
         }
         assert!(stopping.load(Ordering::SeqCst));
