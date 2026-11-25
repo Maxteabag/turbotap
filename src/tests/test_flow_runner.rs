@@ -1221,9 +1221,10 @@ fn test_picker_key_cleartype_typedigits_and_clipboard() {
     flow_err(flow.step("key:f13"));
 
     // cleartype verifies read-back and supports env:VAR
-    std::env::set_var("TEST_SECRET_INPUT", "hello world");
-    let res = step_s(&mut flow, "cleartype:env:TEST_SECRET_INPUT");
-    std::env::remove_var("TEST_SECRET_INPUT");
+    let res = {
+        let _env = set_env(&[("TEST_SECRET_INPUT", Some("hello world"))]);
+        step_s(&mut flow, "cleartype:env:TEST_SECRET_INPUT")
+    };
     assert_eq!(res, "len=11");
     assert_eq!(elval(&c, "tf1"), json!("hello world"));
 
@@ -1249,9 +1250,10 @@ fn test_picker_key_cleartype_typedigits_and_clipboard() {
     flow_fmt.close();
 
     // setclip / clipboard round-trip
-    std::env::set_var("TEST_CLIP", "copied text");
-    let res = step_s(&mut flow, "setclip:env:TEST_CLIP");
-    std::env::remove_var("TEST_CLIP");
+    let res = {
+        let _env = set_env(&[("TEST_CLIP", Some("copied text"))]);
+        step_s(&mut flow, "setclip:env:TEST_CLIP")
+    };
     assert_eq!(res, "len=11");
     assert_eq!(step_s(&mut flow, "clipboard"), "copied text");
     assert_eq!(*flow.reads.last().unwrap(), json!({"clipboard": "copied text"}));
