@@ -134,10 +134,8 @@ fn test_busy_connection_is_never_pooled_or_detached() {
 // OCRBackendSelectionTests, WarmOCRPartitionTests, RelativeModelPathTests,
 // BinaryOCRDrainTests
 //
-// These use ocr.rs API from feat/rust-v1-ocr (WarmOcr::with_factory/lease,
-// TessApi::fake, EnginePool, ScreenReader::tsv_hook, testutil::set_env) that is not
-// on feat/rust-v1 yet. Verified passing in a trial merge of feat/rust-v1-ocr; the
-// (enabled after the ocr merge)
+// These use the ocr.rs test API (WarmOcr::with_factory/lease, TessApi::fake,
+// EnginePool, ScreenReader::tsv_hook) and testutil::set_env.
 // ---------------------------------------------------------------------------
 
 mod needs_ocr_merge {
