@@ -181,6 +181,15 @@ fn test_cli_parses_stock_flag() {
     // Python patched cmd_preflight to record args.stock; Rust cannot patch, so the
     // real `preflight --stock` runs against the mock and must skip the fast probe.
     let _c = isolated_cache();
+    // run_cli syncs agent skills from $XDG_STATE_HOME: keep it off the real HOME.
+    let home = crate::testutil::TempDir::new("tt-home-");
+    let state = home.path().join("state");
+    let _env = crate::testutil::set_env(&[
+        ("HOME", Some(home.path().to_str().unwrap())),
+        ("XDG_STATE_HOME", Some(state.to_str().unwrap())),
+        ("TURBOTAP_DAEMON", None),
+        ("WDA_TURBO", None),
+    ]);
     let m = MockWda::start(MockState::default());
     let argv: Vec<String> = ["--url", m.url.as_str(), "preflight", "--stock"].iter().map(|s| s.to_string()).collect();
     assert_eq!(crate::cli::run_cli(&argv), 0);

@@ -20,7 +20,8 @@ fn png_b64() -> String {
 }
 
 fn wda_router() -> impl Fn(&str, &str, &Value) -> (u16, String, Vec<u8>) + Send + Sync + 'static {
-    let png = png_b64();
+    // Built on first /screenshot (only that route needs image encoding).
+    let png = std::sync::OnceLock::<String>::new();
     move |_m, path, _p| {
         let ok = |v: Value| (200, "application/json".to_string(), json!({"value": v, "sessionId": "sid-d"}).to_string().into_bytes());
         if path == "/status" {
@@ -42,7 +43,7 @@ fn wda_router() -> impl Fn(&str, &str, &Value) -> (u16, String, Vec<u8>) + Send 
             return ok(json!({"locked": false, "bundleId": "com.example.app", "size": {"width": 430, "height": 932}}));
         }
         if path == "/screenshot" {
-            return ok(json!(png));
+            return ok(json!(png.get_or_init(png_b64)));
         }
         (404, "application/json".into(), br#"{"value":{"error":"unknown command"}}"#.to_vec())
     }

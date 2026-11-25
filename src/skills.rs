@@ -157,6 +157,12 @@ fn targets_of(st: &Map<String, Value>) -> Vec<String> {
 /// After an upgrade brings new skill text, refresh every folder `turbotap
 /// install-skill` wrote to. Costs one small file read.
 pub fn sync_skills_if_stale() {
+    // Test builds never refresh skills outside a temporary state dir (an in-process
+    // run_cli must not rewrite the developer's real ~/.claude or ~/.agents skills).
+    #[cfg(test)]
+    if !skill_state_path().starts_with(std::env::temp_dir()) {
+        return;
+    }
     let mut st = load_skill_state();
     let targets = targets_of(&st);
     if targets.is_empty() {
