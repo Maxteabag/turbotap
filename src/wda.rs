@@ -789,6 +789,22 @@ impl WdaClient {
 
     /// Live foreground bundle ID from `GET /wda/activeAppInfo` (never cached).
     /// Err(reason) when the request fails or the answer has no bundle ID.
+    /// GET `path` and return the `value` of an unambiguous success: an actual HTTP 2xx
+    /// whose body passes [`crate::guard::success_value`]. Redirects, error statuses,
+    /// failed protocol envelopes and a missing `value` are Err(reason).
+    pub fn strict_get_value(&mut self, path: &str) -> std::result::Result<Value, String> {
+        match self.exchange_borrowed("GET", path, None, &[], DEFAULT_TIMEOUT, None, false, |b| {
+            serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
+        }) {
+            Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => {
+                crate::guard::success_value(&v).cloned()
+            }
+            Ok(Some((status, _, _))) => Err(format!("HTTP {status}")),
+            Ok(None) => Err("deadline exceeded".into()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn live_foreground_app(&mut self, deadline: Option<f64>) -> std::result::Result<String, String> {
         // Raw status on purpose: the shared typed helper treats every status below 400
         // (redirects included) as success, but only an actual 2xx may authorize input.

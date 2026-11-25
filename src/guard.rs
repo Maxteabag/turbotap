@@ -140,23 +140,30 @@ pub fn classify(path: &str, body: Option<&[u8]>) -> RequestKind {
     RequestKind::Input
 }
 
-/// The foreground bundle ID from a `/wda/activeAppInfo` body, accepted only from an
-/// unambiguous success envelope (see the module docs); Err(reason) otherwise.
-pub fn foreground_from_envelope(v: &Value) -> std::result::Result<String, String> {
+/// The `value` of an unambiguous WDA success envelope (the body of an HTTP 2xx
+/// answer, checked by the caller): a JSON object without any `error` key (even
+/// null), with `status` absent or 0, and with a `value` key that is actually present
+/// (it may be null). Anything else is Err(reason): never proof of anything.
+pub fn success_value(v: &Value) -> std::result::Result<&Value, String> {
     let Some(top) = v.as_object() else {
-        return Err("activeAppInfo failed: not a JSON object".into());
+        return Err("not a JSON object".into());
     };
-    // Any `error` key (even null) and any `status` other than an absent one or 0 (even
-    // null) is not an unambiguous success.
     if top.contains_key("error") {
-        return Err("activeAppInfo failed: error in response".into());
+        return Err("error in response".into());
     }
     match top.get("status") {
         None => {}
         Some(s) if s.as_i64() == Some(0) || s.as_u64() == Some(0) => {}
-        Some(_) => return Err("activeAppInfo failed: protocol status is not 0".into()),
+        Some(_) => return Err("protocol status is not 0".into()),
     }
-    let Some(value) = top.get("value").and_then(Value::as_object) else {
+    top.get("value").ok_or_else(|| "no value in response".to_string())
+}
+
+/// The foreground bundle ID from a `/wda/activeAppInfo` body, accepted only from an
+/// unambiguous success envelope (see the module docs); Err(reason) otherwise.
+pub fn foreground_from_envelope(v: &Value) -> std::result::Result<String, String> {
+    let value = success_value(v).map_err(|e| format!("activeAppInfo failed: {e}"))?;
+    let Some(value) = value.as_object() else {
         return Err("activeAppInfo returned no bundleId".into());
     };
     if value.contains_key("error") {
@@ -628,6 +635,24 @@ mod unit {
         // A malformed list fails closed instead of turning the guard off.
         assert!(effective_allowlist(&json!({"allowed_apps": "com.example.top"}), None, None, &[]).is_err());
         assert!(effective_allowlist(&json!({"devices": {"a": {"allowed_apps": [1]}}}), Some("a"), None, &[]).is_err());
+    }
+
+    #[test]
+    fn success_value_requires_a_strict_envelope() {
+        assert_eq!(success_value(&json!({"value": "Send"})), Ok(&json!("Send")));
+        assert_eq!(success_value(&json!({"value": null, "status": 0, "sessionId": "s"})), Ok(&json!(null)));
+        for bad in [
+            json!({}),
+            json!({"sessionId": "s"}),
+            json!({"status": 13, "value": "Send"}),
+            json!({"status": null, "value": "Send"}),
+            json!({"error": null, "value": "Send"}),
+            json!({"error": "no such element", "value": "Send"}),
+            json!("Send"),
+            json!(null),
+        ] {
+            assert!(success_value(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

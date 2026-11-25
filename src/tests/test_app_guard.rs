@@ -1726,3 +1726,59 @@ fn test_explicit_deny_is_never_relaxed() {
     }
     assert_eq!(mock.tapped_points().len(), 1);
 }
+
+#[test]
+fn test_tapel_attribute_reads_need_a_strict_success_envelope() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let q = serde_json::to_string("Send").unwrap();
+    let fallback = format!("(label CONTAINS[c] {q} OR name CONTAINS[c] {q}) AND enabled == 1");
+    let redirect = |body: &str| {
+        json!({"__raw__": {"status": 302, "content_type": "application/json", "headers": {"Location": "/x"}, "body": body}})
+    };
+    // (attribute answered oddly, its response); the other attribute answers normally
+    // (label "Send" / empty name).
+    let cases: Vec<(&str, Value)> = vec![
+        ("label", redirect(r#"{"value": "Send"}"#)),
+        ("label", json!({"status": 13, "value": "Send"})),
+        ("label", json!({"status": null, "value": "Send"})),
+        ("label", json!({"error": null, "value": "Send"})),
+        ("label", json!({"sessionId": "s"})),
+        ("name", json!({})),
+        ("name", json!({"sessionId": "s"})),
+        ("name", json!({"status": 7, "value": null})),
+        ("name", redirect(r#"{"value": null}"#)),
+    ];
+    let run_case = |attr: &'static str, resp: Option<Value>| {
+        let mut st = state_with_app(json!(ALLOWED));
+        st.element_map.insert(fallback.clone(), Dyn::one(json!({"ELEMENT": "env-1"})));
+        st.element_rects.insert("env-1".into(), json!({"x": 100, "y": 700, "width": 40, "height": 20}));
+        st.element_labels.insert("env-1".into(), json!("Send"));
+        let mock = MockWda::start(st);
+        if let Some(resp) = resp {
+            let path = format!("/element/env-1/attribute/{attr}");
+            mock.set_custom_handler(move |_, _, p, _| p.ends_with(&path).then(|| resp.clone()));
+        }
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+        let r = flow.step("tapel:Send");
+        flow.close();
+        (r, mock)
+    };
+    for (attr, resp) in cases {
+        let what = format!("{attr} {resp}");
+        let (r, mock) = run_case(if attr == "label" { "label" } else { "name" }, Some(resp));
+        match r {
+            Err(Error::Flow(m)) => assert!(m.contains("matches --deny"), "{what}: {m}"),
+            other => panic!("{what}: expected --deny refusal, got {other:?}"),
+        }
+        assert!(input_posts(&mock).is_empty(), "{what}: {:?}", input_posts(&mock));
+        assert!(mock.tapped_points().is_empty(), "{what}");
+    }
+    // Controls: a confirmed empty name (explicit null, status 0) and the mock's own
+    // plain answers both allow the exact label "Send".
+    for resp in [Some(json!({"status": 0, "value": null, "sessionId": "s"})), Some(json!({"value": ""})), None] {
+        let (r, mock) = run_case("name", resp.clone());
+        r.unwrap_or_else(|e| panic!("{resp:?}: {e:?}"));
+        assert_eq!(mock.tapped_points().len(), 1, "{resp:?}");
+    }
+}

@@ -1039,15 +1039,13 @@ impl<R: Reader> Flow<R> {
     /// One accessibility attribute of element `eid`, keeping a failed lookup apart
     /// from a successful empty one.
     fn element_attr(&mut self, eid: &str, attr: &str) -> ElAttr {
+        // Same strict success envelope as the foreground check: HTTP 2xx, no error,
+        // status absent or 0, `value` present. Only then is null/"" a real empty.
         let p = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
-        let r = self.c.get(&p);
-        if !r.is_object() || json::has_err(&r) {
-            return ElAttr::Failed;
-        }
-        match json::get(&r, "value") {
-            Value::Null => ElAttr::Empty,
-            Value::String(s) if s.trim().is_empty() => ElAttr::Empty,
-            Value::String(s) => ElAttr::Value(s.trim().to_string()),
+        match self.c.strict_get_value(&p) {
+            Ok(Value::Null) => ElAttr::Empty,
+            Ok(Value::String(s)) if s.trim().is_empty() => ElAttr::Empty,
+            Ok(Value::String(s)) => ElAttr::Value(s.trim().to_string()),
             _ => ElAttr::Failed,
         }
     }
