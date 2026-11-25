@@ -2,7 +2,25 @@
 
 Apply `patches/wda-vision.patch` **after** the bundled turbo patch on Appium WebDriverAgent 16.14.0. It adds `POST /wda/fastOCR` for OCR alone and `POST /wda/fastRead` for OCR plus fastUI in one request. Both support session and sessionless URLs. The Python reader still uses its existing OCR path.
 
-Send `{}` or `{"mode":"fast"}` for Vision's fast recognizer with language correction disabled. Use `{"mode":"accurate"}` for the accurate recognizer with language correction enabled. Other modes and keys return a WDA invalid argument error. Both routes capture the full main screen once through XCTest's public `XCUIScreen.screenshot.PNGRepresentation` and run one public `VNRecognizeTextRequest` locally. The screenshot stays in the runner. The caller receives recognized text, which may be sensitive.
+Send `{}` or `{"mode":"fast"}` for Vision's fast recognizer with language correction disabled. Use `{"mode":"accurate"}` for the accurate recognizer with language correction enabled. Both routes capture the full main screen once with XCTest and run one public `VNRecognizeTextRequest` locally. The screenshot stays in the runner. The caller receives recognized text, which may be sensitive.
+
+Choose the capture path in the POST body. Compare these three requests on the same screen with the same recognition mode.
+
+```json
+{"mode":"accurate","capture":"png"}
+```
+
+```json
+{"mode":"accurate","capture":"cgimage"}
+```
+
+```json
+{"mode":"accurate","capture":"cgimage","scale":0.75}
+```
+
+The default `png` uses `XCUIScreenshot.PNGRepresentation` and Vision's data initializer. The opt-in `cgimage` reads `XCUIScreenshot.image.CGImage` and passes pixels to Vision. XCTest controls how it produces the underlying screenshot. The runner redraws only for orientation correction or a change in pixel dimensions. The optional linear dimension scale is greater than zero and at most one, and defaults to one. PNG uses full resolution. Top-left normalized OCR boxes use the same coordinate system at every scale.
+
+`value.image` reports the selected capture path, scale, oriented `sourcePixels` and `inputPixels` ([width, height]), and explicit `pngBytes` (zero for CGImage). `timing.startUptimeMs` is a device monotonic timestamp. Within `captureMs`, `screenshotMs` measures the XCTest screenshot call and `representationMs` measures fetching the image or PNG. After AX collection, `inputPrepMs` measures input setup including any redraw, PNG size inspection, and Vision handler construction. Vision may defer decoding until recognition. For latency comparisons use `totalMs` alongside the individual stages and digit hit counts.
 
 Both responses include `value.mode`, `value.lines`, and `value.timing`. A successful blank screen returns an empty array. Each observation contributes its best candidate with `text`, Vision `confidence`, and `x`, `y`, `width`, `height`. The bounding box uses normalized fractions of the oriented screenshot from its **top left**. Multiply horizontal values by the displayed screenshot width and vertical values by its height to convert to the corresponding pixels or points. Lines follow Vision's observation order. Capture and recognition failures return WDA errors.
 

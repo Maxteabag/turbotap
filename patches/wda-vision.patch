@@ -67,7 +67,7 @@
    ];
  }
  
-@@ -123,4 +129,84 @@
+@@ -123,4 +129,141 @@
    return FBResponseWithObject([data base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0]);
  }
  
@@ -79,18 +79,34 @@
 +  if (![@"fast" isEqual:mode] && ![@"accurate" isEqual:mode]) {
 +    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"mode must be fast or accurate" traceback:nil]);
 +  }
++  id capture = args[@"capture"] ?: @"png";
++  BOOL direct = [@"cgimage" isEqual:capture];
++  if (!direct && ![@"png" isEqual:capture]) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"capture must be png or cgimage" traceback:nil]);
++  }
++  id scaleArg = args[@"scale"] ?: @1;
++  if (![scaleArg isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)scaleArg) == CFBooleanGetTypeID()) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"scale must be a number" traceback:nil]);
++  }
++  CGFloat scale = [scaleArg doubleValue];
++  if (!isfinite(scale) || scale <= 0 || scale > 1 || (!direct && scale != 1)) {
++    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"scale must be in (0, 1]; PNG requires scale 1" traceback:nil]);
++  }
 +  for (NSString *key in args) {
-+    if (![@"mode" isEqual:key]) {
-+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Only mode is supported" traceback:nil]);
++    if (![@"mode" isEqual:key] && ![@"capture" isEqual:key] && ![@"scale" isEqual:key]) {
++      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Supported keys are mode, capture and scale" traceback:nil]);
 +    }
 +  }
 +
 +  @autoreleasepool {
 +    NSProcessInfo *clock = NSProcessInfo.processInfo;
 +    NSTimeInterval start = clock.systemUptime;
-+    NSData *png = XCUIScreen.mainScreen.screenshot.PNGRepresentation;
++    XCUIScreenshot *shot = XCUIScreen.mainScreen.screenshot;
++    NSTimeInterval shotReady = clock.systemUptime;
++    UIImage * __attribute__((objc_precise_lifetime)) pixels = direct ? shot.image : nil;
++    NSData *png = direct ? nil : shot.PNGRepresentation;
 +    NSTimeInterval captured = clock.systemUptime;
-+    if (png.length == 0) {
++    if (direct ? pixels.CGImage == NULL : png.length == 0) {
 +      return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:@"No screenshot available" traceback:nil]);
 +    }
 +    NSDictionary *ui = nil;
@@ -100,12 +116,43 @@
 +        return FBResponseWithUnknownErrorFormat(@"Cannot get snapshot of the current application");
 +      }
 +    }
++    NSTimeInterval prepStart = clock.systemUptime;
++    CGSize sourceSize;
++    CGSize inputSize;
++    VNImageRequestHandler *handler;
++    if (direct) {
++      sourceSize = CGSizeMake(round(pixels.size.width * pixels.scale), round(pixels.size.height * pixels.scale));
++      inputSize = CGSizeMake(MAX(1, round(sourceSize.width * scale)), MAX(1, round(sourceSize.height * scale)));
++      if (pixels.imageOrientation != UIImageOrientationUp || !CGSizeEqualToSize(inputSize, sourceSize)) {
++        UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
++        format.scale = 1;
++        format.opaque = YES;
++        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:inputSize format:format];
++        UIImage *original = pixels;
++        pixels = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
++          [original drawInRect:(CGRect){CGPointZero, inputSize}];
++        }];
++      }
++      handler = [[VNImageRequestHandler alloc] initWithCGImage:pixels.CGImage options:@{}];
++    } else {
++      CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)png, NULL);
++      if (src == NULL) {
++        return FBResponseWithUnknownErrorFormat(@"Cannot inspect screenshot dimensions");
++      }
++      NSDictionary *props = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(src, 0, NULL));
++      CFRelease(src);
++      CGFloat w = [props[(__bridge NSString *)kCGImagePropertyPixelWidth] doubleValue];
++      CGFloat h = [props[(__bridge NSString *)kCGImagePropertyPixelHeight] doubleValue];
++      NSInteger orientation = [props[(__bridge NSString *)kCGImagePropertyOrientation] integerValue];
++      sourceSize = orientation >= 5 && orientation <= 8 ? CGSizeMake(h, w) : CGSizeMake(w, h);
++      inputSize = sourceSize;
++      handler = [[VNImageRequestHandler alloc] initWithData:png options:@{}];
++    }
 +    NSTimeInterval recognitionStart = clock.systemUptime;
 +    VNRecognizeTextRequest *ocr = [[VNRecognizeTextRequest alloc] init];
 +    BOOL accurate = [@"accurate" isEqual:mode];
 +    ocr.recognitionLevel = accurate ? VNRequestTextRecognitionLevelAccurate : VNRequestTextRecognitionLevelFast;
 +    ocr.usesLanguageCorrection = accurate;
-+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithData:png options:@{}];
 +    NSError *error = nil;
 +    if (![handler performRequests:@[ocr] error:&error]) {
 +      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Vision text recognition failed" traceback:nil]);
@@ -129,11 +176,21 @@
 +    }
 +    NSTimeInterval end = clock.systemUptime;
 +    NSMutableDictionary *result = [@{@"mode": mode, @"lines": lines, @"timing": @{
++      @"startUptimeMs": @(start * 1000.0),
++      @"screenshotMs": @((shotReady - start) * 1000.0),
++      @"representationMs": @((captured - shotReady) * 1000.0),
++      @"inputPrepMs": @((recognitionStart - prepStart) * 1000.0),
 +      @"captureMs": @((captured - start) * 1000.0),
-+      @"axMs": @(includeUI ? (recognitionStart - captured) * 1000.0 : 0.0),
++      @"axMs": @(includeUI ? (prepStart - captured) * 1000.0 : 0.0),
 +      @"recognitionMs": @((end - recognitionStart) * 1000.0),
 +      @"totalMs": @((end - start) * 1000.0),
 +    }} mutableCopy];
++    result[@"image"] = @{
++      @"capture": capture, @"scale": @(scale),
++      @"sourcePixels": @[@(sourceSize.width), @(sourceSize.height)],
++      @"inputPixels": @[@(inputSize.width), @(inputSize.height)],
++      @"pngBytes": @(png.length),
++    };
 +    if (nil != ui) {
 +      result[@"fastUI"] = ui;
 +    }
