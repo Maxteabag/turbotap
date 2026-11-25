@@ -1,7 +1,7 @@
 //! Gestures and forms: drag/swipe/scroll/back, picker, url, toggle, slider,
 //! clipboard, search, keyboard dismissal (Python Flow L3920-4327, L4894-4964,
 //! L5061-5209).
-use super::{is_url_scheme, py_float, secret_arg, toggle_state, Flow};
+use super::{is_url_scheme, py_float, scope_controls, secret_arg, toggle_state, Flow};
 use crate::clock;
 use crate::error::{Error, Result};
 use crate::json;
@@ -276,13 +276,12 @@ impl<R: Reader> Flow<R> {
         let clean_base = clean_text(&base);
         // Resolve exact matches BEFORE evaluating enabled state so a disabled exact
         // match ('Sync') is never silently displaced by an enabled substring ('Sync Photos').
-        let c: Control = if exact_control(&scoped, &clean_base, &["Switch"], true).is_some() {
-            match exact_control(&scoped, &clean_base, &["Switch"], false) {
-                Some(c) => c.clone(),
-                None => return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base)))),
+        let c: Control = match exact_control(&scoped, &clean_base, &["Switch"], false) {
+            Some(c) => c.clone(),
+            None if exact_control(&scoped, &clean_base, &["Switch"], true).is_some() => {
+                return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
             }
-        } else {
-            match find_control(&scoped, &clean_base, Some(&["Switch"]), false) {
+            None => match find_control(&scoped, &clean_base, Some(&["Switch"]), false) {
                 Some(c) => c.clone(),
                 None => {
                     if find_control(&scoped, &clean_base, Some(&["Switch"]), true).is_some() {
@@ -290,7 +289,7 @@ impl<R: Reader> Flow<R> {
                     }
                     return Err(Error::flow(format!("no switch labelled {}", json::py_repr_str(&base))));
                 }
-            }
+            },
         };
         let value_of = |c: &Control| c.value.clone().map(Value::String).unwrap_or(Value::Null);
         let current = parse_switch_state(&value_of(&c));
@@ -608,7 +607,7 @@ impl<R: Reader> Flow<R> {
                 && ((i == 0 && !lines.iter().any(|l| l.y() >= status_y)) || at_end || i == max_swipes)
             {
                 let all = self.controls(true, None, None, false, false)?;
-                let ctl = controls_in_region(&all, &lines, wh);
+                let ctl = scope_controls(&all, &lines, wh);
                 if let Some(cm) = find_control_match(&ctl, &label, Some(ui::WAIT_UI_TYPES), true) {
                     self.keep_scroll_frame(&lines);
                     return Ok(cm);
@@ -857,14 +856,14 @@ impl<R: Reader> Flow<R> {
                 return Ok("no-kb".to_string());
             }
             if has_kb == Some(true) {
-                let dismiss_set: Vec<String> = ui::DISMISS_KB_LABELS.iter().map(|l| casefold(l)).collect();
+                static DISMISS_SET: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+                let dismiss_set = DISMISS_SET.get_or_init(|| ui::DISMISS_KB_LABELS.iter().map(|l| casefold(l)).collect());
                 // Require actual keyboard or flush keyboard-accessory toolbar provenance
                 // for ALL dismiss labels (never authorize unmarked app buttons by position).
                 let hits: Vec<&Control> = ctl
                     .iter()
-                    .filter(|c| c.kind == "Button" && !c.is_disabled())
-                    .filter(|c| dismiss_set.contains(&casefold(&c.label)))
-                    .filter(|c| c.in_keyboard || c.in_keyboard_accessory)
+                    .filter(|c| c.kind == "Button" && !c.is_disabled() && (c.in_keyboard || c.in_keyboard_accessory))
+                    .filter(|c| dismiss_set.iter().any(|d| d == &casefold(&c.label)))
                     .collect();
                 let best = hits.into_iter().min_by_key(|item| {
                     let low = casefold(&item.label);
