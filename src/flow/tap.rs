@@ -1,24 +1,28 @@
 //! Tapping: `tap:`, `tapif:`, `tapel:`, `tapbatch:`, long-press, double-tap, zoom
 //! (Python Flow L3134-3919 and L4965-5060).
-use super::Flow;
+use super::{scope_controls, Flow};
 use crate::clock;
 use crate::error::{Error, Result};
 use crate::image::{box_diff, content_pixel_still, thumb_diff, Frame, GrayImage};
 use crate::json;
 use crate::ocr::{ReadOpts, Reader};
-use crate::text::{casefold, clean_text, controls_in_region, find_text, norm, region, split_where, Line, Match, DEFAULT_FUZZY};
+use crate::text::{casefold, clean_text, find_text, norm, region, split_where, Line, Match, DEFAULT_FUZZY};
 use crate::ui::{
     exact_control, find_control, find_control_match, Control, BACK_LABELS, CTL_CACHE_MAX_DIFF, CTL_CACHE_TTL,
     CTL_CACHE_TYPES, INPUT_TYPES, KB_TOOLBAR_LABELS, TAP_FORM_TYPES, WAIT_UI_TYPES,
 };
 use serde_json::{json as j, Value};
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::sync::{Arc, OnceLock};
 
 /// `TAP_FORM_TYPES + ("Image", "Slider", "Value")`.
-fn ext_types() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = TAP_FORM_TYPES.to_vec();
-    v.extend(["Image", "Slider", "Value"]);
-    v
+fn ext_types() -> &'static [&'static str] {
+    static EXT: OnceLock<Vec<&'static str>> = OnceLock::new();
+    EXT.get_or_init(|| {
+        let mut v: Vec<&'static str> = TAP_FORM_TYPES.to_vec();
+        v.extend(["Image", "Slider", "Value"]);
+        v
+    })
 }
 
 fn img(f: &Option<Frame>) -> Option<&GrayImage> {
@@ -30,12 +34,9 @@ fn where_set(w: Option<&str>) -> Option<&str> {
     w.filter(|s| !s.is_empty())
 }
 
-/// `_controls_in_region(ctl, lines, where) if where else ctl`.
-fn scope(ctl: &[Control], lines: &[Line], where_: Option<&str>) -> Vec<Control> {
-    match where_set(where_) {
-        Some(w) => controls_in_region(ctl, lines, Some(w)),
-        None => ctl.to_vec(),
-    }
+/// `_controls_in_region(ctl, lines, where) if where else ctl` without cloning when unscoped.
+fn scope<'a>(ctl: &'a [Control], lines: &[Line], where_: Option<&str>) -> Cow<'a, [Control]> {
+    scope_controls(ctl, lines, where_)
 }
 
 /// `where` is a `below:`/`above:` header condition (needs fresh OCR lines).
@@ -199,14 +200,20 @@ impl<R: Reader> Flow<R> {
         let norm_m = norm(&m.text);
         let near = |c: &Control| (c.x - m.x).abs() <= 45 && (c.y - m.y).abs() <= 24;
         let near_disabled = scoped.iter().any(|c| {
+            if !c.is_disabled() || !near(c) {
+                return false;
+            }
             let lab = casefold(&c.label);
-            c.is_disabled() && near(c) && (lab == want || lab.contains(&want) || norm_m.contains(&lab))
+            lab == want || lab.contains(&want) || norm_m.contains(&lab)
         });
         if near_disabled {
             // Only treat as disabled if no enabled control sits at the same spot.
             let has_enabled_here = scoped.iter().any(|c| {
+                if c.is_disabled() || !near(c) {
+                    return false;
+                }
                 let lab = casefold(&c.label);
-                !c.is_disabled() && near(c) && (lab == want || lab.contains(&want))
+                lab == want || lab.contains(&want)
             });
             if !has_enabled_here {
                 return true;
@@ -232,16 +239,19 @@ impl<R: Reader> Flow<R> {
         if base.starts_with("re:") {
             return Ok(None);
         }
-        let Some(cache) = self.ctl_cache.clone() else {
-            return Ok(None);
-        };
         let now = clock::now();
-        if cache.bundle != self.bundle || (now - cache.ts) > CTL_CACHE_TTL {
-            self.invalidate_ctl_cache();
-            return Ok(None);
-        }
-        let Some(c) = exact_control(&cache.controls, base, CTL_CACHE_TYPES, false).cloned() else {
-            return Ok(None);
+        let (c, cache_img) = {
+            let Some(cache) = self.ctl_cache.as_ref() else {
+                return Ok(None);
+            };
+            if cache.bundle != self.bundle || (now - cache.ts) > CTL_CACHE_TTL {
+                self.invalidate_ctl_cache();
+                return Ok(None);
+            }
+            let Some(c) = exact_control(&cache.controls, base, CTL_CACHE_TYPES, false).cloned() else {
+                return Ok(None);
+            };
+            (c, cache.img.clone())
         };
         // Reuse a frame already grabbed after the previous action if very fresh;
         // otherwise take one cheap grab to confirm layout stability and serve as the
@@ -256,8 +266,8 @@ impl<R: Reader> Flow<R> {
             }
         };
         let scale = self.r.scale();
-        if thumb_diff(Some(&cache.img), Some(&cur_img)) >= 5.0
-            || box_diff(Some(&cache.img), Some(&cur_img), c.x as f64, c.y as f64, scale, 35.0, 25.0, 0) >= 8.0
+        if thumb_diff(Some(&cache_img), Some(&cur_img)) >= 5.0
+            || box_diff(Some(&cache_img), Some(&cur_img), c.x as f64, c.y as f64, scale, 35.0, 25.0, 0) >= 8.0
         {
             self.invalidate_ctl_cache();
             return Ok(None);
@@ -267,15 +277,11 @@ impl<R: Reader> Flow<R> {
         let m = self.tap_control(&c, None)?;
         if self.changed_since(Some(before), 0.45, Some(c.x), Some(c.y))? {
             if let Some(last) = self.r.last() {
-                if thumb_diff(Some(&cache.img), Some(&last)) >= 5.0 {
+                if thumb_diff(Some(&cache_img), Some(&last)) >= 5.0 {
                     self.invalidate_ctl_cache();
-                } else {
-                    self.ctl_cache = Some(super::CtlCache {
-                        controls: cache.controls,
-                        bundle: cache.bundle,
-                        ts: clock::now(),
-                        img: last,
-                    });
+                } else if let Some(cache) = self.ctl_cache.as_mut() {
+                    cache.ts = clock::now();
+                    cache.img = last;
                 }
             }
         } else {
@@ -391,7 +397,7 @@ impl<R: Reader> Flow<R> {
             let fl = first_lines.clone().unwrap_or_default();
             let scoped = scope(&ctl, &fl, wh);
             let ext = ext_types();
-            let mut c = exact_control(&scoped, &base, &ext, false).cloned();
+            let mut c = exact_control(&scoped, &base, ext, false).cloned();
             if c.is_none() && BACK_LABELS.contains(&low_base.as_str()) {
                 for alt in BACK_LABELS {
                     c = exact_control(&scoped, alt, &["Button", "Link"], false).cloned();
@@ -403,7 +409,7 @@ impl<R: Reader> Flow<R> {
             if let Some(c) = c {
                 return self.tap_control(&c, None);
             }
-            if exact_control(&scoped, &base, &ext, true).is_some() {
+            if exact_control(&scoped, &base, ext, true).is_some() {
                 return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
             }
         }
@@ -475,9 +481,10 @@ impl<R: Reader> Flow<R> {
             //    its centre.
             let cur_lines = self.tap_current_lines()?;
             let rc = self.tap_ctl(None)?;
-            let ctl = controls_in_region(&rc, &cur_lines, wh);
-            resolved_ctl = Some(rc);
+            let ctl = scope(&rc, &cur_lines, wh);
             let c = self.resolve_ocr_control(&m, &base, &ctl, near_bottom_tab, is_form_label)?;
+            drop(ctl);
+            resolved_ctl = Some(rc);
             if let Some(c) = c {
                 return self.tap_control(&c, None);
             }
@@ -597,7 +604,7 @@ impl<R: Reader> Flow<R> {
             if past(deadline) {
                 return Ok("skipped".into());
             }
-            let ctl = controls_in_region(resolved_ctl.as_deref().unwrap_or(&[]), lines, where_);
+            let ctl = scope(resolved_ctl.as_deref().unwrap_or(&[]), lines, where_);
             if let Some(c) = self.resolve_ocr_control(m, base, &ctl, near_bottom_tab, is_form_label)? {
                 if past(deadline) {
                     return Ok("skipped".into());
@@ -634,7 +641,7 @@ impl<R: Reader> Flow<R> {
     fn tap_if_ctl_hit(&mut self, ctl: &[Control], base: &str, back_alts: bool, deadline: f64) -> Result<Option<String>> {
         let ext = ext_types();
         if base.starts_with("re:") {
-            if let Some(cm) = find_control_match(ctl, base, Some(&ext), false) {
+            if let Some(cm) = find_control_match(ctl, base, Some(ext), false) {
                 if clock::now() >= deadline {
                     return Ok(Some("skipped".into()));
                 }
@@ -642,7 +649,7 @@ impl<R: Reader> Flow<R> {
                 return Ok(Some(cm.text));
             }
         } else {
-            let mut c = exact_control(ctl, base, &ext, false).cloned();
+            let mut c = exact_control(ctl, base, ext, false).cloned();
             if c.is_none() && back_alts && BACK_LABELS.contains(&casefold(base).as_str()) {
                 for alt in BACK_LABELS {
                     c = exact_control(ctl, alt, &["Button", "Link"], false).cloned();
@@ -724,7 +731,7 @@ impl<R: Reader> Flow<R> {
                 // Verified target-app tree can supply direct control coordinates
                 // immediately (unless @below/@above needs fresh OCR lines).
                 if !is_header_where(wh) {
-                    let ctl = controls_in_region(&raw_ctl, &[], wh);
+                    let ctl = scope(&raw_ctl, &[], wh);
                     if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, true, deadline)? {
                         return Ok(r);
                     }
@@ -824,15 +831,17 @@ impl<R: Reader> Flow<R> {
                     last_ctl = Some(raw_ctl.clone());
                     last_ui_img = None;
                     self.r.invalidate_last();
-                    let ctl = if !is_header_where(wh) { controls_in_region(&raw_ctl, &[], wh) } else { vec![] };
-                    if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, false, deadline)? {
-                        return Ok(r);
+                    if !is_header_where(wh) {
+                        let ctl = scope(&raw_ctl, &[], wh);
+                        if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, false, deadline)? {
+                            return Ok(r);
+                        }
                     }
                     continue;
                 }
                 if !stale_app && confirmed_fresh_app {
                     last_ctl = Some(raw_ctl.clone());
-                    let ctl = controls_in_region(&raw_ctl, &lines, wh);
+                    let ctl = scope(&raw_ctl, &lines, wh);
                     if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, true, deadline)? {
                         return Ok(r);
                     }
@@ -911,8 +920,11 @@ impl<R: Reader> Flow<R> {
         Ok(ctl
             .iter()
             .filter(|c| {
+                if c.kind != "Switch" || (c.y - m.y).abs() > 30 {
+                    return false;
+                }
                 let lab = casefold(&c.label);
-                c.kind == "Switch" && (c.y - m.y).abs() <= 30 && (lab.contains(&want) || norm_m.contains(&lab))
+                lab.contains(&want) || norm_m.contains(&lab)
             })
             .min_by_key(|c| (c.y - m.y).abs())
             .cloned())
@@ -979,10 +991,10 @@ impl<R: Reader> Flow<R> {
         let ctl = self.tap_ctl(None)?;
         let low = casefold(label);
         cands.extend(
-            controls_in_region(&ctl, &lines, wh)
-                .into_iter()
-                .filter(|c| (c.kind == "Button" || c.kind == "Link") && casefold(&c.label) == low && !c.is_disabled())
-                .map(|c| (c.is_disabled(), c.y, c.x, c.label)),
+            scope(&ctl, &lines, wh)
+                .iter()
+                .filter(|c| (c.kind == "Button" || c.kind == "Link") && !c.is_disabled() && casefold(&c.label) == low)
+                .map(|c| (false, c.y, c.x, c.label.clone())),
         );
         let Some((_, y, x, text)) = cands.into_iter().min() else {
             return Ok(None);
@@ -1052,10 +1064,10 @@ impl<R: Reader> Flow<R> {
             let ctl = self.tap_ctl(None)?;
             let scoped = scope(&ctl, &lines, wh);
             let ext = ext_types();
-            if let Some(c) = exact_control(&scoped, &base, &ext, false) {
+            if let Some(c) = exact_control(&scoped, &base, ext, false) {
                 return Ok(Match::new(c.x, c.y, c.label.clone(), None, 0));
             }
-            if exact_control(&scoped, &base, &ext, true).is_some() {
+            if exact_control(&scoped, &base, ext, true).is_some() {
                 return Err(disabled(&base));
             }
         }
@@ -1096,7 +1108,7 @@ impl<R: Reader> Flow<R> {
         if m.line.is_some() && m.rank != 0 && !base.starts_with("re:") {
             let cur_lines = self.tap_current_lines()?;
             let rc = self.tap_ctl(None)?;
-            let ctl = controls_in_region(&rc, &cur_lines, wh);
+            let ctl = scope(&rc, &cur_lines, wh);
             if let Some(c) = exact_control(&ctl, &base, TAP_FORM_TYPES, false) {
                 return Ok(Match::new(c.x, c.y, c.label.clone(), None, 0));
             }

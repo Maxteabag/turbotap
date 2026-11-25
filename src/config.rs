@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -52,26 +53,71 @@ pub struct Config {
     pub app_prefer: HashMap<String, String>,
 }
 
-impl Config {
-    pub fn load() -> Config {
-        let path = default_config_path();
-        let raw = std::fs::read_to_string(&path)
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    path: PathBuf,
+    /// `(mtime_sec, mtime_nsec, len, ino)` or `None` when the file does not exist.
+    meta: Option<(i64, i64, u64, u64)>,
+}
+
+impl FileStamp {
+    fn from(path: PathBuf, meta: Option<&std::fs::Metadata>) -> FileStamp {
+        FileStamp {
+            path,
+            meta: meta.map(|m| (m.mtime(), m.mtime_nsec(), m.len(), m.ino())),
+        }
+    }
+}
+
+fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>) {
+    if let Some(p) = env_nonempty("WDA_CONFIG") {
+        let ep = expanduser(&p);
+        let meta = std::fs::metadata(&ep).ok();
+        return (ep, meta);
+    }
+    let h = home();
+    let primary = h.join(".config/turbotap/config.json");
+    if let Ok(m) = std::fs::metadata(&primary) {
+        return (primary, Some(m));
+    }
+    let legacy = h.join(".config/iphone-wda/config.json");
+    if let Ok(m) = std::fs::metadata(&legacy) {
+        return (legacy, Some(m));
+    }
+    (primary, None)
+}
+
+fn load_config_from(path: PathBuf, exists: bool, mac_host_env: Option<&str>) -> (Config, Option<String>) {
+    let raw = if exists {
+        std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
             .filter(|v| v.is_object())
-            .unwrap_or_else(|| Value::Object(Default::default()));
-        let mac_host = env_nonempty("WDA_MAC_HOST")
-            .or_else(|| raw.get("mac_host").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from))
-            .unwrap_or_else(|| "mac".to_string());
-        let mut app_prefer = HashMap::new();
-        if let Some(m) = raw.get("app_prefer").and_then(|v| v.as_object()) {
-            for (k, v) in m {
-                if let Some(s) = v.as_str() {
-                    app_prefer.insert(crate::text::casefold(k), s.to_string());
-                }
+            .unwrap_or_else(|| Value::Object(Default::default()))
+    } else {
+        Value::Object(Default::default())
+    };
+    let file_mac_host = raw.get("mac_host").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
+    let mac_host = mac_host_env
+        .map(String::from)
+        .or_else(|| file_mac_host.clone())
+        .unwrap_or_else(|| "mac".to_string());
+    let mut app_prefer = HashMap::new();
+    if let Some(m) = raw.get("app_prefer").and_then(|v| v.as_object()) {
+        for (k, v) in m {
+            if let Some(s) = v.as_str() {
+                app_prefer.insert(crate::text::casefold(k), s.to_string());
             }
         }
-        Config { path, raw, mac_host, app_prefer }
+    }
+    (Config { path, raw, mac_host, app_prefer }, file_mac_host)
+}
+
+impl Config {
+    pub fn load() -> Config {
+        let (path, meta) = resolve_config_path_and_meta();
+        let mac_host_env = env_nonempty("WDA_MAC_HOST");
+        load_config_from(path, meta.is_some(), mac_host_env.as_deref()).0
     }
 
     pub fn get(&self, key: &str) -> &Value {
@@ -80,33 +126,67 @@ impl Config {
 }
 
 pub fn default_config_path() -> PathBuf {
-    if let Some(p) = env_nonempty("WDA_CONFIG") {
-        return expanduser(&p);
-    }
-    for p in ["~/.config/turbotap/config.json", "~/.config/iphone-wda/config.json"] {
-        let ep = expanduser(p);
-        if ep.exists() {
-            return ep;
-        }
-    }
-    expanduser("~/.config/turbotap/config.json")
+    resolve_config_path_and_meta().0
 }
 
-static CURRENT: RwLock<Option<Arc<Config>>> = RwLock::new(None);
+struct CachedConfig {
+    stamp: FileStamp,
+    mac_host_env: Option<String>,
+    file_mac_host: Option<String>,
+    config: Arc<Config>,
+}
+
+static CURRENT: RwLock<Option<CachedConfig>> = RwLock::new(None);
 
 /// The active configuration (loaded on first use).
 pub fn current() -> Arc<Config> {
-    if let Some(c) = CURRENT.read().unwrap().clone() {
-        return c;
+    if let Some(c) = CURRENT.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return c.config.clone();
     }
     reload()
 }
 
 /// Re-read env-derived configuration (the daemon calls this per request).
+/// Skips re-reading and re-parsing `config.json` when `(path, mtime, len, ino)` is unchanged.
 pub fn reload() -> Arc<Config> {
-    let c = Arc::new(Config::load());
-    *CURRENT.write().unwrap() = Some(c.clone());
-    c
+    let (path, meta) = resolve_config_path_and_meta();
+    let stamp = FileStamp::from(path, meta.as_ref());
+    let mac_host_env = env_nonempty("WDA_MAC_HOST");
+    {
+        let guard = CURRENT.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = guard.as_ref() {
+            if cached.stamp == stamp && cached.mac_host_env == mac_host_env {
+                return cached.config.clone();
+            }
+            if cached.stamp == stamp {
+                // Only WDA_MAC_HOST changed; reuse the parsed JSON without disk I/O.
+                let mut cfg = (*cached.config).clone();
+                cfg.mac_host = mac_host_env
+                    .clone()
+                    .or_else(|| cached.file_mac_host.clone())
+                    .unwrap_or_else(|| "mac".to_string());
+                let file_mac_host = cached.file_mac_host.clone();
+                drop(guard);
+                let arc = Arc::new(cfg);
+                *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(CachedConfig {
+                    stamp,
+                    mac_host_env,
+                    file_mac_host,
+                    config: arc.clone(),
+                });
+                return arc;
+            }
+        }
+    }
+    let (cfg, file_mac_host) = load_config_from(stamp.path.clone(), stamp.meta.is_some(), mac_host_env.as_deref());
+    let arc = Arc::new(cfg);
+    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(CachedConfig {
+        stamp,
+        mac_host_env,
+        file_mac_host,
+        config: arc.clone(),
+    });
+    arc
 }
 
 thread_local! {
@@ -243,4 +323,37 @@ pub fn guard_remote(what: &str) -> Result<()> {
         return Err(Error::runtime(format!("{what} is disabled in test builds (offline only)")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+    use crate::testutil::{set_env, TempDir};
+
+    #[test]
+    fn reload_caches_unchanged_file_and_tracks_mac_host_override() {
+        let tmp = TempDir::new("tt-cfg-cache-");
+        let cfg_path = tmp.path().join("config.json");
+        std::fs::write(&cfg_path, r#"{"mac_host":"mini-1","app_prefer":{"Mail":"com.apple.mobilemail"}}"#).unwrap();
+        let p = cfg_path.to_string_lossy().into_owned();
+        let _e = set_env(&[("WDA_CONFIG", Some(p.as_str())), ("WDA_MAC_HOST", None)]);
+        let c1 = reload();
+        let c2 = reload();
+        assert!(Arc::ptr_eq(&c1, &c2), "unchanged config.json should reuse cached Arc<Config>");
+        assert_eq!(c1.mac_host, "mini-1");
+        assert_eq!(c1.app_prefer.get("mail").map(String::as_str), Some("com.apple.mobilemail"));
+
+        // Env override updates mac_host without needing file changes.
+        std::env::set_var("WDA_MAC_HOST", "mini-override");
+        let c3 = reload();
+        assert_eq!(c3.mac_host, "mini-override");
+        assert_eq!(c3.app_prefer.get("mail").map(String::as_str), Some("com.apple.mobilemail"));
+
+        // File replacement invalidates the cache.
+        std::env::remove_var("WDA_MAC_HOST");
+        std::fs::write(&cfg_path, r#"{"mac_host":"mini-2-updated","app_prefer":{}}"#).unwrap();
+        let c4 = reload();
+        assert_eq!(c4.mac_host, "mini-2-updated");
+        assert!(c4.app_prefer.is_empty());
+    }
 }
