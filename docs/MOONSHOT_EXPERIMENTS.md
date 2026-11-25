@@ -1,6 +1,6 @@
 # Turbotap moonshot experiments
 
-**Two measurements are being rerun.** The original cold baseline used a polling wait that could round latency upward. Original preflight pairs verified equal fields but recorded only the requested route. The direct-capture and transition tables below now use confirmed runner metadata and first-frame receipt timestamps.
+The reported baseline, combined preflight, capture-scale comparisons and transition timings use corrected measurement harnesses. Earlier trials lacked route confirmation, rounded subprocess completion times, or could miss the first changed frame. The corrected trials replaced those series in the public receipts.
 
 ## Reproducing the comparisons
 
@@ -17,23 +17,23 @@ The Rust, daemon, Jev and RapidOCR directories document separate prerequisites a
 
 ## What the baseline measures
 
-Ten interleaved fresh-process trials per CLI operation on a real iPhone 17 running WDA Turbo v5 over Wi-Fi. The host ran the v0.9.0 Python source. OS filesystem caches and WDA session settings were warm. The primitive timings use an existing HTTP connection. Phase timings overlap or come from different requests and cannot be summed into a CLI latency. HTTP service times include the round trip.
+Ten interleaved fresh-process trials per CLI operation on a real iPhone 17 over Wi-Fi. The corrected timing pass used the baseline client against the v5-compatible signed lab runner. The host ran the v0.9.0 Python source. OS filesystem caches and WDA session settings were warm. The timed CLI subprocesses drained both pipes through EOF. The parent required an already responsive runner, and measured device CLI children used the same session guard. The primitive timings use an existing HTTP connection. Phase timings overlap or come from different requests and cannot be summed into a CLI latency. HTTP service times include the round trip.
 
 | Operation | n | Median ms | Range ms |
 |---|---:|---:|---:|
-| cli flow read:ocr | 10 | 365.26 | 364.39–821.10 |
-| cli preflight | 10 | 264.32 | 264.19–267.95 |
-| cli flow ui | 10 | 214.19 | 214.11–214.72 |
-| cli flow ui read:ocr | 10 | 464.75 | 464.60–516.75 |
-| cli --help | 10 | 31.85 | 31.70–64.00 |
-| screenshot HTTP | 10 | 72.42 | 68.60–80.25 |
-| JPEG decode + grayscale | 10 | 3.53 | 2.15–10.18 |
-| cuts incl pixel copy | 10 | 0.88 | 0.58–0.94 |
-| read supplied image empty strip cache | 10 | 22.44 | 16.58–161.74 |
-| read supplied image populated strip cache | 10 | 1.21 | 0.87–1.47 |
-| fastUI HTTP | 10 | 115.94 | 112.40–122.62 |
-| fastUI JSON decode | 10 | 0.03 | 0.02–0.05 |
-| fastUI normalize | 10 | 0.07 | 0.05–0.14 |
+| cli flow read:ocr | 10 | 311.53 | 286.94–321.10 |
+| cli preflight | 10 | 240.53 | 222.50–247.75 |
+| cli flow ui | 10 | 161.04 | 143.83–177.26 |
+| cli flow ui read:ocr | 10 | 408.15 | 373.92–434.90 |
+| cli --help | 10 | 30.25 | 19.02–33.61 |
+| screenshot HTTP | 10 | 68.60 | 66.68–77.97 |
+| JPEG decode + grayscale | 10 | 3.36 | 1.63–11.05 |
+| cuts incl pixel copy | 10 | 0.70 | 0.49–0.98 |
+| read supplied image empty strip cache | 10 | 16.79 | 13.53–124.13 |
+| read supplied image populated strip cache | 10 | 1.00 | 0.76–1.40 |
+| fastUI HTTP | 10 | 107.94 | 102.98–114.86 |
+| fastUI JSON decode | 10 | 0.04 | 0.03–0.09 |
+| fastUI normalize | 10 | 0.07 | 0.06–0.23 |
 
 ## Prototype comparisons
 
@@ -169,12 +169,13 @@ Safari rendered a static HTML page served by the experimental runner over device
 
 ## Fused preflight on Calculator
 
-Twelve alternating-order pairs used the candidate CLI against one installed build. The harness compared every returned field except the elapsed time within each pair. All pairs agreed.
+Twelve alternating-order pairs used the candidate CLI against one installed build. The harness compared every returned field except the elapsed time within each pair. Each timed child also recorded whether the combined response was accepted. All fast-arm runs required acceptance, and all pairs agreed. These trials restored orientation and unlock state after exercising the rotated and locked cases.
 
-| Arm | CLI wall median ms | Inside preflight median ms |
-|---|---:|---:|
-| stock sequence | 237.7 | 205.6 |
-| combined | 229.5 | 193.6 |
+| State | Stock median wall ms | Combined median wall ms | Matching pairs |
+|---|---:|---:|---:|
+| calc | 245.3 | 229.9 | 12/12 |
+| rotated | 237.1 | 225.6 | 12/12 |
+| locked | 136.0 | 125.9 | 12/12 |
 
 ## On-device predicate waits
 
@@ -227,13 +228,6 @@ All three taps changed the display region. Each conditional response matched bot
 ## Conventional model per turn
 
 A direct native CLI trial on four synthetic checkpoints returned `model_not_found` four times, so it yielded no ordinary per-turn success latency. In a separate relay trial, the relay replaced the CLI-generated request with a tool-free prompt. Those four processes took 11.60 s summed and returned four correct choices, including abstention when the square-root key was absent. Jev took 0.86 s summed across the four recorded requests and made three correct choices. The fourth checkpoint was selected because Jev had failed it. The comparison illustrates latency and that failure mode. Four selected cases cannot estimate either model’s general accuracy. The full receipts and environment details are in experimental/jev/.
-
-## Preflight under rotation and lock
-
-The same twelve paired fresh-process calls per state compared all stable output fields. The operator restored the initial orientation after rotation and verified unlock and Calculator activation after the locked trial.
-
-- rotated, stock median 239.3 ms, combined median 229.0 ms, 12/12 matching pairs.
-- locked, stock median 146.4 ms, combined median 123.7 ms, 12/12 matching pairs.
 
 ### WDA overlay compatibility
 
