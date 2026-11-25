@@ -267,8 +267,9 @@ impl GrayImage {
 
     /// Decode JPEG or PNG bytes to grayscale (PIL `convert("L")`: ITU-R 601-2 luma).
     ///
-    /// Fast-paths YCbCr/Luma JPEGs via `zune-jpeg` with `ColorSpace::Luma` to extract
-    /// the Y channel directly without chroma upsampling or RGB -> Luma conversion.
+    /// Single-channel grayscale JPEGs take the direct `zune-jpeg` `ColorSpace::Luma`
+    /// fast path; color JPEGs keep the exact `RGB -> l24` conversion so high-chroma
+    /// edges match `v1.0.0` bit-for-bit.
     pub fn decode(bytes: &[u8]) -> Result<GrayImage> {
         if let Some(img) = decode_jpeg_luma(bytes) {
             return Ok(img);
@@ -615,10 +616,9 @@ fn clip8_i32(ss: i32) -> u8 {
     (ss >> PRECISION_BITS).clamp(0, 255) as u8
 }
 
-/// Fast luma-only JPEG decode via `zune-jpeg` (`ColorSpace::Luma`), extracting the Y
-/// channel directly without Cb/Cr chroma upsampling or RGB -> Luma conversion.
-/// Returns `None` for non-JPEG, non-YCbCr/Luma JPEGs (CMYK/RGB), or decode errors so
-/// `GrayImage::decode` falls back to `image::load_from_memory`.
+/// Fast luma-only JPEG decode via `zune-jpeg` (`ColorSpace::Luma`) strictly for
+/// single-channel grayscale JPEGs. Color JPEGs (YCbCr/RGB/CMYK) return `None` so
+/// `GrayImage::decode` keeps the bit-exact `RGB -> l24` path.
 fn decode_jpeg_luma(bytes: &[u8]) -> Option<GrayImage> {
     use zune_jpeg::zune_core::bytestream::ZCursor;
     use zune_jpeg::zune_core::colorspace::ColorSpace;
@@ -631,7 +631,7 @@ fn decode_jpeg_luma(bytes: &[u8]) -> Option<GrayImage> {
     let opts = DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::Luma);
     let mut dec = JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
     dec.decode_headers().ok()?;
-    if !matches!(dec.input_colorspace(), Some(ColorSpace::YCbCr | ColorSpace::Luma)) {
+    if dec.input_colorspace() != Some(ColorSpace::Luma) {
         return None;
     }
     let info = dec.info()?;
@@ -788,19 +788,21 @@ mod img_opt_tests {
     }
 
     #[test]
-    fn zune_jpeg_luma_matches_rgb_l24_within_rounding() {
-        // Realistic smooth UI colors (avoids 1px XOR chroma-clamping artifacts in 4:2:0).
+    fn color_jpeg_preserves_exact_rgb_l24_on_saturated_chroma_edges_and_gray_uses_fast_path() {
+        // Saturated high-chroma 4:2:0 edges (red/cyan, blue/yellow, green/magenta sharp bars)
+        // where raw Y plane diverges by >20 gray levels from RGB -> l24 due to chroma upsampling/clipping.
         let (w, h) = (160u32, 240u32);
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
         for y in 0..h {
             for x in 0..w {
-                let (r, g, b) = if y < 40 {
-                    (28u8, 32u8, 44u8)
-                } else if y >= 80 && y < 120 && x >= 20 && x < 140 {
-                    (18u8, 122u8, 255u8)
+                let (r, g, b) = if y < 60 {
+                    if (x / 4) % 2 == 0 { (255, 0, 0) } else { (0, 255, 255) }
+                } else if y < 120 {
+                    if ((x + y) / 3) % 2 == 0 { (0, 0, 255) } else { (255, 255, 0) }
+                } else if y < 180 {
+                    if (y / 2) % 2 == 0 { (0, 255, 0) } else { (255, 0, 255) }
                 } else {
-                    let v = 220u8.saturating_add(((x + y) / 16) as u8);
-                    (v, v.saturating_sub(4), v.saturating_sub(8))
+                    (255u8.wrapping_sub(x as u8), (y as u8).wrapping_mul(3), (x ^ y) as u8)
                 };
                 rgb.extend_from_slice(&[r, g, b]);
             }
@@ -809,23 +811,21 @@ mod img_opt_tests {
         let mut enc = ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75);
         enc.encode(&rgb, w, h, ::image::ExtendedColorType::Rgb8).unwrap();
 
-        let fast = decode_jpeg_luma(&jpeg).expect("zune-jpeg fast path");
+        // Color JPEG must NOT bypass RGB -> l24 via the Y-plane shortcut.
+        assert!(decode_jpeg_luma(&jpeg).is_none());
+        let decoded = GrayImage::decode(&jpeg).expect("color jpeg decode");
         let ref_rgb = ::image::load_from_memory(&jpeg).unwrap().to_rgb8();
         let ref_luma: Vec<u8> = ref_rgb.into_raw().chunks_exact(3).map(l24).collect();
-        assert_eq!((fast.w, fast.h), (w, h));
-        let mean_diff: f64 =
-            fast.data.iter().zip(&ref_luma).map(|(&a, &b)| a.abs_diff(b) as f64).sum::<f64>() / fast.data.len() as f64;
-        let max_diff = fast.data.iter().zip(&ref_luma).map(|(&a, &b)| a.abs_diff(b)).max().unwrap_or(0);
-        assert!(mean_diff < 0.5, "mean diff too high: {mean_diff}");
-        assert!(max_diff <= 2, "Y channel vs l24(YCbCr->RGB) diverged by {max_diff}");
+        assert_eq!((decoded.w, decoded.h), (w, h));
+        assert_eq!(decoded.data, ref_luma, "color JPEG grayscale pixels must match RGB -> l24 bit-for-bit");
 
         // PNG still decodes via fallback.
-        let png = fast.encode_png();
+        let png = decoded.encode_png();
         assert!(decode_jpeg_luma(&png).is_none());
-        assert_eq!(GrayImage::decode(&png).unwrap(), fast);
+        assert_eq!(GrayImage::decode(&png).unwrap(), decoded);
 
-        // Grayscale JPEG uses fast path and matches image crate decode exactly.
-        let gray_jpeg = fast.encode_jpeg(80);
+        // Single-channel grayscale JPEG takes the direct zune-jpeg fast path and matches bit-for-bit.
+        let gray_jpeg = decoded.encode_jpeg(80);
         let dec_gray = decode_jpeg_luma(&gray_jpeg).expect("gray jpeg fast path");
         let ref_gray = ::image::load_from_memory(&gray_jpeg).unwrap().into_luma8().into_raw();
         assert_eq!((dec_gray.w, dec_gray.h), (w, h));

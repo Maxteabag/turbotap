@@ -6,9 +6,9 @@
 //! from a single installed binary with no repo checkout. The stamp is computed over
 //! exactly the bytes Python hashed (relative path `name/file` + NUL + contents, in
 //! sorted order), so a Python-era `skills.json` stays valid after the upgrade.
+use crate::config::{read_to_string_stamped, FileStamp};
 use crate::error::{Error, Result};
 use serde_json::{Map, Value};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
@@ -149,22 +149,10 @@ fn load_skill_state() -> Map<String, Value> {
     load_skill_state_from(&skill_state_path())
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct SkillStateStamp {
-    path: PathBuf,
-    meta: (i64, i64, u64, u64),
-}
-
-impl SkillStateStamp {
-    fn from(path: PathBuf, m: &std::fs::Metadata) -> SkillStateStamp {
-        SkillStateStamp { path, meta: (m.mtime(), m.mtime_nsec(), m.len(), m.ino()) }
-    }
-}
-
-static VERIFIED_SKILL_STATE: RwLock<Option<SkillStateStamp>> = RwLock::new(None);
+static VERIFIED_SKILL_STATE: RwLock<Option<FileStamp>> = RwLock::new(None);
 
 /// `json.dump(st, f, indent=1)`.
-fn save_skill_state_to(path: &Path, st: &Map<String, Value>) -> Result<()> {
+fn save_skill_state_to(path: &Path, st: &Map<String, Value>) -> Result<usize> {
     use serde::Serialize;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| os_err(parent, e))?;
@@ -173,11 +161,14 @@ fn save_skill_state_to(path: &Path, st: &Map<String, Value>) -> Result<()> {
     let fmt = serde_json::ser::PrettyFormatter::with_indent(b" ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
     Value::Object(st.clone()).serialize(&mut ser).map_err(|e| Error::Value(e.to_string()))?;
-    std::fs::write(path, buf).map_err(|e| os_err(path, e))
+    let len = buf.len();
+    std::fs::write(path, buf).map_err(|e| os_err(path, e))?;
+    Ok(len)
 }
 
 fn save_skill_state(st: &Map<String, Value>) -> Result<()> {
-    save_skill_state_to(&skill_state_path(), st)
+    save_skill_state_to(&skill_state_path(), st)?;
+    Ok(())
 }
 
 fn targets_of(st: &Map<String, Value>) -> Vec<String> {
@@ -194,25 +185,38 @@ pub fn sync_skills_if_stale() {
     // Test builds never refresh skills outside a temporary state dir (an in-process
     // run_cli must not rewrite the developer's real ~/.claude or ~/.agents skills).
     #[cfg(test)]
-    if !path.starts_with(std::env::temp_dir()) {
+    if !abspath(&path).starts_with(std::env::temp_dir()) {
         return;
     }
     let Ok(meta) = std::fs::metadata(&path) else {
         return;
     };
-    let file_stamp = SkillStateStamp::from(path.clone(), &meta);
-    if VERIFIED_SKILL_STATE.read().unwrap_or_else(|e| e.into_inner()).as_ref() == Some(&file_stamp) {
+    let lookup_stamp = FileStamp::from_meta(&path, &meta);
+    if VERIFIED_SKILL_STATE.read().unwrap_or_else(|e| e.into_inner()).as_ref() == Some(&lookup_stamp) {
         return;
     }
-    let mut st = load_skill_state_from(&path);
+    let Ok((raw, stable_stamp)) = read_to_string_stamped(&path) else {
+        return;
+    };
+    let Some(mut st) = serde_json::from_str::<Value>(&raw).ok().and_then(|v| match v {
+        Value::Object(m) => Some(m),
+        _ => None,
+    }) else {
+        // Never cache corrupt or non-object state files as verified.
+        return;
+    };
     let targets = targets_of(&st);
     if targets.is_empty() {
-        *VERIFIED_SKILL_STATE.write().unwrap_or_else(|e| e.into_inner()) = Some(file_stamp);
+        if let Some(stamp) = stable_stamp {
+            *VERIFIED_SKILL_STATE.write().unwrap_or_else(|e| e.into_inner()) = Some(stamp);
+        }
         return;
     }
     let stamp = skills_stamp_str();
     if st.get("stamp").and_then(|v| v.as_str()) == Some(stamp) {
-        *VERIFIED_SKILL_STATE.write().unwrap_or_else(|e| e.into_inner()) = Some(file_stamp);
+        if let Some(file_stamp) = stable_stamp {
+            *VERIFIED_SKILL_STATE.write().unwrap_or_else(|e| e.into_inner()) = Some(file_stamp);
+        }
         return;
     }
     for root in &targets {
@@ -225,8 +229,11 @@ pub fn sync_skills_if_stale() {
     // Python lets a failed state write propagate; a stale stamp only means the next
     // run refreshes again, so a read-only state dir must not break every command.
     match save_skill_state_to(&path, &st) {
-        Ok(()) => {
-            let new_stamp = std::fs::metadata(&path).ok().map(|m| SkillStateStamp::from(path, &m));
+        Ok(written_len) => {
+            let new_stamp = std::fs::metadata(&path)
+                .ok()
+                .filter(|m| m.len() == written_len as u64)
+                .map(|m| FileStamp::from_meta(&path, &m));
             *VERIFIED_SKILL_STATE.write().unwrap_or_else(|e| e.into_inner()) = new_stamp;
         }
         Err(e) => {
@@ -362,12 +369,38 @@ mod unit {
 
         // Switching XDG_STATE_HOME to state-b must not be masked by state-a's cached verification.
         std::env::set_var("XDG_STATE_HOME", &state_b);
+        let state_b_file = state_b.join("turbotap/skills.json");
         std::fs::write(
-            state_b.join("turbotap/skills.json"),
+            &state_b_file,
             serde_json::json!({"targets": [root_b.to_str().unwrap()], "stamp": "stale"}).to_string(),
         )
         .unwrap();
         sync_skills_if_stale();
         assert!(root_b.join("turbotap/SKILL.md").is_file());
+
+        // In-place overwrite with identical inode, length, and nanosecond mtime invalidates cache.
+        let root_c = tmp.path().join("skills-c");
+        let root_d = tmp.path().join("skills-d");
+        let fresh_json = serde_json::json!({"targets": [root_c.to_str().unwrap()], "stamp": s1}).to_string();
+        let stale_stamp = "0".repeat(s1.len());
+        let stale_json = serde_json::json!({"targets": [root_d.to_str().unwrap()], "stamp": stale_stamp}).to_string();
+        assert_eq!(fresh_json.len(), stale_json.len());
+        std::fs::write(&state_b_file, &fresh_json).unwrap();
+        sync_skills_if_stale();
+        assert!(!root_c.join("turbotap/SKILL.md").exists(), "fresh stamp should not reinstall");
+        crate::config::overwrite_preserving_inode_and_mtime(&state_b_file, &stale_json);
+        sync_skills_if_stale();
+        assert!(root_d.join("turbotap/SKILL.md").is_file(), "in-place same-mtime update must refresh skills");
+
+        // Corrupt JSON is never cached as verified: replacing it with a stale state file triggers sync.
+        let root_e = tmp.path().join("skills-e");
+        let stale_e = serde_json::json!({"targets": [root_e.to_str().unwrap()], "stamp": stale_stamp}).to_string();
+        let corrupt = "{".repeat(stale_e.len());
+        std::fs::write(&state_b_file, &corrupt).unwrap();
+        sync_skills_if_stale();
+        assert!(!root_e.join("turbotap/SKILL.md").exists());
+        crate::config::overwrite_preserving_inode_and_mtime(&state_b_file, &stale_e);
+        sync_skills_if_stale();
+        assert!(root_e.join("turbotap/SKILL.md").is_file(), "corrupt state file must not be cached as verified");
     }
 }

@@ -1,10 +1,10 @@
 //! App display names -> bundle IDs (`open:Spotify`), v0.10.0 cli.py L1934-1999.
+use crate::config::{read_to_string_stamped, FileStamp};
 use crate::error::{Error, Result};
 use crate::json;
 use crate::text::{casefold, clean_text, get_close_matches};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -135,12 +135,6 @@ impl IndexedApp {
     }
 }
 
-type FileStamp = (i64, i64, u64, u64);
-
-fn file_stamp(m: &std::fs::Metadata) -> FileStamp {
-    (m.mtime(), m.mtime_nsec(), m.len(), m.ino())
-}
-
 struct CachedApps {
     stamp: FileStamp,
     apps: Arc<Vec<IndexedApp>>,
@@ -159,26 +153,37 @@ fn store_app_cache(path: PathBuf, stamp: FileStamp, apps: Arc<Vec<IndexedApp>>) 
     cache.insert(path, CachedApps { stamp, apps });
 }
 
+fn remove_app_cache(path: &Path) {
+    let mut cache = app_cache().write().unwrap_or_else(|e| e.into_inner());
+    cache.remove(path);
+}
+
 fn load_apps_indexed(refresh: bool, udid: &str, base_url: &str, cache_dir: &Path) -> Result<Arc<Vec<IndexedApp>>> {
     let cache_path = app_cache_path(cache_dir, udid, base_url);
+    let cache_key = crate::skills::abspath(&cache_path);
     if !refresh {
         if let Ok(meta) = std::fs::metadata(&cache_path) {
-            let stamp = file_stamp(&meta);
+            let lookup_stamp = FileStamp::from_meta(&cache_path, &meta);
             {
                 let cache = app_cache().read().unwrap_or_else(|e| e.into_inner());
-                if let Some(entry) = cache.get(&cache_path) {
-                    if entry.stamp == stamp {
+                if let Some(entry) = cache.get(&cache_key) {
+                    if entry.stamp == lookup_stamp {
                         return Ok(entry.apps.clone());
                     }
                 }
             }
-            if let Ok(s) = std::fs::read_to_string(&cache_path) {
+            if let Ok((s, stable_stamp)) = read_to_string_stamped(&cache_path) {
                 if let Ok(apps) = serde_json::from_str::<Vec<App>>(&s) {
                     let indexed: Arc<Vec<IndexedApp>> = Arc::new(apps.into_iter().map(IndexedApp::from_app).collect());
-                    store_app_cache(cache_path, stamp, indexed.clone());
+                    if let Some(stamp) = stable_stamp {
+                        store_app_cache(cache_key, stamp, indexed.clone());
+                    }
                     return Ok(indexed);
                 }
             }
+            remove_app_cache(&cache_key);
+        } else {
+            remove_app_cache(&cache_key);
         }
     }
     if udid.is_empty() {
@@ -210,10 +215,16 @@ fn load_apps_indexed(refresh: bool, udid: &str, base_url: &str, cache_dir: &Path
         .collect();
     std::fs::create_dir_all(cache_dir).map_err(|e| Error::Os(format!("{}: {e}", cache_dir.display())))?;
     let body = serde_json::to_string(&apps).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(&cache_path, body).map_err(|e| Error::Os(format!("{}: {e}", cache_path.display())))?;
+    std::fs::write(&cache_path, &body).map_err(|e| Error::Os(format!("{}: {e}", cache_path.display())))?;
     let indexed: Arc<Vec<IndexedApp>> = Arc::new(apps.into_iter().map(IndexedApp::from_app).collect());
     if let Ok(meta) = std::fs::metadata(&cache_path) {
-        store_app_cache(cache_path, file_stamp(&meta), indexed.clone());
+        if meta.len() == body.len() as u64 {
+            store_app_cache(cache_key, FileStamp::from_meta(&cache_path, &meta), indexed.clone());
+        } else {
+            remove_app_cache(&cache_key);
+        }
+    } else {
+        remove_app_cache(&cache_key);
     }
     Ok(indexed)
 }
@@ -308,15 +319,24 @@ mod unit {
             resolve_app("spotify", "udid-cache-test", "http://127.0.0.1:8100", tmp.path()).unwrap(),
             "com.spotify.client"
         );
-        // Update file with different content/size: cache must reload.
-        std::fs::write(
-            &path,
-            r#"[{"name":"Spotify","bundleIdentifier":"com.spotify.client"},{"name":"Notes","bundleIdentifier":"com.apple.mobilenotes"},{"name":"Maps","bundleIdentifier":"com.apple.Maps"}]"#,
-        )
-        .unwrap();
+        // In-place overwrite with identical inode, length, and nanosecond mtime invalidates cache.
+        let body_a = r#"[{"name":"Alpha","bundleIdentifier":"com.example.alpha"}]"#;
+        let body_b = r#"[{"name":"Bravo","bundleIdentifier":"com.example.bravo"}]"#;
+        assert_eq!(body_a.len(), body_b.len());
+        std::fs::write(&path, body_a).unwrap();
         assert_eq!(
-            resolve_app("Maps", "udid-cache-test", "http://127.0.0.1:8100", tmp.path()).unwrap(),
-            "com.apple.Maps"
+            resolve_app("Alpha", "udid-cache-test", "http://127.0.0.1:8100", tmp.path()).unwrap(),
+            "com.example.alpha"
         );
+        crate::config::overwrite_preserving_inode_and_mtime(&path, body_b);
+        assert_eq!(
+            resolve_app("Bravo", "udid-cache-test", "http://127.0.0.1:8100", tmp.path()).unwrap(),
+            "com.example.bravo"
+        );
+
+        // Corrupt JSON evicts the stale cache entry rather than serving Alpha/Bravo.
+        std::fs::write(&path, "{not-valid-json").unwrap();
+        let empty = load_apps_indexed(false, "", "http://127.0.0.1:8100", tmp.path()).unwrap();
+        assert!(empty.is_empty());
     }
 }

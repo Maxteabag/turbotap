@@ -53,20 +53,64 @@ pub struct Config {
     pub app_prefer: HashMap<String, String>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct FileStamp {
-    path: PathBuf,
-    /// `(mtime_sec, mtime_nsec, len, ino)` or `None` when the file does not exist.
-    meta: Option<(i64, i64, u64, u64)>,
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct FileMetaStamp {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) ctime: i64,
+    pub(crate) ctime_nsec: i64,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) len: u64,
+}
+
+impl FileMetaStamp {
+    pub(crate) fn from(m: &std::fs::Metadata) -> FileMetaStamp {
+        FileMetaStamp {
+            dev: m.dev(),
+            ino: m.ino(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+            len: m.len(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct FileStamp {
+    pub(crate) path: PathBuf,
+    pub(crate) meta: FileMetaStamp,
 }
 
 impl FileStamp {
-    fn from(path: PathBuf, meta: Option<&std::fs::Metadata>) -> FileStamp {
+    pub(crate) fn from_meta(path: &Path, m: &std::fs::Metadata) -> FileStamp {
         FileStamp {
-            path,
-            meta: meta.map(|m| (m.mtime(), m.mtime_nsec(), m.len(), m.ino())),
+            path: crate::skills::abspath(path),
+            meta: FileMetaStamp::from(m),
         }
     }
+}
+
+/// Read a UTF-8 file and return `(contents, Some(stamp))` only when the path
+/// resolves to the same `(dev, ino, ctime, mtime, len)` before and after reading
+/// and the byte count matches `len`. If the file changed mid-read, returns
+/// `Ok((contents, None))` so callers never cache an unstable snapshot.
+pub(crate) fn read_to_string_stamped(path: &Path) -> std::io::Result<(String, Option<FileStamp>)> {
+    use std::io::Read;
+    let abs = crate::skills::abspath(path);
+    let mut f = std::fs::File::open(path)?;
+    let before = FileMetaStamp::from(&f.metadata()?);
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    let after = std::fs::metadata(path).ok().map(|m| FileMetaStamp::from(&m));
+    let stamp = if after.as_ref() == Some(&before) && s.len() as u64 == before.len {
+        Some(FileStamp { path: abs, meta: before })
+    } else {
+        None
+    };
+    Ok((s, stamp))
 }
 
 fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>) {
@@ -87,13 +131,23 @@ fn resolve_config_path_and_meta() -> (PathBuf, Option<std::fs::Metadata>) {
     (primary, None)
 }
 
-fn load_config_from(path: PathBuf, exists: bool, mac_host_env: Option<&str>) -> (Config, Option<String>) {
+fn load_config_from(
+    path: PathBuf,
+    exists: bool,
+    mac_host_env: Option<&str>,
+) -> (Config, Option<String>, Option<FileStamp>) {
+    let mut cache_stamp = None;
     let raw = if exists {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .filter(|v| v.is_object())
-            .unwrap_or_else(|| Value::Object(Default::default()))
+        match read_to_string_stamped(&path) {
+            Ok((s, stable_stamp)) => match serde_json::from_str::<Value>(&s) {
+                Ok(v) if v.is_object() => {
+                    cache_stamp = stable_stamp;
+                    v
+                }
+                _ => Value::Object(Default::default()),
+            },
+            Err(_) => Value::Object(Default::default()),
+        }
     } else {
         Value::Object(Default::default())
     };
@@ -110,7 +164,7 @@ fn load_config_from(path: PathBuf, exists: bool, mac_host_env: Option<&str>) -> 
             }
         }
     }
-    (Config { path, raw, mac_host, app_prefer }, file_mac_host)
+    (Config { path, raw, mac_host, app_prefer }, file_mac_host, cache_stamp)
 }
 
 impl Config {
@@ -130,7 +184,10 @@ pub fn default_config_path() -> PathBuf {
 }
 
 struct CachedConfig {
-    stamp: FileStamp,
+    /// `Some(stamp)` only for verified, stable, valid-JSON reads; `None` for
+    /// missing, unreadable, invalid, or concurrently modified files so they are
+    /// never served from cache on the next `reload()`.
+    stamp: Option<FileStamp>,
     mac_host_env: Option<String>,
     file_mac_host: Option<String>,
     config: Arc<Config>,
@@ -147,25 +204,29 @@ pub fn current() -> Arc<Config> {
 }
 
 /// Re-read env-derived configuration (the daemon calls this per request).
-/// Skips re-reading and re-parsing `config.json` when `(path, mtime, len, ino)` is unchanged.
+/// Skips re-reading and re-parsing `config.json` only when the resolved path and
+/// `(dev, ino, ctime, mtime, len)` match a previously verified stable read.
 pub fn reload() -> Arc<Config> {
     let (path, meta) = resolve_config_path_and_meta();
-    let stamp = FileStamp::from(path, meta.as_ref());
+    let lookup_stamp = meta.as_ref().map(|m| FileStamp::from_meta(&path, m));
     let mac_host_env = env_nonempty("WDA_MAC_HOST");
-    {
+    if let Some(ref cur_stamp) = lookup_stamp {
         let guard = CURRENT.read().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.as_ref() {
-            if cached.stamp == stamp && cached.mac_host_env == mac_host_env {
-                return cached.config.clone();
-            }
-            if cached.stamp == stamp {
-                // Only WDA_MAC_HOST changed; reuse the parsed JSON without disk I/O.
+            if cached.stamp.as_ref() == Some(cur_stamp) {
+                if cached.mac_host_env == mac_host_env && cached.config.path == path {
+                    return cached.config.clone();
+                }
+                // Only WDA_MAC_HOST or the unnormalized display path changed;
+                // reuse the parsed JSON without disk I/O.
                 let mut cfg = (*cached.config).clone();
+                cfg.path = path;
                 cfg.mac_host = mac_host_env
                     .clone()
                     .or_else(|| cached.file_mac_host.clone())
                     .unwrap_or_else(|| "mac".to_string());
                 let file_mac_host = cached.file_mac_host.clone();
+                let stamp = cached.stamp.clone();
                 drop(guard);
                 let arc = Arc::new(cfg);
                 *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(CachedConfig {
@@ -178,16 +239,19 @@ pub fn reload() -> Arc<Config> {
             }
         }
     }
-    let (cfg, file_mac_host) = load_config_from(stamp.path.clone(), stamp.meta.is_some(), mac_host_env.as_deref());
+    let (cfg, file_mac_host, cache_stamp) = load_config_from(path, meta.is_some(), mac_host_env.as_deref());
     let mut guard = CURRENT.write().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.as_ref() {
-        if cached.stamp == stamp && cached.mac_host_env == mac_host_env {
+    if let (Some(ref stamp), Some(cached)) = (&cache_stamp, guard.as_ref()) {
+        if cached.stamp.as_ref() == Some(stamp)
+            && cached.mac_host_env == mac_host_env
+            && cached.config.path == cfg.path
+        {
             return cached.config.clone();
         }
     }
     let arc = Arc::new(cfg);
     *guard = Some(CachedConfig {
-        stamp,
+        stamp: cache_stamp,
         mac_host_env,
         file_mac_host,
         config: arc.clone(),
@@ -332,6 +396,33 @@ pub fn guard_remote(what: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn overwrite_preserving_inode_and_mtime(path: &Path, body: &str) {
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let before = std::fs::metadata(path).unwrap();
+    let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(path).unwrap();
+    f.write_all(body.as_bytes()).unwrap();
+    f.flush().unwrap();
+    drop(f);
+    let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec { tv_sec: before.atime(), tv_nsec: before.atime_nsec() },
+        libc::timespec { tv_sec: before.mtime(), tv_nsec: before.mtime_nsec() },
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "utimensat failed: {}", std::io::Error::last_os_error());
+    let after = std::fs::metadata(path).unwrap();
+    assert_eq!(before.ino(), after.ino(), "inode changed during in-place overwrite");
+    assert_eq!(before.len(), after.len(), "length must match for same-size test");
+    assert_eq!(
+        (before.mtime(), before.mtime_nsec()),
+        (after.mtime(), after.mtime_nsec()),
+        "mtime was not preserved"
+    );
+}
+
+#[cfg(test)]
 mod unit {
     use super::*;
     use crate::testutil::{set_env, TempDir};
@@ -355,11 +446,22 @@ mod unit {
         assert_eq!(c3.mac_host, "mini-override");
         assert_eq!(c3.app_prefer.get("mail").map(String::as_str), Some("com.apple.mobilemail"));
 
-        // File replacement invalidates the cache.
+        // In-place overwrite with identical inode, length and nanosecond mtime invalidates cache via ctime.
         std::env::remove_var("WDA_MAC_HOST");
-        std::fs::write(&cfg_path, r#"{"mac_host":"mini-2-updated","app_prefer":{}}"#).unwrap();
+        overwrite_preserving_inode_and_mtime(
+            &cfg_path,
+            r#"{"mac_host":"mini-2","app_prefer":{"Mail":"com.apple.mobilemail"}}"#,
+        );
         let c4 = reload();
-        assert_eq!(c4.mac_host, "mini-2-updated");
-        assert!(c4.app_prefer.is_empty());
+        assert_eq!(c4.mac_host, "mini-2");
+        assert!(!Arc::ptr_eq(&c1, &c4));
+
+        // Corrupt JSON is never cached: repairing it with the same length and mtime reloads cleanly.
+        std::fs::write(&cfg_path, r#"{"mac_host":"mini-3", BROKEN_JSON_PAD_123456}"#).unwrap();
+        let c_bad = reload();
+        assert_eq!(c_bad.mac_host, "mac");
+        overwrite_preserving_inode_and_mtime(&cfg_path, r#"{"mac_host":"mini-3","extra":"1234567890123"}"#);
+        let c_fixed = reload();
+        assert_eq!(c_fixed.mac_host, "mini-3");
     }
 }
