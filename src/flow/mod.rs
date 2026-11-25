@@ -182,6 +182,10 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub last_alert_text: Option<String>,
     pub last_alert_buttons: Option<Vec<String>>,
     pub last_ui_retried_stale: bool,
+    /// Test-only override for `changed_since` (Python tests'
+    /// `mock.patch.object(flow, "changed_since", return_value=...)`).
+    #[cfg(test)]
+    pub changed_since_hook: Option<bool>,
 }
 
 impl<R: Reader> Flow<R> {
@@ -221,6 +225,8 @@ impl<R: Reader> Flow<R> {
             last_alert_text: None,
             last_alert_buttons: None,
             last_ui_retried_stale: false,
+            #[cfg(test)]
+            changed_since_hook: None,
         })
     }
 
@@ -845,11 +851,16 @@ pub fn cmd_tap_ocr(client: WdaClient, text: &str) -> Result<()> {
 }
 
 /// `turbotap flow STEP...` (L5696). Returns the process exit code.
-pub fn cmd_flow(client: WdaClient, steps: &[String], timeout: f64, scale: f64, deny: Option<&str>, quiet: bool) -> Result<i32> {
-    let needs_ocr = steps.iter().any(|s| {
+/// True when any step needs screen capture/OCR (`cmd_flow` warms OCR only then).
+pub fn flow_needs_ocr(steps: &[String]) -> bool {
+    steps.iter().any(|s| {
         let v = s.split(':').next().unwrap_or("").trim().to_lowercase();
         IMAGE_STEP_VERBS.contains(&v.as_str())
-    });
+    })
+}
+
+pub fn cmd_flow(client: WdaClient, steps: &[String], timeout: f64, scale: f64, deny: Option<&str>, quiet: bool) -> Result<i32> {
+    let needs_ocr = flow_needs_ocr(steps);
     let mut client = client;
     client.ensure_session(None, true)?;
     let reader = ScreenReader::new(scale, None, 11, needs_ocr);

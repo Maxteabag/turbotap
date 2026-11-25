@@ -750,6 +750,10 @@ impl<R: Reader> Flow<R> {
 
     /// L3084. Default timeout 0.45.
     pub fn changed_since(&mut self, before: Option<Frame>, timeout: f64, x: Option<i64>, y: Option<i64>) -> Result<bool> {
+        #[cfg(test)]
+        if let Some(v) = self.changed_since_hook {
+            return Ok(v);
+        }
         let end = clock::wall() + timeout;
         let b = before.as_deref();
         while clock::wall() < end {
