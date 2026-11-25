@@ -225,3 +225,13 @@ pub fn typing_freq() -> Option<i64> {
     }
     None
 }
+
+/// Test builds never reach a real Mac host or iPhone: deploy, devicectl app refresh
+/// and OTP polling (everything that runs `ssh` or the deploy script) refuse unless
+/// `TURBOTAP_TEST_ALLOW_REMOTE=1` is set. Release builds always allow.
+pub fn guard_remote(what: &str) -> Result<()> {
+    if cfg!(test) && env("TURBOTAP_TEST_ALLOW_REMOTE").as_deref() != Some("1") {
+        return Err(Error::runtime(format!("{what} is disabled in test builds (offline only)")));
+    }
+    Ok(())
+}

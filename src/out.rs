@@ -13,13 +13,28 @@ pub trait Sink: Send + Sync {
 
 static SINK: RwLock<Option<Arc<dyn Sink>>> = RwLock::new(None);
 
+thread_local! {
+    /// Per-thread override (tests capture one command's output while others run).
+    static THREAD_SINK: std::cell::RefCell<Option<Arc<dyn Sink>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Route this thread's output to `sink` (takes precedence over [`set_sink`]);
+/// returns the previous override.
+pub fn set_thread_sink(sink: Option<Arc<dyn Sink>>) -> Option<Arc<dyn Sink>> {
+    THREAD_SINK.with(|t| std::mem::replace(&mut *t.borrow_mut(), sink))
+}
+
+fn current_sink() -> Option<Arc<dyn Sink>> {
+    THREAD_SINK.with(|t| t.borrow().clone()).or_else(|| SINK.read().unwrap().clone())
+}
+
 /// Route output to `sink` (daemon request) or back to real stdio (`None`).
 pub fn set_sink(sink: Option<Arc<dyn Sink>>) {
     *SINK.write().unwrap() = sink;
 }
 
 pub fn print_out(s: &str) {
-    let sink = SINK.read().unwrap().clone();
+    let sink = current_sink();
     match sink {
         Some(k) => k.stdout(s),
         None => {
@@ -31,7 +46,7 @@ pub fn print_out(s: &str) {
 }
 
 pub fn print_err(s: &str) {
-    let sink = SINK.read().unwrap().clone();
+    let sink = current_sink();
     match sink {
         Some(k) => k.stderr(s),
         None => {
