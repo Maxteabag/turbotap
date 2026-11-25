@@ -7,7 +7,7 @@ This guide takes you from zero to driving a physical iPhone headlessly over Wi-F
 1. **An iPhone** running iOS 17+ on the same Wi-Fi network as your machine.
 2. **A Mac with Xcode** (used to sign and launch `WebDriverAgentRunner` onto the iPhone; can be the same machine or a Mac reachable over SSH).
 3. **An Apple ID** (free Apple ID works for personal development signing; a paid Apple Developer account gives longer provisioning lifetimes).
-4. **Python 3.10+** and optionally **Tesseract** (`libtesseract`) on the machine running `turbotap`.
+4. **A Rust toolchain** (`cargo`) to build `turbotap`, and optionally **Tesseract** (`libtesseract`) on the machine running it. Tesseract is loaded at runtime, so it is not needed to build.
 
 ---
 
@@ -104,11 +104,11 @@ curl -fsS http://192.168.1.50:8100/status
 Install `turbotap` and its agent skills:
 
 ```bash
-uv tool install git+https://github.com/Maxteabag/turbotap.git
+cargo install --git https://github.com/Maxteabag/turbotap.git
 turbotap install-skill
 ```
 
-`install-skill` copies the `turbotap` and `turbotap-retro` skills into `~/.agents/skills` and `~/.claude/skills` (whichever exist, else `~/.agents/skills`). Use `--claude`, `--codex`, `--agents` or `--dir DIR` to pick folders. After an upgrade (`uv tool install --force git+https://github.com/Maxteabag/turbotap.git`), the next `turbotap` run refreshes those copies by itself.
+`install-skill` copies the `turbotap` and `turbotap-retro` skills into `~/.agents/skills` and `~/.claude/skills` (whichever exist, else `~/.agents/skills`). Use `--claude`, `--codex`, `--agents` or `--dir DIR` to pick folders. After an upgrade (`cargo install --force --git https://github.com/Maxteabag/turbotap.git`), the next `turbotap` run refreshes those copies by itself.
 
 Install `libtesseract` for 180–250 ms in-process parallel OCR:
 
