@@ -433,6 +433,219 @@ fn test_daemon_stays_up_in_search_only_0111_directory() {
     }
 }
 
+/// PR #13 review: a request containing duplicate JSON env keys for a baseline variable
+/// (first matching baseline A, then overriding to B) must still record the restore delta
+/// so the next ordinary request supplying A reaches A, not B.
+#[test]
+fn test_duplicate_baseline_env_keys_restore_before_next_request() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let make_router = |bundle: &'static str| {
+        move |_m: &str, path: &str, _p: &Value| {
+            let ok = |v: Value| {
+                (200, "application/json".to_string(), json!({"value": v, "sessionId": "sid-dup"}).to_string().into_bytes())
+            };
+            if path == "/status" {
+                return ok(json!({"ready": true}));
+            }
+            if path.ends_with("/appium/settings") {
+                return ok(json!({}));
+            }
+            if path.ends_with("/wda/fastPreflight") {
+                return ok(json!({"locked": false, "bundleId": bundle, "size": {"width": 430, "height": 932}}));
+            }
+            (404, "application/json".into(), br#"{"value":{"error":"unknown command"}}"#.to_vec())
+        }
+    };
+    let srv_a = LoopbackWda::start(make_router("com.example.dup-a"));
+    let srv_b = LoopbackWda::start(make_router("com.example.dup-b"));
+
+    // Start the daemon with WDA_URL=srv_a in its own baseline environment.
+    let mut home = DaemonHome::new();
+    home.env.push(("WDA_URL".into(), srv_a.url.clone()));
+    home.run(&["daemon", "start", "--idle", "120"]);
+
+    // Send a raw protocol request whose JSON "env" object lists baseline key WDA_URL twice: A then B.
+    let mut env_pairs = String::new();
+    for (k, v) in &home.env {
+        if k == "WDA_URL" {
+            continue;
+        }
+        if !env_pairs.is_empty() {
+            env_pairs.push(',');
+        }
+        env_pairs.push_str(&serde_json::to_string(k).unwrap());
+        env_pairs.push(':');
+        env_pairs.push_str(&serde_json::to_string(v).unwrap());
+    }
+    if !env_pairs.is_empty() {
+        env_pairs.push(',');
+    }
+    env_pairs.push_str(&format!(
+        "\"WDA_URL\":{},\"WDA_URL\":{}",
+        serde_json::to_string(&srv_a.url).unwrap(),
+        serde_json::to_string(&srv_b.url).unwrap()
+    ));
+    let payload = format!(
+        "{{\"v\":1,\"op\":\"run\",\"argv\":[\"preflight\"],\"env\":{{{env_pairs}}},\"cwd\":{},\"fingerprint\":{}}}\n",
+        serde_json::to_string(&home.tmp.path().to_string_lossy()).unwrap(),
+        serde_json::to_string(&daemon::code_fingerprint()).unwrap()
+    );
+
+    let mut sock = UnixStream::connect(home.sock()).unwrap();
+    sock.write_all(payload.as_bytes()).unwrap();
+    let mut reader = BufReader::new(sock.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(doc(&line)["ready"], json!(true), "unexpected handshake: {line}");
+    sock.write_all(b"{\"go\":true}\n").unwrap();
+    let mut out1 = String::new();
+    let exit1 = loop {
+        line.clear();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "unexpected EOF");
+        let m = doc(&line);
+        if let Some(s) = m.get("out").and_then(Value::as_str) {
+            out1.push_str(s);
+        }
+        if let Some(c) = m.get("exit").and_then(Value::as_i64) {
+            break c;
+        }
+    };
+    assert_eq!(exit1, 0);
+    assert_eq!(doc(&out1)["active_app"], json!("com.example.dup-b"));
+    assert_eq!(doc(&out1)["wda_url"], json!(srv_b.url));
+    let b_hits_after_req1 = srv_b.paths().len();
+    assert!(b_hits_after_req1 > 0);
+
+    // Next ordinary CLI request supplying WDA_URL=srv_a must reach A, not stale B.
+    let (code2, out2, err2) = home.forward(&["preflight"], &[("WDA_URL", srv_a.url.as_str())], None);
+    assert_eq!(code2, Some(0), "stderr={err2}");
+    assert_eq!(doc(&out2)["active_app"], json!("com.example.dup-a"));
+    assert_eq!(doc(&out2)["wda_url"], json!(srv_a.url));
+    assert!(!srv_a.paths().is_empty(), "ordinary request 2 did not reach endpoint A");
+    assert_eq!(srv_b.paths().len(), b_hits_after_req1, "ordinary request 2 leaked to endpoint B");
+}
+
+/// PR #13 review: stopping a daemon while a request is blocked on async warm-up (before `ready`)
+/// or between `ready` and `go` must never dispatch WDA calls after stop is acknowledged, and a
+/// client that already sent `go` must receive a terminal cancellation exit instead of EOF/retry.
+#[test]
+fn test_stop_during_warmup_and_before_go_dispatches_zero_wda_calls() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+
+    let _l = POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let srv = LoopbackWda::start(wda_router());
+
+    // Part A: stop acknowledged while first run is blocked in join_warm() -> refused before ready, 0 WDA calls.
+    {
+        let fx = FallbackDir::new();
+        let sock_path = fx.path().join("daemon.sock");
+        let cache_dir = fx.path().to_path_buf();
+        let mut server = daemon::Server::new(120.0);
+        server.bind().unwrap();
+
+        let (warm_started_tx, warm_started_rx) = mpsc::channel();
+        let (warm_release_tx, warm_release_rx) = mpsc::channel();
+        server.warm_async_with(move || {
+            let _ = warm_started_tx.send(());
+            let _ = warm_release_rx.recv();
+        });
+        let srv_thread = std::thread::spawn(move || server.serve_forever());
+        warm_started_rx.recv().unwrap();
+
+        let url = srv.url.clone();
+        let cwd = fx.path().to_string_lossy().into_owned();
+        let client_thread = std::thread::spawn(move || {
+            let _g = crate::config::override_cache_dir(&cache_dir);
+            let req = ForwardRequest {
+                argv: strs(&["--url", &url, "preflight"]),
+                env: vec![],
+                cwd,
+                fingerprint: daemon::code_fingerprint(),
+            };
+            daemon::forward_request(&req, &mut |_, _| {})
+        });
+
+        // Wait deterministically until the run request has entered run() and marked busy=true.
+        let deadline = crate::clock::real_now() + 5.0;
+        loop {
+            if daemon::ping().and_then(|m| m.get("busy").and_then(Value::as_bool)) == Some(true) {
+                break;
+            }
+            assert!(crate::clock::real_now() < deadline, "timed out waiting for run to block in join_warm");
+            crate::clock::real_sleep(0.005);
+        }
+
+        // Send stop and verify acknowledgement while warm-up is still paused.
+        let mut stop_sock = UnixStream::connect(&sock_path).unwrap();
+        stop_sock.write_all(b"{\"v\":1,\"op\":\"stop\"}\n").unwrap();
+        let mut stop_line = String::new();
+        BufReader::new(&stop_sock).read_line(&mut stop_line).unwrap();
+        assert_eq!(doc(&stop_line)["stopping"], json!(true), "stop ack={stop_line}");
+
+        // Release warm-up; the queued run must be refused with error=stopping (None) and 0 WDA calls.
+        let _ = warm_release_tx.send(());
+        let client_code = client_thread.join().unwrap();
+        srv_thread.join().unwrap();
+        assert_eq!(client_code, None, "run admitted after stop during warm-up");
+        assert!(srv.paths().is_empty(), "WDA called after stop during warm-up: {:?}", srv.paths());
+    }
+
+    // Part B: stop acknowledged after `ready` and before `go` -> terminal cancellation (exit 1 + stderr), 0 WDA calls.
+    {
+        let fx = FallbackDir::new();
+        let sock_path = fx.path().join("daemon.sock");
+        let mut server = daemon::Server::new(120.0);
+        server.bind().unwrap();
+        let srv_thread = std::thread::spawn(move || server.serve_forever());
+
+        let mut c1 = UnixStream::connect(&sock_path).unwrap();
+        let run_req = json!({
+            "v": 1,
+            "op": "run",
+            "argv": ["--url", srv.url, "preflight"],
+            "env": {},
+            "cwd": fx.path().to_string_lossy(),
+            "fingerprint": daemon::code_fingerprint(),
+        });
+        c1.write_all(format!("{run_req}\n").as_bytes()).unwrap();
+        let mut r1 = BufReader::new(c1.try_clone().unwrap());
+        let mut line = String::new();
+        r1.read_line(&mut line).unwrap();
+        assert_eq!(doc(&line)["ready"], json!(true), "expected ready: {line}");
+
+        // Stop daemon before client 1 sends `go`.
+        let mut stop_sock = UnixStream::connect(&sock_path).unwrap();
+        stop_sock.write_all(b"{\"v\":1,\"op\":\"stop\"}\n").unwrap();
+        let mut stop_line = String::new();
+        BufReader::new(&stop_sock).read_line(&mut stop_line).unwrap();
+        assert_eq!(doc(&stop_line)["stopping"], json!(true), "stop ack={stop_line}");
+
+        // Client 1 sends `go` (already committed) -> must get terminal cancellation, not EOF or WDA dispatch.
+        c1.write_all(b"{\"go\":true}\n").unwrap();
+        let mut err_text = String::new();
+        let exit_code = loop {
+            line.clear();
+            let n = r1.read_line(&mut line).unwrap();
+            assert!(n > 0, "committed client received EOF instead of terminal cancellation");
+            let m = doc(&line);
+            if let Some(s) = m.get("err").and_then(Value::as_str) {
+                err_text.push_str(s);
+            }
+            if let Some(c) = m.get("exit").and_then(Value::as_i64) {
+                break c;
+            }
+        };
+        srv_thread.join().unwrap();
+        assert_eq!(exit_code, 1);
+        assert!(err_text.contains("stopped"), "expected cancellation message, got {err_text:?}");
+        assert!(srv.paths().is_empty(), "WDA called after stop between ready and go: {:?}", srv.paths());
+    }
+}
+
 #[test]
 fn test_errors_keep_exit_codes_and_stderr() {
     let (home, _) = DaemonHome::started("120");

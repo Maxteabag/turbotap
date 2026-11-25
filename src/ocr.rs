@@ -227,6 +227,9 @@ pub fn tess_lib_probed() -> bool {
 pub struct TessApi {
     ptr: *mut c_void,
     lib: Option<&'static TessLib>,
+    /// Reusable dark-mode inversion buffer (owned per engine; eliminates ~150 KB
+    /// per-strip heap allocs/page faults on warm dark-mode OCR).
+    inv_buf: Vec<u8>,
     /// Identity of a fake engine (empty for real ones).
     pub tag: String,
 }
@@ -238,7 +241,7 @@ impl TessApi {
     /// A stand-in engine for tests of the pooling logic (Python
     /// `mock.patch.object(cli, "_create_tess_api", side_effect=...)`).
     pub fn fake(tag: impl Into<String>) -> TessApi {
-        TessApi { ptr: std::ptr::null_mut(), lib: None, tag: tag.into() }
+        TessApi { ptr: std::ptr::null_mut(), lib: None, inv_buf: Vec::new(), tag: tag.into() }
     }
 
     pub fn is_fake(&self) -> bool {
@@ -250,6 +253,14 @@ impl TessApi {
             // SAFETY: valid engine pointer and NUL-terminated strings.
             unsafe { (lib.set_var)(self.ptr, name.as_ptr(), value.as_ptr()) };
         }
+    }
+
+    /// Recognise from this engine's reusable `inv_buf[..len]` without extra allocations.
+    fn words_strided_inv(&mut self, len: usize, w: u32, h: u32, stride: u32) -> Result<Vec<RawWords>> {
+        let inv = std::mem::take(&mut self.inv_buf);
+        let res = self.words_strided(&inv[..len], w, h, stride);
+        self.inv_buf = inv;
+        res
     }
 
     /// Recognise an 8-bit grayscale sub-image `(w x h)` with row stride `stride` bytes
@@ -350,7 +361,7 @@ pub fn create_tess_api(psm: i32) -> Result<TessApi> {
         if ptr.is_null() {
             return Err(Error::runtime("TessBaseAPICreate failed"));
         }
-        let api = TessApi { ptr, lib: Some(lib), tag: String::new() };
+        let api = TessApi { ptr, lib: Some(lib), inv_buf: Vec::new(), tag: String::new() };
         if (lib.init2)(ptr, std::ptr::null(), c"eng".as_ptr(), 1) != 0 {
             return Err(Error::runtime("TessBaseAPIInit2 failed (eng.traineddata missing?)"));
         }
@@ -1057,7 +1068,7 @@ impl ScreenReader {
         if let Some(hook) = self.ocr_raw_hook.as_ref() {
             return hook(raw, w, h, sauvola);
         }
-        let mut inverted: Option<Vec<u8>> = None;
+        let mut need_invert = false;
         let n_samp = raw.len().div_ceil(19);
         if n_samp > 0 {
             // Skip only genuinely uniform flat strips; preserve low-contrast text
@@ -1076,13 +1087,14 @@ impl ScreenReader {
             if mean < 120.0 {
                 // Pre-invert dark-mode strips so LSTM succeeds on pass 1 instead of
                 // retrying via tessedit_do_invert (kept enabled for mixed-polarity UI).
-                // Bitwise `!v == 255 - v` auto-vectorizes cleanly to AVX2/SSE2 XOR.
-                inverted = Some(raw.iter().map(|&v| !v).collect());
+                need_invert = true;
             }
         }
-        let buf: &[u8] = inverted.as_deref().unwrap_or(raw);
         match self.ensure_ocr()? {
             None => {
+                // Bitwise `!v == 255 - v` auto-vectorizes cleanly to AVX2/SSE2 XOR.
+                let inverted = need_invert.then(|| raw.iter().map(|&v| !v).collect::<Vec<u8>>());
+                let buf: &[u8] = inverted.as_deref().unwrap_or(raw);
                 let tsv = match self.tsv_hook.as_ref() {
                     Some(hook) => hook(buf, w, h, self.psm, sauvola)?,
                     None => tesseract_tsv_binary(buf, w, h, self.psm, sauvola)?,
@@ -1097,7 +1109,20 @@ impl ScreenReader {
                     api.set_variable(c"thresholding_kfactor", c"0.15");
                     api.set_variable(c"thresholding_window_size", c"0.80");
                 }
-                let res = api.words_strided(buf, w, h, w);
+                let res = if need_invert {
+                    if api.inv_buf.len() < raw.len() {
+                        api.inv_buf.resize(raw.len(), 0);
+                    }
+                    let inv = &mut api.inv_buf[..raw.len()];
+                    for (d, &v) in inv.iter_mut().zip(raw.iter()) {
+                        *d = !v;
+                    }
+                    // Split borrow via local slice is avoided by passing a temporary method on TessApi;
+                    // call `words_strided_inv` using `self.inv_buf`.
+                    api.words_strided_inv(raw.len(), w, h, w)
+                } else {
+                    api.words_strided(raw, w, h, w)
+                };
                 if sauvola {
                     api.set_variable(c"thresholding_method", c"0");
                 }

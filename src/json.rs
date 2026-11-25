@@ -274,11 +274,37 @@ pub fn dumps(v: &Value) -> String {
     s
 }
 
+/// `json.dumps(m)` for an object map without cloning it into `Value::Object`.
+pub fn dumps_map(m: &Map<String, Value>) -> String {
+    let mut cap = 2 + m.len() * 24;
+    for val in m.values() {
+        if let Value::String(s) = val {
+            cap = cap.saturating_add(s.len());
+        }
+    }
+    let mut s = String::with_capacity(cap);
+    write_map::<true>(&mut s, m);
+    s
+}
+
 /// `json.dumps(v, ensure_ascii=False)` with Python's default separators.
 pub fn dumps_utf8(v: &Value) -> String {
     let mut s = String::with_capacity(estimate_json_cap(v));
     write_value::<false>(&mut s, v);
     s
+}
+
+fn write_map<const ASCII: bool>(out: &mut String, m: &Map<String, Value>) {
+    out.push('{');
+    for (i, (k, x)) in m.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write_str::<ASCII>(out, k);
+        out.push_str(": ");
+        write_value::<ASCII>(out, x);
+    }
+    out.push('}');
 }
 
 fn write_value<const ASCII: bool>(out: &mut String, v: &Value) {
@@ -307,18 +333,7 @@ fn write_value<const ASCII: bool>(out: &mut String, v: &Value) {
             }
             out.push(']');
         }
-        Value::Object(m) => {
-            out.push('{');
-            for (i, (k, x)) in m.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_str::<ASCII>(out, k);
-                out.push_str(": ");
-                write_value::<ASCII>(out, x);
-            }
-            out.push('}');
-        }
+        Value::Object(m) => write_map::<ASCII>(out, m),
     }
 }
 

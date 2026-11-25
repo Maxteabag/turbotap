@@ -30,8 +30,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -59,10 +59,18 @@ pub fn log_path() -> PathBuf {
     crate::config::cache_dir().join("daemon.log")
 }
 
+fn exe_metadata() -> std::io::Result<std::fs::Metadata> {
+    #[cfg(target_os = "linux")]
+    if let Ok(st) = std::fs::metadata("/proc/self/exe") {
+        return Ok(st);
+    }
+    std::env::current_exe().and_then(std::fs::metadata)
+}
+
 /// Version + protocol + binary identity: a daemon started before an upgrade refuses
 /// requests (the client then runs them itself).
 pub fn code_fingerprint() -> String {
-    match std::env::current_exe().and_then(std::fs::metadata) {
+    match exe_metadata() {
         Ok(st) => {
             let mtime_ns = st.mtime() as i128 * 1_000_000_000 + st.mtime_nsec() as i128;
             format!("{}/{}/{}:{mtime_ns}", crate::VERSION, PROTOCOL, st.len())
@@ -93,7 +101,87 @@ fn parse_json_obj(line: &[u8]) -> std::io::Result<Map<String, Value>> {
     }
 }
 
-/// Newline-delimited JSON reader over a socket.
+/// Reusable socket read buffers owned by a worker thread (avoids 8 KB alloc/free per request).
+struct WorkerBufs {
+    io_buf: Vec<u8>,
+    req_buf: Vec<u8>,
+}
+
+impl WorkerBufs {
+    fn new() -> WorkerBufs {
+        WorkerBufs { io_buf: vec![0u8; 8192], req_buf: Vec::with_capacity(8192) }
+    }
+}
+
+/// Buffered newline reader backed by a reusable `io_buf` slice (zero per-connection allocs).
+/// Calls `UnixStream::read` directly (never retrying `EINTR`).
+struct FastLines<'a> {
+    sock: &'a UnixStream,
+    buf: &'a mut [u8],
+    pos: usize,
+    filled: usize,
+}
+
+impl<'a> FastLines<'a> {
+    fn new(sock: &'a UnixStream, buf: &'a mut [u8]) -> FastLines<'a> {
+        FastLines { sock, buf, pos: 0, filled: 0 }
+    }
+
+    fn read_line_into(&mut self, out: &mut Vec<u8>) -> std::io::Result<()> {
+        out.clear();
+        loop {
+            if self.pos < self.filled {
+                let avail = &self.buf[self.pos..self.filled];
+                if let Some(nl) = avail.iter().position(|&b| b == b'\n') {
+                    if out.len() + nl > MAX_LINE {
+                        self.pos += nl + 1;
+                        return Err(proto_err("message too large"));
+                    }
+                    out.extend_from_slice(&avail[..nl]);
+                    self.pos += nl + 1;
+                    return Ok(());
+                }
+                if out.len() + avail.len() > MAX_LINE {
+                    self.pos = self.filled;
+                    return Err(proto_err("message too large"));
+                }
+                out.extend_from_slice(avail);
+                self.pos = self.filled;
+            }
+            let n = (&*self.sock).read(self.buf)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"));
+            }
+            self.pos = 0;
+            self.filled = n;
+        }
+    }
+
+    fn read_go(&mut self, scratch: &mut Vec<u8>) -> std::io::Result<bool> {
+        if self.pos < self.filled {
+            let avail = &self.buf[self.pos..self.filled];
+            if let Some(nl) = avail.iter().position(|&b| b == b'\n') {
+                let line = &avail[..nl];
+                let res = if line == b"{\"go\":true}" {
+                    Ok(true)
+                } else {
+                    let m = parse_json_obj(line)?;
+                    Ok(json::truthy(m.get("go").unwrap_or(&Value::Null)))
+                };
+                self.pos += nl + 1;
+                return res;
+            }
+        }
+        self.read_line_into(scratch)?;
+        if scratch.as_slice() == b"{\"go\":true}" {
+            return Ok(true);
+        }
+        let m = parse_json_obj(scratch)?;
+        Ok(json::truthy(m.get("go").unwrap_or(&Value::Null)))
+    }
+}
+
+/// Newline-delimited JSON reader over a socket (client side and unit tests).
 /// Uses `BufReader::fill_buf` directly (never `read_until`) so single-chunk lines parse
 /// zero-copy without shifting/draining a `Vec<u8>`, while still propagating `EINTR` on SIGINT.
 struct Lines<'a> {
@@ -137,16 +225,6 @@ impl<'a> Lines<'a> {
 
     fn read(&mut self) -> std::io::Result<Map<String, Value>> {
         self.with_line(parse_json_obj)
-    }
-
-    fn read_go(&mut self) -> std::io::Result<bool> {
-        self.with_line(|line| {
-            if line == b"{\"go\":true}" {
-                return Ok(true);
-            }
-            let m = parse_json_obj(line)?;
-            Ok(json::truthy(m.get("go").unwrap_or(&Value::Null)))
-        })
     }
 }
 
@@ -563,12 +641,22 @@ fn restore_cwd_dir(dir: &std::fs::File) -> std::io::Result<()> {
 }
 
 struct BaselineState {
-    env: HashMap<OsString, OsString>,
+    entries: Vec<(OsString, OsString)>,
+    index: HashMap<OsString, usize>,
+    seen: Vec<bool>,
+    mutated: Vec<bool>,
+    deltas: Vec<(OsString, Option<OsString>)>,
 }
 
 impl BaselineState {
     fn capture() -> BaselineState {
-        BaselineState { env: std::env::vars_os().collect() }
+        let entries: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let mut index = HashMap::with_capacity(entries.len());
+        for (i, (k, _)) in entries.iter().enumerate() {
+            index.insert(k.clone(), i);
+        }
+        let n = entries.len();
+        BaselineState { entries, index, seen: vec![false; n], mutated: vec![false; n], deltas: Vec::with_capacity(16) }
     }
 }
 
@@ -587,8 +675,36 @@ struct Inner {
     /// Owned directory handle captured at daemon startup (before binding the socket)
     /// so `fchdir` restores the original directory identity even after renames or in 0111 dirs.
     cwd_dir: std::sync::OnceLock<std::fs::File>,
+    /// Owned write end of the `serve_forever` wakeup self-pipe (cleared under lock
+    /// before closing, eliminating any write-after-close race with worker threads).
+    wake_write: Mutex<Option<OwnedFd>>,
+    /// Fast flag so steady-state requests skip locking `warm_thread`.
+    warm_pending: AtomicBool,
+    warm_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     exec_lock: Mutex<Option<BaselineState>>,
     state: Mutex<State>,
+}
+
+fn wake_server(inner: &Inner) {
+    let guard = inner.wake_write.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref wfd) = *guard {
+        let byte: u8 = 1;
+        // SAFETY: `wfd` is a valid nonblocking OwnedFd pinned by `guard`; EAGAIN is benign.
+        unsafe {
+            libc::write(wfd.as_raw_fd(), &byte as *const u8 as *const libc::c_void, 1);
+        }
+    }
+}
+
+fn join_warm(inner: &Inner) {
+    if !inner.warm_pending.load(Ordering::Acquire) {
+        return;
+    }
+    let mut guard = inner.warm_thread.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = guard.take() {
+        let _ = h.join();
+    }
+    inner.warm_pending.store(false, Ordering::Release);
 }
 
 pub struct Server {
@@ -610,6 +726,9 @@ impl Server {
                 fingerprint: code_fingerprint(),
                 stopping: AtomicBool::new(false),
                 cwd_dir: std::sync::OnceLock::new(),
+                wake_write: Mutex::new(None),
+                warm_pending: AtomicBool::new(false),
+                warm_thread: Mutex::new(None),
                 exec_lock: Mutex::new(None),
                 state: Mutex::new(State { last_activity: crate::clock::now(), requests: 0, busy: 0 }),
             }),
@@ -668,27 +787,47 @@ impl Server {
         Ok(())
     }
 
-    /// Enable the keep-alive pool and the warm OCR engines (Python `warm`).
+    /// Enable the keep-alive pool and the warm OCR engines synchronously (Python `warm`).
     pub fn warm(&mut self) {
         crate::wda::set_pool_enabled(true);
         self.warmed = true;
         crate::ocr::set_warm_ocr(true);
     }
 
+    /// Enable the keep-alive pool immediately and warm OCR engines on a background thread
+    /// so `serve_forever()` can answer `ping` right after `bind()`. The first `run` request
+    /// (or `close()`) joins the warm-up thread before touching process env/cwd or OCR.
+    fn warm_async(&mut self) {
+        self.warm_async_with(|| crate::ocr::set_warm_ocr(true));
+    }
+
+    pub(crate) fn warm_async_with<F: FnOnce() + Send + 'static>(&mut self, f: F) {
+        crate::wda::set_pool_enabled(true);
+        crate::ocr::ensure_omp_thread_limit();
+        self.warmed = true;
+        self.inner.warm_pending.store(true, Ordering::Release);
+        let h = std::thread::spawn(f);
+        *self.inner.warm_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+
     pub fn close(&mut self) {
+        // Stop accepting new connections first.
         self.listener = None;
-        if let Some(ino) = self.inode {
-            if std::fs::symlink_metadata(&self.inner.path).map(|m| m.ino() == ino).unwrap_or(false) {
-                let _ = std::fs::remove_file(&self.inner.path);
-            }
-        }
-        // While unwinding (a panic during warm-up), only the socket and lock are
-        // released: calling back into OCR could panic again and abort the process.
+        // While unwinding (a panic during warm-up), only release the socket and lock:
+        // calling back into OCR could panic again and abort the process.
         if self.warmed && !std::thread::panicking() {
+            join_warm(&self.inner);
             drain_request_work();
             crate::ocr::set_warm_ocr(false);
             crate::wda::set_pool_enabled(false);
             self.warmed = false;
+        }
+        // Remove the socket AFTER OCR teardown finishes so `daemon stop` waiting on socket
+        // removal does not return while we still hold `daemon.lock`.
+        if let Some(ino) = self.inode {
+            if std::fs::symlink_metadata(&self.inner.path).map(|m| m.ino() == ino).unwrap_or(false) {
+                let _ = std::fs::remove_file(&self.inner.path);
+            }
         }
         // Explicitly unlock before closing so a concurrent fork() between open and
         // exec cannot keep the flock held on the duplicated open file description.
@@ -700,8 +839,32 @@ impl Server {
 
     pub fn serve_forever(&mut self) {
         let Some(listener) = self.listener.as_ref() else { return };
-        // Keep one warm standby worker thread so sequential requests skip per-connection
-        // thread::spawn + stack mmap/munmap overhead; concurrent arrivals spill to spawn.
+        // Non-blocking wakeup pipe so `stop` wakes `poll()` immediately instead of sleeping 500 ms.
+        let wake_read: Option<OwnedFd> = unsafe {
+            let mut fds = [-1 as libc::c_int; 2];
+            if libc::pipe(fds.as_mut_ptr()) == 0 {
+                for fd in fds {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                }
+                let rfd = OwnedFd::from_raw_fd(fds[0]);
+                let wfd = OwnedFd::from_raw_fd(fds[1]);
+                *self.inner.wake_write.lock().unwrap_or_else(|e| e.into_inner()) = Some(wfd);
+                Some(rfd)
+            } else {
+                None
+            }
+        };
+        struct WakeGuard<'a>(&'a Inner);
+        impl Drop for WakeGuard<'_> {
+            fn drop(&mut self) {
+                *self.0.wake_write.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        let _wake_guard = WakeGuard(&self.inner);
+        // Keep one warm standby worker thread with reusable read buffers so sequential
+        // requests skip per-connection thread::spawn + stack mmap/munmap + 8 KB alloc;
+        // concurrent arrivals spill to spawn.
         struct PrimarySlot {
             conn: Option<UnixStream>,
             shutdown: bool,
@@ -712,27 +875,38 @@ impl Server {
             let inner = self.inner.clone();
             let slot = primary_slot.clone();
             let busy = primary_busy.clone();
-            crate::clock::spawn(move || loop {
-                let conn = {
-                    let (lk, cv) = &*slot;
-                    let mut g = lk.lock().unwrap_or_else(|e| e.into_inner());
-                    while g.conn.is_none() && !g.shutdown {
-                        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                    }
-                    match g.conn.take() {
-                        Some(c) => c,
-                        None => break,
-                    }
-                };
-                handle(&inner, conn);
-                busy.store(false, Ordering::Release);
+            crate::clock::spawn(move || {
+                let mut bufs = WorkerBufs::new();
+                loop {
+                    let conn = {
+                        let (lk, cv) = &*slot;
+                        let mut g = lk.lock().unwrap_or_else(|e| e.into_inner());
+                        while g.conn.is_none() && !g.shutdown {
+                            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                        }
+                        match g.conn.take() {
+                            Some(c) => c,
+                            None => break,
+                        }
+                    };
+                    handle_with_bufs(&inner, conn, &mut bufs);
+                    busy.store(false, Ordering::Release);
+                }
             })
         };
         let mut threads: Vec<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = Vec::new();
         while !self.inner.stopping.load(Ordering::SeqCst) {
-            let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            // SAFETY: one valid pollfd.
-            let n = unsafe { libc::poll(&mut pfd, 1, 500) };
+            let mut pfds = [
+                libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd {
+                    fd: wake_read.as_ref().map(|r| r.as_raw_fd()).unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let nfds: libc::nfds_t = if wake_read.is_some() { 2 } else { 1 };
+            // SAFETY: valid pollfd array of length `nfds`.
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 500) };
             if n < 0 {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                     continue;
@@ -747,6 +921,21 @@ impl Server {
                 if idle {
                     break;
                 }
+                continue;
+            }
+            if let Some(ref rfd) = wake_read {
+                if pfds[1].revents != 0 {
+                    let mut drain = [0u8; 64];
+                    // SAFETY: nonblocking drain of wakeup pipe.
+                    unsafe {
+                        let _ = libc::read(rfd.as_raw_fd(), drain.as_mut_ptr() as *mut libc::c_void, drain.len());
+                    }
+                    if self.inner.stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
+            if pfds[0].revents == 0 {
                 continue;
             }
             let conn = match listener.accept() {
@@ -765,13 +954,16 @@ impl Server {
             let done = Arc::new(AtomicBool::new(false));
             let d2 = done.clone();
             let t = crate::clock::spawn(move || {
-                handle(&inner, conn);
+                let mut bufs = WorkerBufs::new();
+                handle_with_bufs(&inner, conn, &mut bufs);
                 d2.store(true, Ordering::SeqCst);
             });
             threads.retain(|(_, d)| !d.load(Ordering::SeqCst));
             threads.push((t, done));
         }
-        // Signal standby worker to exit once idle and let any running command finish first.
+        // Clear wake_write under lock before closing the read end, then stop workers cleanly.
+        drop(_wake_guard);
+        drop(wake_read);
         {
             let (lk, cv) = &*primary_slot;
             lk.lock().unwrap_or_else(|e| e.into_inner()).shutdown = true;
@@ -780,7 +972,7 @@ impl Server {
         drop(self.inner.exec_lock.lock().unwrap_or_else(|e| e.into_inner()));
         let deadline = crate::clock::now() + GO_TIMEOUT + 1.0;
         while primary_busy.load(Ordering::Acquire) && crate::clock::now() < deadline {
-            crate::clock::sleep(0.01);
+            crate::clock::sleep(0.005);
         }
         if !primary_busy.load(Ordering::Acquire) {
             let _ = primary_worker.join();
@@ -788,7 +980,7 @@ impl Server {
         for (t, done) in threads {
             let deadline = crate::clock::now() + GO_TIMEOUT + 1.0;
             while !done.load(Ordering::SeqCst) && crate::clock::now() < deadline {
-                crate::clock::sleep(0.01);
+                crate::clock::sleep(0.005);
             }
             if done.load(Ordering::SeqCst) {
                 let _ = t.join();
@@ -876,24 +1068,27 @@ fn status_of(inner: &Inner) -> Value {
     })
 }
 
-/// Deserializes an optional JSON string without failing on wrong types (preserving
-/// `"malformed request"` responses).
+/// Deserializes an optional JSON string borrowing zero-copy when unescaped, without
+/// failing on wrong types (preserving `"malformed request"` responses).
 #[derive(Default)]
-struct MaybeStr(Option<String>);
+struct MaybeStr<'a>(Option<Cow<'a, str>>);
 
-impl<'de> Deserialize<'de> for MaybeStr {
+impl<'de: 'a, 'a> Deserialize<'de> for MaybeStr<'a> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = MaybeStr;
+        struct V<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = MaybeStr<'a>;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("any JSON value")
             }
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> std::result::Result<Self::Value, E> {
+                Ok(MaybeStr(Some(Cow::Borrowed(v))))
+            }
             fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
-                Ok(MaybeStr(Some(v.to_string())))
+                Ok(MaybeStr(Some(Cow::Owned(v.to_string()))))
             }
             fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
-                Ok(MaybeStr(Some(v)))
+                Ok(MaybeStr(Some(Cow::Owned(v))))
             }
             fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
                 Ok(MaybeStr(None))
@@ -922,7 +1117,32 @@ impl<'de> Deserialize<'de> for MaybeStr {
                 Ok(MaybeStr(None))
             }
         }
-        deserializer.deserialize_any(V)
+        deserializer.deserialize_any(V(std::marker::PhantomData))
+    }
+}
+
+/// Zero-copy borrowed JSON string key (unlike serde's default `Cow` impl which always clones).
+struct BorrowedKey<'a>(Cow<'a, str>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for BorrowedKey<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = BorrowedKey<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a JSON string")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> std::result::Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Borrowed(v)))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Owned(v.to_string())))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Owned(v)))
+            }
+        }
+        deserializer.deserialize_str(V(std::marker::PhantomData))
     }
 }
 
@@ -943,7 +1163,7 @@ impl<'de> Deserialize<'de> for MaybeArgv {
                 let mut valid = true;
                 while let Some(item) = seq.next_element::<MaybeStr>()? {
                     match item.0 {
-                        Some(s) if valid => out.push(s),
+                        Some(s) if valid => out.push(s.into_owned()),
                         _ => valid = false,
                     }
                 }
@@ -979,27 +1199,25 @@ impl<'de> Deserialize<'de> for MaybeArgv {
     }
 }
 
-/// Deserializes a JSON object of string values directly into `Option<HashMap<String, String>>`
-/// without allocating intermediate `IndexMap`/`Value`/`Vec` containers.
+/// Deserializes a JSON object of string values directly into a borrowed `Vec` without
+/// allocating a per-request `HashMap`, `IndexMap`, `Value`, or unescaped `String`s.
 #[derive(Default)]
-struct MaybeEnv(Option<HashMap<String, String>>);
+struct MaybeEnv<'a>(Option<Vec<(Cow<'a, str>, Cow<'a, str>)>>);
 
-impl<'de> Deserialize<'de> for MaybeEnv {
+impl<'de: 'a, 'a> Deserialize<'de> for MaybeEnv<'a> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = MaybeEnv;
+        struct V<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = MaybeEnv<'a>;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("any JSON value")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
-                let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(64));
+                let mut out = Vec::with_capacity(map.size_hint().unwrap_or(64));
                 let mut valid = true;
-                while let Some((k, v)) = map.next_entry::<String, MaybeStr>()? {
+                while let Some((k, v)) = map.next_entry::<BorrowedKey<'a>, MaybeStr<'a>>()? {
                     match v.0 {
-                        Some(s) if valid => {
-                            out.insert(k, s);
-                        }
+                        Some(s) if valid => out.push((k.0, s)),
                         _ => valid = false,
                     }
                 }
@@ -1031,27 +1249,27 @@ impl<'de> Deserialize<'de> for MaybeEnv {
                 Ok(MaybeEnv(None))
             }
         }
-        deserializer.deserialize_any(V)
+        deserializer.deserialize_any(V(std::marker::PhantomData))
     }
 }
 
 #[derive(Deserialize)]
-struct ServerReq {
+struct ServerReq<'a> {
     #[serde(default)]
     v: Value,
-    #[serde(default)]
-    op: MaybeStr,
+    #[serde(default, borrow)]
+    op: MaybeStr<'a>,
     #[serde(default)]
     argv: MaybeArgv,
-    #[serde(default)]
-    env: MaybeEnv,
-    #[serde(default)]
-    cwd: MaybeStr,
-    #[serde(default)]
-    fingerprint: MaybeStr,
+    #[serde(default, borrow)]
+    env: MaybeEnv<'a>,
+    #[serde(default, borrow)]
+    cwd: MaybeStr<'a>,
+    #[serde(default, borrow)]
+    fingerprint: MaybeStr<'a>,
 }
 
-fn parse_server_req(line: &[u8]) -> std::io::Result<ServerReq> {
+fn parse_server_req<'a>(line: &'a [u8]) -> std::io::Result<ServerReq<'a>> {
     // Reject non-object top-level JSON values just like parse_json_obj.
     let trimmed = line.iter().copied().find(|b| !b.is_ascii_whitespace());
     if trimmed != Some(b'{') {
@@ -1060,7 +1278,7 @@ fn parse_server_req(line: &[u8]) -> std::io::Result<ServerReq> {
     serde_json::from_slice(line).map_err(|e| proto_err(&e.to_string()))
 }
 
-fn handle(inner: &Inner, conn: UnixStream) {
+fn handle_with_bufs(inner: &Inner, conn: UnixStream, bufs: &mut WorkerBufs) {
     if let Some(u) = peer_uid(&conn) {
         if u != uid() {
             return;
@@ -1069,8 +1287,9 @@ fn handle(inner: &Inner, conn: UnixStream) {
     let _ = (|| -> std::io::Result<()> {
         conn.set_read_timeout(secs(FIRST_REPLY_TIMEOUT))?;
         conn.set_write_timeout(secs(FIRST_REPLY_TIMEOUT))?;
-        let mut reader = Lines::new(&conn);
-        let req = reader.with_line(parse_server_req)?;
+        let mut reader = FastLines::new(&conn, &mut bufs.io_buf);
+        reader.read_line_into(&mut bufs.req_buf)?;
+        let req = parse_server_req(&bufs.req_buf)?;
         let op = req.op.0.as_deref().unwrap_or("");
         if req.v != j!(PROTOCOL) {
             send(&conn, &j!({"error": "protocol mismatch"}))
@@ -1078,6 +1297,7 @@ fn handle(inner: &Inner, conn: UnixStream) {
             send(&conn, &status_of(inner))
         } else if op == "stop" {
             inner.stopping.store(true, Ordering::SeqCst);
+            wake_server(inner);
             send(&conn, &j!({"ok": true, "stopping": true, "pid": std::process::id()}))
         } else if op == "run" {
             run(inner, &conn, &mut reader, req)
@@ -1087,7 +1307,16 @@ fn handle(inner: &Inner, conn: UnixStream) {
     })();
 }
 
-fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, req: ServerReq) -> std::io::Result<()> {
+fn send_exit(conn: &UnixStream, code: i32) {
+    let _ = match code {
+        0 => send_bytes(conn, b"{\"exit\":0}\n"),
+        1 => send_bytes(conn, b"{\"exit\":1}\n"),
+        2 => send_bytes(conn, b"{\"exit\":2}\n"),
+        c => send_bytes(conn, format!("{{\"exit\":{c}}}\n").as_bytes()),
+    };
+}
+
+fn run(inner: &Inner, conn: &UnixStream, reader: &mut FastLines, req: ServerReq<'_>) -> std::io::Result<()> {
     let (Some(argv), Some(env), Some(cwd)) = (req.argv.0, req.env.0, req.cwd.0) else {
         return send(conn, &j!({"error": "malformed request"}));
     };
@@ -1105,6 +1334,7 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, req: ServerReq) -> 
         // Installed code changed under us: let the client run it and retire.
         send(conn, &j!({"error": "stale daemon"}))?;
         inner.stopping.store(true, Ordering::SeqCst);
+        wake_server(inner);
         return Ok(());
     }
     if inner.stopping.load(Ordering::SeqCst) {
@@ -1123,17 +1353,35 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut Lines, req: ServerReq) -> 
         if inner.stopping.load(Ordering::SeqCst) {
             return send(conn, &j!({"error": "stopping"}));
         }
+        // Ensure background OCR warm-up finishes before mutating env/cwd for the first request.
+        join_warm(inner);
+        if inner.stopping.load(Ordering::SeqCst) {
+            return send(conn, &j!({"error": "stopping"}));
+        }
         send_bytes(conn, b"{\"ready\":true}\n")?;
-        conn.set_read_timeout(secs(GO_TIMEOUT))?;
-        if !reader.read_go()? {
+        if (GO_TIMEOUT - FIRST_REPLY_TIMEOUT).abs() > f64::EPSILON {
+            conn.set_read_timeout(secs(GO_TIMEOUT))?;
+        }
+        let mut go_scratch = Vec::new();
+        if !reader.read_go(&mut go_scratch)? {
+            return Ok(());
+        }
+        if inner.stopping.load(Ordering::SeqCst) {
+            // Client already committed (`go` sent); return a terminal cancellation rather
+            // than dropping the socket or dispatching work after stop was acknowledged.
+            let _ = send(conn, &j!({"err": "turbotap: daemon stopped before running request\n"}));
+            send_exit(conn, 1);
             return Ok(());
         }
         conn.set_read_timeout(None)?;
         conn.set_write_timeout(None)?;
         let baseline = exec_guard.get_or_insert_with(BaselineState::capture);
         let code = execute(conn, &argv, &env, &cwd, baseline, inner.cwd_dir.get(), &inner.stopping);
+        if inner.stopping.load(Ordering::SeqCst) {
+            wake_server(inner);
+        }
         inner.state.lock().unwrap_or_else(|e| e.into_inner()).requests += 1;
-        let _ = send_bytes(conn, format!("{{\"exit\":{code}}}\n").as_bytes());
+        send_exit(conn, code);
         Ok(())
     })();
     touch(inner, -1);
@@ -1174,10 +1422,9 @@ fn is_config_env_key(k: &OsStr) -> bool {
 /// calls. If a panic occurs, drop falls back to a full live `vars_os()` diff against
 /// `baseline.env` so any unexpected mutation is still completely reverted.
 struct RequestStateGuard<'a> {
-    baseline: &'a BaselineState,
+    baseline: &'a mut BaselineState,
     cwd_dir: Option<&'a std::fs::File>,
     stopping: &'a AtomicBool,
-    deltas: Vec<(OsString, Option<OsString>)>,
     cwd_changed: bool,
     config_env_changed: bool,
     panicked: bool,
@@ -1185,15 +1432,15 @@ struct RequestStateGuard<'a> {
 
 impl<'a> RequestStateGuard<'a> {
     fn new(
-        baseline: &'a BaselineState,
+        baseline: &'a mut BaselineState,
         cwd_dir: Option<&'a std::fs::File>,
         stopping: &'a AtomicBool,
     ) -> RequestStateGuard<'a> {
+        baseline.deltas.clear();
         RequestStateGuard {
             baseline,
             cwd_dir,
             stopping,
-            deltas: Vec::new(),
             cwd_changed: false,
             config_env_changed: false,
             panicked: false,
@@ -1206,11 +1453,12 @@ impl Drop for RequestStateGuard<'_> {
         let mut reload_cfg = self.config_env_changed;
         let panicking = self.panicked || std::thread::panicking();
         if panicking {
-            if restore_env_diff(&self.baseline.env) {
+            if restore_env_diff(&self.baseline.entries) {
                 reload_cfg = true;
             }
+            self.baseline.deltas.clear();
         } else {
-            for (k, prev) in self.deltas.drain(..).rev() {
+            for (k, prev) in self.baseline.deltas.drain(..).rev() {
                 match prev {
                     Some(v) if valid_os_env_entry(&k, &v) => std::env::set_var(&k, &v),
                     None => std::env::remove_var(&k),
@@ -1245,9 +1493,9 @@ impl Drop for RequestStateGuard<'_> {
 fn execute(
     conn: &UnixStream,
     argv: &[String],
-    env: &HashMap<String, String>,
+    env: &[(Cow<'_, str>, Cow<'_, str>)],
     cwd: &str,
-    baseline: &BaselineState,
+    baseline: &mut BaselineState,
     cwd_dir: Option<&std::fs::File>,
     stopping: &AtomicBool,
 ) -> i32 {
@@ -1262,7 +1510,7 @@ fn execute(
     // Installed before any process state changes; restores it on every exit path.
     let mut restore = RequestStateGuard::new(baseline, cwd_dir, stopping);
     crate::out::set_sink(Some(sink.clone()));
-    restore.config_env_changed = apply_request_env(&baseline.env, env, &mut restore.deltas);
+    restore.config_env_changed = apply_request_env(restore.baseline, env);
     let code = match std::env::set_current_dir(cwd) {
         Err(e) => {
             let err = crate::cli::py_os_error(&e, cwd);
@@ -1293,49 +1541,66 @@ fn execute(
     code
 }
 
-/// Diff-apply the request's environment onto the process environment (only removing keys
-/// absent from `target` and only setting keys whose value changed, plus ensuring
-/// `OMP_THREAD_LIMIT=1` when absent). Records every change in `deltas` for O(deltas)
-/// restoration on drop. Returns true when any config-affecting key changed.
-fn apply_request_env(
-    saved: &HashMap<OsString, OsString>,
-    target: &HashMap<String, String>,
-    deltas: &mut Vec<(OsString, Option<OsString>)>,
-) -> bool {
+/// Diff-apply the request's environment onto the process environment using the cached
+/// slot-indexed [`BaselineState`] (zero per-request `HashMap` allocation). Records every
+/// change in `baseline.deltas` for O(deltas) restoration on drop. Returns true when any
+/// config-affecting key changed.
+fn apply_request_env(baseline: &mut BaselineState, target: &[(Cow<'_, str>, Cow<'_, str>)]) -> bool {
     let omp_key = OsStr::new("OMP_THREAD_LIMIT");
     let omp_default = OsStr::new("1");
+    baseline.seen.fill(false);
+    baseline.mutated.fill(false);
+    baseline.deltas.clear();
     let mut config_changed = false;
-    let omp_in_target = target.contains_key("OMP_THREAD_LIMIT");
-    for (k, cur_v) in saved {
-        let ks = k.as_os_str();
-        if ks.to_str().is_some_and(|s| target.contains_key(s)) {
+    let mut omp_in_target = false;
+    for (k, new_v) in target {
+        let ks = OsStr::new(k.as_ref());
+        let vs = OsStr::new(new_v.as_ref());
+        if ks == omp_key {
+            omp_in_target = true;
+        }
+        if let Some(&idx) = baseline.index.get(ks) {
+            baseline.seen[idx] = true;
+            let already_mutated = baseline.mutated[idx];
+            if (already_mutated || baseline.entries[idx].1.as_os_str() != vs) && valid_os_env_entry(ks, vs) {
+                if is_config_env_key(ks) {
+                    config_changed = true;
+                }
+                if !already_mutated {
+                    baseline.mutated[idx] = true;
+                    baseline
+                        .deltas
+                        .push((baseline.entries[idx].0.clone(), Some(baseline.entries[idx].1.clone())));
+                }
+                std::env::set_var(ks, vs);
+            }
+        } else if valid_os_env_entry(ks, vs) {
+            if is_config_env_key(ks) {
+                config_changed = true;
+            }
+            baseline.deltas.push((OsString::from(k.as_ref()), None));
+            std::env::set_var(ks, vs);
+        }
+    }
+    for (idx, &present) in baseline.seen.iter().enumerate() {
+        if present {
             continue;
         }
+        let (k, cur_v) = &baseline.entries[idx];
+        let ks = k.as_os_str();
         if !omp_in_target && ks == omp_key && cur_v.as_os_str() == omp_default {
             continue;
         }
         if is_config_env_key(ks) {
             config_changed = true;
         }
-        deltas.push((k.clone(), Some(cur_v.clone())));
+        baseline.deltas.push((k.clone(), Some(cur_v.clone())));
         std::env::remove_var(ks);
     }
-    for (k, new_v) in target {
-        let ks = OsStr::new(k);
-        let vs = OsStr::new(new_v);
-        let prev = saved.get(ks);
-        if prev.map(OsString::as_os_str) != Some(vs) && valid_os_env_entry(ks, vs) {
-            if is_config_env_key(ks) {
-                config_changed = true;
-            }
-            deltas.push((OsString::from(k), prev.cloned()));
-            std::env::set_var(ks, vs);
-        }
-    }
     if !omp_in_target {
-        let prev = saved.get(omp_key);
+        let prev = baseline.index.get(omp_key).map(|&idx| &baseline.entries[idx].1);
         if prev.map(OsString::as_os_str) != Some(omp_default) {
-            deltas.push((omp_key.to_os_string(), prev.cloned()));
+            baseline.deltas.push((omp_key.to_os_string(), prev.cloned()));
             std::env::set_var(omp_key, omp_default);
         }
     }
@@ -1344,11 +1609,14 @@ fn apply_request_env(
 
 /// Panic-fallback full diff restore against `saved`, inspecting the live environment
 /// so any unexpected mutations during a panic are completely reverted.
-fn restore_env_diff(saved: &HashMap<OsString, OsString>) -> bool {
-    let mut remaining = saved.clone();
+fn restore_env_diff(saved: &[(OsString, OsString)]) -> bool {
+    let mut remaining: HashMap<&OsStr, &OsStr> = HashMap::with_capacity(saved.len());
+    for (k, v) in saved {
+        remaining.insert(k.as_os_str(), v.as_os_str());
+    }
     let mut config_changed = false;
     for (k, cur_v) in std::env::vars_os() {
-        match remaining.remove(&k) {
+        match remaining.remove(k.as_os_str()) {
             None => {
                 if is_config_env_key(&k) {
                     config_changed = true;
@@ -1356,31 +1624,31 @@ fn restore_env_diff(saved: &HashMap<OsString, OsString>) -> bool {
                 std::env::remove_var(&k);
             }
             Some(saved_v) => {
-                if cur_v != saved_v && valid_os_env_entry(&k, &saved_v) {
+                if cur_v.as_os_str() != saved_v && valid_os_env_entry(&k, saved_v) {
                     if is_config_env_key(&k) {
                         config_changed = true;
                     }
-                    std::env::set_var(&k, &saved_v);
+                    std::env::set_var(&k, saved_v);
                 }
             }
         }
     }
     for (k, saved_v) in remaining {
-        if valid_os_env_entry(&k, &saved_v) {
-            if is_config_env_key(&k) {
+        if valid_os_env_entry(k, saved_v) {
+            if is_config_env_key(k) {
                 config_changed = true;
             }
-            std::env::set_var(&k, &saved_v);
+            std::env::set_var(k, saved_v);
         }
     }
     config_changed
 }
 
-/// Bind, warm and serve until stopped or idle (Python `serve`).
+/// Bind, warm (async overlapping `ping`/accept) and serve until stopped or idle (Python `serve`).
 pub fn serve(idle: f64) -> Result<()> {
     let mut server = Server::new(idle);
     server.bind()?;
-    server.warm();
+    server.warm_async();
     server.serve_forever();
     Ok(())
 }
@@ -1454,6 +1722,7 @@ fn start(idle: Option<f64>, foreground: bool) -> Result<i32> {
     }
     let mut child = cmd.spawn().map_err(|e| Error::Os(format!("cannot start the daemon: {e}")))?;
     let deadline = crate::clock::now() + 20.0;
+    let mut poll_s = 0.002_f64;
     while crate::clock::now() < deadline {
         if let Some(st) = ping() {
             print_doc(st);
@@ -1466,9 +1735,24 @@ fn start(idle: Option<f64>, foreground: bool) -> Result<i32> {
                 log.display()
             )));
         }
-        crate::clock::sleep(0.05);
+        crate::clock::sleep(poll_s);
+        poll_s = (poll_s * 1.5).min(0.015);
     }
     Err(Error::runtime(format!("daemon did not answer within 20 s; see {}", log.display())))
+}
+
+fn lock_held(lock_file_path: &Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new().read(true).open(lock_file_path) else {
+        return false;
+    };
+    // SAFETY: valid open fd owned by `f`.
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        true
+    }
 }
 
 fn stop_running() -> bool {
@@ -1477,9 +1761,12 @@ fn stop_running() -> bool {
         return false;
     }
     let path = socket_path();
+    let lock = lock_path();
     let deadline = crate::clock::now() + 30.0;
-    while crate::clock::now() < deadline && path.exists() {
-        crate::clock::sleep(0.05);
+    let mut poll_s = 0.002_f64;
+    while crate::clock::now() < deadline && (path.exists() || lock_held(&lock)) {
+        crate::clock::sleep(poll_s);
+        poll_s = (poll_s * 1.5).min(0.015);
     }
     true
 }
@@ -1515,25 +1802,28 @@ mod unit {
     #[test]
     fn diff_env_apply_and_restore_is_exact_and_panic_safe() {
         let _lock = set_env(&[("TT_DIFF_KEEP", Some("same")), ("TT_DIFF_MOD", Some("old")), ("TT_DIFF_ADD", None)]);
-        let baseline = BaselineState::capture();
-        let make_target = || -> HashMap<String, String> {
-            let mut target: HashMap<String, String> = baseline
-                .env
+        let mut baseline = BaselineState::capture();
+        let make_target = |entries: &[(OsString, OsString)]| -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
+            let mut target: Vec<(Cow<'static, str>, Cow<'static, str>)> = entries
                 .iter()
-                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
-                .filter(|(k, _)| k != "TT_DIFF_KEEP")
+                .filter_map(|(k, v)| Some((Cow::<str>::Owned(k.to_str()?.to_string()), Cow::<str>::Owned(v.to_str()?.to_string()))))
+                .filter(|(k, _)| k.as_ref() != "TT_DIFF_KEEP")
                 .collect();
-            target.insert("TT_DIFF_MOD".to_string(), "new".to_string());
-            target.insert("TT_DIFF_ADD".to_string(), "added".to_string());
+            for (k, v) in &mut target {
+                if k.as_ref() == "TT_DIFF_MOD" {
+                    *v = Cow::Borrowed("new");
+                }
+            }
+            target.push((Cow::Borrowed("TT_DIFF_ADD"), Cow::Borrowed("added")));
             target
         };
         let stopping = AtomicBool::new(false);
         let cwd_dir = open_cwd_dir().unwrap();
+        let target = make_target(&baseline.entries);
         // Normal delta-replay restoration path (zero vars_os() scan).
         {
-            let mut guard = RequestStateGuard::new(&baseline, Some(&cwd_dir), &stopping);
-            let target = make_target();
-            apply_request_env(&baseline.env, &target, &mut guard.deltas);
+            let guard = RequestStateGuard::new(&mut baseline, Some(&cwd_dir), &stopping);
+            apply_request_env(guard.baseline, &target);
             assert_eq!(std::env::var("TT_DIFF_KEEP").ok(), None);
             assert_eq!(std::env::var("TT_DIFF_MOD").ok().as_deref(), Some("new"));
             assert_eq!(std::env::var("TT_DIFF_ADD").ok().as_deref(), Some("added"));
@@ -1545,9 +1835,8 @@ mod unit {
 
         // Panic fallback path reverts unexpected mid-request mutations too.
         {
-            let mut guard = RequestStateGuard::new(&baseline, Some(&cwd_dir), &stopping);
-            let target = make_target();
-            apply_request_env(&baseline.env, &target, &mut guard.deltas);
+            let mut guard = RequestStateGuard::new(&mut baseline, Some(&cwd_dir), &stopping);
+            apply_request_env(guard.baseline, &target);
             std::env::set_var("TT_DIFF_EXTRA", "mutated");
             guard.panicked = true;
         }
@@ -1559,7 +1848,7 @@ mod unit {
 
         // Failed cwd restoration retires the daemon before accepting another request.
         {
-            let mut guard = RequestStateGuard::new(&baseline, None, &stopping);
+            let mut guard = RequestStateGuard::new(&mut baseline, None, &stopping);
             guard.cwd_changed = true;
         }
         assert!(stopping.load(Ordering::SeqCst));

@@ -5,7 +5,14 @@
 //! Python did with PIL (`Image.open`, `draft("L")`, `convert("L")`, `crop`,
 //! `resize(BOX|BILINEAR)`, `ImageChops.difference`, `ImageStat.mean`, `getextrema`).
 use crate::error::{Error, Result};
+use std::cell::RefCell;
 use std::sync::Arc;
+
+thread_local! {
+    /// Reusable per-thread RGBA decode buffer for `decode_jpeg_fast`, avoiding repeated
+    /// ~3.6 MB mmap/munmap page faults on every 645x1398 screenshot decode.
+    static JPEG_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// An 8-bit grayscale image (PIL mode "L"), row-major.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,11 +274,11 @@ impl GrayImage {
 
     /// Decode JPEG or PNG bytes to grayscale (PIL `convert("L")`: ITU-R 601-2 luma).
     ///
-    /// Single-channel grayscale JPEGs take the direct `zune-jpeg` `ColorSpace::Luma`
-    /// fast path; color JPEGs keep the exact `RGB -> l24` conversion so high-chroma
-    /// edges match `v1.0.0` bit-for-bit.
+    /// Takes a single-pass `zune-jpeg` fast path for YCbCr and Luma JPEGs (matching
+    /// `image::load_from_memory()->to_rgb8()->l24` bit-for-bit, `max_diff == 0`), and
+    /// falls back to `image::load_from_memory` for PNG, CMYK/RGB JPEGs, or errors.
     pub fn decode(bytes: &[u8]) -> Result<GrayImage> {
-        if let Some(img) = decode_jpeg_luma(bytes) {
+        if let Some(img) = decode_jpeg_fast(bytes) {
             return Ok(img);
         }
         use ::image::DynamicImage;
@@ -281,7 +288,12 @@ impl GrayImage {
             DynamicImage::ImageLuma8(b) => b.into_raw(),
             DynamicImage::ImageLumaA8(b) => b.into_raw().chunks_exact(2).map(|p| p[0]).collect(),
             DynamicImage::ImageRgb8(b) => b.into_raw().chunks_exact(3).map(l24).collect(),
-            DynamicImage::ImageRgba8(b) => b.into_raw().chunks_exact(4).map(l24).collect(),
+            DynamicImage::ImageRgba8(b) => {
+                let raw = b.into_raw();
+                let mut out = vec![0u8; (w as usize) * (h as usize)];
+                rgba_to_l24(&raw, &mut out);
+                out
+            }
             DynamicImage::ImageLuma16(b) => b.into_raw().iter().map(|v| (v >> 8) as u8).collect(),
             other => other.to_rgb8().into_raw().chunks_exact(3).map(l24).collect(),
         };
@@ -297,9 +309,12 @@ impl GrayImage {
     }
 
     pub fn encode_png(&self) -> Vec<u8> {
+        use ::image::codecs::png::{CompressionType, FilterType, PngEncoder};
         use ::image::ImageEncoder;
-        let mut out = Vec::new();
-        let enc = ::image::codecs::png::PngEncoder::new(&mut out);
+        let mut out = Vec::with_capacity((self.data.len() / 6).max(256));
+        // Lossless PNG using fast fdeflate + Sub scanline filter (~16x faster than
+        // default zlib level 6 + Adaptive while keeping compact ~7-8:1 grayscale size).
+        let enc = PngEncoder::new_with_quality(&mut out, CompressionType::Fast, FilterType::Sub);
         // Encoding an in-memory L8 buffer of the declared size cannot fail.
         let _ = enc.write_image(&self.data, self.w, self.h, ::image::ExtendedColorType::L8);
         out
@@ -616,10 +631,13 @@ fn clip8_i32(ss: i32) -> u8 {
     (ss >> PRECISION_BITS).clamp(0, 255) as u8
 }
 
-/// Fast luma-only JPEG decode via `zune-jpeg` (`ColorSpace::Luma`) strictly for
-/// single-channel grayscale JPEGs. Color JPEGs (YCbCr/RGB/CMYK) return `None` so
-/// `GrayImage::decode` keeps the bit-exact `RGB -> l24` path.
-fn decode_jpeg_luma(bytes: &[u8]) -> Option<GrayImage> {
+/// Single-pass `zune-jpeg` decode for YCbCr and Luma JPEGs, matching
+/// `image::load_from_memory()->to_rgb8()->l24` bit-for-bit (`max_diff == 0`).
+///
+/// Decodes YCbCr JPEGs straight into `ColorSpace::RGBA` (zune-jpeg's fastest 4-channel
+/// AVX2 converter) inside a reusable thread-local scratch buffer, then runs AVX2 `l24`
+/// RGB -> Luma conversion. Falls back (`None`) for non-JPEG, CMYK/RGB JPEGs, or errors.
+fn decode_jpeg_fast(bytes: &[u8]) -> Option<GrayImage> {
     use zune_jpeg::zune_core::bytestream::ZCursor;
     use zune_jpeg::zune_core::colorspace::ColorSpace;
     use zune_jpeg::zune_core::options::DecoderOptions;
@@ -628,20 +646,126 @@ fn decode_jpeg_luma(bytes: &[u8]) -> Option<GrayImage> {
     if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
         return None;
     }
-    let opts = DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::Luma);
+    let opts = DecoderOptions::default()
+        .set_strict_mode(false)
+        .jpeg_set_out_colorspace(ColorSpace::RGBA);
     let mut dec = JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
     dec.decode_headers().ok()?;
-    if dec.input_colorspace() != Some(ColorSpace::Luma) {
-        return None;
-    }
+    let cs = dec.input_colorspace()?;
     let info = dec.info()?;
     let (w, h) = (info.width as u32, info.height as u32);
-    let expected = (w as usize).checked_mul(h as usize)?;
-    let data = dec.decode().ok()?;
-    if data.len() != expected {
-        return None;
+    let n = (w as usize).checked_mul(h as usize)?;
+    match cs {
+        ColorSpace::YCbCr => {
+            let needed = n.checked_mul(4)?;
+            let mut out = vec![0u8; n];
+            let ok = JPEG_SCRATCH.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                if buf.len() < needed {
+                    buf.resize(needed, 0);
+                }
+                // Zero the full destination slice before decoding so a truncated or
+                // prematurely terminated JPEG can never expose pixels from a prior frame.
+                buf[..needed].fill(0);
+                let ok = dec.decode_into(&mut buf[..needed]).is_ok();
+                if ok {
+                    rgba_to_l24(&buf[..needed], &mut out);
+                }
+                // Cap retained scratch at 16 MB so an occasional giant image does not pin RAM.
+                const MAX_RETAIN: usize = 16 * 1024 * 1024;
+                if buf.capacity() > MAX_RETAIN {
+                    *buf = Vec::new();
+                }
+                ok
+            });
+            if !ok {
+                return None;
+            }
+            Some(GrayImage { w, h, data: out })
+        }
+        ColorSpace::Luma => {
+            let opts_l = DecoderOptions::default()
+                .set_strict_mode(false)
+                .jpeg_set_out_colorspace(ColorSpace::Luma);
+            let mut dec_l = JpegDecoder::new_with_options(ZCursor::new(bytes), opts_l);
+            let mut data = vec![0u8; n];
+            dec_l.decode_into(&mut data).ok()?;
+            Some(GrayImage { w, h, data })
+        }
+        _ => None,
     }
-    Some(GrayImage { w, h, data })
+}
+
+/// Bit-exact `l24` RGBA -> Luma conversion with AVX2 acceleration on x86_64 (~5x faster
+/// than scalar `chunks_exact(3).map(l24)`).
+fn rgba_to_l24(rgba: &[u8], out: &mut [u8]) {
+    debug_assert_eq!(rgba.len(), out.len() * 4);
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 availability verified at runtime; bounds checked via `chunks = n / 32`.
+        unsafe { rgba_to_l24_avx2(rgba, out) };
+        return;
+    }
+    for (p, dst) in rgba.chunks_exact(4).zip(out.iter_mut()) {
+        *dst = l24(p);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rgba_to_l24_avx2(rgba: &[u8], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    let n = out.len().min(rgba.len() / 4);
+    let chunks = n / 32;
+    let mask_ff = _mm256_set1_epi32(0xFF);
+    let wr = _mm256_set1_epi32(19595);
+    let wg = _mm256_set1_epi32(38470);
+    let wb = _mm256_set1_epi32(7471);
+    let bias = _mm256_set1_epi32(0x8000);
+    let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    let mut src = rgba.as_ptr();
+    let mut dst = out.as_mut_ptr();
+
+    for _ in 0..chunks {
+        let p0 = _mm256_loadu_si256(src as *const __m256i);
+        let p1 = _mm256_loadu_si256(src.add(32) as *const __m256i);
+        let p2 = _mm256_loadu_si256(src.add(64) as *const __m256i);
+        let p3 = _mm256_loadu_si256(src.add(96) as *const __m256i);
+
+        macro_rules! luma8 {
+            ($p:expr) => {{
+                let r = _mm256_and_si256($p, mask_ff);
+                let g = _mm256_and_si256(_mm256_srli_epi32($p, 8), mask_ff);
+                let b = _mm256_and_si256(_mm256_srli_epi32($p, 16), mask_ff);
+                let s = _mm256_add_epi32(
+                    _mm256_add_epi32(_mm256_mullo_epi32(r, wr), _mm256_mullo_epi32(g, wg)),
+                    _mm256_add_epi32(_mm256_mullo_epi32(b, wb), bias),
+                );
+                _mm256_srli_epi32(s, 16)
+            }};
+        }
+
+        let y0 = luma8!(p0);
+        let y1 = luma8!(p1);
+        let y2 = luma8!(p2);
+        let y3 = luma8!(p3);
+
+        let y01 = _mm256_packus_epi32(y0, y1);
+        let y23 = _mm256_packus_epi32(y2, y3);
+        let y0123 = _mm256_packus_epi16(y01, y23);
+        let ordered = _mm256_permutevar8x32_epi32(y0123, perm);
+        _mm256_storeu_si256(dst as *mut __m256i, ordered);
+
+        src = src.add(128);
+        dst = dst.add(32);
+    }
+
+    let done = chunks * 32;
+    for (p, d) in rgba[done * 4..n * 4].chunks_exact(4).zip(&mut out[done..n]) {
+        *d = l24(p);
+    }
 }
 
 /// For `Filter::Box`, every non-zero tap has the same fixed-point weight and forms a
@@ -811,25 +935,76 @@ mod img_opt_tests {
         let mut enc = ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75);
         enc.encode(&rgb, w, h, ::image::ExtendedColorType::Rgb8).unwrap();
 
-        // Color JPEG must NOT bypass RGB -> l24 via the Y-plane shortcut.
-        assert!(decode_jpeg_luma(&jpeg).is_none());
+        // Color JPEG takes single-pass zune-jpeg RGBA + AVX2 l24 and must match image::load_from_memory
+        // -> RGB -> l24 bit-for-bit (max_diff == 0) even on saturated 4:2:0 chroma edges.
+        let fast = decode_jpeg_fast(&jpeg).expect("color jpeg fast path");
         let decoded = GrayImage::decode(&jpeg).expect("color jpeg decode");
         let ref_rgb = ::image::load_from_memory(&jpeg).unwrap().to_rgb8();
         let ref_luma: Vec<u8> = ref_rgb.into_raw().chunks_exact(3).map(l24).collect();
         assert_eq!((decoded.w, decoded.h), (w, h));
+        assert_eq!(fast.data, ref_luma, "single-pass color JPEG must match RGB -> l24 bit-for-bit");
         assert_eq!(decoded.data, ref_luma, "color JPEG grayscale pixels must match RGB -> l24 bit-for-bit");
 
-        // PNG still decodes via fallback.
+        // PNG still decodes via fallback and fast lossless PNG round-trips bit-for-bit.
         let png = decoded.encode_png();
-        assert!(decode_jpeg_luma(&png).is_none());
+        assert!(decode_jpeg_fast(&png).is_none());
         assert_eq!(GrayImage::decode(&png).unwrap(), decoded);
 
         // Single-channel grayscale JPEG takes the direct zune-jpeg fast path and matches bit-for-bit.
         let gray_jpeg = decoded.encode_jpeg(80);
-        let dec_gray = decode_jpeg_luma(&gray_jpeg).expect("gray jpeg fast path");
+        let dec_gray = decode_jpeg_fast(&gray_jpeg).expect("gray jpeg fast path");
         let ref_gray = ::image::load_from_memory(&gray_jpeg).unwrap().into_luma8().into_raw();
         assert_eq!((dec_gray.w, dec_gray.h), (w, h));
         assert_eq!(dec_gray.data, ref_gray);
+
+        // Verify rgba_to_l24 AVX2 / tail path matches scalar l24 for every tail length 0..67.
+        for len in [0usize, 1, 7, 31, 32, 33, 63, 64, 67] {
+            let rgba: Vec<u8> = (0..len * 4).map(|i| ((i * 37 + 13) & 255) as u8).collect();
+            let mut got = vec![0u8; len];
+            rgba_to_l24(&rgba, &mut got);
+            let want: Vec<u8> = rgba.chunks_exact(4).map(l24).collect();
+            assert_eq!(got, want, "rgba_to_l24 mismatch at len={len}");
+        }
+    }
+
+    /// PR #13 review: a partially decoded / damaged JPEG must never expose pixels from
+    /// an earlier frame via the reused thread-local RGBA scratch buffer.
+    #[test]
+    fn damaged_color_jpeg_never_leaks_prior_frame_pixels() {
+        let make_solid_jpeg = |r: u8, g: u8, b: u8| -> Vec<u8> {
+            let (w, h) = (160u32, 240u32);
+            let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+            for _ in 0..(w * h) {
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+            let mut jpeg = Vec::new();
+            let mut enc = ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75);
+            enc.encode(&rgb, w, h, ::image::ExtendedColorType::Rgb8).unwrap();
+            jpeg
+        };
+        let seed_white = make_solid_jpeg(250, 250, 250);
+        let seed_black = make_solid_jpeg(10, 10, 10);
+
+        // Build a damaged color JPEG with a premature second SOS marker mid-scan (0xFF 0xDA)
+        // followed by EOI (0xFF 0xD9) so permissive decoding stops partway through the frame.
+        let mut damaged = make_solid_jpeg(120, 140, 160);
+        let sos_pos = damaged.windows(2).position(|w| w == [0xFF, 0xDA]).expect("SOS marker");
+        let cut = (sos_pos + 64).min(damaged.len().saturating_sub(4));
+        damaged.truncate(cut);
+        damaged.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0xFF, 0xD9]);
+
+        // Prime scratch with bright white frame, then decode damaged JPEG.
+        let _ = GrayImage::decode(&seed_white).unwrap();
+        let after_white = GrayImage::decode(&damaged).expect("damaged jpeg after white seed");
+
+        // Prime scratch with dark black frame, then decode the exact same damaged JPEG.
+        let _ = GrayImage::decode(&seed_black).unwrap();
+        let after_black = GrayImage::decode(&damaged).expect("damaged jpeg after black seed");
+
+        assert_eq!(
+            after_white, after_black,
+            "damaged JPEG decode leaked pixels from previous frame in reused scratch buffer"
+        );
     }
 
     #[test]

@@ -403,12 +403,18 @@ impl<R: Reader> Flow<R> {
     /// Run one step; returns its result (string, number) or None.
     pub fn step(&mut self, spec: &str) -> Result<Option<Value>> {
         let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
-        let verb = verb.trim().to_lowercase();
-        if verb != "type" && verb != "key" {
+        let verb_trimmed = verb.trim();
+        let verb: std::borrow::Cow<'_, str> =
+            if verb_trimmed.bytes().all(|b| !b.is_ascii_uppercase()) && verb_trimmed.is_ascii() {
+                std::borrow::Cow::Borrowed(verb_trimmed)
+            } else {
+                std::borrow::Cow::Owned(verb_trimmed.to_lowercase())
+            };
+        if verb.as_ref() != "type" && verb.as_ref() != "key" {
             self.last_tap_type = None;
         }
         let some = |s: String| Ok(Some(Value::String(s)));
-        match verb.as_str() {
+        match verb.as_ref() {
             "unlock" => {
                 self.mark_action(false, false);
                 self.c.unlock_phone()?;
@@ -423,8 +429,8 @@ impl<R: Reader> Flow<R> {
             "open" | "launch" => {
                 self.mark_action(false, false);
                 let bid = crate::apps::resolve_app(arg, &self.c.udid, &self.c.base_url, &self.c.cache_dir)?;
-                let prev_bundle = self.bundle.clone();
-                if verb == "launch" {
+                let bundle_changed = self.bundle.as_deref() != Some(bid.as_str());
+                if verb.as_ref() == "launch" {
                     let r = self.c.fast_launch(&bid, true);
                     check_wda_ok(r, &format!("launch:{bid}"), false)?;
                 } else {
@@ -433,7 +439,7 @@ impl<R: Reader> Flow<R> {
                 }
                 self.bundle = Some(bid.clone());
                 let now = clock::now();
-                if verb == "launch" || Some(&bid) != prev_bundle.as_ref() {
+                if verb.as_ref() == "launch" || bundle_changed {
                     self.pending_bundle = Some(bid.clone());
                     self.pending_bundle_ts = now;
                     if self.last_app_name.as_deref().is_some_and(|s| !s.is_empty())
@@ -914,8 +920,12 @@ impl<R: Reader> Flow<R> {
     /// [`run`](Self::run) plus the success flag, decided from the run itself (never
     /// read back from the serialized, scrubbed result).
     pub fn run_outcome(&mut self, steps: &[String]) -> Result<(bool, Value)> {
+        self.run_outcome_inner(steps, false)
+    }
+
+    fn run_outcome_inner(&mut self, steps: &[String], take_reads: bool) -> Result<(bool, Value)> {
         let t0 = clock::real_now();
-        let mut done: Vec<Value> = Vec::new();
+        let mut done: Vec<Value> = Vec::with_capacity(steps.len());
         for spec in steps {
             let s0 = clock::real_now();
             let secret_step = is_secret_step(spec);
@@ -986,10 +996,11 @@ impl<R: Reader> Flow<R> {
                 Err(e) => return Err(self.scrub_error(e)),
             }
         }
+        let reads = if take_reads { std::mem::take(&mut self.reads) } else { self.reads.clone() };
         let mut res = j!({
             "ok": true,
             "steps": done,
-            "reads": self.reads,
+            "reads": reads,
             "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
         });
         self.scrub_value(&mut res);
@@ -1083,7 +1094,7 @@ pub fn cmd_flow(client: WdaClient, steps: &[String], timeout: f64, scale: f64, d
         ScreenReader::new(scale, None, 11, needs_ocr)
     };
     let mut flow = Flow::new(client, reader, timeout, deny, !quiet)?;
-    let res = flow.run_outcome(steps);
+    let res = flow.run_outcome_inner(steps, true);
     flow.close();
     let (ok, res) = res?;
     crate::outln!("{}", json::dumps_utf8(&res));

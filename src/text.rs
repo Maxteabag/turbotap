@@ -391,6 +391,21 @@ fn wb_search(t: &str, want: &str) -> bool {
     if want.is_empty() || want.len() > t.len() {
         return false;
     }
+    if t.is_ascii() {
+        let tb = t.as_bytes();
+        let mut pos = 0;
+        while let Some(rel) = t[pos..].find(want) {
+            let i = pos + rel;
+            let before_ok = i == 0 || !(tb[i - 1].is_ascii_alphanumeric() || tb[i - 1] == b'_');
+            let after_i = i + want.len();
+            let after_ok = after_i >= tb.len() || !(tb[after_i].is_ascii_alphanumeric() || tb[after_i] == b'_');
+            if before_ok && after_ok {
+                return true;
+            }
+            pos = i + 1;
+        }
+        return false;
+    }
     let mut pos = 0;
     while let Some(rel) = t[pos..].find(want) {
         let i = pos + rel;
@@ -622,23 +637,42 @@ pub fn find_text(lines: &[Line], label: &str, fuzzy: f64, where_: Option<&str>) 
         return None;
     }
     let is_rx = rx.is_some();
-    let short_alpha = !is_rx && !want.is_empty() && want.chars().count() <= 3 && all_alpha(&want);
-    let want_f = if !is_rx { norm(&fold_accents(&want)) } else { String::new() };
-    let short_alpha_f =
-        !is_rx && !want_f.is_empty() && (short_alpha || (want_f.chars().count() <= 3 && all_alpha(&want_f)));
-    let want_has_digit = want.chars().any(|c| c.is_numeric());
+    let want_ascii = want.is_ascii();
+    let short_alpha = !is_rx
+        && !want.is_empty()
+        && (if want_ascii { want.len() <= 3 && want.bytes().all(|b| b.is_ascii_alphabetic()) } else { want.chars().count() <= 3 && all_alpha(&want) });
+    let want_f: std::borrow::Cow<'_, str> = if is_rx {
+        std::borrow::Cow::Borrowed("")
+    } else if want_ascii {
+        std::borrow::Cow::Borrowed(want.as_str())
+    } else {
+        std::borrow::Cow::Owned(norm(&fold_accents(&want)))
+    };
+    let want_f_differs = want_f.as_ref() != want.as_str();
+    let short_alpha_f = if want_ascii {
+        short_alpha
+    } else {
+        !is_rx && !want_f.is_empty() && (short_alpha || (want_f.chars().count() <= 3 && all_alpha(&want_f)))
+    };
+    let want_has_digit = if want_ascii {
+        want.bytes().any(|b| b.is_ascii_digit())
+    } else {
+        want.chars().any(|c| c.is_numeric())
+    };
     let fuzzy_enabled = !is_rx && fuzzy != 0.0 && !short_alpha && !short_alpha_f && !want_has_digit;
     let want_k = if fuzzy_enabled { want.split(py_isspace).filter(|p| !p.is_empty()).count().max(1) } else { 1 };
-    let want_f_k = if fuzzy_enabled && !want_f.is_empty() {
-        want_f.split(py_isspace).filter(|p| !p.is_empty()).count().max(1)
-    } else {
+    let want_f_k = if !fuzzy_enabled || want_f.is_empty() {
         1
+    } else if want_ascii {
+        want_k
+    } else {
+        want_f.split(py_isspace).filter(|p| !p.is_empty()).count().max(1)
     };
     let mut target_want: Option<PreparedTarget> = None;
     let mut target_want_f: Option<PreparedTarget> = None;
 
     // Reusable scratch buffers across lines.
-    let mut t_buf = String::new();
+    let mut t_buf = String::with_capacity(64);
     let mut t_f_buf = String::new();
     let mut words_buf: Vec<String> = Vec::new();
     let mut words_f_buf: Vec<String> = Vec::new();
@@ -686,7 +720,7 @@ pub fn find_text(lines: &[Line], label: &str, fuzzy: f64, where_: Option<&str>) 
                 fold_accents_into(&t_buf, &mut t_f_buf);
                 &t_f_buf
             };
-            let fold_differs = (!t_is_ascii && t_f != t_buf.as_str()) || want_f != want;
+            let fold_differs = (!t_is_ascii && t_f != t_buf.as_str()) || want_f_differs;
             if !want_f.is_empty() && !t_f.is_empty() && res.is_none_or(|r| r.0 > 0) && fold_differs {
                 if let Some((rf_rank, rf_icon)) = classify_line_match(t_f, &want_f, short_alpha_f) {
                     if res.is_none_or(|r| rf_rank < r.0) {
@@ -814,26 +848,26 @@ fn parse_where(where_: &str) -> Where<'_> {
 
 /// Lines allowed by a `split_where` condition, or None if its header is not visible.
 pub fn region(lines: &[Line], where_: &str) -> Option<Vec<Line>> {
-    match parse_where(where_) {
-        Where::Y(gt, lim) => Some(lines.iter().filter(|l| if gt { l.y() > lim } else { l.y() < lim }).cloned().collect()),
-        w @ (Where::Below(_) | Where::Above(_)) => {
-            let (below, val) = match w {
-                Where::Below(v) => (true, v),
-                Where::Above(v) => (false, v),
-                _ => return None,
-            };
-            let hdr = find_text(lines, val, 0.0, None)?;
-            let hl = hdr.line?;
-            Some(
-                lines
-                    .iter()
-                    .filter(|l| if below { l.y0 > hl.y1 - 1.0 } else { l.y1 < hl.y0 + 1.0 })
-                    .cloned()
-                    .collect(),
-            )
+    let filter = resolve_line_filter(lines, where_)?;
+    let count = lines.iter().filter(|l| filter.allows(l)).count();
+    let mut out = Vec::with_capacity(count);
+    for l in lines {
+        if filter.allows(l) {
+            out.push(l.clone());
         }
-        Where::Invalid => None,
     }
+    Some(out)
+}
+
+fn filter_controls_by_y(controls: &[Control], pred: impl Fn(&Control) -> bool) -> Vec<Control> {
+    let count = controls.iter().filter(|c| pred(c)).count();
+    let mut out = Vec::with_capacity(count);
+    for c in controls {
+        if pred(c) {
+            out.push(c.clone());
+        }
+    }
+    out
 }
 
 /// Controls allowed by a `split_where` condition (same rules as [`region`]).
@@ -843,24 +877,20 @@ pub fn controls_in_region(controls: &[Control], lines: &[Line], where_: Option<&
     };
     let (below, val) = match parse_where(where_) {
         Where::Y(gt, lim) => {
-            return controls.iter().filter(|c| if gt { c.y > lim } else { c.y < lim }).cloned().collect();
+            return filter_controls_by_y(controls, |c| if gt { c.y > lim } else { c.y < lim });
         }
         Where::Below(v) => (true, v),
         Where::Above(v) => (false, v),
         Where::Invalid => return Vec::new(),
     };
     if let Some(hl) = find_text(lines, val, 0.0, None).and_then(|m| m.line) {
-        return controls
-            .iter()
-            .filter(|c| if below { (c.y as f64) > hl.y1 } else { (c.y as f64) < hl.y0 })
-            .cloned()
-            .collect();
+        return filter_controls_by_y(controls, |c| if below { (c.y as f64) > hl.y1 } else { (c.y as f64) < hl.y0 });
     }
     let Some(chdr) = crate::ui::find_control(controls, val, None, false) else {
         return Vec::new();
     };
     let cy = chdr.y;
-    controls.iter().filter(|c| if below { c.y > cy } else { c.y < cy }).cloned().collect()
+    filter_controls_by_y(controls, |c| if below { c.y > cy } else { c.y < cy })
 }
 
 /// `'Alice@below:Chats'` -> `("Alice", Some("below:Chats"))`; `@y>300`, `@y<300`,
