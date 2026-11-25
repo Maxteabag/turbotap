@@ -190,3 +190,10 @@ Matched modes were shuffled within each scene. Direct capture obtains a CGImage 
 | fixture | fast cgimage 0.5 | 140.4 | 24/72 |
 | fixture | fast cgimage 1 | 137.9 | 24/72 |
 | fixture | fast png 1 | 139.1 | 24/72 |
+
+### App transitions during a wait
+
+The first run sampled the home screen before its transition completed. The corrected harness waited for SpringBoard and passed the canonical Calculator bundle identifier to the independent launcher. In four trials per arm, both arms observed a miss followed by a match and returned the same reference control. The delay includes an independent launch of Calculator via the Mac.
+
+- v5, median wall 845.5 ms, 3 HTTP requests and 1738 response bytes.
+- flow, median wall 867.4 ms, 1 HTTP requests and 199 response bytes.
