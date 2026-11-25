@@ -341,7 +341,13 @@ fn test_cmd_deploy_aborts_before_restart_when_unlock_fails() {
     // passcode (the configured passcode_cmd never runs) and an unresolvable Mac host
     // for the deploy script.
     let _cache = isolated_cache();
+    // config::guard_remote also refuses the deploy script in test builds; a temporary
+    // HOME (no real config.json / passcode_cmd) and no WDA_UDID keep device lookups local.
+    let home = crate::testutil::TempDir::new("turbotap-test-home-");
+    let home_s = home.path().to_string_lossy().into_owned();
     let _env = set_env(&[
+        ("HOME", Some(home_s.as_str())),
+        ("WDA_UDID", None),
         ("WDA_PASSCODE", Some("0000")),
         ("WDA_MAC_HOST", Some("turbotap-test-no-such-host.invalid")),
     ]);
@@ -353,8 +359,10 @@ fn test_cmd_deploy_aborts_before_restart_when_unlock_fails() {
     };
     let e = res.unwrap_err();
     assert!(e.is_runtime(), "{e:?}");
-    // start_wda_on_mac.assert_not_called(): the deploy script never ran.
+    // start_wda_on_mac.assert_not_called(): the deploy script was never attempted (it
+    // would fail with a Subprocess error, or guard_remote's "disabled in test builds").
     assert!(!matches!(e, Error::Subprocess { .. }), "{e:?}");
+    assert!(!e.to_string().contains("deploy script"), "{e:?}");
 }
 
 // Gen 5: WDA v4 doubletap / zoom / fastTapBatch + OCR icon-noise stripping
