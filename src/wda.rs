@@ -1,6 +1,6 @@
 //! Persistent HTTP/1.1 keep-alive WebDriverAgent client.
 //!
-//! Port of Python `WDAClient` (cli.py L279-1015) plus the warm-daemon connection
+//! Port of Python `WDAClient` (v0.10.0 cli.py L279-1015) plus the warm-daemon connection
 //! pool (L136-241), `_is_unsupported_route`, `_fast_preflight`, `cmd_preflight`
 //! and `cmd_unlock`.
 //!
@@ -677,7 +677,7 @@ impl WdaClient {
 }
 
 // ---------------------------------------------------------------------------
-// Session, fast routes and fallbacks (cli.py L485-931)
+// Session, fast routes and fallbacks (v0.10.0 cli.py L485-931)
 // ---------------------------------------------------------------------------
 
 /// Python `type(v).__name__` for a JSON value.

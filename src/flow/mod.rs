@@ -1,5 +1,5 @@
 //! The multi-step flow runner: many steps in one keep-alive process, no LLM turn
-//! per step (Python `Flow`, cli.py L2391-5556).
+//! per step (Python `Flow`, v0.10.0 cli.py L2391-5556).
 //!
 //! The engine is split over several `impl<R: Reader> Flow<R>` blocks:
 //! - `mod.rs`: state, `step()` dispatcher, `run()`, shared primitives

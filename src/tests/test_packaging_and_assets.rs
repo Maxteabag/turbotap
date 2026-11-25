@@ -16,7 +16,7 @@ fn read(p: &Path) -> String {
     std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 
-/// Replaces `test_cli_compiles_cleanly` (py_compile of cli.py): the assets compiled
+/// Replaces `test_cli_compiles_cleanly` (py_compile of v0.10.0 cli.py): the assets compiled
 /// into the binary are exactly the repo files, and every repo skill is embedded.
 #[test]
 fn test_cli_compiles_cleanly() {

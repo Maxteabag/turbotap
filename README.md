@@ -100,7 +100,7 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 
 | Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
-| CLI startup (`--help` / UI-only) | ~150-210ms | **~55ms** | Lazy-loads Pillow/OCR; UI-only flows skip Tesseract init |
+| CLI startup (`--help` / UI-only) | ~150-210ms (v0.x Python) | **~1ms** | One native Rust binary; UI-only flows never load Tesseract (offline microbenchmark) |
 | Session startup | ~88ms (uncached) | ~14ms | Caches fast settings & screen size per device |
 | Tap | 740-1200ms | ~260ms | Instant-wake `CFRunLoopStop` touch synthesis (`0.02s`) |
 | Type text (27 chars) | ~725ms | **~350ms** (opt-in `240/s`) | `/wda/fastKeys` keeps legacy pace by default; set `TURBOTAP_TYPING_FREQ=240` for turbo |

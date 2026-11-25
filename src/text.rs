@@ -1,6 +1,6 @@
 //! OCR lines, text matching and regions.
 //!
-//! Ports: `Line` (cli.py L1092), `_norm`, `_fold_accents`, `Match`,
+//! Ports: `Line` (v0.10.0 cli.py L1092), `_norm`, `_fold_accents`, `Match`,
 //! `_match_line_tokens`, `find_text` (L1194), `_region`, `_controls_in_region`,
 //! `_text_overlap`, `_clean_text` (L1971), `split_where` (L2384) and the difflib
 //! pieces (`SequenceMatcher.ratio`, `get_close_matches`).

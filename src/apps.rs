@@ -1,4 +1,4 @@
-//! App display names -> bundle IDs (`open:Spotify`), cli.py L1934-1999.
+//! App display names -> bundle IDs (`open:Spotify`), v0.10.0 cli.py L1934-1999.
 use crate::error::{Error, Result};
 use crate::json;
 use crate::text::{casefold, clean_text, get_close_matches};

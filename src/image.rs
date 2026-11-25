@@ -1,6 +1,6 @@
 //! 8-bit grayscale frames and the frame-diff primitives (Python PIL usage).
 //!
-//! Ports: `_box_diff` (cli.py L1312), `_thumb_diff` (L1324), `_frame_reacted`
+//! Ports: `_box_diff` (v0.10.0 cli.py L1312), `_thumb_diff` (L1324), `_frame_reacted`
 //! (L1335), `_content_pixel_still` (L2488), plus decode/convert/crop/resize that
 //! Python did with PIL (`Image.open`, `draft("L")`, `convert("L")`, `crop`,
 //! `resize(BOX|BILINEAR)`, `ImageChops.difference`, `ImageStat.mean`, `getextrema`).

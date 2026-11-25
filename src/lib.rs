@@ -6,7 +6,7 @@
 //! screen-size-agnostic passcode unlock, verified form/PIN input and an opt-in warm
 //! Unix-socket daemon.
 //!
-//! Module map (ported 1:1 from the Python `v0.10.0` `cli.py` / `daemon.py`):
+//! Module map (ported 1:1 from the Python v0.10.0 `cli.py` / `daemon.py`):
 //! - [`config`]  config.json, env overrides, cache dir, passcode source
 //! - [`wda`]     keep-alive HTTP/1.1 WDA client, fast routes + stock fallbacks, unlock, preflight
 //! - [`image`]   8-bit grayscale frames, decode, frame-diff primitives

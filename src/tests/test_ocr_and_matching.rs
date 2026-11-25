@@ -481,9 +481,8 @@ fn test_random_jpeg_noise_ringing_and_status_bar_near_top_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// StripSlicingAndOcrTests that mock tesseract / _ocr_raw (need ocr.rs from
-// feat/rust-v1-ocr: ScreenReader.tsv_hook / ocr_raw_hook). Append to
-// src/tests/test_ocr_and_matching.rs once ocr.rs is merged.
+// StripSlicingAndOcrTests that mock tesseract / _ocr_raw (via ScreenReader.tsv_hook /
+// ocr_raw_hook in place of Python's mock.patch).
 // ---------------------------------------------------------------------------
 
 use crate::ocr::{OcrRawHook, ReadOpts, Reader, TsvHook};

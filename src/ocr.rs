@@ -1,6 +1,6 @@
 //! Screen reading for any app: device-downscaled JPEG + parallel in-process OCR.
 //!
-//! Ports cli.py L1017-1927: `_tess_lib` (here: `libloading` dlopen of
+//! Ports v0.10.0 cli.py L1017-1927: `_tess_lib` (here: `libloading` dlopen of
 //! libtesseract, so neither build nor run needs Tesseract; `WDA_OCR=binary` or a
 //! missing library forks the `tesseract` binary instead), `tesseract_tsv`,
 //! `_create_tess_api`, `_tess_model_key`, `_WarmOCR`, and `ScreenReader` (`pt_size`,

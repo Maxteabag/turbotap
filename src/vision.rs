@@ -1,5 +1,5 @@
 //! On-device Apple Vision OCR via wda-turbo v6 `POST /wda/fastOCR`
-//! (cli.py L5572-5680).
+//! (v0.10.0 cli.py L5572-5680).
 use crate::clock;
 use crate::error::{Error, Result};
 use crate::json;

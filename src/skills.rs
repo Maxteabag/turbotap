@@ -1,7 +1,7 @@
 //! Agent skills embedded in the binary: `turbotap install-skill` and the
-//! auto-refresh of installed copies after an upgrade (cli.py L5737-5856).
+//! auto-refresh of installed copies after an upgrade (v0.10.0 cli.py L5737-5856).
 //!
-//! The Python package copied the `skills/` folder that shipped next to `cli.py`; the
+//! The Python package copied the `skills/` folder that shipped next to `v0.10.0 cli.py`; the
 //! Rust binary carries the same files in [`BUNDLED_SKILLS`], so `install-skill` works
 //! from a single installed binary with no repo checkout. The stamp is computed over
 //! exactly the bytes Python hashed (relative path `name/file` + NUL + contents, in

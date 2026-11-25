@@ -1,6 +1,6 @@
 //! `turbotap deploy`: the wda-turbo patch and the Mac deploy script are embedded in
 //! the binary, so a single installed `turbotap` can clone, patch, build and start
-//! WebDriverAgent on the Mac host with no repo checkout (cli.py L529-541, L5859).
+//! WebDriverAgent on the Mac host with no repo checkout (v0.10.0 cli.py L529-541, L5859).
 use crate::error::{Error, Result};
 use crate::wda::WdaClient;
 use std::path::{Path, PathBuf};

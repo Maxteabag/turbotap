@@ -1,6 +1,6 @@
 //! Argument parsing and subcommands (Python `main`, `run_cli`, `_main`,
 //! `_cli_subcommand`, `_daemon_requested`, `cmd_tree`, `cmd_screenshot`,
-//! `cmd_otp_type`; cli.py L5876-6078).
+//! `cmd_otp_type`; v0.10.0 cli.py L5876-6078).
 //!
 //! The clap definition mirrors the Python argparse parser: global options before the
 //! subcommand, the same subcommands, options, defaults and choices, usage errors on
