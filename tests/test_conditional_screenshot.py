@@ -201,6 +201,29 @@ class ConditionalScreenshotTests(unittest.TestCase):
             self.assertEqual(r.conditional_hits, 0)
             self.assertNotIn("ifNoneMatch", srv.posts[2][0])
 
+    def test_headerless_304_is_refetched_unconditionally(self):
+        state = {"n": 0}
+        first, second = jpeg(200), jpeg(60)
+
+        def route(payload):
+            state["n"] += 1
+            if state["n"] == 1:
+                return 200, {"Content-Type": "image/jpeg", "ETag": tag(first)}, first
+            if state["n"] == 2:
+                return 304, {}, b""  # no ETag: cannot prove which frame it refers to
+            return 200, {"Content-Type": "image/jpeg", "ETag": tag(second)}, second
+
+        with _Server(route) as srv:
+            r = self.reader(srv.url)
+            r.grab()
+            img = r.grab()
+            self.assertLess(img.getpixel((10, 10)), 100)  # the fresh frame, not the seeded one
+            self.assertEqual(r.conditional_hits, 0)
+            self.assertEqual(srv.posts[1][0]["ifNoneMatch"], tag(first))
+            self.assertNotIn("ifNoneMatch", srv.posts[2][0])
+            self.assertIsNone(srv.posts[2][1])
+            self.assertEqual(r._shot_validator[1], tag(second))
+
     def test_error_response_drops_the_validator(self):
         state = {"fail": False}
         body = jpeg(200)

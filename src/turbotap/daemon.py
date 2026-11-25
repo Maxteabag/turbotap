@@ -322,6 +322,7 @@ class Server:
             reader_workers = int(os.environ.get("WDA_OCR_WORKERS", 0)) or max(2, min(6, os.cpu_count() or 4))
             try:
                 cli._WARM_OCR.lease(11, reader_workers)
+                cli._WARM_OCR.end_request()
             except RuntimeError:
                 cli._WARM_OCR = None
 

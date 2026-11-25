@@ -184,9 +184,13 @@ def _take_pooled_conn(host, port):
 
 
 def _release_conn(client):
-    """Return a client's idle keep-alive connection to the daemon pool, or close it."""
+    """Return a client's idle keep-alive connection to the daemon pool, or close it.
+
+    A connection still carrying a request (a worker thread that outlived its caller)
+    is never pooled, closed or detached here: its owner finishes with it and it is
+    discarded with the client, so no later request can read another's reply."""
     conn = getattr(client, "_conn", None)
-    if conn is None:
+    if conn is None or getattr(client, "_inflight", 0):
         return
     client._conn = None
     pool = _CONN_POOL
@@ -204,8 +208,11 @@ def _release_conn(client):
 
 
 def _recycle_request_conns():
-    """Daemon: after a request, park every connection its clients opened."""
+    """Daemon: after a request, wait for its OCR workers and park every idle
+    connection its clients opened."""
     global _CONN_CLIENTS
+    if _WARM_OCR is not None:
+        _WARM_OCR.end_request()
     clients, _CONN_CLIENTS = _CONN_CLIENTS or [], ([] if _CONN_POOL is not None else None)
     for c in clients:
         _release_conn(c)
@@ -254,6 +261,7 @@ class WDAClient:
         self.device_key = device_key
         self.sid = None
         self._conn = None
+        self._inflight = 0  # requests currently using self._conn (another thread may own it)
         self.last_response_headers = None
         if os.environ.get("WDA_TURBO") == "0":
             self.turbo = False
@@ -373,9 +381,13 @@ class WDAClient:
                 if deadline is not None and time.monotonic() >= deadline:
                     return 0, "", b"deadline exceeded"
                 sent = True
-                self._conn.request(method, path, body=body, headers=headers)
-                resp = self._conn.getresponse()
-                raw = resp.read()
+                self._inflight += 1
+                try:
+                    self._conn.request(method, path, body=body, headers=headers)
+                    resp = self._conn.getresponse()
+                    raw = resp.read()
+                finally:
+                    self._inflight -= 1
                 ct = resp.getheader("Content-Type") or ""
                 self.last_response_headers = {k.lower(): v for k, v in resp.getheaders()}
                 return resp.status, ct, raw
@@ -416,9 +428,13 @@ class WDAClient:
                 if deadline is not None and time.monotonic() >= deadline:
                     return {"error": "deadline exceeded", "deadline_exceeded": True}
                 sent = True
-                self._conn.request(method, path, body=body, headers=headers)
-                resp = self._conn.getresponse()
-                raw = resp.read()
+                self._inflight += 1
+                try:
+                    self._conn.request(method, path, body=body, headers=headers)
+                    resp = self._conn.getresponse()
+                    raw = resp.read()
+                finally:
+                    self._inflight -= 1
                 if resp.status >= 400:
                     # Same shape as the old urllib HTTPError path: callers test .get("error").
                     return {"error": resp.status, "body": raw.decode(errors="replace")[:400]}
@@ -988,11 +1004,13 @@ def _tess_lib():
     OMP_THREAD_LIMIT=1 is set at import: Tesseract's own OpenMP threads made a
     full-screen pass 312 ms vs 181 ms single-threaded, and they fight the strip
     threads below."""
+    if os.environ.get("WDA_OCR") == "binary":
+        # Benchmark baseline: fork the tesseract binary per call. Checked on every call,
+        # before the native cache, so a warm daemon honours each caller's choice.
+        return None
     if "lib" not in _TESS:
         lib = None
         try:
-            if os.environ.get("WDA_OCR") == "binary":  # benchmark baseline: fork per call
-                raise OSError("WDA_OCR=binary")
             import ctypes
             import ctypes.util
             _TESS["ctypes"] = ctypes
@@ -1362,37 +1380,54 @@ def _create_tess_api(psm):
     return api
 
 
-class _WarmOCR:
-    """Pre-initialised libtesseract engines plus worker pools, keyed by (psm, workers).
+def _tess_model_key():
+    """What decides which model data TessBaseAPIInit2(datapath=NULL) loads."""
+    return os.environ.get("TESSDATA_PREFIX") or ""
 
-    Only the warm daemon creates one. Engines carry no per-image state between
-    calls (LSTM-only; Sauvola variables are reset after every use), and the daemon
-    runs one request at a time, so readers in later requests see the same engines a
-    fresh process would, minus the ~100-300 ms load."""
+
+class _WarmOCR:
+    """Pre-initialised libtesseract engines for the warm daemon.
+
+    Engines are partitioned by (page segmentation mode, effective model data), so a
+    request never gets an engine initialised under another caller's TESSDATA_PREFIX.
+    LSTM-only engines carry no per-image state between calls and Sauvola variables
+    are reset after every use. Worker threads are per request: end_request() cancels
+    queued strips and waits for running ones, so every engine is back in its queue
+    and no OCR work outlives the request that started it."""
 
     def __init__(self):
         import threading
         self._lock = threading.Lock()
-        self._slots = {}
+        self._engines = {}        # (psm, model key) -> (queue.Queue of engines, count)
+        self._request_pools = []
 
     def lease(self, psm, workers):
         import queue
+        key = (psm, _tess_model_key())
         with self._lock:
-            slot = self._slots.get((psm, workers))
-            if slot is None:
+            apis, count = self._engines.get(key, (None, 0))
+            if apis is None:
                 apis = queue.Queue()
-                pool = _thread_pool(workers)
-                for _ in range(workers):
-                    apis.put(_create_tess_api(psm))
-                slot = self._slots[(psm, workers)] = (pool, apis)
-            return slot
+            while count < workers:
+                apis.put(_create_tess_api(psm))
+                count += 1
+            self._engines[key] = (apis, count)
+            pool = _thread_pool(workers)
+            self._request_pools.append(pool)
+            return pool, apis
+
+    def end_request(self):
+        with self._lock:
+            pools, self._request_pools = self._request_pools, []
+        for pool in pools:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def close(self):
+        self.end_request()
         lib = _tess_lib()
         with self._lock:
-            slots, self._slots = list(self._slots.values()), {}
-        for pool, apis in slots:
-            pool.shutdown(wait=True)
+            engines, self._engines = list(self._engines.values()), {}
+        for apis, _ in engines:
             while lib is not None and not apis.empty():
                 lib.TessBaseAPIDelete(apis.get_nowait())
 
@@ -1663,7 +1698,9 @@ class ScreenReader:
             hdrs = getattr(self.c, "last_response_headers", None) or {}
             etag = hdrs.get("etag")
             if status == 304:
-                if validator is not None and (etag is None or etag == validator[1]):
+                # The v6 runner names the matched validator on every 304; anything else
+                # (missing or different tag) is refetched unconditionally.
+                if validator is not None and etag == validator[1]:
                     self.conditional_hits += 1
                     return 200, validator[3], validator[2]
                 # A 304 we cannot pair with our own retained bytes: never guess a frame.
@@ -2581,7 +2618,10 @@ class Flow:
 
     def close(self):
         if self._ui_pool is not None:
-            self._ui_pool.shutdown(wait=False)
+            # Cancel tree fetches that have not started and wait for a running one: its
+            # side connection must be idle before it is recycled or closed, and no worker
+            # may outlive the request (the warm daemon restores process state next).
+            self._ui_pool.shutdown(wait=True, cancel_futures=True)
             self._ui_pool = None
         if self._side is not None and self._side is not self.c and getattr(self._side, "_conn", None) is not None:
             _release_conn(self._side)
@@ -5571,6 +5611,8 @@ def _vision_ocr_raw(client, mode="accurate", scale=VISION_DEFAULT_SCALE, deadlin
             raise RuntimeError(f"Invalid /wda/fastOCR line {i}: expected a nonempty box within the screen")
         box["width"] = min(box["width"], 1.0 - box["x"])
         box["height"] = min(box["height"], 1.0 - box["y"])
+        if box["width"] <= 0 or box["height"] <= 0:
+            raise RuntimeError(f"Invalid /wda/fastOCR line {i}: box is empty once clipped to the screen")
         lines.append({"text": line["text"], **box})
     return lines
 

@@ -108,6 +108,21 @@ class VisionCLITests(unittest.TestCase):
                 self.assertIn("Invalid /wda/fastOCR line 1", str(code))
                 self.assertEqual(out, "")
 
+    def test_boxes_that_are_empty_once_clipped_are_rejected_on_both_axes(self):
+        for change in ({"x": 1.0, "width": 0.0001}, {"y": 1.0, "height": 0.0001},
+                       {"x": 1.0005, "width": 0.0002}, {"y": 1.0008, "height": 0.0001}):
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "line 0: box is empty"):
+                cli._vision_ocr_raw(VisionClient(response=ok([dict(LINE, **change)])))
+
+    def test_valid_near_edge_boxes_keep_positive_size(self):
+        for change in ({"x": 0.9995, "width": 0.001}, {"y": 0.9995, "height": 0.001}):
+            with self.subTest(change=change):
+                (line,) = cli._vision_ocr_raw(VisionClient(response=ok([dict(LINE, **change)])))
+                self.assertGreater(line["width"], 0)
+                self.assertGreater(line["height"], 0)
+                self.assertLessEqual(line["x"] + line["width"], 1.0)
+                self.assertLessEqual(line["y"] + line["height"], 1.0)
+
     def test_float_rounding_at_the_screen_edge_is_clamped_not_rejected(self):
         edge = dict(LINE, x=0.5, width=0.5000004, y=-0.0000002, height=1.0000001)
         lines = cli._vision_ocr_raw(VisionClient(response=ok([edge])))
