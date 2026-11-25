@@ -2,6 +2,16 @@
 
 The reported baseline, combined preflight, capture-scale comparisons and transition timings use corrected measurement harnesses. Earlier trials lacked route confirmation, rounded subprocess completion times, or could miss the first changed frame. The corrected trials replaced those series in the public receipts.
 
+## Recommended actions
+
+1. **Offer accurate Vision OCR when text coverage matters.** On the twelve-word browser fixture, the half-resolution path read all twelve words in each of six trials. On native Settings it agreed with 72/138 accessibility references versus 36/138 for host OCR, at 266 versus 98 ms median. The CLI exposes capture scale explicitly. Validate the choice against the target language, font size and latency budget.
+2. **Reuse existing fixed keypad batching for known static layouts.** The baseline CLI entered and verified 7 + 4 in 804 ms median using a fixed batch, with five successes in five trials. Re-resolving the batch took 2,046 ms. Require fresh layout checks when controls can move.
+3. **Trial persistent OCR for repeated independent commands.** A fresh CLI using the daemon took 288 ms versus 555 ms for an equivalent fresh observer in eight paired trials. Before promoting the daemon, establish recognition parity, isolation between readers, behavior across lock and rotation, and idle resource use on workloads beyond Calculator.
+4. **Use conditional JPEGs when bandwidth limits a polling loop.** Fresh full-screen captures transmitted 244 KB versus 1.22 MB over twenty requests on idle Calculator. Median latency improved by 3.6 ms. The request-local validator and retained bytes keep independent readers separate. Measure hit rate on an animated screen before choosing this transport.
+5. **Use MJPEG selectively for action feedback.** A streaming reader saw the first verified display change at 178 ms from tap dispatch versus 326 ms for an acknowledgment-followed-by-pull. An idle stream also delivered identical 99 KB frames roughly ten times per second. A short-lived observer around latency-sensitive actions fits these results.
+6. **Keep automation choices narrow.** Jev added about 0.95 s to one verified four-key run. It selected 17/22 present icons on synthetic visual boards. Use those results to design a suggestion or recovery trial with independent target verification. The on-device predicate wait reduced requests and bytes, but did not accelerate the measured app transition.
+7. **Prioritize measured native operations over a complete Rust port.** The guarded three-step real-device flow took 840 ms in Rust versus 899 ms in the Python comparator. Fresh startup and JPEG decode benefited more than the complete flow. Rust's restricted control parser and whole-frame OCR still need output-parity evidence before replacing their production counterparts.
+
 ## Reproducing the comparisons
 
 The [device measurements](../experimental/results/iphone17.jsonl) contain one JSON record per observation, keyed by series. The daemon, RapidOCR, and conditional JPEG series use their native grouped records. The [Jev receipts](../experimental/jev/) include the mapped synthetic choices. No image files are required to inspect the results.
