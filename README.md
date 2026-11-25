@@ -38,20 +38,20 @@ Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle
 
 - An iPhone running iOS 17+ on your local Wi-Fi
 - A Mac with Xcode (Apple requires it to sign and install WebDriverAgent on the phone. Once it's running, you can run `turbotap` from that Mac or from a Linux machine on the same network.)
-- Python 3.10+ and Tesseract if you want local OCR
+- A Rust toolchain to build `turbotap` (one standalone binary, no Python), and Tesseract if you want local OCR
 
 ## Setup
 
 Install the CLI and the agent skills:
 
 ```bash
-uv tool install git+https://github.com/Maxteabag/turbotap.git
+cargo install --git https://github.com/Maxteabag/turbotap.git
 turbotap install-skill
 ```
 
-That's it: the package carries the skills, the WebDriverAgent patch and the deploy script, so you don't need a clone. `install-skill` puts the skills in `~/.agents/skills` and `~/.claude/skills` (whichever exist; add `--codex` or `--dir DIR` for other agents), prints where they went, and refreshes them by itself after you upgrade with `uv tool install --force git+https://github.com/Maxteabag/turbotap.git`. `npx skills add Maxteabag/turbotap` installs just the skills too. `pip install git+https://github.com/Maxteabag/turbotap.git` works in place of uv, and `uv tool install --editable .` in a clone is for hacking on it.
+That's it: `turbotap` is one standalone binary with the skills, the WebDriverAgent patch and the deploy script built in, so you don't need a clone and there is no Python runtime. `install-skill` puts the skills in `~/.agents/skills` and `~/.claude/skills` (whichever exist; add `--codex` or `--dir DIR` for other agents), prints where they went, and refreshes them by itself after you upgrade with `cargo install --force --git https://github.com/Maxteabag/turbotap.git`. `npx skills add Maxteabag/turbotap` installs just the skills too. In a clone, `cargo build --release` puts the binary at `target/release/turbotap`.
 
-Install Tesseract (used for local screen reading):
+Install Tesseract (used for local screen reading). `turbotap` loads `libtesseract` at runtime, so it builds and runs without it; without the library it falls back to the `tesseract` binary, and without either only local OCR is unavailable:
 
 ```bash
 # macOS
@@ -100,7 +100,7 @@ Stock WebDriverAgent waits for iOS animations to settle on every tap, sends full
 
 | Operation | Stock WDA | turbotap | Notes |
 |---|---:|---:|---|
-| CLI startup (`--help` / UI-only) | ~150-210ms | **~55ms** | Lazy-loads Pillow/OCR; UI-only flows skip Tesseract init |
+| CLI startup (`--help` / UI-only) | ~150-210ms (v0.x Python) | **~1ms** | One native Rust binary; UI-only flows never load Tesseract (offline microbenchmark) |
 | Session startup | ~88ms (uncached) | ~14ms | Caches fast settings & screen size per device |
 | Tap | 740-1200ms | ~260ms | Instant-wake `CFRunLoopStop` touch synthesis (`0.02s`) |
 | Type text (27 chars) | ~725ms | **~350ms** (opt-in `240/s`) | `/wda/fastKeys` keeps legacy pace by default; set `TURBOTAP_TYPING_FREQ=240` for turbo |
@@ -123,7 +123,7 @@ The last five rows were measured on an iPhone 17 during the overnight lab in [PR
 
 ### Warm daemon (optional)
 
-When an agent runs many separate `turbotap` commands rather than one `flow`, each new process pays for Python startup, Pillow and Tesseract engine loading. `turbotap daemon start` keeps one process warm on a private Unix socket (`~/.cache/turbotap/daemon.sock`, mode 0600, in a user-only directory). It exits after 15 idle minutes (`--idle SECONDS`). Add `--daemon` to a command, or set `TURBOTAP_DAEMON=1`, to route through it. Each request runs with the caller's environment and working directory, and gets a fresh WDA client, screen reader and flow, so nothing about sessions, frames or app switches carries over between calls. If the daemon is not running, is out of date, or does not confirm a request, the command runs in-process as usual. `turbotap daemon status` and `turbotap daemon stop` manage it.
+When an agent runs many separate `turbotap` commands rather than one `flow`, each new process pays for a new WDA connection and Tesseract engine loading. `turbotap daemon start` keeps one process warm on a private Unix socket (`~/.cache/turbotap/daemon.sock`, mode 0600, in a user-only directory). It exits after 15 idle minutes (`--idle SECONDS`). Add `--daemon` to a command, or set `TURBOTAP_DAEMON=1`, to route through it. Each request runs with the caller's environment and working directory, and gets a fresh WDA client, screen reader and flow, so nothing about sessions, frames or app switches carries over between calls. If the daemon is not running, is out of date, or does not confirm a request, the command runs in-process as usual. `turbotap daemon status` and `turbotap daemon stop` manage it.
 
 ### On-device Vision OCR
 
@@ -153,7 +153,7 @@ Formatted iOS text fields (phone numbers, OTPs, IDs) tend to drop characters whe
 
 ### Where does the iPhone passcode live, and does Claude ever see it?
 
-It stays on your machine and never enters the model's context. When `turbotap unlock` (or the `unlock` step in a flow) runs, the Python process runs your `passcode_cmd` itself, taps the digits on the phone over your local Wi-Fi, and prints `{"ok": true, "unlocked_now": true, "locked": false}`. The agent only ever sees that result, not the digits, and error messages never include them either.
+It stays on your machine and never enters the model's context. When `turbotap unlock` (or the `unlock` step in a flow) runs, `turbotap` runs your `passcode_cmd` itself, taps the digits on the phone over your local Wi-Fi, and prints `{"ok": true, "unlocked_now": true, "locked": false}`. The agent only ever sees that result, not the digits, and error messages never include them either.
 
 `passcode_cmd` is whatever command prints your passcode, so you can use the secret store you already have. On macOS the Keychain works well and nothing gets written to disk:
 

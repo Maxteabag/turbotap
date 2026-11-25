@@ -1,0 +1,1374 @@
+//! Tapping: `tap:`, `tapif:`, `tapel:`, `tapbatch:`, long-press, double-tap, zoom
+//! (Python Flow L3134-3919 and L4965-5060).
+use super::Flow;
+use crate::clock;
+use crate::error::{Error, Result};
+use crate::image::{box_diff, content_pixel_still, thumb_diff, Frame, GrayImage};
+use crate::json;
+use crate::ocr::{ReadOpts, Reader};
+use crate::text::{casefold, clean_text, controls_in_region, find_text, norm, region, split_where, Line, Match, DEFAULT_FUZZY};
+use crate::ui::{
+    exact_control, find_control, find_control_match, Control, BACK_LABELS, CTL_CACHE_MAX_DIFF, CTL_CACHE_TTL,
+    CTL_CACHE_TYPES, INPUT_TYPES, KB_TOOLBAR_LABELS, TAP_FORM_TYPES, WAIT_UI_TYPES,
+};
+use serde_json::{json as j, Value};
+use std::sync::Arc;
+
+/// `TAP_FORM_TYPES + ("Image", "Slider", "Value")`.
+fn ext_types() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = TAP_FORM_TYPES.to_vec();
+    v.extend(["Image", "Slider", "Value"]);
+    v
+}
+
+fn img(f: &Option<Frame>) -> Option<&GrayImage> {
+    f.as_deref()
+}
+
+/// Python truthiness of an optional `where` string.
+fn where_set(w: Option<&str>) -> Option<&str> {
+    w.filter(|s| !s.is_empty())
+}
+
+/// `_controls_in_region(ctl, lines, where) if where else ctl`.
+fn scope(ctl: &[Control], lines: &[Line], where_: Option<&str>) -> Vec<Control> {
+    match where_set(where_) {
+        Some(w) => controls_in_region(ctl, lines, Some(w)),
+        None => ctl.to_vec(),
+    }
+}
+
+/// `where` is a `below:`/`above:` header condition (needs fresh OCR lines).
+fn is_header_where(where_: Option<&str>) -> bool {
+    where_set(where_).is_some_and(|w| w.starts_with("below:") || w.starts_with("above:"))
+}
+
+/// Python `f"{x:g}"`.
+pub(crate) fn py_fmt_g(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    let sci = format!("{:.5e}", x);
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let strip = |s: &str| -> String {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    if (-4..6).contains(&exp) {
+        let decimals = (5 - exp).max(0) as usize;
+        strip(&format!("{:.*}", decimals, x))
+    } else {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{}{:02}", strip(mant), sign, exp.abs())
+    }
+}
+
+/// Split on commas not preceded by a backslash (`re.split(r"(?<!\\),", s)`).
+fn split_unescaped_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev: Option<char> = None;
+    for ch in s.chars() {
+        if ch == ',' && prev != Some('\\') {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(ch);
+        }
+        prev = Some(ch);
+    }
+    out.push(cur);
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook run before every `controls()` call made by the tap code (replaces the
+    /// Python tests' `flow.controls = wrapper` monkeypatch). Receives
+    /// `&mut flow.pending_bundle_ts`.
+    pub(crate) static BEFORE_CONTROLS: std::cell::RefCell<Option<Box<dyn FnMut(&mut f64)>>> =
+        std::cell::RefCell::new(None);
+}
+
+impl<R: Reader> Flow<R> {
+    /// `self.controls()` / `self.controls(deadline=deadline)` from the tap code.
+    fn tap_ctl(&mut self, deadline: Option<f64>) -> Result<Vec<Control>> {
+        #[cfg(test)]
+        BEFORE_CONTROLS.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f(&mut self.pending_bundle_ts);
+            }
+        });
+        self.controls(false, None, deadline, false, false)
+    }
+
+    fn tap_grab(&mut self) -> Result<Frame> {
+        self.r.grab(&mut self.c, 0, None, None, None)
+    }
+
+    fn tap_read_img(&mut self, f: Frame) -> Result<Vec<Line>> {
+        self.r.read(&mut self.c, ReadOpts::img(f))
+    }
+
+    fn tap_pt(&mut self) -> Result<(i64, i64)> {
+        self.r.pt_size(&mut self.c, false, None)
+    }
+
+    /// `self._fresh_lines() or self.lines()`.
+    fn tap_fresh_or_lines(&mut self) -> Result<Vec<Line>> {
+        match self.fresh_lines(0.15)? {
+            Some(l) if !l.is_empty() => Ok(l),
+            _ => self.lines(None, None),
+        }
+    }
+
+    /// `getattr(self.r, "last_lines", None)` else `self.r.read(img=self.r.last)` else [].
+    fn tap_current_lines(&mut self) -> Result<Vec<Line>> {
+        if let Some(l) = self.r.last_lines() {
+            return Ok(l);
+        }
+        match self.r.last() {
+            Some(f) => self.tap_read_img(f),
+            None => Ok(vec![]),
+        }
+    }
+
+    /// L3134.
+    pub fn tap_point(&mut self, x: i64, y: i64, text: &str, deadline: Option<f64>) -> Result<()> {
+        self.guard(text, "tap")?;
+        if let Some(d) = deadline {
+            if clock::now() >= d {
+                return Err(Error::DeadlineExceeded("tap deadline exceeded".into()));
+            }
+        }
+        self.mark_action(true, false);
+        let res = self.c.fast_tap(x, y, None, deadline);
+        if json::truthy(json::get(&res, "deadline_exceeded")) {
+            return Err(Error::DeadlineExceeded("tap deadline exceeded".into()));
+        }
+        // A transport error (socket timeout capped by the deadline) that comes back at
+        // or after the deadline is the deadline expiring, not a failed tap: Python's
+        // in-process test double returned the late 404 instead of timing out.
+        if let Some(d) = deadline {
+            if json::get(&res, "error").is_string() && clock::now() >= d {
+                return Err(Error::DeadlineExceeded("tap deadline exceeded".into()));
+            }
+        }
+        crate::wda::check_wda_ok(res, "tap", false)?;
+        let now = clock::now();
+        self.last_action_ts = now;
+        self.last_tap_type = None;
+        self.last_tap_ts = now;
+        Ok(())
+    }
+
+    /// L3147 `_is_disabled_ocr_match`: reconcile an OCR match against known
+    /// accessibility controls to detect explicitly disabled buttons/targets (e.g. a
+    /// dimmed 'New Note' button). Uses the supplied controls or a fresh cached
+    /// control list for the current bundle.
+    pub fn is_disabled_ocr_match(
+        &self,
+        m: &Match,
+        base: &str,
+        lines: &[Line],
+        where_: Option<&str>,
+        controls: Option<&[Control]>,
+    ) -> bool {
+        let mut ctl: Option<&[Control]> = controls;
+        if ctl.is_none() {
+            if let Some(cache) = self.ctl_cache.as_ref() {
+                if cache.bundle == self.bundle && (clock::now() - cache.ts) <= CTL_CACHE_TTL {
+                    ctl = Some(&cache.controls);
+                }
+            }
+        }
+        let Some(ctl) = ctl.filter(|c| !c.is_empty()) else {
+            return false;
+        };
+        let scoped = scope(ctl, lines, where_);
+        let want = casefold(&clean_text(base));
+        let norm_m = norm(&m.text);
+        let near = |c: &Control| (c.x - m.x).abs() <= 45 && (c.y - m.y).abs() <= 24;
+        let near_disabled = scoped.iter().any(|c| {
+            let lab = casefold(&c.label);
+            c.is_disabled() && near(c) && (lab == want || lab.contains(&want) || norm_m.contains(&lab))
+        });
+        if near_disabled {
+            // Only treat as disabled if no enabled control sits at the same spot.
+            let has_enabled_here = scoped.iter().any(|c| {
+                let lab = casefold(&c.label);
+                !c.is_disabled() && near(c) && (lab == want || lab.contains(&want))
+            });
+            if !has_enabled_here {
+                return true;
+            }
+        }
+        if !base.starts_with("re:") {
+            let en_exact = exact_control(&scoped, base, TAP_FORM_TYPES, false);
+            let dis_exact = exact_control(&scoped, base, TAP_FORM_TYPES, true);
+            if let (None, Some(d)) = (en_exact, dis_exact) {
+                if d.is_disabled() && (d.x - m.x).abs() <= 60 && (d.y - m.y).abs() <= 30 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// L3183 `_try_cached_tap`: fast path for repeated taps on static keypads/layouts
+    /// (e.g. Calculator). If a recent control cache matches `base` and the screen has
+    /// only changed locally, tap once and use the pixel diff solely to keep or
+    /// invalidate the cache (never replays an acknowledged tap).
+    pub fn try_cached_tap(&mut self, base: &str) -> Result<Option<Match>> {
+        if base.starts_with("re:") {
+            return Ok(None);
+        }
+        let Some(cache) = self.ctl_cache.clone() else {
+            return Ok(None);
+        };
+        let now = clock::now();
+        if cache.bundle != self.bundle || (now - cache.ts) > CTL_CACHE_TTL {
+            self.invalidate_ctl_cache();
+            return Ok(None);
+        }
+        let Some(c) = exact_control(&cache.controls, base, CTL_CACHE_TYPES, false).cloned() else {
+            return Ok(None);
+        };
+        // Reuse a frame already grabbed after the previous action if very fresh;
+        // otherwise take one cheap grab to confirm layout stability and serve as the
+        // pre-tap reaction baseline.
+        let last_ts = self.r.last_ts();
+        let cur_img: Frame = match self.r.last() {
+            Some(l) if last_ts >= self.last_action_ts && (now - last_ts) < 0.25 => l,
+            _ => {
+                let g = self.tap_grab()?;
+                self.r.set_last(Some(g.clone()), None, None);
+                g
+            }
+        };
+        let scale = self.r.scale();
+        if thumb_diff(Some(&cache.img), Some(&cur_img)) >= 5.0
+            || box_diff(Some(&cache.img), Some(&cur_img), c.x as f64, c.y as f64, scale, 35.0, 25.0, 0) >= 8.0
+        {
+            self.invalidate_ctl_cache();
+            return Ok(None);
+        }
+        self.last_tap_small_delta = true;
+        let before = cur_img;
+        let m = self.tap_control(&c, None)?;
+        if self.changed_since(Some(before), 0.45, Some(c.x), Some(c.y))? {
+            if let Some(last) = self.r.last() {
+                if thumb_diff(Some(&cache.img), Some(&last)) >= 5.0 {
+                    self.invalidate_ctl_cache();
+                } else {
+                    self.ctl_cache = Some(super::CtlCache {
+                        controls: cache.controls,
+                        bundle: cache.bundle,
+                        ts: clock::now(),
+                        img: last,
+                    });
+                }
+            }
+        } else {
+            // Pixels stayed still after an acknowledged tap: drop cached coordinates
+            // for future steps, but NEVER replay the tap.
+            self.invalidate_ctl_cache();
+        }
+        Ok(Some(m))
+    }
+
+    /// L3231.
+    pub fn tap_text(&mut self, label: &str) -> Result<Match> {
+        let app_confirmed = self.wait_active_app(1.5, 0.03, None);
+        let (base, where_) = split_where(label);
+        let where_ = where_set(where_.as_deref()).map(str::to_string);
+        let wh = where_.as_deref();
+        let low_base = casefold(&base);
+        if BACK_LABELS.contains(&low_base.as_str()) {
+            // The nav-bar chevron OCRs as a lone '<' (Spotify, Messenger): tapping it
+            // skips a /source fetch (2.1 s on a long Spotify playlist). y > 55 skips the
+            // status bar's '< AppName' return link.
+            let lines = self.tap_fresh_or_lines()?;
+            let chev = lines
+                .iter()
+                .find(|l| ["<", "\u{2039}", "\u{3008}", "\u{ab}"].contains(&l.text.trim()) && l.x() < 70 && 55 < l.y() && l.y() < 130)
+                .cloned();
+            if let Some(chev) = chev {
+                self.tap_point(chev.x(), chev.y(), &base, None)?;
+                self.settle(1.5, None, 0.6)?;
+                return Ok(Match::new(chev.x(), chev.y(), "<", Some(chev), 0));
+            }
+        }
+        if KB_TOOLBAR_LABELS.contains(&low_base.as_str()) {
+            if let Some(m) = self.tap_form_button(&base, wh)? {
+                return Ok(m);
+            }
+        }
+        if wh.is_none() && self.ctl_cache.is_some() {
+            if let Some(m) = self.try_cached_tap(&base)? {
+                return Ok(m);
+            }
+        }
+        // If the previous tap triggered a full-screen slide/push (last_reaction_diff
+        // >= 2.0), drain the animation with cheap ~34 ms raw grabs before paying for
+        // full OCR on blurry mid-transition frames.
+        let mut m0: Option<Match> = None;
+        let mut m0_pixel_stable = false;
+        let mut first_lines: Option<Vec<Line>> = None;
+        if self.last_action_ts != 0.0
+            && (clock::now() - self.last_action_ts) < 0.7
+            && self.wait_settled_ts < self.last_action_ts
+            && self.last_reaction_diff >= 2.0
+            && self.r.last_lines().is_none()
+            && self.r.last().is_some()
+        {
+            let (settled_prev, settled_img) = self.settle_transition(0.5, 1.2)?;
+            if let Some(si) = settled_img.clone() {
+                let fl = self.tap_read_img(si.clone())?;
+                self.r.set_last(Some(si.clone()), Some(fl.clone()), None);
+                m0 = find_text(&fl, &base, DEFAULT_FUZZY, wh);
+                if let (Some(m), Some(sp)) = (m0.as_ref(), settled_prev.as_ref()) {
+                    if !Arc::ptr_eq(sp, &si)
+                        && (content_pixel_still(Some(sp), Some(&si), 6) || thumb_diff(Some(sp), Some(&si)) < 0.8)
+                        && box_diff(Some(sp), Some(&si), m.x as f64, m.y as f64, self.r.scale(), 30.0, 18.0, 0) < 2.0
+                    {
+                        m0_pixel_stable = true;
+                    }
+                }
+                first_lines = Some(fl);
+            }
+        }
+        if first_lines.is_none() {
+            // Reuse a very recent frame (< 0.15 s) from the preceding step as Frame #1
+            // if it already contains the target; otherwise grab a fresh Frame #1 and
+            // feed its match into wait(stable=True) so static screens only need one
+            // confirming frame.
+            if let Some(cached) = self.fresh_lines(0.15)? {
+                m0 = find_text(&cached, &base, DEFAULT_FUZZY, wh);
+            }
+            if m0.is_none() {
+                let fl = self.lines(None, None)?;
+                m0 = find_text(&fl, &base, DEFAULT_FUZZY, wh);
+                first_lines = Some(fl);
+            }
+        }
+        if m0.is_none()
+            && self.last_action_ts != 0.0
+            && !self.last_action_is_typing
+            && (clock::now() - self.last_action_ts) < 0.7
+        {
+            // Right after open:/launch: once wait_active_app() confirmed the app and
+            // Frame 1 already rendered page content below the status bar (e.g. Safari
+            // before tapping accessibility-only TextField:Adresse), go straight to
+            // controls() instead of burning a redundant 2nd full OCR pass.
+            let (_, sh) = self.tap_pt()?;
+            let status_y = (sh as f64 * 0.06) as i64;
+            let skip_second_ocr =
+                app_confirmed && first_lines.as_ref().is_some_and(|fl| fl.iter().any(|l| l.y() >= status_y));
+            if !skip_second_ocr {
+                // Inside a short post-action transition window (e.g. iOS nav push right
+                // after a previous tap): grab one more OCR frame before paying for a
+                // /source fetch on the outgoing screen.
+                let fl = self.lines(None, None)?;
+                m0 = find_text(&fl, &base, DEFAULT_FUZZY, wh);
+                first_lines = Some(fl);
+            }
+        }
+        if m0.is_none() && !base.starts_with("re:") {
+            // Not in the first fresh OCR frame: an exact accessibility label (icon-only
+            // Back/Close/Search/tab or keypad Key) is tapped at once instead of after the
+            // 2.2 s OCR wait (Messenger Back: 2,979 -> ~800 ms), honoring @region.
+            let ctl = self.tap_ctl(None)?;
+            let fl = first_lines.clone().unwrap_or_default();
+            let scoped = scope(&ctl, &fl, wh);
+            let ext = ext_types();
+            let mut c = exact_control(&scoped, &base, &ext, false).cloned();
+            if c.is_none() && BACK_LABELS.contains(&low_base.as_str()) {
+                for alt in BACK_LABELS {
+                    c = exact_control(&scoped, alt, &["Button", "Link"], false).cloned();
+                    if c.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some(c) = c {
+                return self.tap_control(&c, None);
+            }
+            if exact_control(&scoped, &base, &ext, true).is_some() {
+                return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
+            }
+        }
+        let m: Match = match m0 {
+            Some(m0) if m0_pixel_stable => {
+                self.wait_settled_ts = clock::now();
+                m0
+            }
+            m0 => match self.wait(label, Some(2.2f64.min(self.timeout)), true, m0, false) {
+                Ok(m) => m,
+                Err(e) if e.is_flow() => {
+                    // Icon-only buttons (tab bars, nav icons, Close/Back/Search/Direct
+                    // messages) have no visible text for OCR: one /source lookup with
+                    // coordinates, then targeted Sauvola fallback, then the slower
+                    // element-predicate poll.
+                    let cur_lines = match self.r.last_lines() {
+                        Some(l) => l,
+                        None => first_lines.clone().unwrap_or_default(),
+                    };
+                    let raw_ctl_fb = self.tap_ctl(None)?;
+                    let ctl_fb = scope(&raw_ctl_fb, &cur_lines, wh);
+                    if base.starts_with("re:") {
+                        if let Some(cm) = find_control_match(&ctl_fb, &base, Some(WAIT_UI_TYPES), false) {
+                            self.tap_point(cm.x, cm.y, &cm.text, None)?;
+                            return Ok(cm);
+                        }
+                    } else if let Some(c) = find_control(&ctl_fb, &base, None, false).cloned() {
+                        return self.tap_control(&c, None);
+                    }
+                    let last = self.r.last();
+                    if let Some(slines) = self.read_sauvola(last)?.filter(|s| !s.is_empty()) {
+                        if let Some(sm) = find_text(&slines, &base, DEFAULT_FUZZY, wh) {
+                            if self.is_disabled_ocr_match(&sm, &base, &slines, wh, Some(&raw_ctl_fb)) {
+                                return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
+                            }
+                            self.tap_point(sm.x, sm.y, &sm.text, None)?;
+                            return Ok(sm);
+                        }
+                    }
+                    if base.starts_with("re:") {
+                        if find_control_match(&ctl_fb, &base, Some(WAIT_UI_TYPES), true).is_some() {
+                            return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
+                        }
+                    } else if find_control(&ctl_fb, &base, None, true).is_some() {
+                        return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
+                    }
+                    if wh.is_some() || base.starts_with("re:") {
+                        return Err(e);
+                    }
+                    let (x, y) = self.tap_el(&base, Some(2.0f64.max(self.timeout - 2.2)))?;
+                    return Ok(Match::new(x, y, format!("[el:{label}]"), None, 0));
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        let (_, h) = self.tap_pt()?;
+        let near_bottom_tab = m.line.is_some() && m.y > h - 55;
+        let is_form_label = base.trim_end().ends_with(':');
+        let mut resolved_ctl: Option<Vec<Control>> = None;
+        if m.line.is_some() && (m.rank != 0 || near_bottom_tab || is_form_label) {
+            // 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
+            //    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
+            //    labelled exactly TEXT wins over the substring.
+            // 2. near_bottom_tab: OCR matched a tab label near the bottom edge
+            //    (y > h - 55, close to the home indicator): prefer the Tab/Button centre.
+            // 3. is_form_label: classic form label ('To:', 'Subject:', 'Til:', 'Emne:')
+            //    where OCR matches the left-aligned label text, but the focusable input
+            //    (TextField/TextView/SearchField) spans the row and should be tapped at
+            //    its centre.
+            let cur_lines = self.tap_current_lines()?;
+            let rc = self.tap_ctl(None)?;
+            let ctl = controls_in_region(&rc, &cur_lines, wh);
+            resolved_ctl = Some(rc);
+            let c = self.resolve_ocr_control(&m, &base, &ctl, near_bottom_tab, is_form_label)?;
+            if let Some(c) = c {
+                return self.tap_control(&c, None);
+            }
+        }
+        if m.line.is_some() {
+            let cur_lines = self.r.last_lines().unwrap_or_default();
+            if self.is_disabled_ocr_match(&m, &base, &cur_lines, wh, resolved_ctl.as_deref()) {
+                return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
+            }
+        }
+        // Take a fresh pre-tap baseline when m came from wait()'s UI fallback so
+        // changed_since() measures the tap cleanly (used for switch/input companion
+        // resolution and cache invalidation; never replays an acknowledged tap).
+        let before: Option<Frame> = if m.line.is_none() { Some(self.tap_grab()?) } else { self.r.last() };
+        self.tap_point(m.x, m.y, &m.text, None)?;
+        if !self.changed_since(before.clone(), 0.45, Some(m.x), Some(m.y))? {
+            self.invalidate_ctl_cache();
+            // Tapping a switch row's label does nothing: tap the distinct toggle control
+            // on that row, unless the toggle itself already flipped.
+            let ctl = match resolved_ctl {
+                Some(rc) => rc,
+                None => self.tap_ctl(None)?,
+            };
+            if let Some(sw) = self.switch_near(&base, &m, Some(&ctl))? {
+                if (sw.x - m.x).abs() > 12 || (sw.y - m.y).abs() > 12 {
+                    let now_img = self.tap_grab()?;
+                    if box_diff(img(&before), Some(&now_img), sw.x as f64, sw.y as f64, self.r.scale(), 30.0, 18.0, 0) < 4.0 {
+                        return self.tap_control(&sw, None);
+                    }
+                    return Ok(m);
+                }
+            }
+            // Tapping a form field's static label may not focus its input: tap a
+            // distinct row-aligned TextField/TextView/SearchField/SecureTextField.
+            if let Some(inp) = self.input_near(&base, &m, Some(&ctl))? {
+                if (inp.x - m.x).abs() > 12 || (inp.y - m.y).abs() > 12 {
+                    return self.tap_control(&inp, None);
+                }
+            }
+        } else if let (Some(cache), Some(last)) = (self.ctl_cache.as_ref(), self.r.last()) {
+            if thumb_diff(Some(&cache.img), Some(&last)) >= CTL_CACHE_MAX_DIFF {
+                self.invalidate_ctl_cache();
+            }
+        }
+        Ok(m)
+    }
+
+    /// Shared by `tap_text` and `_tap_if_ocr_match`: the control that should win over
+    /// an OCR substring / bottom-tab / form-label hit.
+    fn resolve_ocr_control(
+        &mut self,
+        m: &Match,
+        base: &str,
+        ctl: &[Control],
+        near_bottom_tab: bool,
+        is_form_label: bool,
+    ) -> Result<Option<Control>> {
+        let mut c = if m.rank != 0 || is_form_label { exact_control(ctl, base, TAP_FORM_TYPES, false).cloned() } else { None };
+        if c.is_none() && is_form_label {
+            c = self.input_near(base, m, Some(ctl))?;
+        }
+        if c.is_none() && near_bottom_tab {
+            c = exact_control(ctl, base, &["Tab", "Button"], false).cloned();
+            if c.is_none() {
+                let near: Vec<Control> = ctl
+                    .iter()
+                    .filter(|x| {
+                        (x.kind == "Tab" || x.kind == "Button") && (x.y - m.y).abs() <= 35 && (x.x - m.x).abs() <= 60
+                    })
+                    .cloned()
+                    .collect();
+                c = find_control(&near, base, Some(&["Tab", "Button"]), false).cloned();
+            }
+        }
+        Ok(c)
+    }
+
+    /// L3446 `_tap_if_ocr_match`: tap an OCR match found by tap_if, preferring an
+    /// exact control on substring/bottom-tab/form-label hits, skipping explicitly
+    /// disabled controls, enforcing the tap_if deadline right before dispatch, and
+    /// respecting --deny.
+    pub fn tap_if_ocr_match(
+        &mut self,
+        m: &Match,
+        base: &str,
+        where_: Option<&str>,
+        lines: &[Line],
+        controls: Option<Vec<Control>>,
+        deadline: Option<f64>,
+    ) -> Result<String> {
+        let past = |d: Option<f64>| d.is_some_and(|d| clock::now() >= d);
+        if past(deadline) {
+            return Ok("skipped".into());
+        }
+        let h = match self.r.pt_size(&mut self.c, false, deadline) {
+            Ok((_, h)) => h,
+            Err(Error::Timeout(_)) => return Ok("skipped".into()),
+            Err(e) => return Err(e),
+        };
+        let near_bottom_tab = m.line.is_some() && m.y > h - 55;
+        let is_form_label = base.trim_end().ends_with(':');
+        let mut resolved_ctl = controls;
+        if m.line.is_some() && (m.rank != 0 || near_bottom_tab || is_form_label) {
+            if resolved_ctl.is_none() {
+                if let Some(d) = deadline {
+                    if d - clock::now() <= 0.0 {
+                        return Ok("skipped".into());
+                    }
+                }
+                resolved_ctl = Some(match self.tap_ctl(deadline) {
+                    Ok(c) => c,
+                    Err(Error::StaleApp(_)) => return Ok("skipped".into()),
+                    Err(e) if e.is_flow() => vec![],
+                    Err(e) => return Err(e),
+                });
+            }
+            if past(deadline) {
+                return Ok("skipped".into());
+            }
+            let ctl = controls_in_region(resolved_ctl.as_deref().unwrap_or(&[]), lines, where_);
+            if let Some(c) = self.resolve_ocr_control(m, base, &ctl, near_bottom_tab, is_form_label)? {
+                if past(deadline) {
+                    return Ok("skipped".into());
+                }
+                return Ok(self.tap_control(&c, deadline)?.text);
+            }
+        }
+        if self.is_disabled_ocr_match(m, base, lines, where_, resolved_ctl.as_deref()) {
+            return Ok("skipped".into());
+        }
+        if past(deadline) {
+            return Ok("skipped".into());
+        }
+        self.tap_point(m.x, m.y, &m.text, deadline)?;
+        Ok(m.text.clone())
+    }
+
+    /// L3473. Default timeout 1.0. Returns the tapped text or "skipped".
+    ///
+    /// Optional tap with a unified monotonic deadline (~1.0 s max, never 8 s). Shares
+    /// one budget across app confirmation, screenshots, UI lookups, and tap transport
+    /// (including 404 fallback); rechecks accessibility controls if a prompt arrives
+    /// mid-window, never dispatches a tap after the deadline, never taps outgoing-app
+    /// OCR/Sauvola frames on wrong-app rejection, skips explicitly disabled targets
+    /// consistently, supports @region, and enforces --deny.
+    pub fn tap_if(&mut self, label: &str, timeout: f64) -> Result<String> {
+        match self.tap_if_impl(label, timeout) {
+            Err(Error::DeadlineExceeded(_)) | Err(Error::Timeout(_)) => Ok("skipped".into()),
+            r => r,
+        }
+    }
+
+    /// Tap a control match (`re:` path) or control within the tap_if deadline.
+    fn tap_if_ctl_hit(&mut self, ctl: &[Control], base: &str, back_alts: bool, deadline: f64) -> Result<Option<String>> {
+        let ext = ext_types();
+        if base.starts_with("re:") {
+            if let Some(cm) = find_control_match(ctl, base, Some(&ext), false) {
+                if clock::now() >= deadline {
+                    return Ok(Some("skipped".into()));
+                }
+                self.tap_point(cm.x, cm.y, &cm.text, Some(deadline))?;
+                return Ok(Some(cm.text));
+            }
+        } else {
+            let mut c = exact_control(ctl, base, &ext, false).cloned();
+            if c.is_none() && back_alts && BACK_LABELS.contains(&casefold(base).as_str()) {
+                for alt in BACK_LABELS {
+                    c = exact_control(ctl, alt, &["Button", "Link"], false).cloned();
+                    if c.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some(c) = c {
+                if clock::now() >= deadline {
+                    return Ok(Some("skipped".into()));
+                }
+                return Ok(Some(self.tap_control(&c, Some(deadline))?.text));
+            }
+        }
+        Ok(None)
+    }
+
+    fn tap_if_impl(&mut self, label: &str, timeout: f64) -> Result<String> {
+        let skipped = || Ok("skipped".to_string());
+        let eff_timeout = timeout.min(self.timeout);
+        let now0 = clock::now();
+        let deadline = now0 + eff_timeout;
+        // Snapshot whether a recent open:/launch: switch still needs UI-tree
+        // verification BEFORE wait_active_app() can clear pending_bundle, so even the
+        // very first open: in a flow (with no prior app name) confirms the target UI
+        // tree before trusting any OCR or Sauvola coordinates.
+        let needs_ui_confirm = self.pending_bundle.as_deref().is_some_and(|b| !b.is_empty())
+            || (self.pending_bundle_ts != 0.0 && (now0 - self.pending_bundle_ts) <= 3.0)
+            || (self.switched_from_app_name.as_deref().is_some_and(|s| !s.is_empty())
+                && self.switched_at != 0.0
+                && (now0 - self.switched_at) <= 3.0);
+        let rem = deadline - clock::now();
+        if rem > 0.0 {
+            self.wait_active_app(1.5f64.min(rem), 0.03, Some(deadline));
+        }
+        if clock::now() >= deadline {
+            return skipped();
+        }
+        let (base, where_) = split_where(label);
+        let where_ = where_set(where_.as_deref()).map(str::to_string);
+        let wh = where_.as_deref();
+        let mut last_ui_check = 0.0f64;
+        let mut last_ui_img: Option<Frame> = None;
+        let mut last_ctl: Option<Vec<Control>> = None;
+        let mut last_sauvola: Option<Frame> = None;
+        let mut prev_texts: Option<Vec<String>> = None;
+        let mut prev_img: Option<Frame> = None;
+        let mut frames = 0usize;
+        let mut confirmed_fresh_app = !needs_ui_confirm;
+        loop {
+            let t_frame = clock::now();
+            let rem = deadline - t_frame;
+            if rem <= 0.0 {
+                return skipped();
+            }
+            if !confirmed_fresh_app {
+                // Resolve the pending app switch BEFORE capturing/using any OCR or
+                // Sauvola frame so outgoing-app pixels can never authorize a tap.
+                let raw_ctl = match self.tap_ctl(Some(deadline)) {
+                    Ok(c) => c,
+                    Err(e) if e.is_flow() => {
+                        let rem_after = deadline - clock::now();
+                        if rem_after <= 0.0 {
+                            return skipped();
+                        }
+                        clock::sleep(0.05f64.min(rem_after));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                confirmed_fresh_app = true;
+                if clock::now() >= deadline {
+                    return skipped();
+                }
+                last_ctl = Some(raw_ctl.clone());
+                last_ui_check = clock::now();
+                last_ui_img = None;
+                // Verified target-app tree can supply direct control coordinates
+                // immediately (unless @below/@above needs fresh OCR lines).
+                if !is_header_where(wh) {
+                    let ctl = controls_in_region(&raw_ctl, &[], wh);
+                    if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, true, deadline)? {
+                        return Ok(r);
+                    }
+                }
+                // Discard any pre-confirmation cached frame so the upcoming OCR/Sauvola
+                // pass captures a fresh frame from the confirmed target app.
+                self.r.invalidate_last();
+                continue;
+            }
+            let mut lines: Option<Vec<Line>> = None;
+            if frames == 0 {
+                lines = self.fresh_lines(0.15)?;
+            }
+            let lines = match lines {
+                Some(l) => l,
+                None => match self.lines(Some(rem), Some(deadline)) {
+                    Ok(l) => l,
+                    Err(_) => return skipped(),
+                },
+            };
+            frames += 1;
+            if clock::now() >= deadline {
+                return skipped();
+            }
+            let cur_img = self.r.last();
+            if last_ui_img.is_none() && last_ctl.is_some() {
+                last_ui_img = cur_img.clone();
+            }
+            let mut stale_app = false;
+            if let Some(m) = find_text(&lines, &base, DEFAULT_FUZZY, wh) {
+                let mut ctl_for_check = last_ctl.clone();
+                let rem_ctl = deadline - clock::now();
+                if ctl_for_check.is_none() && rem_ctl > 0.0 {
+                    match self.tap_ctl(Some(deadline)) {
+                        Ok(c) => {
+                            ctl_for_check = Some(c.clone());
+                            last_ctl = Some(c);
+                            last_ui_check = clock::now();
+                            last_ui_img = cur_img.clone();
+                            if self.last_ui_retried_stale {
+                                // The lookup just resolved a stale-app mismatch: discard
+                                // the pre-confirmation OCR frame and capture a fresh one.
+                                self.r.invalidate_last();
+                                last_ui_img = None;
+                                continue;
+                            }
+                        }
+                        Err(Error::StaleApp(_)) => {
+                            confirmed_fresh_app = false;
+                            stale_app = true;
+                            last_ctl = None;
+                            ctl_for_check = None;
+                        }
+                        Err(e) if e.is_flow() => ctl_for_check = None,
+                        Err(e) => return Err(e),
+                    }
+                }
+                if clock::now() >= deadline {
+                    return skipped();
+                }
+                if !stale_app && confirmed_fresh_app {
+                    return self.tap_if_ocr_match(&m, &base, wh, &lines, ctl_for_check, Some(deadline));
+                }
+            }
+            let now = clock::now();
+            let screen_changed_since_ui = match (&last_ui_img, &cur_img) {
+                (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && !content_pixel_still(Some(a), Some(b), 6),
+                _ => false,
+            };
+            if !stale_app
+                && now < deadline
+                && (last_ui_check == 0.0 || screen_changed_since_ui || (now - last_ui_check) >= 0.35)
+            {
+                last_ui_check = now;
+                last_ui_img = cur_img.clone();
+                if deadline - clock::now() <= 0.0 {
+                    return skipped();
+                }
+                let raw_ctl = match self.tap_ctl(Some(deadline)) {
+                    Ok(c) => c,
+                    Err(Error::StaleApp(_)) => {
+                        confirmed_fresh_app = false;
+                        stale_app = true;
+                        last_ctl = None;
+                        vec![]
+                    }
+                    Err(e) if e.is_flow() => vec![],
+                    Err(e) => return Err(e),
+                };
+                if clock::now() >= deadline {
+                    return skipped();
+                }
+                if self.last_ui_retried_stale && !stale_app {
+                    // Resolved a mismatch mid-loop: allow verified target-app controls
+                    // directly, but discard cur_img so Sauvola never runs on an older
+                    // frame.
+                    last_ctl = Some(raw_ctl.clone());
+                    last_ui_img = None;
+                    self.r.invalidate_last();
+                    let ctl = if !is_header_where(wh) { controls_in_region(&raw_ctl, &[], wh) } else { vec![] };
+                    if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, false, deadline)? {
+                        return Ok(r);
+                    }
+                    continue;
+                }
+                if !stale_app && confirmed_fresh_app {
+                    last_ctl = Some(raw_ctl.clone());
+                    let ctl = controls_in_region(&raw_ctl, &lines, wh);
+                    if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, true, deadline)? {
+                        return Ok(r);
+                    }
+                    if let Some(ci) = cur_img.as_ref() {
+                        let seen = last_sauvola.as_ref().is_some_and(|s| Arc::ptr_eq(s, ci));
+                        if clock::now() < deadline && !seen {
+                            last_sauvola = Some(ci.clone());
+                            let slines = self.read_sauvola(Some(ci.clone()))?;
+                            if clock::now() >= deadline {
+                                return skipped();
+                            }
+                            if let Some(slines) = slines.filter(|s| !s.is_empty()) {
+                                if let Some(sm) = find_text(&slines, &base, DEFAULT_FUZZY, wh) {
+                                    if self.is_disabled_ocr_match(&sm, &base, &slines, wh, Some(&raw_ctl)) {
+                                        return skipped();
+                                    }
+                                    if clock::now() >= deadline {
+                                        return skipped();
+                                    }
+                                    self.tap_point(sm.x, sm.y, &sm.text, Some(deadline))?;
+                                    return Ok(sm.text);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let cur_texts: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
+            let in_transition = self.last_action_ts != 0.0 && (clock::now() - self.last_action_ts) < 0.5;
+            if !stale_app && !in_transition && prev_texts.as_ref() == Some(&cur_texts) {
+                let img_still = match (&prev_img, &cur_img) {
+                    (Some(a), Some(b)) => content_pixel_still(Some(a), Some(b), 6),
+                    _ => true,
+                };
+                if img_still {
+                    return skipped();
+                }
+            }
+            if !stale_app {
+                prev_texts = Some(cur_texts);
+                prev_img = cur_img.clone();
+            }
+            let rem_after = deadline - clock::now();
+            if rem_after <= 0.0 {
+                return skipped();
+            }
+            if stale_app || (clock::now() - t_frame) < 0.02 {
+                clock::sleep(0.05f64.min(rem_after));
+            }
+        }
+    }
+
+    /// L3705.
+    pub fn tap_control(&mut self, c: &Control, deadline: Option<f64>) -> Result<Match> {
+        self.tap_point(c.x, c.y, &c.label, deadline)?;
+        self.last_tap_type = Some(c.kind.clone());
+        self.last_tap_ts = clock::now();
+        if INPUT_TYPES.contains(&c.kind.as_str()) {
+            self.invalidate_ctl_cache();
+        }
+        Ok(Match::new(c.x, c.y, format!("[{}:{}]", c.kind, c.label), None, 0))
+    }
+
+    /// L3713. The Switch on the matched text's row whose label contains `label`.
+    pub fn switch_near(&mut self, label: &str, m: &Match, controls: Option<&[Control]>) -> Result<Option<Control>> {
+        let owned;
+        let ctl: &[Control] = match controls {
+            Some(c) => c,
+            None => {
+                owned = self.tap_ctl(None)?;
+                &owned
+            }
+        };
+        let want = casefold(&clean_text(label));
+        let norm_m = norm(&m.text);
+        Ok(ctl
+            .iter()
+            .filter(|c| {
+                let lab = casefold(&c.label);
+                c.kind == "Switch" && (c.y - m.y).abs() <= 30 && (lab.contains(&want) || norm_m.contains(&lab))
+            })
+            .min_by_key(|c| (c.y - m.y).abs())
+            .cloned())
+    }
+
+    /// L3721. Exact or row-aligned TextField/SearchField/SecureTextField/TextView for a
+    /// form label.
+    pub fn input_near(&mut self, label: &str, m: &Match, controls: Option<&[Control]>) -> Result<Option<Control>> {
+        let owned;
+        let ctl: &[Control] = match controls {
+            Some(c) => c,
+            None => {
+                owned = self.tap_ctl(None)?;
+                &owned
+            }
+        };
+        let inputs: Vec<&Control> = ctl.iter().filter(|c| INPUT_TYPES.contains(&c.kind.as_str())).collect();
+        if inputs.is_empty() {
+            return Ok(None);
+        }
+        let want = casefold(clean_text(label).trim_end_matches(':'));
+        let dy = |c: &Control| (c.y - m.y).abs();
+        if let Some(c) = inputs
+            .iter()
+            .filter(|c| dy(c) <= 35 && casefold(c.label.trim_end_matches(':')) == want)
+            .min_by_key(|c| dy(c))
+        {
+            return Ok(Some((*c).clone()));
+        }
+        let norm_m = norm(&m.text);
+        let norm_m = norm_m.trim_end_matches(':');
+        if let Some(c) = inputs
+            .iter()
+            .filter(|c| {
+                dy(c) <= 35
+                    && (casefold(&c.label).contains(&want) || norm_m.contains(&casefold(c.label.trim_end_matches(':'))))
+            })
+            .min_by_key(|c| dy(c))
+        {
+            return Ok(Some((*c).clone()));
+        }
+        Ok(inputs
+            .iter()
+            .filter(|c| dy(c) <= 25 && c.x >= m.x - 20)
+            .min_by_key(|c| (dy(c), (c.x - m.x).abs()))
+            .map(|c| (*c).clone()))
+    }
+
+    /// L3742. Next/Previous also sit on the keyboard toolbar: tap the topmost exact
+    /// match from OCR or the tree, i.e. the form's own button when both show.
+    pub fn tap_form_button(&mut self, label: &str, where_: Option<&str>) -> Result<Option<Match>> {
+        let lines = self.lines(None, None)?;
+        let want = norm(label);
+        let wh = where_set(where_);
+        let region_lines: Vec<Line> = match wh {
+            Some(w) => region(&lines, w).unwrap_or_default(),
+            None => lines.clone(),
+        };
+        let mut cands: Vec<(bool, i64, i64, String)> = region_lines
+            .iter()
+            .filter(|l| norm(&l.text) == want)
+            .map(|l| (false, l.y(), l.x(), l.text.clone()))
+            .collect();
+        let ctl = self.tap_ctl(None)?;
+        let low = casefold(label);
+        cands.extend(
+            controls_in_region(&ctl, &lines, wh)
+                .into_iter()
+                .filter(|c| (c.kind == "Button" || c.kind == "Link") && casefold(&c.label) == low && !c.is_disabled())
+                .map(|c| (c.is_disabled(), c.y, c.x, c.label)),
+        );
+        let Some((_, y, x, text)) = cands.into_iter().min() else {
+            return Ok(None);
+        };
+        self.tap_point(x, y, &text, None)?;
+        self.settle(1.5, None, 0.6)?;
+        Ok(Some(Match::new(x, y, text, None, 0)))
+    }
+
+    /// L3760. Returns the tapped point (the `tapel:` step result is `[x, y]`).
+    pub fn tap_el(&mut self, label: &str, timeout: Option<f64>) -> Result<(i64, i64)> {
+        self.wait_active_app(1.5, 0.03, None);
+        let q = json::dumps(&Value::String(label.to_string()));
+        let preds = [
+            format!("(label == {q} OR name == {q}) AND enabled == 1"),
+            format!("label == {q} OR name == {q}"),
+            format!("(label CONTAINS[c] {q} OR name CONTAINS[c] {q}) AND enabled == 1"),
+            format!("label CONTAINS[c] {q} OR name CONTAINS[c] {q}"),
+        ];
+        let end = clock::wall() + timeout.filter(|t| *t != 0.0).unwrap_or(self.timeout);
+        while clock::wall() < end {
+            for pred in &preds {
+                let p = self.c.spath("/element");
+                let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));
+                let v = json::get(&r, "value");
+                let eid = if v.is_object() { json::get(v, "ELEMENT") } else { &Value::Null };
+                if json::truthy(eid) {
+                    let eid = json::py_str(eid);
+                    let p = self.c.spath(&format!("/element/{eid}/rect"));
+                    let rr = self.c.get(&p);
+                    let rect = json::get(&rr, "value");
+                    if json::truthy(json::get(rect, "width")) {
+                        let f = |k: &str| json::get(rect, k).as_f64().unwrap_or(0.0);
+                        let x = (f("x") + f("width") / 2.0).trunc() as i64;
+                        let y = (f("y") + f("height") / 2.0).trunc() as i64;
+                        self.tap_point(x, y, label, None)?;
+                        return Ok((x, y));
+                    }
+                }
+            }
+        }
+        Err(Error::flow(format!("no element labelled {}", json::py_repr_str(label))))
+    }
+
+    /// L3784 `_find_target`: resolve TEXT (with optional @region or re:REGEX) to an
+    /// on-screen Match using OCR first, then accessibility controls and targeted
+    /// Sauvola OCR.
+    pub fn find_target(&mut self, label: &str, timeout: Option<f64>) -> Result<Match> {
+        self.wait_active_app(1.5, 0.03, None);
+        let (base, where_) = split_where(label);
+        let where_ = where_set(where_.as_deref()).map(str::to_string);
+        let wh = where_.as_deref();
+        let mut m0: Option<Match> = None;
+        let cached_lines = self.fresh_lines(0.15)?;
+        if let Some(cl) = cached_lines.as_ref() {
+            m0 = find_text(cl, &base, DEFAULT_FUZZY, wh);
+        }
+        let lines: Vec<Line> = if m0.is_none() {
+            let l = self.lines(None, None)?;
+            m0 = find_text(&l, &base, DEFAULT_FUZZY, wh);
+            l
+        } else {
+            cached_lines.unwrap_or_default()
+        };
+        let disabled = |b: &str| Error::flow(format!("{} is disabled", json::py_repr_str(b)));
+        if m0.is_none() && !base.starts_with("re:") {
+            let ctl = self.tap_ctl(None)?;
+            let scoped = scope(&ctl, &lines, wh);
+            let ext = ext_types();
+            if let Some(c) = exact_control(&scoped, &base, &ext, false) {
+                return Ok(Match::new(c.x, c.y, c.label.clone(), None, 0));
+            }
+            if exact_control(&scoped, &base, &ext, true).is_some() {
+                return Err(disabled(&base));
+            }
+        }
+        let t = timeout.filter(|t| *t != 0.0).unwrap_or(self.timeout);
+        let m = match self.wait(label, Some(2.2f64.min(t)), true, m0, false) {
+            Ok(m) => m,
+            Err(e) if e.is_flow() => {
+                let cur_lines = self.r.last_lines().unwrap_or_else(|| lines.clone());
+                let raw_ctl = self.tap_ctl(None)?;
+                let ctl = scope(&raw_ctl, &cur_lines, wh);
+                if base.starts_with("re:") {
+                    if let Some(cm) = find_control_match(&ctl, &base, Some(WAIT_UI_TYPES), false) {
+                        return Ok(cm);
+                    }
+                } else if let Some(c) = find_control(&ctl, &base, None, false) {
+                    return Ok(Match::new(c.x, c.y, c.label.clone(), None, 0));
+                }
+                let last = self.r.last();
+                if let Some(slines) = self.read_sauvola(last)?.filter(|s| !s.is_empty()) {
+                    if let Some(sm) = find_text(&slines, &base, DEFAULT_FUZZY, wh) {
+                        if self.is_disabled_ocr_match(&sm, &base, &slines, wh, Some(&raw_ctl)) {
+                            return Err(disabled(&base));
+                        }
+                        return Ok(sm);
+                    }
+                }
+                if base.starts_with("re:") {
+                    if find_control_match(&ctl, &base, Some(WAIT_UI_TYPES), true).is_some() {
+                        return Err(disabled(&base));
+                    }
+                } else if find_control(&ctl, &base, None, true).is_some() {
+                    return Err(disabled(&base));
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        if m.line.is_some() && m.rank != 0 && !base.starts_with("re:") {
+            let cur_lines = self.tap_current_lines()?;
+            let rc = self.tap_ctl(None)?;
+            let ctl = controls_in_region(&rc, &cur_lines, wh);
+            if let Some(c) = exact_control(&ctl, &base, TAP_FORM_TYPES, false) {
+                return Ok(Match::new(c.x, c.y, c.label.clone(), None, 0));
+            }
+        }
+        Ok(m)
+    }
+
+    /// L3845. Default duration 0.65.
+    pub fn long_press_point(&mut self, x: i64, y: i64, text: &str, duration: f64) -> Result<()> {
+        self.guard(text, "long-press")?;
+        self.mark_action(false, false);
+        let r = self.c.long_press(x, y, duration);
+        crate::wda::check_wda_ok(r, "long-press", false)?;
+        let now = clock::now();
+        self.last_action_ts = now;
+        self.last_tap_type = None;
+        self.last_tap_ts = now;
+        Ok(())
+    }
+
+    /// L3854.
+    pub fn long_press_text(&mut self, label: &str, duration: f64) -> Result<Match> {
+        let (base, _) = split_where(label);
+        if !base.starts_with("re:") {
+            self.guard(&base, "long-press")?;
+        }
+        let m = self.find_target(label, None)?;
+        self.long_press_point(m.x, m.y, &m.text, duration)?;
+        self.settle(1.2, None, 0.6)?;
+        Ok(m)
+    }
+
+    /// L3863.
+    pub fn double_tap_point(&mut self, x: i64, y: i64, text: &str, interval: Option<f64>, duration: Option<f64>) -> Result<Value> {
+        self.guard(text, "double-tap")?;
+        self.mark_action(false, false);
+        let res = self.c.fast_double_tap(x, y, interval, duration);
+        let r = crate::wda::check_wda_ok(res, "double-tap", false)?;
+        let now = clock::now();
+        self.last_action_ts = now;
+        self.last_tap_type = None;
+        self.last_tap_ts = now;
+        Ok(r)
+    }
+
+    /// L3873.
+    pub fn double_tap_text(&mut self, label: &str) -> Result<Match> {
+        let (base, _) = split_where(label);
+        if !base.starts_with("re:") {
+            self.guard(&base, "double-tap")?;
+        }
+        let m = self.find_target(label, None)?;
+        self.double_tap_point(m.x, m.y, &m.text, None, None)?;
+        self.settle(1.2, None, 0.6)?;
+        Ok(m)
+    }
+
+    /// L3882. Two-finger pinch/zoom: `zoom:in|out|SCALE[@X,Y]` (defaults to screen
+    /// center). scale > 1.0 zooms in (in = 2.0); 0 < scale < 1.0 zooms out (out = 0.5).
+    pub fn zoom(&mut self, spec: &str) -> Result<String> {
+        self.wait_active_app(1.5, 0.03, None);
+        let raw = spec.trim();
+        if raw.is_empty() {
+            return Err(Error::flow("zoom expects in|out|SCALE[@X,Y] (e.g. zoom:in, zoom:out@200,450, zoom:1.5)"));
+        }
+        let (mode_str, has_at, pos_str) = match raw.split_once('@') {
+            Some((a, b)) => (a, true, b),
+            None => (raw, false, ""),
+        };
+        let mode_str = mode_str.trim().to_lowercase();
+        let rs = json::py_repr_str(spec);
+        let scale = match mode_str.as_str() {
+            "in" => 2.0,
+            "out" => 0.5,
+            _ => {
+                let s = super::py_float(&mode_str)
+                    .map_err(|_| Error::flow(format!("invalid zoom scale {rs}; use zoom:in|out|SCALE[@X,Y]")))?;
+                if !(s > 0.0 && s.is_finite()) {
+                    return Err(Error::flow(format!("zoom scale must be a finite number > 0, got {rs}")));
+                }
+                s
+            }
+        };
+        let (cx, cy) = if has_at {
+            let parts: Vec<&str> = pos_str.split(',').map(str::trim).collect();
+            let bad = || Error::flow(format!("invalid zoom coordinates {rs}; expected @X,Y"));
+            if parts.len() != 2 {
+                return Err(bad());
+            }
+            // int(float(v)): ValueError (bad text, NaN) -> FlowError; inf -> OverflowError.
+            let coord = |p: &str| -> Result<i64> {
+                let f = super::py_float(p).map_err(|_| bad())?;
+                if f.is_nan() {
+                    return Err(bad());
+                }
+                super::parse_coord(p)
+            };
+            (coord(parts[0])?, coord(parts[1])?)
+        } else {
+            let (w, h) = self.tap_pt()?;
+            (w.div_euclid(2), h.div_euclid(2))
+        };
+        self.mark_action(false, false);
+        let r = self.c.fast_pinch(Some(cx), Some(cy), scale, 0.18, None, Some(has_at))?;
+        if json::truthy(json::get(&r, "error")) {
+            let body = json::get(&r, "body");
+            let detail = if json::truthy(body) { body } else { json::get(&r, "error") };
+            return Err(Error::flow(format!("zoom failed: {}", json::py_str(detail))));
+        }
+        self.settle(1.5, None, 0.6)?;
+        Ok(format!("{}x@{cx},{cy}", py_fmt_g(scale)))
+    }
+
+    /// L4965. Tap comma-separated control labels (supporting escaped `\,` and per-label
+    /// @region), validating all upfront targets and --deny BEFORE dispatching any tap.
+    /// Generic `tapbatch:A,B,C` re-resolves live UI controls + `--deny` before every
+    /// subsequent tap (including Key controls and older WDA) so layout shifts never
+    /// tap stale coordinates. Explicit `tapbatch:fixed:A,B,C` opts into
+    /// single-snapshot `/wda/fastTapBatch` dispatch for known stationary keypads
+    /// (e.g. Calculator).
+    pub fn tap_batch(&mut self, spec: &str) -> Result<String> {
+        let mut raw_spec = spec.trim();
+        let mut fixed_layout = false;
+        if raw_spec.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("fixed:")) {
+            fixed_layout = true;
+            raw_spec = raw_spec[6..].trim();
+        }
+        let parts: Vec<String> = split_unescaped_commas(raw_spec)
+            .into_iter()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| p.trim().replace("\\,", ",").trim().to_string())
+            .collect();
+        if parts.is_empty() {
+            return Err(Error::flow(
+                "tapbatch requires at least one label (e.g. tapbatch:1,2,+,3,= or tapbatch:fixed:1,2,+,3,=)",
+            ));
+        }
+        let parsed: Vec<(String, Option<String>)> = parts
+            .iter()
+            .map(|p| {
+                let (b, w) = split_where(p);
+                (b, where_set(w.as_deref()).map(str::to_string))
+            })
+            .collect();
+        for (base, _) in &parsed {
+            if base.is_empty() {
+                return Err(Error::flow(format!("tapbatch: empty label in {}", json::py_repr_str(spec))));
+            }
+        }
+        self.wait_active_app(1.5, 0.03, None);
+        let mut raw_ctl = self.tap_ctl(None)?;
+        if raw_ctl.is_empty() && self.last_action_ts != 0.0 && (clock::now() - self.last_action_ts) < 3.0 {
+            let poll_end = clock::now() + 2.0f64.min(self.timeout);
+            while raw_ctl.is_empty() && clock::now() < poll_end {
+                clock::sleep(0.10f64.min(0.01f64.max(poll_end - clock::now())));
+                raw_ctl = match self.tap_ctl(None) {
+                    Ok(c) => c,
+                    Err(e) if e.is_flow() => vec![],
+                    Err(e) => return Err(e),
+                };
+            }
+        }
+        let needs_lines = parsed.iter().any(|(_, w)| w.as_deref().is_some_and(|w| !w.starts_with('y')));
+        let lines = if needs_lines { self.tap_fresh_or_lines()? } else { vec![] };
+        let disabled = |b: &str| Error::flow(format!("{} is disabled", json::py_repr_str(b)));
+        let mut targets: Vec<Control> = Vec::new();
+        for (base, wh) in &parsed {
+            let scoped = scope(&raw_ctl, &lines, wh.as_deref());
+            let Some(c) = exact_control(&scoped, base, TAP_FORM_TYPES, false).cloned() else {
+                if exact_control(&scoped, base, TAP_FORM_TYPES, true).is_some() {
+                    return Err(disabled(base));
+                }
+                return Err(Error::flow(format!("tapbatch: control {} not found", json::py_repr_str(base))));
+            };
+            self.guard(&c.label, "tap")?;
+            targets.push(c);
+        }
+        if !fixed_layout && targets.len() > 1 {
+            // Generic labelled path: re-resolve live UI controls + guard() before every
+            // subsequent tap so layout mutations (even on Key-only screens) never hit a
+            // replaced coordinate.
+            for (idx, (base, wh)) in parsed.iter().enumerate() {
+                let c = if idx == 0 {
+                    targets[0].clone()
+                } else {
+                    let cur_ctl = self.tap_ctl(None)?;
+                    let cur_lines = if wh.as_deref().is_some_and(|w| !w.starts_with('y')) {
+                        self.lines(None, None)?
+                    } else {
+                        vec![]
+                    };
+                    let scoped = scope(&cur_ctl, &cur_lines, wh.as_deref());
+                    let Some(c) = exact_control(&scoped, base, TAP_FORM_TYPES, false).cloned() else {
+                        if exact_control(&scoped, base, TAP_FORM_TYPES, true).is_some() {
+                            return Err(Error::flow(format!(
+                                "tapbatch: {} became disabled after previous tap",
+                                json::py_repr_str(base)
+                            )));
+                        }
+                        return Err(Error::flow(format!(
+                            "tapbatch: control {} not found after previous tap",
+                            json::py_repr_str(base)
+                        )));
+                    };
+                    self.guard(&c.label, "tap")?;
+                    c
+                };
+                let before_step = match self.r.last() {
+                    Some(l) => l,
+                    None => self.tap_grab()?,
+                };
+                self.tap_control(&c, None)?;
+                self.changed_since(Some(before_step), 0.35, Some(c.x), Some(c.y))?;
+            }
+            self.invalidate_ctl_cache();
+            return Ok(format!("{} taps", parsed.len()));
+        }
+        let before = match self.r.last() {
+            Some(l) => l,
+            None => self.tap_grab()?,
+        };
+        if self.ctl_cache.is_none() {
+            self.store_ctl_cache(&raw_ctl, Some(before.clone()));
+        }
+        let pts: Vec<(i64, i64)> = targets.iter().map(|c| (c.x, c.y)).collect();
+        self.mark_action(true, false);
+        let res = self.c.fast_tap_batch(&pts, 0.09, 0.02);
+        if let Err(e) = crate::wda::check_wda_ok(res, "tapbatch", false) {
+            self.invalidate_ctl_cache();
+            return Err(e);
+        }
+        let now = clock::now();
+        self.last_action_ts = now;
+        self.last_tap_type = targets.last().map(|c| c.kind.clone());
+        self.last_tap_ts = now;
+        let has_input = targets.iter().any(|c| INPUT_TYPES.contains(&c.kind.as_str()));
+        if self.changed_since(Some(before), 0.45, None, None)? {
+            if has_input {
+                self.invalidate_ctl_cache();
+            } else if let (Some(cache), Some(last)) = (self.ctl_cache.as_ref(), self.r.last()) {
+                if thumb_diff(Some(&cache.img), Some(&last)) >= CTL_CACHE_MAX_DIFF {
+                    self.invalidate_ctl_cache();
+                } else if let Some(cache) = self.ctl_cache.as_mut() {
+                    cache.ts = clock::now();
+                    cache.img = last;
+                }
+            }
+        } else {
+            self.invalidate_ctl_cache();
+        }
+        Ok(format!("{} taps", pts.len()))
+    }
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    #[test]
+    fn fmt_g_matches_python() {
+        assert_eq!(py_fmt_g(2.0), "2");
+        assert_eq!(py_fmt_g(0.5), "0.5");
+        assert_eq!(py_fmt_g(1.5), "1.5");
+        assert_eq!(py_fmt_g(1e-5), "1e-05");
+        assert_eq!(py_fmt_g(1234567.0), "1.23457e+06");
+        assert_eq!(py_fmt_g(123456.0), "123456");
+        assert_eq!(py_fmt_g(0.0001), "0.0001");
+        assert_eq!(py_fmt_g(0.333333333), "0.333333");
+    }
+
+    #[test]
+    fn split_commas_respects_escapes() {
+        assert_eq!(split_unescaped_commas(r"a,b\,c,,d"), vec!["a", r"b\,c", "", "d"]);
+    }
+}

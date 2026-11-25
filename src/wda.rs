@@ -1,0 +1,1467 @@
+//! Persistent HTTP/1.1 keep-alive WebDriverAgent client.
+//!
+//! Port of Python `WDAClient` (v0.10.0 cli.py L279-1015) plus the warm-daemon connection
+//! pool (L136-241), `_is_unsupported_route`, `_fast_preflight`, `cmd_preflight`
+//! and `cmd_unlock`.
+//!
+//! Responses are `serde_json::Value` with exactly the Python shapes (see
+//! [`crate::json`]). Every request honours an optional absolute monotonic
+//! `deadline` (seconds on [`crate::clock::now`]).
+use crate::clock;
+use crate::error::{Error, Result};
+use crate::json;
+use serde_json::{json as j, Value};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::Duration;
+
+pub const DEFAULT_TIMEOUT: f64 = 25.0;
+pub const SPRINGBOARD: &str = "com.apple.springboard";
+
+// ---------------------------------------------------------------------------
+// Raw HTTP/1.1 connection
+// ---------------------------------------------------------------------------
+
+/// One HTTP response.
+#[derive(Debug, Clone, Default)]
+pub struct HttpResponse {
+    pub status: u16,
+    /// Lower-cased header names; the last value wins on duplicates.
+    pub headers: HashMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+/// A keep-alive HTTP/1.1 connection (Python `http.client.HTTPConnection`).
+pub struct Conn {
+    pub host: String,
+    pub port: u16,
+    reader: Option<BufReader<TcpStream>>,
+}
+
+impl Conn {
+    pub fn new(host: &str, port: u16) -> Conn {
+        Conn { host: host.to_string(), port, reader: None }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    pub fn close(&mut self) {
+        self.reader = None;
+    }
+
+    pub fn connect(&mut self, timeout: f64) -> std::io::Result<()> {
+        let to = Duration::from_secs_f64(timeout.max(0.001));
+        let mut last_err = None;
+        for addr in (self.host.as_str(), self.port).to_socket_addrs()? {
+            match TcpStream::connect_timeout(&addr, to) {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    self.reader = Some(BufReader::with_capacity(64 * 1024, s));
+                    return Ok(());
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address")))
+    }
+
+    pub fn set_timeout(&mut self, timeout: f64) {
+        if let Some(r) = self.reader.as_mut() {
+            let to = Some(Duration::from_secs_f64(timeout.max(0.001)));
+            let _ = r.get_mut().set_read_timeout(to);
+            let _ = r.get_mut().set_write_timeout(to);
+        }
+    }
+
+    /// False when the peer already closed (or sent unsolicited bytes on) an idle
+    /// socket (Python `_conn_alive`).
+    pub fn alive(&self) -> bool {
+        let Some(r) = self.reader.as_ref() else { return false };
+        if !r.buffer().is_empty() {
+            return false;
+        }
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd { fd: r.get_ref().as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd, zero timeout.
+        let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+        n == 0
+    }
+
+    /// Send one request and read the whole response. The connection must be open.
+    pub fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(String, String)],
+    ) -> std::io::Result<HttpResponse> {
+        let host_hdr = if self.port == 80 { self.host.clone() } else { format!("{}:{}", self.host, self.port) };
+        let r = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected"))?;
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept-Encoding: identity\r\n");
+        if let Some(b) = body {
+            head.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        } else if ["POST", "PUT", "PATCH"].iter().any(|m| method.eq_ignore_ascii_case(m)) {
+            // http.client sends an explicit zero length for body-carrying methods.
+            head.push_str("Content-Length: 0\r\n");
+        }
+        for (k, v) in headers {
+            head.push_str(k);
+            head.push_str(": ");
+            head.push_str(v);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        let mut msg = head.into_bytes();
+        if let Some(b) = body {
+            msg.extend_from_slice(b);
+        }
+        r.get_mut().write_all(&msg)?;
+        let resp = read_response(r, method)?;
+        let close = resp.headers.get("connection").map(|v| v.eq_ignore_ascii_case("close")).unwrap_or(false);
+        if close {
+            self.reader = None;
+        }
+        Ok(resp)
+    }
+}
+
+fn bad(msg: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
+}
+
+fn read_line(r: &mut BufReader<TcpStream>) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    let n = r.read_until(b'\n', &mut line)?;
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Remote end closed connection without response",
+        ));
+    }
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+fn read_response(r: &mut BufReader<TcpStream>, method: &str) -> std::io::Result<HttpResponse> {
+    let mut status_line = read_line(r)?;
+    let mut status: u16;
+    let mut headers: HashMap<String, String>;
+    loop {
+        let mut parts = status_line.splitn(3, ' ');
+        let proto = parts.next().unwrap_or("");
+        if !proto.starts_with("HTTP/") {
+            return Err(bad(&format!("bad status line: {status_line:?}")));
+        }
+        status = parts.next().and_then(|s| s.parse().ok()).ok_or_else(|| bad("bad status code"))?;
+        headers = HashMap::new();
+        loop {
+            let line = read_line(r)?;
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+        if status == 100 {
+            status_line = read_line(r)?;
+            continue;
+        }
+        break;
+    }
+    let no_body = method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 || (100..200).contains(&status);
+    let mut body = Vec::new();
+    if !no_body {
+        let chunked = headers.get("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
+        if chunked {
+            loop {
+                let size_line = read_line(r)?;
+                let size_hex = size_line.split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(size_hex, 16).map_err(|_| bad("bad chunk size"))?;
+                if size == 0 {
+                    loop {
+                        if read_line(r)?.is_empty() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                let start = body.len();
+                body.resize(start + size, 0);
+                r.read_exact(&mut body[start..])?;
+                let _ = read_line(r)?;
+            }
+        } else if let Some(len) = headers.get("content-length").and_then(|v| v.parse::<usize>().ok()) {
+            body.resize(len, 0);
+            r.read_exact(&mut body)?;
+        } else {
+            r.read_to_end(&mut body)?;
+            headers.insert("connection".into(), "close".into());
+        }
+    }
+    Ok(HttpResponse { status, headers, body })
+}
+
+/// `(host, port)` from a base URL such as `http://10.0.0.5:8100` or `http://[::1]:8100/`.
+pub fn parse_host_port(url: &str) -> (String, u16) {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let netloc = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let netloc = netloc.rsplit_once('@').map(|(_, h)| h).unwrap_or(netloc);
+    if let Some(v6) = netloc.strip_prefix('[') {
+        if let Some((h, tail)) = v6.split_once(']') {
+            let port = tail.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(80);
+            return (h.to_string(), port);
+        }
+    }
+    match netloc.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+            (h.to_string(), p.parse().unwrap_or(80))
+        }
+        _ => (netloc.to_string(), 80),
+    }
+}
+
+/// The `netloc` of a URL (`host:port` as written).
+pub fn netloc(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split(['/', '?', '#']).next().unwrap_or("").to_string()
+}
+
+/// `re.sub(r"[^A-Za-z0-9_.-]+", "_", s)`.
+pub fn sanitize_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_bad = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-' {
+            out.push(ch);
+            in_bad = false;
+        } else if !in_bad {
+            out.push('_');
+            in_bad = true;
+        }
+    }
+    out
+}
+
+/// `~/.cache/turbotap/session-<udid|netloc|default>.json`.
+pub fn session_cache_path(cache_dir: &std::path::Path, base_url: &str, udid: &str) -> PathBuf {
+    let nl = if base_url.is_empty() { String::new() } else { netloc(base_url) };
+    let raw = if !udid.is_empty() {
+        udid.to_string()
+    } else if !nl.is_empty() {
+        nl
+    } else {
+        "default".to_string()
+    };
+    cache_dir.join(format!("session-{}.json", sanitize_key(&raw)))
+}
+
+// ---------------------------------------------------------------------------
+// Warm-daemon keep-alive pool (Python _CONN_POOL / _take_pooled_conn / _release_conn)
+// ---------------------------------------------------------------------------
+
+pub const POOL_IDLE: f64 = 60.0;
+pub const POOL_MAX: usize = 4;
+
+static POOL: Mutex<Option<HashMap<(String, u16), Vec<(Conn, f64)>>>> = Mutex::new(None);
+
+/// Enable (daemon start) or disable and close (daemon stop) the connection pool.
+pub fn set_pool_enabled(on: bool) {
+    let mut p = POOL.lock().unwrap();
+    *p = if on { Some(p.take().unwrap_or_default()) } else { None };
+}
+
+pub fn pool_enabled() -> bool {
+    POOL.lock().unwrap().is_some()
+}
+
+/// Number of idle pooled connections (tests/diagnostics).
+pub fn pool_len() -> usize {
+    POOL.lock().unwrap().as_ref().map(|m| m.values().map(Vec::len).sum()).unwrap_or(0)
+}
+
+/// Idle pooled connections for one `(host, port)` (tests/diagnostics).
+pub fn pool_len_for(host: &str, port: u16) -> usize {
+    POOL.lock().unwrap().as_ref().and_then(|m| m.get(&(host.to_string(), port)).map(Vec::len)).unwrap_or(0)
+}
+
+/// Close every pooled connection but keep pooling enabled.
+pub fn pool_clear() {
+    if let Some(m) = POOL.lock().unwrap().as_mut() {
+        m.clear();
+    }
+}
+
+fn take_pooled_conn(host: &str, port: u16) -> Option<Conn> {
+    let mut guard = POOL.lock().unwrap();
+    let pool = guard.as_mut()?;
+    let entries = pool.get_mut(&(host.to_string(), port))?;
+    while let Some((conn, since)) = entries.pop() {
+        if clock::real_now() - since <= POOL_IDLE && conn.alive() {
+            return Some(conn);
+        }
+    }
+    None
+}
+
+/// Return an idle connection to the pool, or close it.
+pub fn release_conn(conn: Conn) {
+    if !conn.is_connected() {
+        return;
+    }
+    let mut guard = POOL.lock().unwrap();
+    if let Some(pool) = guard.as_mut() {
+        let entries = pool.entry((conn.host.clone(), conn.port)).or_default();
+        if entries.len() < POOL_MAX {
+            entries.push((conn, clock::real_now()));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WDA client
+// ---------------------------------------------------------------------------
+
+pub struct WdaClient {
+    pub base_url: String,
+    pub udid: String,
+    pub device_key: Option<String>,
+    pub sid: Option<String>,
+    /// None = not probed yet; Some(true) when the wda-turbo patch is running.
+    /// `WDA_TURBO=0` forces the stock endpoints.
+    pub turbo: Option<bool>,
+    /// binary /wda/fastScreenshot (Some(true)) vs legacy JSON (Some(false)).
+    pub raw_shot: Option<bool>,
+    /// /wda/fastUI available.
+    pub fast_ui: Option<bool>,
+    pub fast_keys: Option<bool>,
+    pub fast_double_tap: Option<bool>,
+    pub fast_pinch: Option<bool>,
+    pub fast_tap_batch: Option<bool>,
+    pub fast_launch: Option<bool>,
+    /// conditional /wda/fastScreenshot (v6) honoured.
+    pub etag_shot: Option<bool>,
+    /// Lower-cased headers of the last `req_raw` answer.
+    pub last_response_headers: Option<HashMap<String, String>>,
+    /// `(hasKeyboard, keyboardRect)` from the last /wda/fastUI answer.
+    pub last_fast_ui_kb: Option<(Option<bool>, Option<Value>)>,
+    /// Session/app caches live here (captured at construction).
+    pub cache_dir: PathBuf,
+    host: String,
+    port: u16,
+    conn: Option<Conn>,
+}
+
+impl Drop for WdaClient {
+    fn drop(&mut self) {
+        // Idle keep-alive connections go back to the daemon pool (if any). A
+        // connection still carrying a request is never here: requests borrow the
+        // client mutably, and failed requests drop their connection.
+        if let Some(c) = self.conn.take() {
+            release_conn(c);
+        }
+    }
+}
+
+impl WdaClient {
+    pub fn new(base_url: &str, udid: &str, device_key: Option<&str>) -> WdaClient {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let (host, port) = parse_host_port(&base_url);
+        let turbo = if crate::config::env("WDA_TURBO").as_deref() == Some("0") { Some(false) } else { None };
+        WdaClient {
+            base_url,
+            udid: udid.to_string(),
+            device_key: device_key.map(String::from),
+            sid: None,
+            turbo,
+            raw_shot: None,
+            fast_ui: None,
+            fast_keys: None,
+            fast_double_tap: None,
+            fast_pinch: None,
+            fast_tap_batch: None,
+            fast_launch: None,
+            etag_shot: None,
+            last_response_headers: None,
+            last_fast_ui_kb: None,
+            cache_dir: crate::config::cache_dir(),
+            host,
+            port,
+            conn: None,
+        }
+    }
+
+    /// The session id or "" (Python f"/session/{self.sid}" prints "None" when unset;
+    /// WDA rejects both alike).
+    pub fn sid_str(&self) -> String {
+        self.sid.clone().unwrap_or_else(|| "None".to_string())
+    }
+
+    /// `f"/session/{sid}{suffix}"`.
+    pub fn spath(&self, suffix: &str) -> String {
+        format!("/session/{}{}", self.sid_str(), suffix)
+    }
+
+    /// A second client on its own connection with the same session and probe
+    /// results (Python `_side_client`), for parallel UI-tree fetches.
+    pub fn side_client(&self) -> WdaClient {
+        let mut side = WdaClient::new(&self.base_url, &self.udid, self.device_key.as_deref());
+        side.cache_dir = self.cache_dir.clone();
+        side.copy_probes_from(self);
+        side
+    }
+
+    /// Copy sid, turbo and every probed capability (Python `_get_ui_worker` sync).
+    pub fn copy_probes_from(&mut self, o: &WdaClient) {
+        self.sid = o.sid.clone();
+        self.turbo = o.turbo;
+        self.raw_shot = o.raw_shot;
+        self.fast_ui = o.fast_ui;
+        self.fast_keys = o.fast_keys;
+        self.fast_double_tap = o.fast_double_tap;
+        self.fast_pinch = o.fast_pinch;
+        self.fast_tap_batch = o.fast_tap_batch;
+        self.fast_launch = o.fast_launch;
+        self.etag_shot = o.etag_shot;
+    }
+
+    pub fn has_conn(&self) -> bool {
+        self.conn.as_ref().map(|c| c.is_connected()).unwrap_or(false)
+    }
+
+    /// Give the idle connection back to the daemon pool now (or close it).
+    pub fn release_conn(&mut self) {
+        if let Some(c) = self.conn.take() {
+            release_conn(c);
+        }
+    }
+
+    // -- session cache ------------------------------------------------------
+
+    pub fn session_cache_file(&self) -> PathBuf {
+        session_cache_path(&self.cache_dir, &self.base_url, &self.udid)
+    }
+
+    pub fn load_session_cache(&self) -> serde_json::Map<String, Value> {
+        std::fs::read_to_string(self.session_cache_file())
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| match v {
+                Value::Object(m) => Some(m),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn write_session_cache(&self, cur: &serde_json::Map<String, Value>) {
+        let path = self.session_cache_file();
+        if let Some(dir) = path.parent() {
+            if std::fs::create_dir_all(dir).is_err() {
+                return;
+            }
+        }
+        let tmp = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
+        if std::fs::write(&tmp, json::dumps(&Value::Object(cur.clone()))).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    pub fn save_session_cache(&self, updates: serde_json::Map<String, Value>) {
+        let Some(sid) = self.sid.clone().filter(|s| !s.is_empty()) else { return };
+        let mut cur = self.load_session_cache();
+        if cur.get("base_url").and_then(|v| v.as_str()) != Some(self.base_url.as_str())
+            || cur.get("sid").and_then(|v| v.as_str()) != Some(sid.as_str())
+        {
+            cur = serde_json::Map::new();
+            cur.insert("base_url".into(), j!(self.base_url));
+            cur.insert("udid".into(), j!(self.udid));
+            cur.insert("sid".into(), j!(sid));
+        }
+        for (k, v) in updates {
+            cur.insert(k, v);
+        }
+        cur.insert("base_url".into(), j!(self.base_url));
+        cur.insert("udid".into(), j!(self.udid));
+        cur.insert("sid".into(), j!(sid));
+        self.write_session_cache(&cur);
+    }
+
+    /// Drop one field (or the whole file when `field` is None).
+    pub fn invalidate_session_cache(&self, field: Option<&str>) {
+        let path = self.session_cache_file();
+        match field {
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+            Some(f) => {
+                let mut cur = self.load_session_cache();
+                if cur.remove(f).is_some() {
+                    self.write_session_cache(&cur);
+                }
+            }
+        }
+    }
+
+    // -- transport ----------------------------------------------------------
+
+    fn ensure_conn(&mut self, timeout: f64) -> std::io::Result<()> {
+        if self.conn.is_none() {
+            self.conn = take_pooled_conn(&self.host, self.port).or_else(|| Some(Conn::new(&self.host, self.port)));
+        }
+        let conn = self.conn.as_mut().unwrap();
+        if !conn.is_connected() {
+            conn.connect(timeout)?;
+        }
+        conn.set_timeout(timeout);
+        Ok(())
+    }
+
+    /// One attempt-pair of an HTTP exchange shared by [`req`](Self::req) and
+    /// [`req_raw`](Self::req_raw). Returns `Err(message)` for transport failures
+    /// after the Python retry policy (reconnect once for GET/HEAD or provably unsent
+    /// writes), or `Ok(None)` when the deadline expired before sending.
+    fn exchange(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(String, String)],
+        timeout: f64,
+        deadline: Option<f64>,
+        parse_json: bool,
+    ) -> std::result::Result<Option<(HttpResponse, Option<Value>)>, String> {
+        let idempotent = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+        for attempt in 0..2 {
+            let mut eff_timeout = timeout;
+            if let Some(d) = deadline {
+                let rem = d - clock::now();
+                if rem <= 0.0 {
+                    return Ok(None);
+                }
+                eff_timeout = timeout.min(rem).max(0.05);
+            }
+            let mut sent = false;
+            let res: std::io::Result<(HttpResponse, Option<Value>)> = (|| {
+                self.ensure_conn(eff_timeout)?;
+                if let Some(d) = deadline {
+                    if clock::now() >= d {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "__deadline__"));
+                    }
+                }
+                sent = true;
+                let resp = self.conn.as_mut().unwrap().request(method, path, body, headers)?;
+                let parsed = if parse_json && resp.status < 400 {
+                    Some(
+                        serde_json::from_slice::<Value>(&resp.body)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                Ok((resp, parsed))
+            })();
+            match res {
+                Ok(r) => return Ok(Some(r)),
+                Err(e) if e.to_string() == "__deadline__" => return Ok(None),
+                Err(e) => {
+                    self.conn = None;
+                    if attempt == 1 || (sent && !idempotent) {
+                        let msg = match e.kind() {
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "timed out".to_string(),
+                            _ => py_os_error(&e),
+                        };
+                        return Err(msg);
+                    }
+                }
+            }
+        }
+        Err("request failed".into())
+    }
+
+    /// JSON request on the persistent keep-alive connection (Python `req`).
+    ///
+    /// HTTP >= 400 gives `{"error": status, "body": text[:400]}`; transport or JSON
+    /// errors give `{"error": "<message>"}`; an expired deadline gives
+    /// [`json::deadline_value`].
+    pub fn req(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>) -> Value {
+        let body = data.map(|d| serde_json::to_vec(d).unwrap_or_default());
+        let headers: Vec<(String, String)> =
+            if data.is_some() { vec![("Content-Type".into(), "application/json".into())] } else { vec![] };
+        match self.exchange(method, path, body.as_deref(), &headers, timeout, deadline, true) {
+            Ok(None) => json::deadline_value(),
+            Ok(Some((resp, parsed))) => {
+                if resp.status >= 400 {
+                    let text = String::from_utf8_lossy(&resp.body);
+                    let truncated: String = text.chars().take(400).collect();
+                    j!({"error": resp.status, "body": truncated})
+                } else {
+                    parsed.unwrap_or(Value::Null)
+                }
+            }
+            Err(msg) => json::error_value(msg),
+        }
+    }
+
+    /// `req("GET", path)` with the default 25 s timeout.
+    pub fn get(&mut self, path: &str) -> Value {
+        self.req("GET", path, None, DEFAULT_TIMEOUT, None)
+    }
+
+    /// `req("POST", path, data)` with the default 25 s timeout.
+    pub fn post(&mut self, path: &str, data: &Value) -> Value {
+        self.req("POST", path, Some(data), DEFAULT_TIMEOUT, None)
+    }
+
+    /// Python `_req_with_deadline`: cap the timeout by the remaining budget.
+    pub fn req_with_deadline(
+        &mut self,
+        method: &str,
+        path: &str,
+        data: Option<&Value>,
+        timeout: f64,
+        deadline: Option<f64>,
+    ) -> Value {
+        let Some(d) = deadline else {
+            return self.req(method, path, data, timeout, None);
+        };
+        let rem = d - clock::now();
+        if rem <= 0.0 {
+            return json::deadline_value();
+        }
+        let eff = timeout.min(rem).max(0.05);
+        self.req(method, path, data, eff, Some(d))
+    }
+
+    /// Raw request: `(status, content_type, body)`; status 0 on transport failure
+    /// (body = message) or an expired deadline (body = "deadline exceeded"). The
+    /// answer's headers are kept in `last_response_headers`.
+    pub fn req_raw(
+        &mut self,
+        method: &str,
+        path: &str,
+        data: Option<&Value>,
+        timeout: f64,
+        deadline: Option<f64>,
+        extra_headers: Option<&[(String, String)]>,
+    ) -> (u16, String, Vec<u8>) {
+        let body = data.map(|d| serde_json::to_vec(d).unwrap_or_default());
+        let mut headers: Vec<(String, String)> =
+            if data.is_some() { vec![("Content-Type".into(), "application/json".into())] } else { vec![] };
+        if let Some(extra) = extra_headers {
+            for (k, v) in extra {
+                headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(k));
+                headers.push((k.clone(), v.clone()));
+            }
+        }
+        self.last_response_headers = None;
+        match self.exchange(method, path, body.as_deref(), &headers, timeout, deadline, false) {
+            Ok(None) => (0, String::new(), b"deadline exceeded".to_vec()),
+            Ok(Some((resp, _))) => {
+                let ct = resp.headers.get("content-type").cloned().unwrap_or_default();
+                self.last_response_headers = Some(resp.headers);
+                (resp.status, ct, resp.body)
+            }
+            Err(msg) => (0, String::new(), msg.into_bytes()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session, fast routes and fallbacks (v0.10.0 cli.py L485-931)
+// ---------------------------------------------------------------------------
+
+/// Python `type(v).__name__` for a JSON value.
+fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// Python `float(x or 0)` for a cached timestamp (unparseable -> 0.0).
+fn py_float_or_zero(v: &Value) -> f64 {
+    if !json::truthy(v) {
+        return 0.0;
+    }
+    match v {
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::Bool(b) => f64::from(u8::from(*b)),
+        Value::String(s) => s.trim().parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Python `int(x)` for a JSON number (floats truncate toward zero).
+fn py_int(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f.trunc() as i64)),
+        Value::Bool(b) => Some(i64::from(*b)),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Python `str(OSError)` style: `[Errno N] <strerror>` for OS errors.
+fn py_os_error(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(n) => {
+            let s = e.to_string();
+            let desc = s.strip_suffix(&format!(" (os error {n})")).unwrap_or(&s);
+            format!("[Errno {n}] {desc}")
+        }
+        None => e.to_string(),
+    }
+}
+
+/// Python `base64.b64decode(s)` (non-validating: characters outside the alphabet
+/// are discarded before decoding).
+fn py_b64decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    use base64::Engine;
+    let clean: String = s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')).collect();
+    base64::engine::general_purpose::STANDARD.decode(clean.as_bytes()).map_err(|e| match e {
+        base64::DecodeError::InvalidPadding | base64::DecodeError::InvalidLength(_) => "Incorrect padding".to_string(),
+        other => other.to_string(),
+    })
+}
+
+fn sid_is_set(sid: &Option<String>) -> bool {
+    sid.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+impl WdaClient {
+    /// Python `ensure_session` (L485-527): /status (ping + restart WDA on the Mac when
+    /// unreachable), create a session if needed, apply fast `/appium/settings` once
+    /// per session per [`crate::config::SESSION_SETTINGS_TTL`].
+    pub fn ensure_session(&mut self, bundle_id: Option<&str>, apply_fast_settings: bool) -> Result<Option<String>> {
+        let mut st = self.req("GET", "/status", None, 4.0, None);
+        if json::has_err(&st) {
+            // Wake idle iOS Wi-Fi with one ICMP ping before assuming WDA died.
+            let (host, _) = parse_host_port(&self.base_url);
+            if !host.is_empty() {
+                std::process::Command::new("ping")
+                    .args(["-c", "1", "-W", "2", host.as_str()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map_err(|e| Error::Os(format!("{}: 'ping'", py_os_error(&e))))?;
+                st = self.req("GET", "/status", None, 6.0, None);
+            }
+        }
+        if json::has_err(&st) {
+            crate::errln!("WDA not responding; restarting WebDriverAgentRunner on the Mac host...");
+            self.start_wda_on_mac(false)?;
+            st = self.req("GET", "/status", None, 8.0, None);
+            if json::has_err(&st) {
+                return Err(Error::runtime(format!("WDA unreachable at {}: {}", self.base_url, json::py_repr(&st))));
+            }
+        }
+        self.sid = json::get(&st, "sessionId").as_str().map(String::from);
+        if !sid_is_set(&self.sid) {
+            let caps = match bundle_id.filter(|b| !b.is_empty()) {
+                Some(b) => j!({"alwaysMatch": {"bundleId": b}}),
+                None => j!({"alwaysMatch": {}}),
+            };
+            let s = self.post("/session", &j!({"capabilities": caps}));
+            let top = json::get(&s, "sessionId");
+            let sid = if json::truthy(top) { top } else { json::get(json::get(&s, "value"), "sessionId") };
+            self.sid = sid.as_str().map(String::from);
+        }
+        if apply_fast_settings && sid_is_set(&self.sid) {
+            let cached = self.load_session_cache();
+            let g = |k: &str| cached.get(k).unwrap_or(&json::NULL);
+            let settings_fresh = g("base_url").as_str() == Some(self.base_url.as_str())
+                && g("sid").as_str() == self.sid.as_deref()
+                && g("settings_applied") == &Value::Bool(true)
+                && (clock::wall() - py_float_or_zero(g("settings_ts"))) < crate::config::SESSION_SETTINGS_TTL;
+            if !settings_fresh {
+                let path = self.spath("/appium/settings");
+                let r = self.post(
+                    &path,
+                    &j!({"settings": {"snapshotMaxDepth": 150, "waitForIdleTimeout": 0, "screenshotQuality": 2}}),
+                );
+                if !json::has_err(&r) {
+                    let mut upd = serde_json::Map::new();
+                    upd.insert("settings_applied".into(), Value::Bool(true));
+                    upd.insert("settings_ts".into(), j!(clock::wall()));
+                    self.save_session_cache(upd);
+                }
+            }
+        }
+        Ok(self.sid.clone())
+    }
+
+    /// Python `start_wda_on_mac` (L529-541) using the embedded deploy script + patch
+    /// ([`crate::deploy`]).
+    pub fn start_wda_on_mac(&mut self, build: bool) -> Result<()> {
+        crate::deploy::run_deploy_script(&self.base_url, &self.udid, self.device_key.as_deref(), build)
+    }
+
+    /// L556-580. Coordinate tap (or long-press with `duration`), strict deadline:
+    /// with an absolute monotonic `deadline` the fast probe is capped and no fallback
+    /// POST is dispatched once it expired.
+    pub fn fast_tap(&mut self, x: i64, y: i64, duration: Option<f64>, deadline: Option<f64>) -> Value {
+        let mut body = j!({"x": x, "y": y});
+        if let Some(d) = duration {
+            body["duration"] = j!(d);
+        }
+        if self.turbo != Some(false) {
+            if deadline.is_some_and(|d| clock::now() >= d) {
+                return json::deadline_value();
+            }
+            let r = self.req_with_deadline("POST", "/wda/fastTap", Some(&body), DEFAULT_TIMEOUT, deadline);
+            if !json::has_err(&r) {
+                self.turbo = Some(true);
+                return r;
+            }
+            if !json::err_is(&r, 404) {
+                return r;
+            }
+            self.turbo = Some(false);
+        }
+        if deadline.is_some_and(|d| clock::now() >= d) {
+            return json::deadline_value();
+        }
+        let path = if duration.is_some() { self.spath("/wda/touchAndHold") } else { self.spath("/wda/tap") };
+        self.req_with_deadline("POST", &path, Some(&body), DEFAULT_TIMEOUT, deadline)
+    }
+
+    /// L582-601. `/wda/fastDoubleTap` (wda-turbo v4), stock `/wda/doubleTap` on 404.
+    pub fn fast_double_tap(&mut self, x: i64, y: i64, interval: Option<f64>, duration: Option<f64>) -> Value {
+        let mut body = j!({"x": x, "y": y});
+        if let Some(i) = interval {
+            body["interval"] = j!(i);
+        }
+        if let Some(d) = duration {
+            body["duration"] = j!(d);
+        }
+        if self.turbo != Some(false) && self.fast_double_tap != Some(false) {
+            let r = self.post("/wda/fastDoubleTap", &body);
+            if r.is_object() {
+                if !json::has_err(&r) {
+                    self.fast_double_tap = Some(true);
+                    return r;
+                }
+                if !json::err_is(&r, 404) {
+                    return r;
+                }
+            }
+            self.fast_double_tap = Some(false);
+        }
+        let path = self.spath("/wda/doubleTap");
+        self.post(&path, &j!({"x": x, "y": y}))
+    }
+
+    /// L603-647. `explicit_pos`: None = infer from x/y presence. A non-finite or
+    /// non-positive scale is `Error::Value`.
+    pub fn fast_pinch(
+        &mut self,
+        x: Option<i64>,
+        y: Option<i64>,
+        scale: f64,
+        duration: f64,
+        radius: Option<f64>,
+        explicit_pos: Option<bool>,
+    ) -> Result<Value> {
+        let sc = scale;
+        if !(sc > 0.0 && sc.is_finite()) {
+            return Err(Error::value(format!("pinch scale must be finite and > 0, got {}", json::py_float(scale))));
+        }
+        let has_explicit_pos = explicit_pos.unwrap_or(x.is_some() && y.is_some());
+        let mut body = j!({"scale": sc, "duration": duration});
+        if let (Some(px), Some(py)) = (x, y) {
+            body["x"] = j!(px);
+            body["y"] = j!(py);
+        }
+        if let Some(r) = radius {
+            body["radius"] = j!(r);
+        }
+        if self.turbo != Some(false) && self.fast_pinch != Some(false) {
+            let r = self.post("/wda/fastPinch", &body);
+            if r.is_object() {
+                if !json::has_err(&r) {
+                    self.fast_pinch = Some(true);
+                    return Ok(r);
+                }
+                if !json::err_is(&r, 404) {
+                    return Ok(r);
+                }
+            }
+            self.fast_pinch = Some(false);
+        }
+        if has_explicit_pos {
+            let (Some(px), Some(py)) = (x, y) else {
+                // Python int(None) raises TypeError here.
+                return Err(Error::value("int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"));
+            };
+            return Ok(j!({
+                "error": "unsupported operation",
+                "body": format!(
+                    "positioned zoom (@{px},{py}) requires wda-turbo v4 (/wda/fastPinch); \
+                     stock /wda/pinch only zooms the screen center (omit @X,Y for centered fallback)"
+                ),
+            }));
+        }
+        let vel = if sc >= 1.0 { 1.0 } else { -1.0 };
+        let path = self.spath("/wda/pinch");
+        let fb = self.post(&path, &j!({"scale": sc, "velocity": vel}));
+        if json::has_err(&fb) {
+            let b = json::get(&fb, "body");
+            let detail = if json::truthy(b) { b } else { json::get(&fb, "error") };
+            return Ok(j!({
+                "error": json::get(&fb, "error").clone(),
+                "body": format!(
+                    "/wda/fastPinch unavailable (requires wda-turbo v4) and stock /wda/pinch fallback failed: {}",
+                    json::py_str(detail)
+                ),
+            }));
+        }
+        Ok(fb)
+    }
+
+    /// L649-674. One synthesized multi-tap via `/wda/fastTapBatch`; sequential
+    /// [`fast_tap`](Self::fast_tap) on 404. Python defaults: interval 0.09, duration 0.02.
+    pub fn fast_tap_batch(&mut self, points: &[(i64, i64)], interval: f64, duration: f64) -> Value {
+        if points.is_empty() {
+            return json::ok_null();
+        }
+        let pts: Vec<Value> = points.iter().map(|&(px, py)| j!([px, py])).collect();
+        let body = j!({"points": pts, "interval": interval, "duration": duration});
+        if self.turbo != Some(false) && self.fast_tap_batch != Some(false) {
+            let r = self.post("/wda/fastTapBatch", &body);
+            if r.is_object() {
+                if !json::has_err(&r) {
+                    self.fast_tap_batch = Some(true);
+                    return r;
+                }
+                if !json::err_is(&r, 404) {
+                    return r;
+                }
+            }
+            self.fast_tap_batch = Some(false);
+        }
+        let mut last = json::ok_null();
+        let dur_arg = if duration != 0.02 { Some(duration) } else { None };
+        for (idx, &(px, py)) in points.iter().enumerate() {
+            last = self.fast_tap(px, py, dur_arg, None);
+            if json::has_err(&last) {
+                return last;
+            }
+            if idx + 1 < points.len() && interval > 0.0 {
+                clock::sleep(interval);
+            }
+        }
+        last
+    }
+
+    /// L676-701. `/wda/fastKeys` (wda-turbo v3+), stock `/wda/keys` only on a
+    /// definitive 404 (never replays an accepted request).
+    pub fn fast_keys(&mut self, text: &str, frequency: Option<i64>) -> Value {
+        let freq = match frequency {
+            Some(f) if f != 0 => Some(f),
+            _ => crate::config::typing_freq(),
+        };
+        if self.turbo != Some(false) && self.fast_keys != Some(false) {
+            let mut body = j!({"value": text});
+            if let Some(f) = freq {
+                body["frequency"] = j!(f);
+            }
+            let r = self.post("/wda/fastKeys", &body);
+            if !r.is_object() {
+                return json::error_value("invalid response from /wda/fastKeys");
+            }
+            if !json::has_err(&r) {
+                self.fast_keys = Some(true);
+                return r;
+            }
+            if !json::err_is(&r, 404) {
+                return r;
+            }
+            self.fast_keys = Some(false);
+        }
+        let chars: Vec<Value> = text.chars().map(|c| Value::String(c.to_string())).collect();
+        let mut legacy = j!({"value": chars});
+        if let Some(f) = freq {
+            legacy["frequency"] = j!(f);
+        }
+        let path = self.spath("/wda/keys");
+        self.post(&path, &legacy)
+    }
+
+    /// L703-741. `/wda/fastLaunch` (wda-turbo v5); on 404 optional terminate +
+    /// `launchUnattached`, then `activate` only on a confirmed no-effect rejection.
+    pub fn fast_launch(&mut self, bundle_id: &str, terminate: bool) -> Value {
+        let bid = bundle_id;
+        let body = j!({"bundleId": bid, "terminate": terminate});
+        if self.turbo != Some(false) && self.fast_launch != Some(false) {
+            let r = self.post("/wda/fastLaunch", &body);
+            if !r.is_object() {
+                return json::error_value("invalid response from /wda/fastLaunch");
+            }
+            if !json::has_err(&r) {
+                self.fast_launch = Some(true);
+                return r;
+            }
+            if !json::err_is(&r, 404) {
+                return r;
+            }
+            self.fast_launch = Some(false);
+        }
+        if terminate {
+            let path = self.spath("/wda/apps/terminate");
+            let term = self.post(&path, &j!({"bundleId": bid}));
+            if json::has_err(&term) {
+                return term;
+            }
+        }
+        let r = self.post("/wda/apps/launchUnattached", &j!({"bundleId": bid}));
+        if !r.is_object() || !json::has_err(&r) {
+            return r;
+        }
+        let b = json::get(&r, "body");
+        let body_txt = if json::truthy(b) { json::py_str(b).to_lowercase() } else { String::new() };
+        let confirmed_no_effect = json::err_is(&r, 404)
+            || body_txt.contains("lsapplicationworkspace failed")
+            || body_txt.contains("unknown command")
+            || body_txt.contains("unhandled endpoint");
+        if !confirmed_no_effect {
+            return r;
+        }
+        let path = self.spath("/wda/apps/activate");
+        self.post(&path, &j!({"bundleId": bid}))
+    }
+
+    /// L743-747. Long-press via fast_tap with `duration` (clamped to >= 0.1 s).
+    pub fn long_press(&mut self, x: i64, y: i64, duration: f64) -> Value {
+        self.fast_tap(x, y, Some(duration.max(0.1)), None)
+    }
+
+    /// L749-761. Read the general pasteboard (base64 -> UTF-8, lossy).
+    pub fn get_pasteboard(&mut self, content_type: &str) -> Result<String> {
+        let r = self.post("/wda/getPasteboard", &j!({"contentType": content_type}));
+        if !r.is_object() || json::has_err(&r) {
+            return Err(Error::runtime(format!("getPasteboard failed: {}", json::py_repr(&r))));
+        }
+        let v = json::get(&r, "value");
+        if !json::truthy(v) {
+            return Ok(String::new());
+        }
+        let Some(raw_b64) = v.as_str() else {
+            return Err(Error::runtime(format!(
+                "getPasteboard invalid base64: argument should be a bytes-like object or ASCII string, not '{}'",
+                py_type_name(v)
+            )));
+        };
+        match py_b64decode(raw_b64) {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) => Err(Error::runtime(format!("getPasteboard invalid base64: {e}"))),
+        }
+    }
+
+    /// L763-772. Write UTF-8 text to the general pasteboard.
+    pub fn set_pasteboard(&mut self, text: &str, content_type: &str) -> Result<Value> {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let r = self.post("/wda/setPasteboard", &j!({"content": encoded, "contentType": content_type}));
+        if !r.is_object() || json::has_err(&r) {
+            if echoes_secret(&r, text) {
+                return Err(Error::runtime(format!("setPasteboard failed (error {})", json::py_str(json::get(&r, "error")))));
+            }
+            return Err(Error::runtime(format!("setPasteboard failed: {}", json::py_repr(&r))));
+        }
+        Ok(r)
+    }
+
+    /// L774-788. Poll for an element and click it; returns its id or None on timeout.
+    pub fn wait_click(
+        &mut self,
+        predicate: Option<&str>,
+        class_chain: Option<&str>,
+        timeout: f64,
+        poll: f64,
+        post_wait: f64,
+    ) -> Option<String> {
+        let deadline = clock::wall() + timeout;
+        let chain = class_chain.filter(|c| !c.is_empty());
+        let using = if chain.is_some() { "class chain" } else { "predicate string" };
+        let val = match chain {
+            Some(c) => j!(c),
+            None => predicate.map(|p| j!(p)).unwrap_or(Value::Null),
+        };
+        while clock::wall() < deadline {
+            let path = self.spath("/element");
+            let res = self.post(&path, &j!({"using": using, "value": val}));
+            let eid = json::get(json::get(&res, "value"), "ELEMENT");
+            if json::truthy(eid) {
+                let eid = json::py_str(eid);
+                let path = self.spath(&format!("/element/{eid}/click"));
+                self.post(&path, &j!({}));
+                if post_wait != 0.0 {
+                    clock::sleep(post_wait);
+                }
+                return Some(eid);
+            }
+            clock::sleep(poll);
+        }
+        None
+    }
+
+    /// L790-808. Strict `GET /wda/locked`: Ok(true) only on explicit `true`,
+    /// Ok(false) only on explicit `false`; a redacted RuntimeError after bounded
+    /// retries on transport/HTTP errors or malformed values.
+    pub fn confirm_locked_state(&mut self, retries: u32) -> Result<bool> {
+        let mut last_err = "unknown error".to_string();
+        for attempt in 0..=retries {
+            let r = self.get("/wda/locked");
+            if r.is_object() && !json::has_err(&r) {
+                match json::get(&r, "value") {
+                    Value::Bool(true) => return Ok(true),
+                    Value::Bool(false) => return Ok(false),
+                    other => last_err = format!("malformed /wda/locked value ({})", py_type_name(other)),
+                }
+            } else {
+                last_err = "error querying /wda/locked".to_string();
+            }
+            if attempt < retries {
+                clock::sleep(0.08);
+            }
+        }
+        Err(Error::runtime(format!("Unable to confirm lock state ({last_err})")))
+    }
+
+    /// L810-828. SpringBoard provenance from `/wda/activeAppInfo`, then explicit
+    /// locked=true from `/wda/locked` as the FINAL read. Ok(false) when explicitly
+    /// unlocked; a redacted RuntimeError if SpringBoard cannot be confirmed.
+    pub fn confirm_springboard_locked(&mut self, retries: u32) -> Result<bool> {
+        let app_r = self.get("/wda/activeAppInfo");
+        let mut active_bid = String::new();
+        if app_r.is_object() && !json::has_err(&app_r) {
+            let val = json::get(&app_r, "value");
+            if val.is_object() {
+                let b = json::get(val, "bundleId");
+                if json::truthy(b) {
+                    active_bid = json::py_str(b);
+                }
+            }
+        }
+        // Final read is always /wda/locked so Face ID unlocking during activeAppInfo
+        // (even while SpringBoard Home Screen stays foreground) exits cleanly.
+        if !self.confirm_locked_state(retries)? {
+            return Ok(false);
+        }
+        if active_bid == SPRINGBOARD {
+            return Ok(true);
+        }
+        Err(Error::runtime("Passcode keypad unavailable: unable to confirm SpringBoard lock screen"))
+    }
+
+    fn press_home(&mut self) {
+        let path = self.spath("/wda/pressButton");
+        self.post(&path, &j!({"name": "home"}));
+    }
+
+    /// L830-931. Returns true when this call unlocked the phone (or it unlocked
+    /// while we worked). Never echoes passcode digits.
+    pub fn unlock_phone(&mut self) -> Result<bool> {
+        self.ensure_session(None, false)?;
+        if !self.confirm_locked_state(0)? {
+            return Ok(false);
+        }
+        let passcode: Vec<char> = crate::config::get_passcode()?.chars().collect();
+        self.press_home();
+        let mut key_map: Option<HashMap<char, (i64, i64)>> = None;
+        let mut second_home_sent = false;
+        if self.turbo != Some(false) && self.fast_ui != Some(false) {
+            let t0 = clock::now();
+            let mut virtual_elapsed = 0.0_f64;
+            let poll_max = 5.0;
+            loop {
+                let eff_elapsed = (clock::now() - t0).max(virtual_elapsed);
+                let rem = poll_max - eff_elapsed;
+                if rem <= 0.0 {
+                    break;
+                }
+                if !second_home_sent && eff_elapsed >= 0.45 {
+                    self.press_home();
+                    second_home_sent = true;
+                }
+                let (ctl, _, bundle_id) =
+                    crate::ui::fetch_ui_controls_full(self, (430, 932), false, None, 0, false, Some(rem.min(1.5)));
+                match ctl {
+                    Some(ctl) if bundle_id == SPRINGBOARD => {
+                        let mut km: HashMap<char, (i64, i64)> = HashMap::new();
+                        for c in &ctl {
+                            if c.kind == "Key" && !c.is_disabled() {
+                                let mut it = c.label.chars();
+                                if let (Some(ch), None) = (it.next(), it.next()) {
+                                    if ch.is_numeric() {
+                                        km.entry(ch).or_insert((c.x, c.y));
+                                    }
+                                }
+                            }
+                        }
+                        if !passcode.is_empty() && passcode.iter().all(|d| km.contains_key(d)) {
+                            key_map = Some(km);
+                            break;
+                        }
+                    }
+                    None if self.fast_ui == Some(false) => break,
+                    _ => {}
+                }
+                let r_lk = self.get("/wda/locked");
+                if r_lk.is_object() && !json::has_err(&r_lk) && json::get(&r_lk, "value") == &Value::Bool(false) {
+                    return Ok(true);
+                }
+                let eff_elapsed = (clock::now() - t0).max(virtual_elapsed);
+                let rem = poll_max - eff_elapsed;
+                if rem <= 0.0 {
+                    break;
+                }
+                let dt = rem.min(0.12);
+                clock::sleep(dt);
+                virtual_elapsed += dt;
+            }
+        }
+        if let Some(km) = key_map {
+            // Require explicit boolean True right before dispatching digits so Face ID
+            // or a /wda/locked transport failure never sends passcode taps blindly.
+            if !self.confirm_locked_state(1)? {
+                return Ok(true);
+            }
+            let pts: Vec<(i64, i64)> = passcode.iter().filter_map(|d| km.get(d).copied()).collect();
+            check_wda_ok(self.fast_tap_batch(&pts, 0.12, 0.02), "unlock", true)?;
+        } else {
+            if !second_home_sent {
+                clock::sleep(0.5);
+                self.press_home();
+                clock::sleep(2.8);
+            }
+            // Screen-size-agnostic XCUIElementTypeKey lookup (works on any iPhone model).
+            // Verify SpringBoard bundle + locked=True (as the final read) immediately
+            // before EACH digit lookup and EACH click.
+            for d in &passcode {
+                if !self.confirm_springboard_locked(1)? {
+                    return Ok(true);
+                }
+                let path = self.spath("/element");
+                let el = self.post(
+                    &path,
+                    &j!({"using": "predicate string", "value": format!("type == 'XCUIElementTypeKey' AND name == '{d}'")}),
+                );
+                let eid = json::get(json::get(&el, "value"), "ELEMENT");
+                if !json::truthy(eid) {
+                    // Face ID or the home press may have already unlocked the device.
+                    if !self.confirm_locked_state(1)? {
+                        return Ok(true);
+                    }
+                    return Err(Error::runtime("Passcode keypad not found on screen")); // never echo digits
+                }
+                let eid = json::py_str(eid);
+                if !self.confirm_springboard_locked(1)? {
+                    return Ok(true);
+                }
+                let path = self.spath(&format!("/element/{eid}/click"));
+                let res = self.post(&path, &j!({}));
+                check_wda_ok(res, "unlock", true)?;
+                clock::sleep(0.1);
+            }
+        }
+        let v_t0 = clock::now();
+        let mut v_virtual = 0.0_f64;
+        let v_max = 1.2;
+        loop {
+            let r_v = self.get("/wda/locked");
+            if r_v.is_object() && !json::has_err(&r_v) && json::get(&r_v, "value") == &Value::Bool(false) {
+                return Ok(true);
+            }
+            let eff = (clock::now() - v_t0).max(v_virtual);
+            let rem = v_max - eff;
+            if rem <= 0.0 {
+                break;
+            }
+            let dt = rem.min(0.08);
+            clock::sleep(dt);
+            v_virtual += dt;
+        }
+        Err(Error::runtime("iPhone is still locked after entering passcode"))
+    }
+}
+
+/// Python `_check_wda_ok`: raise `FlowError` if a mutating call failed; `redact`
+/// omits response bodies that might echo secret input.
+pub fn check_wda_ok(res: Value, action: &str, redact: bool) -> Result<Value> {
+    if json::has_err(&res) {
+        let err = json::get(&res, "error");
+        if redact {
+            return Err(Error::flow(format!("{action} failed (error {})", json::py_str(err))));
+        }
+        let body = json::get(&res, "body");
+        let detail = if json::truthy(body) { body } else { err };
+        return Err(Error::flow(format!("{action} failed: {}", json::py_str(detail))));
+    }
+    Ok(res)
+}
+
+/// True when a WDA answer quotes `secret` back (raw or base64), so error messages
+/// built from it must be redacted.
+pub fn echoes_secret(res: &Value, secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    use base64::Engine;
+    let text = json::py_repr(res);
+    text.contains(secret) || text.contains(&base64::engine::general_purpose::STANDARD.encode(secret.as_bytes()))
+}
+
+pub const UNSUPPORTED_ROUTE_STATUS: [i64; 3] = [404, 405, 501];
+pub const UNSUPPORTED_ROUTE_ERRORS: [&str; 3] = ["unknown command", "unknown method", "unsupported operation"];
+
+/// L938-947.
+pub fn is_unsupported_route(res: &Value) -> bool {
+    if let Some(code) = json::err_code(res) {
+        if UNSUPPORTED_ROUTE_STATUS.contains(&code) {
+            return true;
+        }
+    }
+    match json::get(json::get(res, "value"), "error") {
+        Value::String(s) => UNSUPPORTED_ROUTE_ERRORS.contains(&s.as_str()),
+        _ => false,
+    }
+}
+
+/// L950-983: `(locked, bundleId, size)` from one wda-turbo v6 `GET
+/// /wda/fastPreflight`, or None so the caller re-reads all three with the stock
+/// endpoints. A definitively missing route is remembered for this WDA session.
+pub fn fast_preflight(client: &mut WdaClient, sid: &str) -> Option<(bool, String, Value)> {
+    let cached = client.load_session_cache();
+    if cached.get("base_url").and_then(Value::as_str) == Some(client.base_url.as_str())
+        && cached.get("sid").and_then(Value::as_str) == Some(sid)
+        && cached.get("fast_preflight") == Some(&Value::Bool(false))
+    {
+        return None;
+    }
+    let response = client.get(&format!("/session/{sid}/wda/fastPreflight"));
+    if is_unsupported_route(&response) {
+        let mut upd = serde_json::Map::new();
+        upd.insert("fast_preflight".into(), Value::Bool(false));
+        client.save_session_cache(upd);
+        return None;
+    }
+    if !response.is_object() || json::has_err_key(&response) {
+        return None;
+    }
+    let value = json::get(&response, "value");
+    let locked = match json::get(value, "locked") {
+        Value::Bool(b) if value.is_object() => *b,
+        _ => return None,
+    };
+    let size = json::get(value, "size");
+    let bundle = match json::get(value, "bundleId") {
+        Value::String(s) if !s.trim().is_empty() => s.clone(),
+        _ => return None,
+    };
+    if !size.is_object() {
+        return None;
+    }
+    for key in ["width", "height"] {
+        // WDA reads an integral rectangle; orientation may swap the axes.
+        let Value::Number(n) = json::get(size, key) else { return None };
+        let f = if let Some(i) = n.as_i64() {
+            i as f64
+        } else if let Some(u) = n.as_u64() {
+            u as f64
+        } else {
+            let f = n.as_f64()?;
+            if !f.is_finite() || f.fract() != 0.0 {
+                return None;
+            }
+            f
+        };
+        if f <= 0.0 {
+            return None;
+        }
+    }
+    Some((locked, bundle, size.clone()))
+}
+
+/// The preflight JSON object (Python `cmd_preflight` without the print), so tests
+/// can read it without capturing stdout.
+pub fn preflight_value(client: &mut WdaClient, stock: bool) -> Result<Value> {
+    let t0 = clock::now();
+    let sid = client.ensure_session(None, true)?;
+    let mut snapshot = None;
+    if let Some(s) = sid.as_deref().filter(|s| !s.is_empty()) {
+        if !stock && client.turbo != Some(false) {
+            snapshot = fast_preflight(client, s);
+        }
+    }
+    let (locked, app, sz) = match snapshot {
+        Some((locked, app, sz)) => (Value::Bool(locked), Value::String(app), sz),
+        None => {
+            let locked = json::get(&client.get("/wda/locked"), "value").clone();
+            let app = json::get(json::get(&client.get("/wda/activeAppInfo"), "value"), "bundleId").clone();
+            let sid_s = sid.clone().unwrap_or_else(|| "None".to_string());
+            let r = client.get(&format!("/session/{sid_s}/window/size"));
+            let v = json::get(&r, "value");
+            let sz = if json::truthy(v) { v.clone() } else { j!({}) };
+            (locked, app, sz)
+        }
+    };
+    let (w, h) = (json::get(&sz, "width"), json::get(&sz, "height"));
+    if json::truthy(w) && json::truthy(h) {
+        if let (Some(wi), Some(hi)) = (py_int(w), py_int(h)) {
+            let mut upd = serde_json::Map::new();
+            upd.insert("screen_pt".into(), j!([wi, hi]));
+            client.save_session_cache(upd);
+        }
+    }
+    let dt = (clock::now() - t0) * 1000.0;
+    Ok(j!({
+        "ok": true,
+        "wda_url": client.base_url,
+        "session_id": sid,
+        "locked": locked,
+        "active_app": app,
+        "screen_pt": [w.clone(), h.clone()],
+        "elapsed_ms": json::round_to(dt, 1),
+    }))
+}
+
+/// L986-1009: prints the preflight JSON line.
+pub fn cmd_preflight(client: &mut WdaClient, stock: bool) -> Result<()> {
+    let v = preflight_value(client, stock)?;
+    crate::outln!("{}", json::dumps(&v));
+    Ok(())
+}
+
+/// L1012-1014.
+pub fn cmd_unlock(client: &mut WdaClient) -> Result<()> {
+    let was_locked = client.unlock_phone()?;
+    crate::outln!("{}", json::dumps(&j!({"ok": true, "unlocked_now": was_locked, "locked": false})));
+    Ok(())
+}
+
+#[cfg(test)]
+impl WdaClient {
+    /// Test seam: preset the keep-alive connection's target, so the first attempt of
+    /// the next request connects there (Python tests swapped the HTTPConnection class
+    /// to make one connect() fail before the request was sent).
+    pub(crate) fn test_preset_conn(&mut self, host: &str, port: u16) {
+        self.conn = Some(Conn::new(host, port));
+    }
+}
