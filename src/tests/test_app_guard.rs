@@ -87,6 +87,7 @@ fn cli_env(url: &str, extra_env: &[(&str, Option<&str>)]) -> CliEnv {
         ("WDA_URL", None),
         ("WDA_DEVICE", None),
         ("WDA_UDID", None),
+        ("IPHONE_UDID", None),
         ("WDA_TURBO", None),
         ("TURBOTAP_DAEMON", None),
         ("TURBOTAP_ALLOWED_APPS", None),
@@ -1016,24 +1017,26 @@ fn test_url_override_uses_the_addressed_devices_own_policy() {
     assert_eq!(flow(&[]).0, 0);
     std::env::remove_var("WDA_URL");
     assert_eq!(b.tapped_points().len(), 2);
-    // Explicit device A pointed at B's endpoint: identity conflict, no input.
+    // Explicit device A pointed at B's endpoint: identity conflict, refused before
+    // any WDA request (exit 6: the target's stop file is unknown too).
     b.state().active_app = Seq::one(json!(A_APP));
+    let (b_before, a_before) = (b.calls().len(), a.calls().len());
     let (code, _, err) = flow(&["--device", "a", "--url", b.url.as_str()]);
-    assert_eq!(code, 1, "{err}");
+    assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
     assert!(err.contains("does not match the endpoint"), "{err}");
     std::env::set_var("WDA_DEVICE", "a");
     std::env::set_var("WDA_URL", &b.url);
     let (code, _, err) = flow(&[]);
-    assert_eq!(code, 1, "{err}");
+    assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
     assert!(err.contains("does not match the endpoint"), "{err}");
     std::env::remove_var("WDA_DEVICE");
     std::env::remove_var("WDA_URL");
-    assert_eq!(b.tapped_points().len(), 2);
-    // An endpoint no record describes, under default device A: conflict, no input.
+    assert_eq!((b.calls().len(), a.calls().len()), (b_before, a_before), "WDA contacted despite the conflict");
+    // An endpoint no record describes, under default device A: conflict, no WDA calls.
     let (code, _, err) = flow(&["--url", unknown.url.as_str()]);
-    assert_eq!(code, 1, "{err}");
+    assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
     assert!(err.contains("is not device 'a'"), "{err}");
-    assert!(input_posts(&unknown).is_empty());
+    assert!(unknown.calls().is_empty());
     assert_eq!(a.tapped_points().len(), 1);
 }
 
@@ -1109,4 +1112,130 @@ fn test_stop_file_refuses_acting_commands_with_exit_6_and_zero_wda_calls() {
     std::env::remove_var("TURBOTAP_STOP_FILE");
     // Absent stop files: the commands run (or fail for their own reasons), never exit 6.
     run_all(false, "");
+}
+
+// ---------------------------------------------------------------------------
+// Review round 3: one device identity for endpoint, policy and stop file
+// ---------------------------------------------------------------------------
+
+const A_APP3: &str = "com.example.a-app";
+const B_APP3: &str = "com.example.b-app";
+
+fn two_phone_config(e: &CliEnv, a: &MockWda, b: &MockWda, b_stop: Option<&std::path::Path>) {
+    let mut bdev = json!({"url": b.url, "udid": "UDID-B", "allowed_apps": [B_APP3]});
+    if let Some(p) = b_stop {
+        bdev["stop_file"] = json!(p.to_string_lossy());
+    }
+    std::fs::write(
+        &e.cfg,
+        json!({
+            "default_device": "a",
+            "devices": {
+                "a": {"url": a.url, "udid": "UDID-A", "allowed_apps": [A_APP3]},
+                "b": bdev,
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_overrides_resolve_endpoint_udid_key_and_policy_from_one_record() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let a = MockWda::start(state_with_app(json!(A_APP3)));
+    let b = MockWda::start(state_with_app(json!(B_APP3)));
+    let e = cli_env(&a.url, &[]);
+    two_phone_config(&e, &a, &b, None);
+    let t = |u: Option<&str>, d: Option<&str>, id: Option<&str>| crate::config::resolve_target(u, d, id);
+    // URL-only override for B: B's endpoint, B's UDID and key.
+    let tb = t(Some(b.url.as_str()), None, None);
+    assert_eq!(
+        (tb.url.as_deref(), tb.udid.as_str(), tb.dev_key.as_deref(), tb.identity_error.as_deref()),
+        (Some(b.url.as_str()), "UDID-B", Some("b"), None)
+    );
+    // UDID-only override for B: B's endpoint (not the default device's), B's key.
+    let tu = t(None, None, Some("UDID-B"));
+    assert_eq!(
+        (tu.url.as_deref(), tu.udid.as_str(), tu.dev_key.as_deref(), tu.identity_error.as_deref()),
+        (Some(b.url.as_str()), "UDID-B", Some("b"), None)
+    );
+    // No override: the default device as configured.
+    let ta = t(None, None, None);
+    assert_eq!((ta.url.as_deref(), ta.udid.as_str(), ta.dev_key.as_deref()), (Some(a.url.as_str()), "UDID-A", Some("a")));
+    // Contradiction: identity error.
+    assert!(t(Some(b.url.as_str()), Some("a"), None).identity_error.is_some());
+    assert!(t(None, Some("a"), Some("UDID-B")).identity_error.is_some());
+
+    let tap = |pre: &[&str]| {
+        let mut v = vec!["--no-daemon"];
+        v.extend_from_slice(pre);
+        v.extend_from_slice(&["flow", "--no-deny", "--quiet", "tapxy:5,6"]);
+        run(&v)
+    };
+    // URL-only and UDID-only (flag and env) each land on B, under B's policy.
+    for pre in [&["--url", b.url.as_str()][..], &["--udid", "UDID-B"][..]] {
+        let (code, _, err) = tap(pre);
+        assert_eq!(code, 0, "{pre:?}: {err}");
+    }
+    std::env::set_var("WDA_UDID", "UDID-B");
+    assert_eq!(tap(&[]).0, 0);
+    std::env::remove_var("WDA_UDID");
+    assert_eq!(b.tapped_points().len(), 3);
+    assert!(a.calls().is_empty(), "the default device was contacted: {:?}", a.paths());
+    // B's own restriction holds on B for both override kinds.
+    b.state().active_app = Seq::one(json!(A_APP3));
+    for pre in [&["--url", b.url.as_str()][..], &["--udid", "UDID-B"][..]] {
+        let (code, _, err) = tap(pre);
+        assert_eq!(code, 1, "{pre:?}: {err}");
+        assert!(err.contains(&format!("not in allowlist [{B_APP3}]")), "{pre:?}: {err}");
+    }
+    assert_eq!(b.tapped_points().len(), 3);
+    assert!(a.calls().is_empty(), "{:?}", a.paths());
+}
+
+#[test]
+fn test_conflicting_identity_never_skips_the_target_stop_file() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let a = MockWda::start(state_with_app(json!(A_APP3)));
+    let b = MockWda::start(state_with_app(json!(B_APP3)));
+    let e = cli_env(&a.url, &[]);
+    let stop_b = e.cfg.parent().unwrap().join("b.stop");
+    std::fs::write(&stop_b, "").unwrap();
+    two_phone_config(&e, &a, &b, Some(&stop_b));
+    let cmds: [&[&str]; 4] = [&["flow", "home"], &["flow", "--no-deny", "tapxy:1,2"], &["deploy", "--no-build"], &["unlock"]];
+    let conflicts: [&[&str]; 3] = [
+        &["--device", "a", "--url", b.url.as_str()],
+        &["--device", "a", "--udid", "UDID-B"],
+        &["--url", "http://127.0.0.1:9", "--udid", "UDID-B"],
+    ];
+    for pre in conflicts {
+        for cmd in cmds {
+            let mut v = vec!["--no-daemon"];
+            v.extend_from_slice(pre);
+            v.extend_from_slice(cmd);
+            let (code, _, err) = run(&v);
+            assert_eq!(code, crate::stop::STOP_EXIT, "{pre:?} {cmd:?}: {err}");
+            assert!(err.contains("device identity unresolved"), "{pre:?} {cmd:?}: {err}");
+        }
+    }
+    // Resolved to B (override under the default device): B's own stop file applies.
+    for pre in [&["--url", b.url.as_str()][..], &["--udid", "UDID-B"][..]] {
+        for cmd in cmds {
+            let mut v = vec!["--no-daemon"];
+            v.extend_from_slice(pre);
+            v.extend_from_slice(cmd);
+            let (code, _, err) = run(&v);
+            assert_eq!(code, crate::stop::STOP_EXIT, "{pre:?} {cmd:?}: {err}");
+            assert!(err.contains("b.stop exists"), "{pre:?} {cmd:?}: {err}");
+        }
+    }
+    assert!(a.calls().is_empty(), "{:?}", a.paths());
+    assert!(b.calls().is_empty(), "{:?}", b.paths());
+    // A itself is not stopped.
+    let (code, _, err) = run(&["--no-daemon", "flow", "--quiet", "home"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!a.calls().is_empty());
 }

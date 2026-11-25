@@ -290,38 +290,32 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         }
         _ => {}
     }
-    let cfg = crate::config::reload();
-    let (url_ov, udid_ov, explicit) = crate::config::device_overrides(s(&m, "url"), s(&m, "device"), s(&m, "udid"));
-    {
-        // Stop file: before anything else touches WDA, the Mac or the phone.
-        let selected = crate::config::selected_device_key(s(&m, "device"));
-        let mut keys: Vec<String> = selected.iter().cloned().collect();
-        if let Ok(Some(k)) =
-            crate::guard::policy_device(&cfg.raw, selected.as_deref(), explicit, url_ov.as_deref(), udid_ov.as_deref())
-        {
-            if !keys.contains(&k) {
-                keys.push(k);
-            }
+    crate::config::reload();
+    // One resolution for endpoint, UDID, device key, allowlist and stop file.
+    let target = crate::config::resolve_target(s(&m, "url"), s(&m, "device"), s(&m, "udid"));
+    if crate::stop::STOP_CMDS.contains(&cmd) {
+        // Before anything touches WDA, the Mac or the phone: an unresolvable device
+        // means its stop file is unknown too.
+        if let Some(e) = target.identity_error.as_ref() {
+            crate::errln!("turbotap: device identity unresolved ({e}); its stop_file is unknown; refusing {cmd}");
+            return Ok(crate::stop::STOP_EXIT);
         }
-        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        if let Some(msg) = crate::stop::refusal(cmd, &refs) {
+        let keys: Vec<&str> = target.dev_key.iter().map(String::as_str).collect();
+        if let Some(msg) = crate::stop::refusal(cmd, &keys) {
             crate::errln!("turbotap: {msg}");
             return Ok(crate::stop::STOP_EXIT);
         }
     }
     crate::skills::sync_skills_if_stale();
-    let (url, udid, dev_key) = crate::config::resolve_device_settings(s(&m, "url"), s(&m, "device"), s(&m, "udid"))?;
-    let allowed = crate::guard::resolve_allowlist(
-        dev_key.as_deref(),
-        explicit,
-        url_ov.as_deref(),
-        udid_ov.as_deref(),
-        &allow_app_values(&m, sm),
-    );
-    let mut client = WdaClient::new(&url, &udid, dev_key.as_deref());
+    let url = target.url.clone().ok_or_else(crate::config::no_url_error)?;
+    let allowed = match target.identity_error.as_ref() {
+        Some(e) => Err(e.clone()),
+        None => crate::guard::resolve_allowlist(target.dev_key.as_deref(), &allow_app_values(&m, sm)),
+    };
+    let mut client = WdaClient::new(&url, &target.udid, target.dev_key.as_deref());
     match allowed {
         Ok(list) => client.set_allowed_apps(list),
-        // A config.json that exists but could not be loaded never means "no guard".
+        // A broken config.json or an unresolvable device never means "no guard".
         Err(reason) => client.set_guard_policy_error(reason),
     }
     match cmd {

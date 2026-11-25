@@ -287,23 +287,16 @@ pub fn policy_device(
     }
 }
 
-/// [`effective_allowlist`] for the device actually addressed ([`policy_device`]),
-/// from the loaded config and the process environment. Err(reason) when config.json
-/// exists but could not be loaded, its allowlist is malformed, or the device identity
-/// conflicts: the caller must then fail every input closed.
-pub fn resolve_allowlist(
-    selected: Option<&str>,
-    selected_explicitly: bool,
-    url_override: Option<&str>,
-    udid_override: Option<&str>,
-    cli: &[String],
-) -> std::result::Result<Vec<String>, String> {
+/// [`effective_allowlist`] for `device_key` (the resolved target device, see
+/// [`crate::config::resolve_target`]) from the loaded config and the process
+/// environment. Err(reason) when config.json exists but could not be loaded or the
+/// allowlist is malformed: the caller must then fail every input closed.
+pub fn resolve_allowlist(device_key: Option<&str>, cli: &[String]) -> std::result::Result<Vec<String>, String> {
     let cfg = crate::config::current();
     if let Some(e) = cfg.load_error.as_ref() {
         return Err(e.clone());
     }
-    let dev = policy_device(&cfg.raw, selected, selected_explicitly, url_override, udid_override)?;
-    effective_allowlist(&cfg.raw, dev.as_deref(), crate::config::env(ENV_ALLOWED_APPS).as_deref(), cli).map_err(|e| e.to_string())
+    effective_allowlist(&cfg.raw, device_key, crate::config::env(ENV_ALLOWED_APPS).as_deref(), cli).map_err(|e| e.to_string())
 }
 
 const HINT: &str = "(use --allow-app <bundle_id> for this run)";

@@ -422,40 +422,74 @@ pub fn selected_device_key(device_arg: Option<&str>) -> Option<String> {
         .or_else(|| current().get("default_device").as_str().filter(|s| !s.is_empty()).map(String::from))
 }
 
-/// `(url, udid, device_key)` from CLI args, env and config.json.
+/// The device one invocation talks to, resolved once so the WDA endpoint, UDID,
+/// device key, allowlist and stop file all describe the same phone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceTarget {
+    /// WDA base URL (None: nothing configured; the caller reports it).
+    pub url: Option<String>,
+    pub udid: String,
+    /// The config.json device key the endpoint belongs to (or the unconfigured name
+    /// given with `--device`/`WDA_DEVICE`).
+    pub dev_key: Option<String>,
+    /// Set when the selected device and the `--url`/`--udid` overrides contradict
+    /// each other or match several records ([`crate::guard::policy_device`]). Then
+    /// nothing may act on a phone; `url`/`udid` fall back to the plain precedence
+    /// (override, else the selected record) so read-only commands still work.
+    pub identity_error: Option<String>,
+}
+
+/// Resolve the target device from CLI args, env and config.json. Overrides
+/// (`--url`/`WDA_URL`, `--udid`/`WDA_UDID`/`IPHONE_UDID`) pick the configured
+/// device they describe, and its other fields come from that same record: a
+/// URL-only override for device B uses B's UDID and key, a UDID-only override for B
+/// connects to B's URL.
+pub fn resolve_target(url_arg: Option<&str>, device_arg: Option<&str>, udid_arg: Option<&str>) -> DeviceTarget {
+    let cfg = current();
+    let (url_ov, udid_ov, explicit) = device_overrides(url_arg, device_arg, udid_arg);
+    let selected = selected_device_key(device_arg);
+    let devices = cfg.get("devices");
+    let rec = |k: &str| crate::json::get(devices, k);
+    let str_of = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let fields = |r: &Value| {
+        (
+            url_ov.clone().or_else(|| str_of(crate::json::get(r, "url"))),
+            udid_ov.clone().or_else(|| str_of(crate::json::get(r, "udid"))).unwrap_or_default(),
+        )
+    };
+    match crate::guard::policy_device(&cfg.raw, selected.as_deref(), explicit, url_ov.as_deref(), udid_ov.as_deref()) {
+        Ok(Some(k)) => {
+            let (url, udid) = fields(rec(&k));
+            DeviceTarget { url, udid, dev_key: Some(k), identity_error: None }
+        }
+        Ok(None) => {
+            // No configured record: only overrides (or an unconfigured --device name).
+            let (url, udid) = fields(&crate::json::NULL);
+            DeviceTarget { url, udid, dev_key: selected, identity_error: None }
+        }
+        Err(e) => {
+            let (url, udid) = fields(selected.as_deref().map(rec).unwrap_or(&crate::json::NULL));
+            DeviceTarget { url, udid, dev_key: selected, identity_error: Some(e) }
+        }
+    }
+}
+
+/// `(url, udid, device_key)` of [`resolve_target`]; Err when no WDA URL is configured.
 pub fn resolve_device_settings(
     url_arg: Option<&str>,
     device_arg: Option<&str>,
     udid_arg: Option<&str>,
 ) -> Result<(String, String, Option<String>)> {
-    let cfg = current();
-    let devices = cfg.get("devices");
-    let dev_key: Option<String> = device_arg
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| env_nonempty("WDA_DEVICE"))
-        .or_else(|| cfg.get("default_device").as_str().filter(|s| !s.is_empty()).map(String::from));
-    let dev = dev_key.as_deref().map(|k| crate::json::get(devices, k)).unwrap_or(&crate::json::NULL);
-    let str_of = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(String::from);
-    let url = url_arg
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| env_nonempty("WDA_URL"))
-        .or_else(|| str_of(crate::json::get(dev, "url")));
-    let udid = udid_arg
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| env_nonempty("WDA_UDID"))
-        .or_else(|| env_nonempty("IPHONE_UDID"))
-        .or_else(|| str_of(crate::json::get(dev, "udid")))
-        .unwrap_or_default();
-    let Some(url) = url else {
-        return Err(Error::runtime(format!(
-            "No WDA URL configured. Pass --url http://<iphone-ip>:8100, set WDA_URL, or configure {}",
-            cfg.path.display()
-        )));
-    };
-    Ok((url, udid, dev_key))
+    let t = resolve_target(url_arg, device_arg, udid_arg);
+    let url = t.url.ok_or_else(no_url_error)?;
+    Ok((url, t.udid, t.dev_key))
+}
+
+pub fn no_url_error() -> Error {
+    Error::runtime(format!(
+        "No WDA URL configured. Pass --url http://<iphone-ip>:8100, set WDA_URL, or configure {}",
+        current().path.display()
+    ))
 }
 
 /// Run a shell-split credential command and return its stdout (Python
