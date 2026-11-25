@@ -165,32 +165,30 @@ fn test_binary_flag_wins_before_and_after_native_load() {
 // These exercise ocr.rs internals that the skeleton does not expose yet:
 // `WarmOcr::new()`, `WarmOcr::lease(psm, workers) -> (pool, engines)`, an injectable
 // `create_tess_api` / `tesseract_tsv`, and the request-pool cleanup registry. They
-// are written against that API and compiled out until the ocr helper lands it
-// (reported as blocked on ocr.rs; the lead enables them by removing `cfg(any())`).
+// are kept as named, compiled-out placeholders until the ocr helper lands it
+// (reported as blocked on ocr.rs; tt-ocr was asked to port them against its API).
 // ---------------------------------------------------------------------------
 
 #[cfg(any())]
 mod blocked_on_ocr_api {
-    use super::*;
-
     #[test]
     fn test_engines_are_partitioned_by_model_data_in_both_orders() {
-        todo!("needs WarmOcr::new/lease and a create_tess_api test hook")
+        // blocked: needs WarmOcr::new/lease and a create_tess_api test hook
     }
 
     #[test]
     fn test_end_request_cancels_queued_strips_and_waits_for_running_ones() {
-        todo!("needs WarmOcr::lease pool submit/cancel")
+        // blocked: needs WarmOcr::lease pool submit/cancel
     }
 
     #[test]
     fn test_same_relative_prefix_in_two_cwds_gets_two_engines() {
-        todo!("needs WarmOcr::lease and a create_tess_api test hook")
+        // blocked: needs WarmOcr::lease and a create_tess_api test hook
     }
 
     #[test]
     fn test_failed_strip_drains_running_sibling_before_next_request() {
-        todo!("needs a tesseract_tsv test hook and the request cleanup registry")
+        // blocked: needs a tesseract_tsv test hook and the request cleanup registry
     }
 }
 
