@@ -1,0 +1,37 @@
+--- a/WebDriverAgentLib/Commands/FBSessionCommands.m
++++ b/WebDriverAgentLib/Commands/FBSessionCommands.m
+@@ -49,6 +49,7 @@
+     [[FBRoute GET:@"/wda/apps/list"] respondWithTarget:self action:@selector(handleGetActiveAppsList:)],
+     [[FBRoute GET:@""] respondWithTarget:self action:@selector(handleGetActiveSession:)],
+     [[FBRoute DELETE:@""].standalone respondWithTarget:self action:@selector(handleDeleteSession:)],
++    [[FBRoute GET:@"/wda/labFixture"].withoutSession.standalone respondWithTarget:self action:@selector(handleLabFixture:)],
+     [[FBRoute GET:@"/status"].withoutSession.standalone respondWithTarget:self action:@selector(handleGetStatus:)],
+ 
+     // Health check might modify simulator state so it should only be called in-between testing sessions
+@@ -63,6 +64,26 @@
+ 
+ #pragma mark - Commands
+ 
++// Lab-only synthetic OCR target from experimental/profile_ocr.py.
+++ (id<FBResponsePayload>)handleLabFixture:(FBRouteRequest *)request
++{
++  NSString *html =
++    @"<meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
++    "<div style='background:#fff;color:#191919;font:14px/32px system-ui'>Moonlight</div>"
++    "<div style='background:#151515;color:#fff;font:18px/32px system-ui'>Bjørn</div>"
++    "<div style='background:#fff;color:#191919;font:24px/32px system-ui'>Ålesund</div>"
++    "<div style='background:#151515;color:#fff;font:14px/32px system-ui'>Gjøvik</div>"
++    "<div style='background:#fff;color:#191919;font:18px/32px system-ui'>Blåbær</div>"
++    "<div style='background:#151515;color:#fff;font:24px/32px system-ui'>Ærlig</div>"
++    "<div style='background:#fff;color:#191919;font:14px/32px system-ui'>Høst</div>"
++    "<div style='background:#151515;color:#fff;font:18px/32px system-ui'>Vestfjord</div>"
++    "<div style='background:#fff;color:#191919;font:24px/32px system-ui'>Måling</div>"
++    "<div style='background:#151515;color:#fff;font:14px/32px system-ui'>Crème</div>"
++    "<div style='background:#fff;color:#191919;font:18px/32px system-ui'>Fjord</div>"
++    "<div style='background:#151515;color:#fff;font:24px/32px system-ui'>Snapshot</div>";
++  return FBResponseWithRawData([html dataUsingEncoding:NSUTF8StringEncoding], @"text/html; charset=utf-8");
++}
++
+ + (id<FBResponsePayload>)handleOpenURL:(FBRouteRequest *)request
+ {
+   NSString *urlString = request.arguments[@"url"];
