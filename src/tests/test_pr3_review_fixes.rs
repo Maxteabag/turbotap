@@ -5,7 +5,7 @@ use crate::error::Error;
 use crate::flow::{Flow, DENY_DEFAULT};
 use crate::image::{content_pixel_still, thumb_diff, Frame, GrayImage};
 use crate::ocr::{ReadOpts, Reader, ScreenReader};
-use crate::testutil::{isolated_cache, make_line, skip_sleep, solid_img, Dyn, FakeReader, MockState, MockWda, Seq};
+use crate::testutil::{isolated_cache, make_line, set_env, skip_sleep, solid_img, Dyn, FakeReader, MockState, MockWda, Seq};
 use crate::text::Line;
 use crate::wda::WdaClient;
 use serde_json::{json, Value};
@@ -174,9 +174,10 @@ fn test_typing_500_fails_and_redacts_secrets_and_200_never_replays() {
     });
     let r = FakeReader::new(vec![(solid_img(200, (120, 240)), vec![])]);
     let mut flow = new_flow(&c500, r);
-    std::env::set_var("TT_PR3_TEST_SECRET_VAL", "SuperSecret123");
-    let res = flow.step("type:env:TT_PR3_TEST_SECRET_VAL");
-    std::env::remove_var("TT_PR3_TEST_SECRET_VAL");
+    let res = {
+        let _env = set_env(&[("TEST_SECRET_VAL", Some("SuperSecret123"))]);
+        flow.step("type:env:TEST_SECRET_VAL")
+    };
     let e = res.unwrap_err();
     assert!(e.is_flow(), "{e:?}");
     assert!(!e.to_string().contains("SuperSecret123"));
@@ -340,24 +341,16 @@ fn test_cmd_deploy_aborts_before_restart_when_unlock_fails() {
     // passcode (the configured passcode_cmd never runs) and an unresolvable Mac host
     // for the deploy script.
     let _cache = isolated_cache();
-    let prev_pass = std::env::var_os("WDA_PASSCODE");
-    let prev_mac = std::env::var_os("WDA_MAC_HOST");
-    std::env::set_var("WDA_PASSCODE", "0000");
-    std::env::set_var("WDA_MAC_HOST", "turbotap-test-no-such-host.invalid");
+    let _env = set_env(&[
+        ("WDA_PASSCODE", Some("0000")),
+        ("WDA_MAC_HOST", Some("turbotap-test-no-such-host.invalid")),
+    ]);
     let m = MockWda::start(MockState { locked: Seq::one(json!(true)), ..Default::default() });
     let mut c = m.client();
     let res = {
         let _v = crate::testutil::virtual_clock();
         crate::deploy::cmd_deploy(&mut c, false)
     };
-    match prev_pass {
-        Some(v) => std::env::set_var("WDA_PASSCODE", v),
-        None => std::env::remove_var("WDA_PASSCODE"),
-    }
-    match prev_mac {
-        Some(v) => std::env::set_var("WDA_MAC_HOST", v),
-        None => std::env::remove_var("WDA_MAC_HOST"),
-    }
     let e = res.unwrap_err();
     assert!(e.is_runtime(), "{e:?}");
     // start_wda_on_mac.assert_not_called(): the deploy script never ran.
