@@ -330,7 +330,7 @@ fn write_str<const ASCII: bool>(out: &mut String, s: &str) {
     while i < bytes.len() {
         let b = bytes[i];
         let safe = if ASCII {
-            b >= 0x20 && b <= 0x7e && b != b'"' && b != b'\\'
+            (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\'
         } else {
             b >= 0x20 && b != b'"' && b != b'\\'
         };

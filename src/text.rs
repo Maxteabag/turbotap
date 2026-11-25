@@ -39,11 +39,19 @@ pub struct Line {
 impl Line {
     /// Python `Line(words)`; `words` must be non-empty.
     pub fn new(words: Vec<Word>) -> Line {
-        let text = words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
-        let x0 = words.iter().map(|w| w.x0).fold(f64::INFINITY, f64::min);
-        let y0 = words.iter().map(|w| w.y0).fold(f64::INFINITY, f64::min);
-        let x1 = words.iter().map(|w| w.x1).fold(f64::NEG_INFINITY, f64::max);
-        let y1 = words.iter().map(|w| w.y1).fold(f64::NEG_INFINITY, f64::max);
+        let cap: usize = words.iter().map(|w| w.text.len()).sum::<usize>() + words.len().saturating_sub(1);
+        let mut text = String::with_capacity(cap);
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 {
+                text.push(' ');
+            }
+            text.push_str(&w.text);
+            x0 = x0.min(w.x0);
+            y0 = y0.min(w.y0);
+            x1 = x1.max(w.x1);
+            y1 = y1.max(w.y1);
+        }
         Line { text, words, x0, y0, x1, y1 }
     }
 
@@ -201,12 +209,15 @@ fn casefold_special(c: char) -> Option<&'static str> {
     })
 }
 
-/// Python `str.casefold()` (lowercase + full folds such as ß -> ss).
-pub fn casefold(s: &str) -> String {
+/// Python `str.casefold()` written into a reusable buffer.
+pub(crate) fn casefold_into(s: &str, out: &mut String) {
+    out.clear();
     if s.is_ascii() {
-        return s.to_ascii_lowercase();
+        for &b in s.as_bytes() {
+            out.push(b.to_ascii_lowercase() as char);
+        }
+        return;
     }
-    let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         if let Some(f) = casefold_special(ch) {
             out.push_str(f);
@@ -221,6 +232,15 @@ pub fn casefold(s: &str) -> String {
             }
         }
     }
+}
+
+/// Python `str.casefold()` (lowercase + full folds such as ß -> ss).
+pub fn casefold(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    let mut out = String::with_capacity(s.len());
+    casefold_into(s, &mut out);
     out
 }
 
@@ -374,8 +394,8 @@ fn wb_search(t: &str, want: &str) -> bool {
     let mut pos = 0;
     while let Some(rel) = t[pos..].find(want) {
         let i = pos + rel;
-        let before_ok = t[..i].chars().next_back().map_or(true, |c| !py_isword(c));
-        let after_ok = t[i + want.len()..].chars().next().map_or(true, |c| !py_isword(c));
+        let before_ok = t[..i].chars().next_back().is_none_or(|c| !py_isword(c));
+        let after_ok = t[i + want.len()..].chars().next().is_none_or(|c| !py_isword(c));
         if before_ok && after_ok {
             return true;
         }
@@ -542,6 +562,44 @@ fn fuzzy_window_prepared(
     None
 }
 
+#[derive(Clone, Copy)]
+enum LineFilter {
+    All,
+    YGt(i64),
+    YLt(i64),
+    BelowY(f64),
+    AboveY(f64),
+}
+
+impl LineFilter {
+    #[inline]
+    fn allows(self, ln: &Line) -> bool {
+        match self {
+            LineFilter::All => true,
+            LineFilter::YGt(lim) => ln.y() > lim,
+            LineFilter::YLt(lim) => ln.y() < lim,
+            LineFilter::BelowY(y) => ln.y0 > y,
+            LineFilter::AboveY(y) => ln.y1 < y,
+        }
+    }
+}
+
+fn resolve_line_filter(lines: &[Line], where_: &str) -> Option<LineFilter> {
+    match parse_where(where_) {
+        Where::Y(true, lim) => Some(LineFilter::YGt(lim)),
+        Where::Y(false, lim) => Some(LineFilter::YLt(lim)),
+        Where::Below(val) => {
+            let hl = find_text(lines, val, 0.0, None)?.line?;
+            Some(LineFilter::BelowY(hl.y1 - 1.0))
+        }
+        Where::Above(val) => {
+            let hl = find_text(lines, val, 0.0, None)?.line?;
+            Some(LineFilter::AboveY(hl.y0 + 1.0))
+        }
+        Where::Invalid => None,
+    }
+}
+
 /// Best on-screen match for `label` (see Python docstring). `fuzzy` 0 disables the
 /// fuzzy pass; `where_` is a `split_where` region. An invalid `re:` regex never
 /// matches.
@@ -551,13 +609,9 @@ fn fuzzy_window_prepared(
 /// to the topmost. Returns the centre of the matching words, not the line.
 pub fn find_text(lines: &[Line], label: &str, fuzzy: f64, where_: Option<&str>) -> Option<Match> {
     let where_ = where_.filter(|w| !w.is_empty());
-    let region_lines;
-    let lines: &[Line] = match where_ {
-        Some(w) => {
-            region_lines = region(lines, w)?;
-            &region_lines
-        }
-        None => lines,
+    let filter = match where_ {
+        Some(w) => resolve_line_filter(lines, w)?,
+        None => LineFilter::All,
     };
     let want = norm(label);
     let rx = match label.strip_prefix("re:") {
@@ -594,6 +648,9 @@ pub fn find_text(lines: &[Line], label: &str, fuzzy: f64, where_: Option<&str>) 
     // (in_status, rank, folded, icon_stripped, y) + Match
     let mut best: Option<((bool, u8, bool, bool, i64), Match)> = None;
     for ln in lines {
+        if !filter.allows(ln) {
+            continue;
+        }
         let mut icon_stripped = false;
         let mut folded = false;
         let mut span: Option<Span> = None;
@@ -809,6 +866,9 @@ pub fn controls_in_region(controls: &[Control], lines: &[Line], where_: Option<&
 /// `'Alice@below:Chats'` -> `("Alice", Some("below:Chats"))`; `@y>300`, `@y<300`,
 /// `@above:TEXT` restrict where the text may be (carousel vs list rows).
 pub fn split_where(arg: &str) -> (String, Option<String>) {
+    if !arg.contains('@') {
+        return (arg.to_string(), None);
+    }
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(r"^(.*?)@((?:below|above):.+|y[<>]\d+)\n?$").expect("static split_where regex")
@@ -831,9 +891,19 @@ pub fn text_overlap(a: &[String], b: &[String]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-    let sa: HashSet<&String> = a.iter().collect();
-    let sb: HashSet<&String> = b.iter().collect();
-    sa.intersection(&sb).count() as f64 / sa.len().max(sb.len()) as f64
+    let mut sa: HashSet<&str> = HashSet::with_capacity(a.len());
+    for s in a {
+        sa.insert(s.as_str());
+    }
+    let mut sb: HashSet<&str> = HashSet::with_capacity(b.len());
+    let mut shared = 0usize;
+    for s in b {
+        let st = s.as_str();
+        if sb.insert(st) && sa.contains(st) {
+            shared += 1;
+        }
+    }
+    shared as f64 / sa.len().max(sb.len()) as f64
 }
 
 // ---------------------------------------------------------------------------
@@ -982,10 +1052,11 @@ impl PreparedTarget {
         }
         self.gen += 1;
         let mut prev_g = self.gen;
-        for i in alo..ahi {
+        for (off, &ch) in a[alo..ahi].iter().enumerate() {
+            let i = alo + off;
             self.gen += 1;
             let curr_g = self.gen;
-            if let Some(js) = b2j.get(&a[i]) {
+            if let Some(js) = b2j.get(&ch) {
                 for &j in js {
                     if j < blo {
                         continue;
