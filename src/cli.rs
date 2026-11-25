@@ -44,7 +44,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
 
 /// Subcommands that always run in the calling process (never in the daemon).
 pub const DAEMON_LOCAL_CMDS: &[&str] = &["daemon", "install-skill", "deploy"];
-const GLOBAL_VALUE_OPTS: &[&str] = &["--url", "--device", "--udid"];
+const GLOBAL_VALUE_OPTS: &[&str] = &["--url", "--device", "--udid", "--allow-app"];
 
 /// `(subcommand, --daemon seen, --no-daemon seen, other option seen)` from the
 /// global options before the subcommand.
@@ -115,6 +115,24 @@ fn parse_py_int(s: &str) -> std::result::Result<i64, String> {
     s.trim().replace('_', "").parse::<i64>().map_err(|_| format!("invalid int value: {}", json::py_repr_str(s)))
 }
 
+/// Repeatable `--allow-app BUNDLE_ID` (global and on the input subcommands).
+fn allow_app_arg() -> Arg {
+    Arg::new("allow-app").long("allow-app").value_name("BUNDLE_ID").action(ArgAction::Append).help(
+        "also allow input into this app for this run (repeatable; extends allowed_apps / TURBOTAP_ALLOWED_APPS, never disables the app guard)",
+    )
+}
+
+/// `--allow-app` values given before and after the subcommand.
+fn allow_app_values(m: &ArgMatches, sm: &ArgMatches) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for mm in [m, sm] {
+        if let Ok(Some(v)) = mm.try_get_many::<String>("allow-app") {
+            out.extend(v.cloned());
+        }
+    }
+    out
+}
+
 fn flag(name: &'static str, help: &'static str) -> Arg {
     Arg::new(name).long(name).action(ArgAction::SetTrue).help(help)
 }
@@ -135,6 +153,7 @@ pub fn build_command() -> Command {
         .arg(Arg::new("url").long("url").value_name("URL").help("WDA base URL (or set WDA_URL / ~/.config/turbotap/config.json)"))
         .arg(Arg::new("device").long("device").value_name("DEVICE").help("device key from ~/.config/turbotap/config.json (or WDA_DEVICE)"))
         .arg(Arg::new("udid").long("udid").value_name("UDID").help("device UDID (or WDA_UDID / config.json)"))
+        .arg(allow_app_arg())
         .arg(flag(
             "daemon",
             "run through the warm local daemon when it is running (or TURBOTAP_DAEMON=1); falls back to this process otherwise",
@@ -194,7 +213,7 @@ pub fn build_command() -> Command {
                 )
                 .arg(float_arg("scale").value_name("FACTOR").help(vision_scale_help)),
         )
-        .subcommand(Command::new("tap-ocr").arg(Arg::new("text").required(true)))
+        .subcommand(Command::new("tap-ocr").arg(Arg::new("text").required(true)).arg(allow_app_arg()))
         .subcommand(Command::new("tree"))
         .subcommand(Command::new("screenshot").arg(Arg::new("out").required(true)))
         .subcommand(
@@ -206,7 +225,8 @@ pub fn build_command() -> Command {
                 .arg(float_arg("scale").default_value("1.5").help("OCR px per point"))
                 .arg(Arg::new("deny").long("deny").help("regex of tap labels to refuse"))
                 .arg(Arg::new("no-deny").long("no-deny").action(ArgAction::SetTrue))
-                .arg(flag("quiet", "no per-step progress on stderr")),
+                .arg(flag("quiet", "no per-step progress on stderr"))
+                .arg(allow_app_arg()),
         )
         .subcommand(
             Command::new("otp-type")
@@ -214,7 +234,8 @@ pub fn build_command() -> Command {
                 .arg(Arg::new("pattern").long("pattern").default_value("%code%"))
                 .arg(int_arg("after-rowid").default_value("0"))
                 .arg(float_arg("timeout").default_value("20.0"))
-                .arg(Arg::new("mac-host").long("mac-host")),
+                .arg(Arg::new("mac-host").long("mac-host"))
+                .arg(allow_app_arg()),
         )
 }
 
@@ -272,7 +293,9 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     crate::config::reload();
     crate::skills::sync_skills_if_stale();
     let (url, udid, dev_key) = crate::config::resolve_device_settings(s(&m, "url"), s(&m, "device"), s(&m, "udid"))?;
+    let allowed = crate::guard::resolve_allowlist(dev_key.as_deref(), &allow_app_values(&m, sm))?;
     let mut client = WdaClient::new(&url, &udid, dev_key.as_deref());
+    client.set_allowed_apps(allowed);
     match cmd {
         "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock"))?,
         "unlock" => crate::wda::cmd_unlock(&mut client)?,
@@ -406,6 +429,20 @@ pub fn cmd_otp_type(
     mac_host: &str,
 ) -> Result<()> {
     client.ensure_session(None, true)?;
+    client.guard_action = Some("otp-type".into());
+    client.ensure_allowed_app("otp-type", None)?;
+    let r = otp_type_inner(client, code, pattern, after_rowid, timeout, mac_host);
+    client.guard_result(r)
+}
+
+fn otp_type_inner(
+    client: &mut WdaClient,
+    code: Option<&str>,
+    pattern: &str,
+    after_rowid: i64,
+    timeout: f64,
+    mac_host: &str,
+) -> Result<()> {
     let mut code: Option<String> = code.filter(|c| !c.is_empty()).map(String::from);
     if code.is_none() {
         let q = format!("select ROWID, text from message where text like '{pattern}' order by ROWID desc limit 1");

@@ -26,6 +26,9 @@ pub enum Error {
     Os(String),
     /// Python `subprocess.CalledProcessError`: `cmd` is the program name shown to the user.
     Subprocess { cmd: String, code: i32 },
+    /// The foreground app guard refused an input action (see [`crate::guard`]). Never a
+    /// flow error: nothing catches it, so the run stops with exit 1.
+    AppGuard(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -66,7 +69,8 @@ impl fmt::Display for Error {
             | Error::Timeout(m)
             | Error::VisionUnsupported(m)
             | Error::Value(m)
-            | Error::Os(m) => f.write_str(m),
+            | Error::Os(m)
+            | Error::AppGuard(m) => f.write_str(m),
             Error::Subprocess { cmd, code } => write!(f, "{cmd} failed (exit {code})"),
         }
     }

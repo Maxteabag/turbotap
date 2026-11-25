@@ -3,7 +3,7 @@
 //!
 //! Env vars: `WDA_CONFIG`, `WDA_URL`, `WDA_DEVICE`, `WDA_UDID` (`IPHONE_UDID`),
 //! `WDA_MAC_HOST`, `WDA_PASSCODE`, `WDA_PASSCODE_CMD`, `TURBOTAP_TYPING_FREQ`,
-//! `TURBOTAP_DAEMON`, `WDA_OCR`, `TESSDATA_PREFIX`, `WDA_TURBO`,
+//! `TURBOTAP_DAEMON`, `TURBOTAP_ALLOWED_APPS`, `WDA_OCR`, `TESSDATA_PREFIX`, `WDA_TURBO`,
 //! `WDA_CONDITIONAL_SHOT`, `WDA_OCR_WORKERS`.
 //!
 //! Everything is read at call time (or per [`reload`]) so the warm daemon applies

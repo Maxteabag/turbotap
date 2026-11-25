@@ -660,6 +660,14 @@ pub struct WdaClient {
     pub last_fast_ui_kb: Option<(Option<bool>, Option<Value>)>,
     /// Session/app caches live here (captured at construction).
     pub cache_dir: PathBuf,
+    /// Foreground app guard allowlist ([`crate::guard`]); empty = guard off.
+    pub allowed_apps: Vec<String>,
+    /// First app guard refusal in this invocation (sticky: later input is refused).
+    pub guard_refusal: Option<String>,
+    /// Label of the action in progress, used in guard refusals (a flow step, a command).
+    pub guard_action: Option<String>,
+    /// Set while `unlock_phone` runs: SpringBoard may receive the passcode taps.
+    guard_unlock_scope: bool,
     host: String,
     port: u16,
     conn: Option<Conn>,
@@ -698,10 +706,144 @@ impl WdaClient {
             last_response_headers: None,
             last_fast_ui_kb: None,
             cache_dir: crate::config::cache_dir(),
+            allowed_apps: Vec::new(),
+            guard_refusal: None,
+            guard_action: None,
+            guard_unlock_scope: false,
             host,
             port,
             conn: None,
         }
+    }
+
+    // -- foreground app guard (crate::guard) --------------------------------
+
+    /// Turn the app guard on for this client (an empty list leaves it off).
+    pub fn set_allowed_apps(&mut self, apps: Vec<String>) {
+        self.allowed_apps = apps;
+    }
+
+    pub fn app_guard_active(&self) -> bool {
+        !self.allowed_apps.is_empty()
+    }
+
+    fn guard_refuse(&mut self, msg: String) -> Error {
+        if self.guard_refusal.is_none() {
+            self.guard_refusal = Some(msg.clone());
+        }
+        Error::AppGuard(msg)
+    }
+
+    fn guard_sticky(&self) -> Result<()> {
+        match &self.guard_refusal {
+            Some(m) => Err(Error::AppGuard(m.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// `r`, unless the app guard refused something meanwhile (then that refusal), so
+    /// callers that swallow request errors still stop.
+    pub fn guard_result<T>(&self, r: Result<T>) -> Result<T> {
+        self.guard_sticky()?;
+        r
+    }
+
+    /// Live foreground bundle ID from `GET /wda/activeAppInfo` (never cached).
+    /// Err(reason) when the request fails or the answer has no bundle ID.
+    pub fn live_foreground_app(&mut self, deadline: Option<f64>) -> std::result::Result<String, String> {
+        match self.req_typed_with_deadline("GET", "/wda/activeAppInfo", 5.0, deadline, |b| {
+            serde_json::from_slice::<RawActiveAppResp>(b)
+        }) {
+            TypedHttpResult::Ok(RawActiveAppResp { is_object: true, has_err: false, bundle_id }) => {
+                match bundle_id.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(b) => Ok(b.to_string()),
+                    None => Err("activeAppInfo returned no bundleId".into()),
+                }
+            }
+            TypedHttpResult::Ok(_) => Err("activeAppInfo failed".into()),
+            TypedHttpResult::HttpError { status } => Err(format!("activeAppInfo failed: HTTP {status}")),
+            TypedHttpResult::TransportError(_) => Err("activeAppInfo failed".into()),
+            TypedHttpResult::DeadlineExceeded => Err("activeAppInfo failed: deadline exceeded".into()),
+        }
+    }
+
+    /// Refuse `action` unless the app in front right now (live `/wda/activeAppInfo`)
+    /// is in the allowlist. Fails closed when the answer is missing. No-op when the
+    /// guard is off.
+    pub fn ensure_allowed_app(&mut self, action: &str, deadline: Option<f64>) -> Result<()> {
+        if !self.app_guard_active() {
+            return Ok(());
+        }
+        if self.check_foreground(action, deadline)? {
+            return Ok(());
+        }
+        let why = "activeAppInfo failed: deadline exceeded";
+        Err(self.guard_refuse(crate::guard::refuse_unknown(action, why, &self.allowed_apps)))
+    }
+
+    /// Live foreground check: Ok(true) allowed, Ok(false) `deadline` ran out first
+    /// (nothing decided), Err refusal (sticky).
+    fn check_foreground(&mut self, action: &str, deadline: Option<f64>) -> Result<bool> {
+        self.guard_sticky()?;
+        let expired = |d: Option<f64>| d.is_some_and(|d| clock::now() >= d);
+        if expired(deadline) {
+            return Ok(false);
+        }
+        match self.live_foreground_app(deadline) {
+            Ok(b) if self.allowed_apps.iter().any(|a| a == &b) => Ok(true),
+            Ok(b) if self.guard_unlock_scope && b == SPRINGBOARD => Ok(true),
+            Ok(b) => Err(self.guard_refuse(crate::guard::refuse_foreground(action, &b, &self.allowed_apps))),
+            Err(_) if expired(deadline) => Ok(false),
+            Err(why) => Err(self.guard_refuse(crate::guard::refuse_unknown(action, &why, &self.allowed_apps))),
+        }
+    }
+
+    /// Refuse launching/activating/terminating `target` unless it is in the allowlist
+    /// (whatever app is in front now).
+    pub fn ensure_allowed_target(&mut self, action: &str, target: Option<&str>) -> Result<()> {
+        if !self.app_guard_active() {
+            return Ok(());
+        }
+        self.guard_sticky()?;
+        match target {
+            Some(t) if self.allowed_apps.iter().any(|a| a == t) => Ok(()),
+            _ => Err(self.guard_refuse(crate::guard::refuse_target(action, target, &self.allowed_apps))),
+        }
+    }
+
+    /// Refuse `url:` unless Safari is in the allowlist.
+    pub fn ensure_url_allowed(&mut self, action: &str) -> Result<()> {
+        if !self.app_guard_active() {
+            return Ok(());
+        }
+        self.guard_sticky()?;
+        if self.allowed_apps.iter().any(|a| a == crate::guard::SAFARI) {
+            return Ok(());
+        }
+        Err(self.guard_refuse(crate::guard::refuse_url(action, &self.allowed_apps)))
+    }
+
+    /// The request-level check every non-GET request passes before it is sent:
+    /// Ok(true) send it, Ok(false) the caller's deadline ran out while checking (send
+    /// nothing, report the deadline as usual), Err(refusal) send nothing.
+    fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
+        if !self.app_guard_active() || crate::guard::is_safe_method(method) {
+            return Ok(true);
+        }
+        use crate::guard::RequestKind;
+        let kind = crate::guard::classify(path, body);
+        if matches!(kind, RequestKind::ReadOnly | RequestKind::Home) {
+            return Ok(true);
+        }
+        let label = self.guard_action.clone().unwrap_or_else(|| format!("{method} {}", path.split('?').next().unwrap_or(path)));
+        let r = match kind {
+            RequestKind::TargetApp(t) => self.ensure_allowed_target(&label, t.as_deref()),
+            RequestKind::Url => self.ensure_url_allowed(&label),
+            // A caller deadline that ends before the foreground check answers means
+            // "nothing sent, deadline exceeded" (e.g. tapif: skips cleanly).
+            _ => return self.check_foreground(&label, deadline).map_err(|e| e.to_string()),
+        };
+        r.map(|_| true).map_err(|e| e.to_string())
     }
 
     /// The session id or "" (Python f"/session/{self.sid}" prints "None" when unset;
@@ -720,6 +862,7 @@ impl WdaClient {
     pub fn side_client(&self) -> WdaClient {
         let mut side = WdaClient::new(&self.base_url, &self.udid, self.device_key.as_deref());
         side.cache_dir = self.cache_dir.clone();
+        side.allowed_apps = self.allowed_apps.clone();
         side.copy_probes_from(self);
         side
     }
@@ -902,6 +1045,9 @@ impl WdaClient {
     where
         F: FnMut(&[u8]) -> std::result::Result<Option<T>, String>,
     {
+        if !self.guard_request(method, path, body, deadline)? {
+            return Ok(None);
+        }
         let idempotent = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
         for attempt in 0..2 {
             let mut eff_timeout = timeout;
@@ -960,6 +1106,9 @@ impl WdaClient {
     where
         F: FnMut(&[u8]) -> std::result::Result<Option<T>, String>,
     {
+        if !self.guard_request(method, path, body, deadline)? {
+            return Ok(None);
+        }
         let idempotent = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
         for attempt in 0..2 {
             let mut eff_timeout = timeout;
@@ -2560,6 +2709,13 @@ impl WdaClient {
     /// L830-931. Returns true when this call unlocked the phone (or it unlocked
     /// while we worked). Never echoes passcode digits.
     pub fn unlock_phone(&mut self) -> Result<bool> {
+        let prev = std::mem::replace(&mut self.guard_unlock_scope, true);
+        let r = self.unlock_phone_inner();
+        self.guard_unlock_scope = prev;
+        r
+    }
+
+    fn unlock_phone_inner(&mut self) -> Result<bool> {
         self.ensure_session(None, false)?;
         if !self.confirm_locked_state(0)? {
             return Ok(false);

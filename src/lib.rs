@@ -8,6 +8,7 @@
 //!
 //! Module map (ported 1:1 from the Python v0.10.0 `cli.py` / `daemon.py`):
 //! - [`config`]  config.json, env overrides, cache dir, passcode source
+//! - [`guard`]   foreground app guard (`allowed_apps`, `--allow-app`)
 //! - [`wda`]     keep-alive HTTP/1.1 WDA client, fast routes + stock fallbacks, unlock, preflight
 //! - [`image`]   8-bit grayscale frames, decode, frame-diff primitives
 //! - [`ocr`]     libtesseract (dlopen) / binary fallback, `ScreenReader`, warm engines
@@ -29,6 +30,7 @@ pub mod daemon;
 pub mod deploy;
 pub mod error;
 pub mod flow;
+pub mod guard;
 pub mod image;
 pub mod json;
 pub mod ocr;

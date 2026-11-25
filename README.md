@@ -78,11 +78,14 @@ Create `~/.config/turbotap/config.json`:
   "devices": {
     "iphone": {
       "url": "http://192.168.1.50:8100",
-      "udid": "000081XX-XXXXXXXXXXXXXXXX"
+      "udid": "000081XX-XXXXXXXXXXXXXXXX",
+      "allowed_apps": ["com.example.app"]
     }
   }
 }
 ```
+
+`allowed_apps` is optional but recommended: it turns on the app guard (see [Safety and quirks](#safety-and-quirks)).
 
 Deploy and start the patched WebDriverAgent on the iPhone (over SSH to the Mac in `mac_host`), then make sure it responds:
 
@@ -138,6 +141,19 @@ If you don't want to patch WDA, `turbotap` still works against stock WDA and fal
 ## Safety and quirks
 
 By default, `turbotap` blocks taps on buttons matching `Send`, `Pay`, `Buy`, `Delete`, `Cancel booking`, or `Start call` (`--deny`). Pass `--no-deny` when you actually want it to press one of those.
+
+**App guard.** List the apps `turbotap` may control in `allowed_apps` (per device under `devices.<name>`, or top-level for all devices; a device's own list wins). With a list in place, every input (`tap:`, `tapxy:`, `tapel:`, `tapif:`, `tapbatch:`, `toggle:`, `slider:`, `picker:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `scroll:`, `scrollto:`, `back`, `type:`, `cleartype:`, `typedigits:`, `pintap:`, `key:`, `search:`, `dismisskb`, `setclip:`, `alert:accept|dismiss`, `tap-ocr`, `otp-type`) first asks WDA which app is in front (`/wda/activeAppInfo`, live, never cached) and is refused unless that app is on the list. The check runs again right before every request that would touch the screen, so an app switch in the middle of a step is caught too. If WDA can't say which app is in front, the action is refused. A refusal stops the run with exit 1 and nothing is sent:
+
+```text
+turbotap: app guard refused tap:Message: foreground app 'com.example.other' is not in allowlist [com.example.app] (use --allow-app <bundle_id> for this run)
+```
+
+- `open:APP` / `launch:APP` check the target app instead, so a flow can start from the Home Screen: `open:com.example.app` works, opening an app that isn't listed is refused before anything is launched.
+- `url:` can open any app, so it needs `com.apple.mobilesafari` on the list.
+- `unlock` may type the passcode on the lock screen, and `home` is always allowed.
+- Read-only steps (`read`, `ui`, `ocr`, `wait:`, `assert:`, `alert:text`, `clipboard`, `shot:`, `preflight`, `tree`, `screenshot`) work in any app.
+- `--allow-app BUNDLE_ID` (repeatable, before or after `flow`/`tap-ocr`/`otp-type`) adds an app for one run; `TURBOTAP_ALLOWED_APPS=a,b` adds apps for every run in that environment. Neither can remove an app from the configured list, and with no config they turn the guard on by themselves.
+- `--no-deny` only turns off the label filter above. It never weakens the app guard.
 
 `tap:TEXT` prefers a button, app keypad `Key`, or link labelled exactly `TEXT` over a longer OCR line (`tap:"Sign In"` won't hit `Sign in with another account`), and deprioritizes iOS status-bar matches (`y < 54`) behind in-app text unless targeted explicitly. `wait:TEXT` is OCR-first and falls back to the accessibility tree for low-contrast or colored buttons, while `gone:TEXT` polls until a spinner or sheet disappears. Tapping a switch row's label flips the switch itself, and `Next`/`Previous` pick the form's button over the keyboard toolbar's copy. When a step fails, the JSON lists the visible text and the top 30 interactive controls with their exact labels.
 
