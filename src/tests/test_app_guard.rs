@@ -1382,14 +1382,13 @@ fn test_mixed_candidates_conflict_and_transport_uses_only_checked_addresses() {
     // address cannot be assigned to the phone's policy.
     let cfg = json!({"devices": {"p": {"url": phone.url, "allowed_apps": [ALLOWED]}}});
     let mut ids = crate::guard::EndpointIds::default();
-    ids.preset("http://phone.test:8100", &[phone_addr.as_str(), other_addr.as_str()]);
-    ids.preset("http://alias.test:8100", &[phone_addr.as_str()]);
-    let e = crate::guard::policy_device_with(&cfg, None, false, Some("http://phone.test:8100"), None, &mut ids).unwrap_err();
+    let (mixed, alias) = (format!("http://phone.test:{}", phone.port()), format!("http://alias.test:{}", phone.port()));
+    let unrelated = format!("127.0.0.2:{}", phone.port());
+    ids.preset(&mixed, &[phone_addr.as_str(), unrelated.as_str()]);
+    ids.preset(&alias, &[phone_addr.as_str()]);
+    let e = crate::guard::policy_device_with(&cfg, None, false, Some(&mixed), None, &mut ids).unwrap_err();
     assert!(e.contains("and to others"), "{e}");
-    assert_eq!(
-        crate::guard::policy_device_with(&cfg, None, false, Some("http://alias.test:8100"), None, &mut ids),
-        Ok(Some("p".into()))
-    );
+    assert_eq!(crate::guard::policy_device_with(&cfg, None, false, Some(&alias), None, &mut ids), Ok(Some("p".into())));
     // Transport: pinned to the checked address, the client never resolves the host
     // again and never talks to anything else, whatever its URL says.
     let mut c = crate::wda::WdaClient::new("http://alias.test.invalid:8100", TEST_UDID, None);
@@ -1414,4 +1413,88 @@ fn test_mixed_candidates_conflict_and_transport_uses_only_checked_addresses() {
     c4.pin_addrs(Vec::new());
     assert!(crate::json::has_err(&c4.get("/status")));
     assert_eq!(phone.paths().iter().filter(|p| p.as_str() == "/status").count(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Review round 6: UDID ownership, unresolved host names
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_udid_owned_by_another_stopped_record_is_refused() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mock = MockWda::start(state_with_app(json!(ALLOWED)));
+    let e = cli_env(&mock.url, &[]);
+    let stop_s = e.cfg.parent().unwrap().join("s.stop");
+    std::fs::write(&stop_s, "").unwrap();
+    // p: URL only. s: a different phone that owns UDID-S and is stopped.
+    std::fs::write(
+        &e.cfg,
+        json!({"devices": {
+            "p": {"url": mock.url, "allowed_apps": [ALLOWED]},
+            "s": {"url": "http://10.0.0.9:8100", "udid": "UDID-S", "allowed_apps": [ALLOWED], "stop_file": stop_s.to_string_lossy()},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let url = mock.url.clone();
+    for stopped in [true, false] {
+        if !stopped {
+            std::fs::remove_file(&stop_s).unwrap();
+        }
+        for cmd in [&["flow", "--no-deny", "tapxy:1,2"][..], &["flow", "home"][..], &["deploy", "--no-build"][..], &["unlock"][..]] {
+            let mut v = vec!["--no-daemon", "--url", url.as_str(), "--udid", "UDID-S"];
+            v.extend_from_slice(cmd);
+            let (code, _, err) = run(&v);
+            assert_eq!(code, crate::stop::STOP_EXIT, "{cmd:?}: {err}");
+            assert!(err.contains("udid UDID-S is device 's'"), "{cmd:?}: {err}");
+        }
+    }
+    assert!(mock.calls().is_empty(), "WDA contacted: {:?}", mock.paths());
+    // An unknown UDID with p's URL is fine (p has no UDID of its own).
+    let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "--udid", "UDID-NEW", "flow", "--quiet", "tapxy:1,2"]);
+    assert_eq!(code, 0, "{err}");
+}
+
+#[test]
+fn test_unresolved_configured_host_is_never_treated_as_a_different_endpoint() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // Resolver fixture: a guarded record whose host name lookup fails, same port as the
+    // reachable override.
+    let cfg = json!({"devices": {"g": {"url": "http://phone.test:8100", "allowed_apps": [ALLOWED], "stop_file": "/x"}}});
+    let mut ids = crate::guard::EndpointIds::default();
+    ids.preset_unresolved("http://phone.test:8100");
+    assert_eq!(ids.rel("http://10.0.0.7:8100", "http://phone.test:8100"), crate::guard::EndpointRel::Unknown);
+    let e = crate::guard::policy_device_with(&cfg, None, false, Some("http://10.0.0.7:8100"), None, &mut ids).unwrap_err();
+    assert!(e.contains("lookup failed"), "{e}");
+    // Another port is another endpoint, resolvable or not.
+    assert_eq!(crate::guard::policy_device_with(&cfg, None, false, Some("http://10.0.0.7:8101"), None, &mut ids), Ok(None));
+    // The chosen device must not share an unknown endpoint either.
+    let cfg2 = json!({"devices": {
+        "a": {"url": "http://10.0.0.7:8100"},
+        "g": {"url": "http://phone.test:8100", "stop_file": "/x"},
+    }});
+    assert!(crate::guard::policy_device_with(&cfg2, Some("a"), true, None, None, &mut ids).is_err());
+
+    // End to end with a name that cannot resolve (RFC 6761 .invalid).
+    let mock = MockWda::start(state_with_app(json!(OTHER)));
+    let e = cli_env(&mock.url, &[]);
+    let stop = e.cfg.parent().unwrap().join("g.stop");
+    std::fs::write(&stop, "").unwrap();
+    let write = |devices: Value| std::fs::write(&e.cfg, json!({"devices": devices}).to_string()).unwrap();
+    write(json!({"g": {"url": format!("http://turbotap-guard-test.invalid:{}", mock.port()), "allowed_apps": [ALLOWED], "stop_file": stop.to_string_lossy()}}));
+    let url = mock.url.clone();
+    for cmd in [&["flow", "--no-deny", "tapxy:1,2"][..], &["flow", "home"][..], &["deploy", "--no-build"][..]] {
+        let mut v = vec!["--no-daemon", "--url", url.as_str()];
+        v.extend_from_slice(cmd);
+        let (code, _, err) = run(&v);
+        assert_eq!(code, crate::stop::STOP_EXIT, "{cmd:?}: {err}");
+        assert!(err.contains("lookup failed"), "{cmd:?}: {err}");
+    }
+    assert!(mock.calls().is_empty(), "WDA contacted: {:?}", mock.paths());
+    // An unresolvable record on another port does not block this endpoint.
+    write(json!({"g": {"url": "http://turbotap-guard-test.invalid:1", "allowed_apps": [ALLOWED], "stop_file": stop.to_string_lossy()}}));
+    let (code, _, err) = run(&["--no-daemon", "--url", url.as_str(), "flow", "--quiet", "home"]);
+    assert_eq!(code, 0, "{err}");
 }

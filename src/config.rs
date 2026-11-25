@@ -487,7 +487,7 @@ pub fn resolve_target(url_arg: Option<&str>, device_arg: Option<&str>, udid_arg:
     // The same resolution the identity check used (cached), so the transport can be
     // bound to exactly the addresses that were checked.
     if let Some(u) = t.url.as_deref() {
-        t.addrs = ids.addrs(u);
+        t.addrs = ids.addrs(u).unwrap_or_default();
     }
     t
 }

@@ -226,7 +226,8 @@ pub fn effective_allowlist(cfg: &Value, device_key: Option<&str>, env_value: Opt
 #[derive(Default)]
 pub struct EndpointIds {
     keys: std::collections::HashMap<String, (String, u16)>,
-    addrs: std::collections::HashMap<String, Vec<std::net::SocketAddr>>,
+    /// None: the lookup failed (an unknown identity, never "no addresses").
+    addrs: std::collections::HashMap<String, Option<Vec<std::net::SocketAddr>>>,
 }
 
 /// How the URL we connect to relates to a configured record's URL.
@@ -238,8 +239,11 @@ pub enum EndpointRel {
     /// Some but not all of our addresses belong to the record: we might reach that
     /// phone, or something else. Never assignable to one policy.
     Partial,
-    /// No address in common.
+    /// No address in common, or a different port (the transport connects to
+    /// `(address, port)`, so another port is another endpoint).
     Disjoint,
+    /// Same port, but a lookup failed: they might be the same endpoint.
+    Unknown,
 }
 
 impl EndpointIds {
@@ -257,15 +261,17 @@ impl EndpointIds {
             .clone()
     }
 
-    /// The socket addresses the transport may connect to for `url`, resolved once
-    /// (empty when unresolvable).
-    pub fn addrs(&mut self, url: &str) -> Vec<std::net::SocketAddr> {
+    /// The socket addresses the transport may connect to for `url`, resolved once.
+    /// None when the lookup fails or finds nothing: an unknown identity, which is
+    /// never taken as proof of a different endpoint.
+    pub fn addrs(&mut self, url: &str) -> Option<Vec<std::net::SocketAddr>> {
         if let Some(a) = self.addrs.get(url) {
             return a.clone();
         }
         use std::net::ToSocketAddrs;
         let (h, port) = crate::wda::parse_host_port(url.trim());
-        let a: Vec<std::net::SocketAddr> = (h.as_str(), port).to_socket_addrs().map(|i| i.collect()).unwrap_or_default();
+        let a: Option<Vec<std::net::SocketAddr>> =
+            (h.as_str(), port).to_socket_addrs().ok().map(|i| i.collect::<Vec<_>>()).filter(|v| !v.is_empty());
         self.addrs.insert(url.to_string(), a.clone());
         a
     }
@@ -273,15 +279,27 @@ impl EndpointIds {
     /// Test seam: what `url` "resolves" to.
     #[cfg(test)]
     pub fn preset(&mut self, url: &str, addrs: &[&str]) {
-        self.addrs.insert(url.to_string(), addrs.iter().map(|a| a.parse().unwrap()).collect());
+        self.addrs.insert(url.to_string(), Some(addrs.iter().map(|a| a.parse().unwrap()).collect()));
+    }
+
+    /// Test seam: `url`'s lookup fails.
+    #[cfg(test)]
+    pub fn preset_unresolved(&mut self, url: &str) {
+        self.addrs.insert(url.to_string(), None);
     }
 
     /// How connecting to `ours` relates to the record URL `theirs`.
     pub fn rel(&mut self, ours: &str, theirs: &str) -> EndpointRel {
-        if self.key(ours) == self.key(theirs) {
+        let (ko, kt) = (self.key(ours), self.key(theirs));
+        if ko == kt {
             return EndpointRel::Same;
         }
-        let (a, b) = (self.addrs(ours), self.addrs(theirs));
+        if ko.1 != kt.1 {
+            return EndpointRel::Disjoint;
+        }
+        let (Some(a), Some(b)) = (self.addrs(ours), self.addrs(theirs)) else {
+            return EndpointRel::Unknown;
+        };
         let shared = a.iter().filter(|x| b.contains(x)).count();
         if shared == 0 {
             EndpointRel::Disjoint
@@ -352,6 +370,11 @@ pub fn policy_device_with(
                             "{u} resolves to addresses of device '{k}' ({ru}) and to others, so the phone it reaches is not known"
                         ))
                     }
+                    EndpointRel::Unknown => {
+                        return Err(format!(
+                            "{u} cannot be told apart from device '{k}' ({ru}): a host name lookup failed, so it may be the same phone"
+                        ))
+                    }
                     EndpointRel::Disjoint => {}
                 }
             }
@@ -384,6 +407,11 @@ pub fn policy_device_with(
                     if ru != d {
                         return Err(format!("udid {d} contradicts device '{k}' at {u} (udid {ru})"));
                     }
+                }
+                // Even when the URL's record has no UDID: a UDID that another record
+                // owns names that other phone (and its stop file).
+                if let Some((owner, _)) = devices.iter().find(|(o, r)| o.as_str() != k && field(r, "udid").as_deref() == Some(d)) {
+                    return Err(format!("udid {d} is device '{owner}' in config.json, but {u} is device '{k}'"));
                 }
             }
             pick
