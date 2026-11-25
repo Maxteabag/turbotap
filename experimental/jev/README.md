@@ -23,7 +23,6 @@ Median time to first response body byte was 225.22 ms. Median time to validated 
 With basic Calculator already foreground in portrait and an unlocked device configured in TurboTap, run this from the parent Clarp session:
 
 ```sh
-cd /var/tmp/moonshot-1125/jev
 PYTHONPATH=src TYPESAFE_API_KEY="$(secret-tool lookup service typesafe)" python3 experimental/jev/parent_e2e.py
 ```
 

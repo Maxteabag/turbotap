@@ -1,5 +1,18 @@
 # Turbotap moonshot experiments
 
+## Reproducing the comparisons
+
+The [device measurements](../experimental/results/iphone17.jsonl) contain one JSON record per observation, keyed by series. The daemon, RapidOCR, and conditional JPEG series use their native grouped records. The [Jev receipts](../experimental/jev/) include the mapped synthetic choices. No image files are required to inspect the results.
+
+For the baseline, use a checkout of tag `v0.9.0` on the Python import path, an interpreter with TurboTap’s dependencies, an existing WDA session, and an unlocked iPhone showing Calculator. Set `WDA_URL` outside the shell history or use an existing environment. Run the profile scripts from the lab checkout. For example:
+
+```sh
+PYTHONPATH="$BASELINE/src" timeout 120 python experimental/profile_baseline.py
+PYTHONPATH="$BASELINE/src" timeout 120 python experimental/profile_calculator.py
+```
+
+The Rust, daemon, Jev and RapidOCR directories document separate prerequisites and commands. The Vision, fastFlow, conditional screenshot, and combined preflight studies require their respective WDA overlays. The lab fixture is static HTML served by an optional runner route. Select the device loopback URL for `FIXTURE_URL` when using it. Each script describes its expected app state. The numerical comparisons below apply to this device, software and workload.
+
 ## What the baseline measures
 
 Ten interleaved fresh-process trials per CLI operation on a real iPhone 17 running WDA Turbo v5 over Wi-Fi. The host ran the v0.9.0 Python source. OS filesystem caches and WDA session settings were warm. The primitive timings use an existing HTTP connection. Phase timings overlap or come from different requests and cannot be summed into a CLI latency. HTTP service times include the round trip.
@@ -24,7 +37,7 @@ Ten interleaved fresh-process trials per CLI operation on a real iPhone 17 runni
 
 ### MJPEG on idle Calculator
 
-Two open connections in an ABBA comparison. First frame median 132.22 ms (n=2), interframe median 102.62 ms (n=48), all 48 successive encoded frames byte-identical. Each unchanged frame still cost 98,743 bytes. Independent binary screenshot pulls measured 35.20 ms alone and 34.59 ms with the stream open (20 per arm). This acquisition cadence cannot establish post-action freshness. See stream.jsonl.
+Two open connections in an ABBA comparison. First frame median 132.22 ms (n=2), interframe median 102.62 ms (n=48), all 48 successive encoded frames byte-identical. Each unchanged frame still cost 98,743 bytes. Independent binary screenshot pulls measured 35.20 ms alone and 34.59 ms with the stream open (20 per arm). This acquisition cadence cannot establish post-action freshness. The MJPEG samples are in the `stream` series of the linked results.
 
 ### Synthetic Safari fixture attempt
 
@@ -207,7 +220,7 @@ Each request acquired a fresh JPEG. The conditional protocol sent the previous J
 | full | 20 | 16 | 1220111 | 243985 | 34.9 | 31.2 |
 | display | 20 | 19 | 62180 | 3109 | 18.3 | 18.2 |
 
-Display-region reference comparisons after three taps: {'detected': 3, 'missed': 0, 'unstable_reference': 0, 'unchanged_reference': 0}. The harness verified the final Calculator readout independently.
+All three taps changed the display region. Each conditional response matched both fresh reference images taken around it. The harness verified the final Calculator readout independently.
 
 ## Conventional model per turn
 
