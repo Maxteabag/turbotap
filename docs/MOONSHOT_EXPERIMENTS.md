@@ -74,3 +74,28 @@ Synthetic replay oracle 13/13; Jev 12/13 given correct key history at each check
 Serial host capture and tree, n=20, median 203.99 ms.
 
 Parallel host capture and tree, n=20, median 94.80 ms.
+
+## Apple Vision on iPhone 17
+
+Ten randomized repetitions per arm. Each recognition unit must be an exact digit centered within 22 points on each axis of the matching live Calculator accessibility key. The host uses Tesseract word boxes and Vision uses its observation boxes. Merged digit groups earn no individual hits. Host time includes fresh capture and OCR with warmed engines and a cleared strip cache. Vision wall time includes the HTTP round trip. The device timing columns report independent medians.
+
+| Arm | Median wall ms | Key hits / 100 | Capture ms | AX ms | Recognition ms | Response bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| fastOCR accurate | 218.8 | 60 | 112.4 | 0.0 | 95.2 | 3544.0 |
+| fastOCR fast | 140.6 | 0 | 110.7 | 0.0 | 22.0 | 1598.0 |
+| fastRead accurate | 303.2 | 60 | 106.0 | 74.6 | 105.4 | 6321.5 |
+| fastRead fast | 220.6 | 0 | 105.6 | 74.9 | 25.8 | 4375.0 |
+| host | 83.4 | 50 | — | — | — | — |
+
+## Paired CPU OCR engines
+
+Eight captures of Calculator were passed to both engines with the same grayscale pixels. Timing covers recognition only. The multilingual fixture was rendered locally. Each expected key or word counts once per image. Coverage omits false positives.
+
+| Scene | Engine | Covered | Median OCR ms |
+|---|---|---:|---:|
+| multilingual | tesseract | 16/96 | 42.03 |
+| multilingual | rapidocr | 32/96 | 520.37 |
+| calculator | tesseract | 16/80 | 55.16 |
+| calculator | rapidocr | 48/80 | 761.57 |
+
+RapidOCR improved exact coverage on both inputs. On Calculator its median added about 706 ms over Tesseract. The two device series used different frames and display state from the earlier scale sweep, so compare engines within the same series.
