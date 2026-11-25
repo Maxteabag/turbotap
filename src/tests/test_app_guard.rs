@@ -1243,3 +1243,72 @@ fn test_conflicting_identity_never_skips_the_target_stop_file() {
     assert_eq!(code, 0, "{err}");
     assert!(!a.calls().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Review round 4: the endpoint identity the transport actually uses
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_equivalent_endpoint_spellings_resolve_to_the_configured_device() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mock = MockWda::start(state_with_app(json!(OTHER)));
+    let e = cli_env(&mock.url, &[]);
+    let port = mock.port();
+    let stop = e.cfg.parent().unwrap().join("p.stop");
+    // No default device and no top-level policy: only the device record carries one.
+    let write_cfg = |extra: Option<(&str, String)>| {
+        let mut devices = json!({
+            "p": {"url": format!("http://127.0.0.1:{port}"), "allowed_apps": [ALLOWED], "stop_file": stop.to_string_lossy()},
+        });
+        if let Some((k, url)) = extra {
+            devices[k] = json!({"url": url, "allowed_apps": [OTHER]});
+        }
+        std::fs::write(&e.cfg, json!({"devices": devices}).to_string()).unwrap();
+    };
+    write_cfg(None);
+    let spellings = [
+        format!("http://127.0.0.1:{port}"),
+        format!("HTTP://127.0.0.1:{port}/"),
+        format!("http://127.0.0.1:0{port}"),
+        format!("http://127.1:{port}"),
+        format!("http://localhost:{port}/"),
+    ];
+    let run_with = |url: &str, cmd: &[&str]| {
+        let mut v = vec!["--no-daemon", "--url", url];
+        v.extend_from_slice(cmd);
+        run(&v)
+    };
+    // The device's stop file applies whatever the spelling: exit 6, zero WDA calls.
+    std::fs::write(&stop, "").unwrap();
+    for url in &spellings {
+        for cmd in [&["flow", "--no-deny", "tapxy:1,2"][..], &["flow", "home"][..], &["deploy", "--no-build"][..]] {
+            let (code, _, err) = run_with(url, cmd);
+            assert_eq!(code, crate::stop::STOP_EXIT, "{url} {cmd:?}: {err}");
+            assert!(err.contains("p.stop exists"), "{url} {cmd:?}: {err}");
+        }
+    }
+    assert!(mock.calls().is_empty(), "WDA contacted while stopped: {:?}", mock.paths());
+    // Without the stop file, the same callers get that device's allowlist.
+    std::fs::remove_file(&stop).unwrap();
+    for url in &spellings {
+        let (code, _, err) = run_with(url, &["flow", "--no-deny", "--quiet", "tapxy:1,2"]);
+        assert_eq!(code, 1, "{url}: {err}");
+        assert!(err.contains(&format!("not in allowlist [{ALLOWED}]")), "{url}: {err}");
+    }
+    assert!(input_posts(&mock).is_empty(), "{:?}", input_posts(&mock));
+    // A second record for the same endpoint under another spelling: ambiguous, so
+    // nothing acts on the phone (exit 6 before any WDA call).
+    write_cfg(Some(("q", format!("http://localhost:0{port}/"))));
+    let before = mock.calls().len();
+    for url in &spellings {
+        let (code, _, err) = run_with(url, &["flow", "--no-deny", "tapxy:1,2"]);
+        assert_eq!(code, crate::stop::STOP_EXIT, "{url}: {err}");
+        assert!(err.contains("device identity unresolved"), "{url}: {err}");
+    }
+    let (code, _, err) = run(&["--no-daemon", "--device", "p", "flow", "--no-deny", "tapxy:1,2"]);
+    assert_eq!(code, crate::stop::STOP_EXIT, "{err}");
+    assert!(err.contains("share the endpoint"), "{err}");
+    assert_eq!(mock.calls().len(), before);
+    assert!(mock.tapped_points().is_empty());
+}

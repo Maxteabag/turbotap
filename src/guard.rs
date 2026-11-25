@@ -219,8 +219,51 @@ pub fn effective_allowlist(cfg: &Value, device_key: Option<&str>, env_value: Opt
     Ok(out)
 }
 
-fn norm_url(u: &str) -> String {
-    u.trim().trim_end_matches('/').to_ascii_lowercase()
+/// Endpoint identity as the WDA transport sees it: the transport connects to
+/// `(host, port).to_socket_addrs()` of [`crate::wda::parse_host_port`], so two URLs
+/// are the same endpoint when their canonical `(host, port)` match (case, trailing
+/// dot, IP literal formatting, an omitted default port, a zero-padded port) or when
+/// they resolve to an overlapping socket address (`localhost` vs `127.0.0.1`,
+/// `127.1`). Lookups are cached per policy resolution.
+#[derive(Default)]
+pub struct EndpointIds {
+    keys: std::collections::HashMap<String, (String, u16)>,
+    addrs: std::collections::HashMap<String, Vec<std::net::SocketAddr>>,
+}
+
+impl EndpointIds {
+    /// Canonical `(host, port)` of `url`, exactly as the transport parses it.
+    pub fn key(&mut self, url: &str) -> (String, u16) {
+        self.keys
+            .entry(url.to_string())
+            .or_insert_with(|| {
+                let (h, port) = crate::wda::parse_host_port(url.trim());
+                let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
+                let h = h.parse::<std::net::IpAddr>().map(|ip| ip.to_string()).unwrap_or(h);
+                (h, port)
+            })
+            .clone()
+    }
+
+    /// Socket addresses the transport would try for `url` (empty when unresolvable).
+    fn addrs(&mut self, url: &str) -> Vec<std::net::SocketAddr> {
+        if let Some(a) = self.addrs.get(url) {
+            return a.clone();
+        }
+        use std::net::ToSocketAddrs;
+        let (h, port) = crate::wda::parse_host_port(url.trim());
+        let a: Vec<std::net::SocketAddr> = (h.as_str(), port).to_socket_addrs().map(|i| i.collect()).unwrap_or_default();
+        self.addrs.insert(url.to_string(), a.clone());
+        a
+    }
+
+    pub fn same(&mut self, a: &str, b: &str) -> bool {
+        if self.key(a) == self.key(b) {
+            return true;
+        }
+        let (aa, bb) = (self.addrs(a), self.addrs(b));
+        aa.iter().any(|x| bb.contains(x))
+    }
 }
 
 /// The config.json device whose policy governs this invocation: the device actually
@@ -228,12 +271,14 @@ fn norm_url(u: &str) -> String {
 ///
 /// Without a URL/UDID override the endpoint comes from the selected record, so that
 /// record is it. With an override (`--url`/`WDA_URL`, `--udid`/`WDA_UDID`), the
-/// selected record must match it (URL equal; UDID equal when the record has one);
-/// otherwise an implicitly selected default yields to the single configured device
-/// that does match. An explicit selection that conflicts, several matches, or a
-/// default device with an endpoint no record describes is an identity conflict
-/// (Err): input then fails closed. With no device selected and no match, the
-/// top-level policy applies (Ok(None)).
+/// selected record must match it (same endpoint per [`EndpointIds`]; UDID equal when
+/// the record has one); otherwise an implicitly selected default yields to the single
+/// configured device that does match. An explicit selection that conflicts, several
+/// matches, a default device with an endpoint no record describes, or the chosen
+/// device sharing its effective endpoint with another record (the transport cannot
+/// tell them apart) is an identity conflict (Err): input then fails closed. With no
+/// device selected and no record at that endpoint, the top-level policy applies
+/// (Ok(None)).
 pub fn policy_device(
     cfg: &Value,
     selected: Option<&str>,
@@ -244,47 +289,74 @@ pub fn policy_device(
     let empty = serde_json::Map::new();
     let devices = crate::json::get(cfg, "devices").as_object().unwrap_or(&empty);
     let sel = selected.filter(|k| devices.contains_key(*k));
-    if url_override.is_none() && udid_override.is_none() {
-        return Ok(sel.map(String::from));
-    }
     let field = |rec: &Value, k: &str| rec.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from);
-    let matches = |rec: &Value| {
-        let url_ok = url_override.is_none_or(|u| field(rec, "url").is_some_and(|ru| norm_url(&ru) == norm_url(u)));
-        let udid_ok = udid_override.is_none_or(|d| field(rec, "udid").is_none_or(|ru| ru == d.trim()));
-        url_ok && udid_ok
-    };
-    let endpoint = || {
-        let mut parts = Vec::new();
-        if let Some(u) = url_override {
-            parts.push(format!("url {u}"));
-        }
-        if let Some(d) = udid_override {
-            parts.push(format!("udid {d}"));
-        }
-        parts.join(", ")
-    };
-    if let Some(k) = sel {
-        if matches(&devices[k]) {
-            return Ok(Some(k.to_string()));
-        }
-        if selected_explicitly {
+    let ids = std::cell::RefCell::new(EndpointIds::default());
+    let same = |a: &str, b: &str| ids.borrow_mut().same(a, b);
+    let chosen: Option<String> = if url_override.is_none() && udid_override.is_none() {
+        sel.map(String::from)
+    } else {
+        let matches = |rec: &Value| {
+            let url_ok = url_override.is_none_or(|u| field(rec, "url").is_some_and(|ru| same(&ru, u)));
+            let udid_ok = udid_override.is_none_or(|d| field(rec, "udid").is_none_or(|ru| ru == d.trim()));
+            url_ok && udid_ok
+        };
+        let endpoint = || {
+            let mut parts = Vec::new();
+            if let Some(u) = url_override {
+                parts.push(format!("url {u}"));
+            }
+            if let Some(d) = udid_override {
+                parts.push(format!("udid {d}"));
+            }
+            parts.join(", ")
+        };
+        let sel_hit = sel.filter(|k| matches(&devices[*k]));
+        if let (Some(k), None, true) = (sel, sel_hit, selected_explicitly) {
             return Err(format!("device '{k}' in config.json does not match the endpoint ({})", endpoint()));
         }
+        match sel_hit {
+            Some(k) => Some(k.to_string()),
+            None => {
+                let hits: Vec<&String> = devices.iter().filter(|(_, rec)| matches(rec)).map(|(k, _)| k).collect();
+                match (hits.as_slice(), sel) {
+                    ([one], _) => Some((*one).clone()),
+                    ([], None) => None,
+                    ([], Some(k)) => {
+                        return Err(format!(
+                            "the endpoint ({}) is not device '{k}' nor any other device in config.json; pass --device or add it to config.json",
+                            endpoint()
+                        ))
+                    }
+                    (many, _) => {
+                        return Err(format!(
+                            "the endpoint ({}) matches several devices in config.json ({}); pass --device",
+                            endpoint(),
+                            many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        ))
+                    }
+                }
+            }
+        }
+    };
+    let Some(k) = chosen else {
+        return Ok(None);
+    };
+    // Several records at one effective endpoint describe a phone the transport cannot
+    // tell apart: whichever policy we picked could be the wrong one.
+    if let Some(eff) = url_override.map(String::from).or_else(|| field(&devices[&k], "url")) {
+        let others: Vec<&str> = devices
+            .iter()
+            .filter(|(o, rec)| o.as_str() != k && field(rec, "url").is_some_and(|u| same(&u, &eff)))
+            .map(|(o, _)| o.as_str())
+            .collect();
+        if !others.is_empty() {
+            return Err(format!(
+                "devices '{k}' and '{}' in config.json share the endpoint {eff}, so the phone cannot be told apart; give each its own WDA endpoint",
+                others.join("', '")
+            ));
+        }
     }
-    let hits: Vec<&String> = devices.iter().filter(|(_, rec)| matches(rec)).map(|(k, _)| k).collect();
-    match (hits.as_slice(), sel) {
-        ([one], _) => Ok(Some((*one).clone())),
-        ([], None) => Ok(None),
-        ([], Some(k)) => Err(format!(
-            "the endpoint ({}) is not device '{k}' nor any other device in config.json; pass --device or add it to config.json",
-            endpoint()
-        )),
-        (many, _) => Err(format!(
-            "the endpoint ({}) matches several devices in config.json ({}); pass --device",
-            endpoint(),
-            many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-        )),
-    }
+    Ok(Some(k))
 }
 
 /// [`effective_allowlist`] for `device_key` (the resolved target device, see
@@ -489,6 +561,33 @@ mod unit {
             "n": {"url": "http://10.0.0.4:8100"},
         }});
         assert!(policy_device(&cfg2, Some("a"), false, None, Some("UDID-B")).is_err());
+    }
+
+    #[test]
+    fn endpoint_identity_follows_the_transport() {
+        let mut ids = EndpointIds::default();
+        for (a, b) in [
+            ("http://10.0.0.1:8100", "HTTP://10.0.0.1:8100/"),
+            ("http://10.0.0.1:8100", "http://10.0.0.1:08100"),
+            ("http://10.0.0.1", "http://10.0.0.1:80/"),
+            ("http://[::1]:8100", "http://[0:0:0:0:0:0:0:1]:8100"),
+            ("http://Example.Invalid.:8100", "http://example.invalid:8100/x"),
+            ("http://127.0.0.1:8100", "http://127.1:8100"),
+            ("http://127.0.0.1:8100", "http://localhost:8100"),
+        ] {
+            assert!(ids.same(a, b), "{a} vs {b}");
+        }
+        for (a, b) in [("http://10.0.0.1:8100", "http://10.0.0.2:8100"), ("http://10.0.0.1:8100", "http://10.0.0.1:8101")] {
+            assert!(!ids.same(a, b), "{a} vs {b}");
+        }
+        // Two records for one endpoint: never resolved to either.
+        let cfg = json!({"devices": {
+            "a": {"url": "http://10.0.0.1:8100", "udid": "UDID-A"},
+            "b": {"url": "http://10.0.0.1:08100/", "udid": "UDID-B"},
+        }});
+        assert!(policy_device(&cfg, Some("a"), true, None, None).is_err());
+        assert!(policy_device(&cfg, None, false, Some("http://10.0.0.1:8100"), Some("UDID-A")).is_err());
+        assert!(policy_device(&cfg, None, false, Some("http://10.0.0.1:8100"), None).is_err());
     }
 
     #[test]
