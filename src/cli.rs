@@ -337,13 +337,19 @@ pub fn cmd_tree(client: &mut WdaClient) -> Result<()> {
     let res = client.req("GET", &client.spath("/wda/accessibleSource"), None, crate::wda::DEFAULT_TIMEOUT, None);
     let dt = (crate::clock::now() - t0) * 1000.0;
     let value = json::get(&res, "value");
-    let node = if json::truthy(value) { value.clone() } else { j!({}) };
+    let empty = j!({});
+    let node = if json::truthy(value) { value } else { &empty };
     let mut lines = Vec::new();
-    crate::ui::walk_accessible(&node, &mut lines, 0);
-    crate::outln!("# accessibleSource ({} items, {dt:.0} ms)", lines.len());
-    for line in lines {
-        crate::outln!("{line}");
+    crate::ui::walk_accessible(node, &mut lines, 0);
+    let cap: usize = lines.iter().map(|l| l.len() + 1).sum::<usize>() + 48;
+    let mut out = String::with_capacity(cap);
+    use std::fmt::Write;
+    let _ = writeln!(out, "# accessibleSource ({} items, {dt:.0} ms)", lines.len());
+    for line in &lines {
+        out.push_str(line);
+        out.push('\n');
     }
+    crate::out::print_out(&out);
     Ok(())
 }
 
