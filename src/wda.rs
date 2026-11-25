@@ -10,8 +10,11 @@
 use crate::clock;
 use crate::error::{Error, Result};
 use crate::json;
+use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{json as j, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -34,14 +37,18 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+const MAX_RETAINED_BODY_CAP: usize = 256 * 1024;
+
 /// A keep-alive HTTP/1.1 connection (Python `http.client.HTTPConnection`).
 pub struct Conn {
     pub host: String,
     pub port: u16,
     host_hdr: String,
     reader: Option<BufReader<TcpStream>>,
+    last_timeout: Option<Duration>,
     req_buf: Vec<u8>,
     line_buf: Vec<u8>,
+    body_buf: Vec<u8>,
 }
 
 impl Conn {
@@ -52,8 +59,10 @@ impl Conn {
             port,
             host_hdr,
             reader: None,
+            last_timeout: None,
             req_buf: Vec::with_capacity(512),
             line_buf: Vec::with_capacity(256),
+            body_buf: Vec::with_capacity(4096),
         }
     }
 
@@ -63,6 +72,7 @@ impl Conn {
 
     pub fn close(&mut self) {
         self.reader = None;
+        self.last_timeout = None;
     }
 
     pub fn connect(&mut self, timeout: f64) -> std::io::Result<()> {
@@ -74,6 +84,7 @@ impl Conn {
                     let _ = s.set_nodelay(true);
                     set_quickack(&s);
                     self.reader = Some(BufReader::with_capacity(64 * 1024, s));
+                    self.last_timeout = None;
                     return Ok(());
                 }
                 Err(e) => last_err = Some(e),
@@ -83,10 +94,14 @@ impl Conn {
     }
 
     pub fn set_timeout(&mut self, timeout: f64) {
+        let to = Duration::from_secs_f64(timeout.max(0.001));
+        if self.last_timeout == Some(to) {
+            return;
+        }
         if let Some(r) = self.reader.as_mut() {
-            let to = Some(Duration::from_secs_f64(timeout.max(0.001)));
-            let _ = r.get_mut().set_read_timeout(to);
-            let _ = r.get_mut().set_write_timeout(to);
+            let _ = r.get_mut().set_read_timeout(Some(to));
+            let _ = r.get_mut().set_write_timeout(Some(to));
+            self.last_timeout = Some(to);
         }
     }
 
@@ -119,14 +134,7 @@ impl Conn {
         self.request_inner(method, path, body, &slices, true)
     }
 
-    fn request_inner(
-        &mut self,
-        method: &str,
-        path: &str,
-        body: Option<&[u8]>,
-        headers: &[(&str, &str)],
-        collect_headers: bool,
-    ) -> std::io::Result<HttpResponse> {
+    fn write_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, headers: &[(&str, &str)]) -> std::io::Result<()> {
         let r = self
             .reader
             .as_mut()
@@ -168,11 +176,66 @@ impl Conn {
         // stalls when a keep-alive server (e.g. WDA/GCDAsyncSocket) writes response
         // headers and body in separate segments without TCP_NODELAY.
         set_quickack(r.get_ref());
-        let (resp, close) = read_response_into(r, method, &mut self.line_buf, collect_headers)?;
+        Ok(())
+    }
+
+    fn request_inner(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+        collect_headers: bool,
+    ) -> std::io::Result<HttpResponse> {
+        self.write_request(method, path, body, headers)?;
+        let r = self.reader.as_mut().expect("connected after write_request");
+        let mut resp_body = Vec::new();
+        let (status, resp_headers, close) =
+            read_response_into_buf(r, method, &mut self.line_buf, &mut resp_body, collect_headers)?;
         if close {
             self.reader = None;
+            self.last_timeout = None;
         }
-        Ok(resp)
+        Ok(HttpResponse { status, headers: resp_headers, body: resp_body })
+    }
+
+    /// Send a request and parse the response directly from a reusable scratch body buffer
+    /// (zero response `Vec<u8>` and header `HashMap` allocations on steady-state keep-alive).
+    fn request_borrowed<T, F>(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+        capture_err_body: bool,
+        mut parser: F,
+    ) -> std::io::Result<(u16, Option<T>, Option<String>)>
+    where
+        F: FnMut(&[u8]) -> std::result::Result<Option<T>, String>,
+    {
+        self.write_request(method, path, body, headers)?;
+        let r = self.reader.as_mut().expect("connected after write_request");
+        let (status, _, close) = read_response_into_buf(r, method, &mut self.line_buf, &mut self.body_buf, false)?;
+        if close {
+            self.reader = None;
+            self.last_timeout = None;
+        }
+        let result = if status < 400 {
+            let parsed = parser(&self.body_buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+            parsed.map(|p| (status, p, None))
+        } else {
+            let err_body = if capture_err_body {
+                let text = String::from_utf8_lossy(&self.body_buf);
+                Some(text.chars().take(400).collect())
+            } else {
+                None
+            };
+            Ok((status, None, err_body))
+        };
+        if self.body_buf.capacity() > MAX_RETAINED_BODY_CAP {
+            self.body_buf = Vec::with_capacity(4096);
+        }
+        result
     }
 }
 
@@ -341,12 +404,13 @@ fn parse_status_line(line: &[u8]) -> std::io::Result<u16> {
     parse_u16_ascii(&rest[..sp2]).ok_or_else(|| bad("bad status code"))
 }
 
-fn read_response_into(
+fn read_response_into_buf(
     r: &mut BufReader<TcpStream>,
     method: &str,
     line_buf: &mut Vec<u8>,
+    body: &mut Vec<u8>,
     collect_headers: bool,
-) -> std::io::Result<(HttpResponse, bool)> {
+) -> std::io::Result<(u16, HashMap<String, String>, bool)> {
     let mut status: u16;
     let mut headers: HashMap<String, String>;
     let mut chunked: bool;
@@ -393,7 +457,7 @@ fn read_response_into(
         break;
     }
     let no_body = method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 || (100..200).contains(&status);
-    let mut body = Vec::new();
+    body.clear();
     if !no_body {
         if chunked {
             loop {
@@ -424,18 +488,18 @@ fn read_response_into(
             if r.buffer().len() < len {
                 set_quickack(r.get_ref());
             }
-            body = vec![0u8; len];
-            r.read_exact(&mut body)?;
+            body.resize(len, 0);
+            r.read_exact(&mut body[..len])?;
         } else {
             set_quickack(r.get_ref());
-            r.read_to_end(&mut body)?;
+            r.read_to_end(body)?;
             conn_close = true;
             if collect_headers {
                 headers.insert("connection".into(), "close".into());
             }
         }
     }
-    Ok((HttpResponse { status, headers, body }, conn_close))
+    Ok((status, headers, conn_close))
 }
 
 /// `(host, port)` from a base URL such as `http://10.0.0.5:8100` or `http://[::1]:8100/`.
@@ -691,22 +755,23 @@ impl WdaClient {
         session_cache_path(&self.cache_dir, &self.base_url, &self.udid)
     }
 
-    fn load_session_cache_arc(&self) -> Arc<serde_json::Map<String, Value>> {
+    /// Shared read-only view of the validated on-disk session cache (zero `Map::clone`).
+    pub fn load_session_cache_arc(&self) -> Arc<serde_json::Map<String, Value>> {
         let path = self.session_cache_file();
-        let key = crate::skills::abspath(&path);
         let Ok(meta) = std::fs::metadata(&path) else {
-            remove_session_cache_entry(&key);
+            remove_session_cache_entry(&crate::skills::abspath(&path));
             return Arc::new(serde_json::Map::new());
         };
         let lookup_stamp = crate::config::FileStamp::from_meta(&path, &meta);
         {
             let guard = SESSION_CACHE.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = guard.as_ref().and_then(|c| c.get(&key)) {
+            if let Some(entry) = guard.as_ref().and_then(|c| c.get(&lookup_stamp.path)) {
                 if entry.stamp == lookup_stamp {
                     return entry.map.clone();
                 }
             }
         }
+        let key = lookup_stamp.path;
         let Ok((s, stable_stamp)) = crate::config::read_to_string_stamped(&path) else {
             remove_session_cache_entry(&key);
             return Arc::new(serde_json::Map::new());
@@ -747,7 +812,7 @@ impl WdaClient {
                 return;
             }
         }
-        let body = json::dumps(&Value::Object(cur.clone()));
+        let body = json::dumps_map(cur);
         let tmp = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
         if std::fs::write(&tmp, &body).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
@@ -758,16 +823,25 @@ impl WdaClient {
     }
 
     pub fn save_session_cache(&self, updates: serde_json::Map<String, Value>) {
-        let Some(sid) = self.sid.clone().filter(|s| !s.is_empty()) else { return };
-        let mut cur = self.load_session_cache();
-        if cur.get("base_url").and_then(|v| v.as_str()) != Some(self.base_url.as_str())
-            || cur.get("sid").and_then(|v| v.as_str()) != Some(sid.as_str())
+        let Some(sid) = self.sid.as_deref().filter(|s| !s.is_empty()) else { return };
+        let cur_arc = self.load_session_cache_arc();
+        let same_session = cur_arc.get("base_url").and_then(|v| v.as_str()) == Some(self.base_url.as_str())
+            && cur_arc.get("sid").and_then(|v| v.as_str()) == Some(sid);
+        if same_session
+            && cur_arc.get("udid").and_then(|v| v.as_str()) == Some(self.udid.as_str())
+            && updates.iter().all(|(k, v)| cur_arc.get(k) == Some(v))
         {
-            cur = serde_json::Map::new();
-            cur.insert("base_url".into(), j!(self.base_url));
-            cur.insert("udid".into(), j!(self.udid));
-            cur.insert("sid".into(), j!(sid));
+            return;
         }
+        let mut cur = if same_session {
+            (*cur_arc).clone()
+        } else {
+            let mut fresh = serde_json::Map::new();
+            fresh.insert("base_url".into(), j!(self.base_url));
+            fresh.insert("udid".into(), j!(self.udid));
+            fresh.insert("sid".into(), j!(sid));
+            fresh
+        };
         for (k, v) in updates {
             cur.insert(k, v);
         }
@@ -787,8 +861,10 @@ impl WdaClient {
                 remove_session_cache_entry(&key);
             }
             Some(f) => {
-                let mut cur = self.load_session_cache();
-                if cur.remove(f).is_some() {
+                let cur_arc = self.load_session_cache_arc();
+                if cur_arc.contains_key(f) {
+                    let mut cur = (*cur_arc).clone();
+                    cur.remove(f);
                     self.write_session_cache(&cur);
                 }
             }
@@ -809,11 +885,67 @@ impl WdaClient {
         Ok(())
     }
 
-    /// One attempt-pair of an HTTP exchange shared by [`req`](Self::req),
-    /// [`req_typed_with_deadline`](Self::req_typed_with_deadline), and
-    /// [`req_raw`](Self::req_raw). Returns `Err(message)` for transport failures
-    /// after the Python retry policy (reconnect once for GET/HEAD or provably unsent
-    /// writes), or `Ok(None)` when the deadline expired before sending.
+    /// Borrowed-body attempt-pair of an HTTP exchange for `req()` and typed GETs.
+    /// Reads the response body into `Conn::body_buf` (zero per-request response `Vec<u8>`
+    /// and header `HashMap` allocations on steady-state keep-alive).
+    fn exchange_borrowed<T, F>(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+        timeout: f64,
+        deadline: Option<f64>,
+        capture_err_body: bool,
+        mut parser: F,
+    ) -> std::result::Result<Option<(u16, Option<T>, Option<String>)>, String>
+    where
+        F: FnMut(&[u8]) -> std::result::Result<Option<T>, String>,
+    {
+        let idempotent = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+        for attempt in 0..2 {
+            let mut eff_timeout = timeout;
+            if let Some(d) = deadline {
+                let rem = d - clock::now();
+                if rem <= 0.0 {
+                    return Ok(None);
+                }
+                eff_timeout = timeout.min(rem).max(0.05);
+            }
+            let mut sent = false;
+            let res: std::io::Result<(u16, Option<T>, Option<String>)> = (|| {
+                self.ensure_conn(eff_timeout)?;
+                if let Some(d) = deadline {
+                    if clock::now() >= d {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "__deadline__"));
+                    }
+                }
+                sent = true;
+                self.conn
+                    .as_mut()
+                    .unwrap()
+                    .request_borrowed(method, path, body, headers, capture_err_body, &mut parser)
+            })();
+            match res {
+                Ok(r) => return Ok(Some(r)),
+                Err(e) if e.to_string() == "__deadline__" => return Ok(None),
+                Err(e) => {
+                    self.conn = None;
+                    if attempt == 1 || (sent && !idempotent) {
+                        let msg = match e.kind() {
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "timed out".to_string(),
+                            _ => py_os_error(&e),
+                        };
+                        return Err(msg);
+                    }
+                }
+            }
+        }
+        Err("request failed".into())
+    }
+
+    /// One attempt-pair of an HTTP exchange for callers needing owned response bytes/headers
+    /// (`req_raw`, `req_post_bytes`).
     fn exchange_with<T, F>(
         &mut self,
         method: &str,
@@ -881,15 +1013,13 @@ impl WdaClient {
     pub fn req(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>) -> Value {
         let body = data.map(|d| serde_json::to_vec(d).unwrap_or_default());
         let headers: &[(&str, &str)] = if data.is_some() { &[("Content-Type", "application/json")] } else { &[] };
-        match self.exchange_with(method, path, body.as_deref(), headers, timeout, deadline, false, |b| {
+        match self.exchange_borrowed(method, path, body.as_deref(), headers, timeout, deadline, true, |b| {
             serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
         }) {
             Ok(None) => json::deadline_value(),
-            Ok(Some((resp, parsed))) => {
-                if resp.status >= 400 {
-                    let text = String::from_utf8_lossy(&resp.body);
-                    let truncated: String = text.chars().take(400).collect();
-                    j!({"error": resp.status, "body": truncated})
+            Ok(Some((status, parsed, err_body))) => {
+                if status >= 400 {
+                    j!({"error": status, "body": err_body.unwrap_or_default()})
                 } else {
                     parsed.unwrap_or(Value::Null)
                 }
@@ -898,7 +1028,8 @@ impl WdaClient {
         }
     }
 
-    /// Typed GET request bypassing intermediate `serde_json::Value` (IndexMap) trees.
+    /// Typed GET request bypassing intermediate `serde_json::Value` (IndexMap) trees
+    /// and reusing `Conn::body_buf`.
     pub(crate) fn req_typed_with_deadline<T, F>(
         &mut self,
         method: &str,
@@ -920,13 +1051,13 @@ impl WdaClient {
                 timeout.min(rem).max(0.05)
             }
         };
-        match self.exchange_with(method, path, None, &[], eff, deadline, false, |b| {
+        match self.exchange_borrowed(method, path, None, &[], eff, deadline, false, |b| {
             parser(b).map(Some).map_err(|e| e.to_string())
         }) {
             Ok(None) => TypedHttpResult::DeadlineExceeded,
-            Ok(Some((resp, parsed))) => {
-                if resp.status >= 400 {
-                    TypedHttpResult::HttpError { status: resp.status }
+            Ok(Some((status, parsed, _))) => {
+                if status >= 400 {
+                    TypedHttpResult::HttpError { status }
                 } else {
                     TypedHttpResult::Ok(parsed.expect("parser returns Some on < 400"))
                 }
@@ -1094,17 +1225,910 @@ fn py_b64decode(s: &str) -> std::result::Result<Vec<u8>, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Fast typed serde deserializers for hot WDA metadata endpoints
+// (/status, /wda/fastPreflight, /wda/locked, /wda/activeAppInfo, /window/size)
+// ---------------------------------------------------------------------------
+
+struct BorrowedKey<'de>(Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for BorrowedKey<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = BorrowedKey<'de>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("string")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> std::result::Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Borrowed(v)))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Owned(v.to_string())))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Owned(v)))
+            }
+        }
+        deserializer.deserialize_str(V)
+    }
+}
+
+#[derive(Default)]
+struct OptStrField(Option<String>);
+
+impl<'de> Deserialize<'de> for OptStrField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptStrField;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("optional string")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(OptStrField(Some(v.to_string())))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(OptStrField(Some(v)))
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(OptStrField(None))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(OptStrField(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(OptStrField(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(OptStrField(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(OptStrField(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(OptStrField(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(OptStrField(None))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct TruthyField(bool);
+
+impl<'de> Deserialize<'de> for TruthyField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = TruthyField;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(TruthyField(false))
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<Self::Value, E> {
+                Ok(TruthyField(v))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(TruthyField(v != 0))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(TruthyField(v != 0))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                Ok(TruthyField(v != 0.0))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(TruthyField(!v.is_empty()))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut any = false;
+                while seq.next_element::<IgnoredAny>()?.is_some() {
+                    any = true;
+                }
+                Ok(TruthyField(any))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut any = false;
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
+                    any = true;
+                }
+                Ok(TruthyField(any))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct OptBoolField(Option<bool>);
+
+impl<'de> Deserialize<'de> for OptBoolField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptBoolField;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("optional bool")
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<Self::Value, E> {
+                Ok(OptBoolField(Some(v)))
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(OptBoolField(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(OptBoolField(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(OptBoolField(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(OptBoolField(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(OptBoolField(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(OptBoolField(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(OptBoolField(None))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// Typed `GET /status` response (avoids allocating nested `value` IndexMaps on the happy path).
+#[derive(Default)]
+struct RawStatusResp {
+    is_object: bool,
+    has_err: bool,
+    session_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for RawStatusResp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawStatusResp;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("status response")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = RawStatusResp { is_object: true, ..Default::default() };
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    match k.as_ref() {
+                        "sessionId" => out.session_id = map.next_value::<OptStrField>()?.0,
+                        "error" => out.has_err = map.next_value::<TruthyField>()?.0,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(RawStatusResp::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(RawStatusResp::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(RawStatusResp::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(RawStatusResp::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(RawStatusResp::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(RawStatusResp::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawStatusResp::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+enum StatusFetch {
+    Ok(Option<String>),
+    Err(Value),
+}
+
+/// Typed `GET /wda/locked` value (zero allocations; preserves exact `py_type_name` on malformed values).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+enum LockedVal {
+    #[default]
+    NoneType,
+    Bool(bool),
+    Other(&'static str),
+}
+
+impl<'de> Deserialize<'de> for LockedVal {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = LockedVal;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("locked value")
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(LockedVal::NoneType)
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<Self::Value, E> {
+                Ok(LockedVal::Bool(v))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(LockedVal::Other("int"))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(LockedVal::Other("int"))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(LockedVal::Other("float"))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(LockedVal::Other("str"))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(LockedVal::Other("list"))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(LockedVal::Other("dict"))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct RawLockedResp {
+    is_object: bool,
+    has_err: bool,
+    value: LockedVal,
+}
+
+impl<'de> Deserialize<'de> for RawLockedResp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawLockedResp;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("locked response")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = RawLockedResp { is_object: true, ..Default::default() };
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    match k.as_ref() {
+                        "value" => out.value = map.next_value()?,
+                        "error" => out.has_err = map.next_value::<TruthyField>()?.0,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(RawLockedResp::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(RawLockedResp::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(RawLockedResp::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(RawLockedResp::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(RawLockedResp::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(RawLockedResp::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawLockedResp::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// Typed `GET /wda/locked` returning `value` as `Value` (for stock preflight fallback, zero top-level IndexMap).
+#[derive(Default)]
+struct RawValueField(Value);
+
+impl<'de> Deserialize<'de> for RawValueField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawValueField;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("object with value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut val = Value::Null;
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    if k.as_ref() == "value" {
+                        val = map.next_value()?;
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(RawValueField(val))
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(RawValueField(Value::Null))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(RawValueField(Value::Null))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(RawValueField(Value::Null))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(RawValueField(Value::Null))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(RawValueField(Value::Null))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(RawValueField(Value::Null))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawValueField(Value::Null))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// Typed `GET /wda/activeAppInfo` response (extracts only `value.bundleId`, ignores `pid`/`name`/`processArguments`).
+#[derive(Default)]
+struct ActiveAppInner {
+    bundle_id: Value,
+}
+
+impl<'de> Deserialize<'de> for ActiveAppInner {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ActiveAppInner;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("activeAppInfo value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = ActiveAppInner::default();
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    if k.as_ref() == "bundleId" {
+                        out.bundle_id = map.next_value()?;
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(ActiveAppInner::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(ActiveAppInner::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(ActiveAppInner::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(ActiveAppInner::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(ActiveAppInner::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(ActiveAppInner::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ActiveAppInner::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct RawActiveAppResp {
+    is_object: bool,
+    has_err: bool,
+    bundle_id: Value,
+}
+
+impl<'de> Deserialize<'de> for RawActiveAppResp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawActiveAppResp;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("activeAppInfo response")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = RawActiveAppResp { is_object: true, ..Default::default() };
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    match k.as_ref() {
+                        "value" => out.bundle_id = map.next_value::<ActiveAppInner>()?.bundle_id,
+                        "error" => out.has_err = map.next_value::<TruthyField>()?.0,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(RawActiveAppResp::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(RawActiveAppResp::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(RawActiveAppResp::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(RawActiveAppResp::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(RawActiveAppResp::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(RawActiveAppResp::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawActiveAppResp::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// Typed `GET /session/{sid}/window/size` response (extracts only `value.width` and `value.height`).
+#[derive(Default)]
+struct WindowSizeInner {
+    width: Value,
+    height: Value,
+}
+
+impl<'de> Deserialize<'de> for WindowSizeInner {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = WindowSizeInner;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("window size value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = WindowSizeInner::default();
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    match k.as_ref() {
+                        "width" => out.width = map.next_value()?,
+                        "height" => out.height = map.next_value()?,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(WindowSizeInner::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(WindowSizeInner::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(WindowSizeInner::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(WindowSizeInner::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(WindowSizeInner::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(WindowSizeInner::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(WindowSizeInner::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct RawWindowSizeResp {
+    width: Value,
+    height: Value,
+}
+
+impl<'de> Deserialize<'de> for RawWindowSizeResp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawWindowSizeResp;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("window size response")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = RawWindowSizeResp::default();
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    if k.as_ref() == "value" {
+                        let inner = map.next_value::<WindowSizeInner>()?;
+                        out.width = inner.width;
+                        out.height = inner.height;
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(RawWindowSizeResp::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(RawWindowSizeResp::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(RawWindowSizeResp::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(RawWindowSizeResp::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(RawWindowSizeResp::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(RawWindowSizeResp::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawWindowSizeResp::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// Positive finite integral JSON number (preserves int vs float `serde_json::Number` representation).
+#[derive(Default)]
+struct OptPosIntegralNum(Option<serde_json::Number>);
+
+impl<'de> Deserialize<'de> for OptPosIntegralNum {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptPosIntegralNum;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("positive integral number")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(OptPosIntegralNum((v > 0).then(|| serde_json::Number::from(v))))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(OptPosIntegralNum((v > 0).then(|| serde_json::Number::from(v))))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                let num = (v.is_finite() && v.fract() == 0.0 && v > 0.0)
+                    .then(|| serde_json::Number::from_f64(v))
+                    .flatten();
+                Ok(OptPosIntegralNum(num))
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(OptPosIntegralNum(None))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(OptPosIntegralNum(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(OptPosIntegralNum(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(OptPosIntegralNum(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(OptPosIntegralNum(None))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct OptErrCodeField(Option<i64>);
+
+impl<'de> Deserialize<'de> for OptErrCodeField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptErrCodeField;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("optional integer error code")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(OptErrCodeField(Some(v)))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(OptErrCodeField(i64::try_from(v).ok()))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(OptErrCodeField(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(OptErrCodeField(None))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(OptErrCodeField(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(OptErrCodeField(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(OptErrCodeField(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(OptErrCodeField(None))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct RawPreflightSize {
+    is_object: bool,
+    width: Option<serde_json::Number>,
+    height: Option<serde_json::Number>,
+}
+
+impl<'de> Deserialize<'de> for RawPreflightSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawPreflightSize;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("preflight size object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = RawPreflightSize { is_object: true, ..Default::default() };
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    match k.as_ref() {
+                        "width" => out.width = map.next_value::<OptPosIntegralNum>()?.0,
+                        "height" => out.height = map.next_value::<OptPosIntegralNum>()?.0,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightSize::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightSize::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightSize::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightSize::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightSize::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightSize::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawPreflightSize::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct RawPreflightVal {
+    is_object: bool,
+    unsupported_err: bool,
+    locked: Option<bool>,
+    bundle_id: Option<String>,
+    size: RawPreflightSize,
+}
+
+impl<'de> Deserialize<'de> for RawPreflightVal {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawPreflightVal;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("fastPreflight value object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = RawPreflightVal { is_object: true, ..Default::default() };
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    match k.as_ref() {
+                        "locked" => out.locked = map.next_value::<OptBoolField>()?.0,
+                        "bundleId" => out.bundle_id = map.next_value::<OptStrField>()?.0,
+                        "size" => out.size = map.next_value()?,
+                        "error" => {
+                            let s = map.next_value::<OptStrField>()?.0;
+                            out.unsupported_err = s.as_deref().is_some_and(|e| UNSUPPORTED_ROUTE_ERRORS.contains(&e));
+                        }
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightVal::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightVal::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightVal::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightVal::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightVal::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(RawPreflightVal::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawPreflightVal::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct RawFastPreflightResp {
+    is_object: bool,
+    has_err_key: bool,
+    err_code: Option<i64>,
+    value: RawPreflightVal,
+}
+
+impl<'de> Deserialize<'de> for RawFastPreflightResp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawFastPreflightResp;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("fastPreflight response")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = RawFastPreflightResp { is_object: true, ..Default::default() };
+                while let Some(BorrowedKey(k)) = map.next_key::<BorrowedKey<'de>>()? {
+                    match k.as_ref() {
+                        "error" => {
+                            out.has_err_key = true;
+                            out.err_code = map.next_value::<OptErrCodeField>()?.0;
+                        }
+                        "value" => out.value = map.next_value()?,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(RawFastPreflightResp::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+                Ok(RawFastPreflightResp::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(RawFastPreflightResp::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(RawFastPreflightResp::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(RawFastPreflightResp::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+                Ok(RawFastPreflightResp::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawFastPreflightResp::default())
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
 fn sid_is_set(sid: &Option<String>) -> bool {
     sid.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
 }
 
 impl WdaClient {
+    fn fetch_status_typed(&mut self, timeout: f64) -> StatusFetch {
+        match self.exchange_borrowed("GET", "/status", None, &[], timeout, None, true, |b| {
+            let parsed: RawStatusResp = serde_json::from_slice(b).map_err(|e| e.to_string())?;
+            if parsed.is_object && !parsed.has_err {
+                Ok(Some(StatusFetch::Ok(parsed.session_id)))
+            } else {
+                let v: Value = serde_json::from_slice(b).map_err(|e| e.to_string())?;
+                if json::has_err(&v) {
+                    Ok(Some(StatusFetch::Err(v)))
+                } else {
+                    Ok(Some(StatusFetch::Ok(json::get(&v, "sessionId").as_str().map(String::from))))
+                }
+            }
+        }) {
+            Ok(None) => StatusFetch::Err(json::deadline_value()),
+            Ok(Some((status, parsed, err_body))) => {
+                if status >= 400 {
+                    StatusFetch::Err(j!({"error": status, "body": err_body.unwrap_or_default()}))
+                } else {
+                    parsed.unwrap_or(StatusFetch::Ok(None))
+                }
+            }
+            Err(msg) => StatusFetch::Err(json::error_value(msg)),
+        }
+    }
+
+    fn is_unlocked_fast(&mut self) -> bool {
+        matches!(
+            self.req_typed_with_deadline("GET", "/wda/locked", DEFAULT_TIMEOUT, None, |b| {
+                serde_json::from_slice::<RawLockedResp>(b)
+            }),
+            TypedHttpResult::Ok(RawLockedResp { is_object: true, has_err: false, value: LockedVal::Bool(false) })
+        )
+    }
+
     /// Python `ensure_session` (L485-527): /status (ping + restart WDA on the Mac when
     /// unreachable), create a session if needed, apply fast `/appium/settings` once
     /// per session per [`crate::config::SESSION_SETTINGS_TTL`].
     pub fn ensure_session(&mut self, bundle_id: Option<&str>, apply_fast_settings: bool) -> Result<Option<String>> {
-        let mut st = self.req("GET", "/status", None, 4.0, None);
-        if json::has_err(&st) {
+        let mut st = self.fetch_status_typed(4.0);
+        if matches!(st, StatusFetch::Err(_)) {
             // Wake idle iOS Wi-Fi with one ICMP ping before assuming WDA died.
             let (host, _) = parse_host_port(&self.base_url);
             if !host.is_empty() {
@@ -1115,18 +2139,21 @@ impl WdaClient {
                     .stderr(std::process::Stdio::null())
                     .status()
                     .map_err(|e| Error::Os(format!("{}: 'ping'", py_os_error(&e))))?;
-                st = self.req("GET", "/status", None, 6.0, None);
+                st = self.fetch_status_typed(6.0);
             }
         }
-        if json::has_err(&st) {
+        if matches!(st, StatusFetch::Err(_)) {
             crate::errln!("WDA not responding; restarting WebDriverAgentRunner on the Mac host...");
             self.start_wda_on_mac(false)?;
-            st = self.req("GET", "/status", None, 8.0, None);
-            if json::has_err(&st) {
-                return Err(Error::runtime(format!("WDA unreachable at {}: {}", self.base_url, json::py_repr(&st))));
+            st = self.fetch_status_typed(8.0);
+            if let StatusFetch::Err(err_val) = st {
+                return Err(Error::runtime(format!("WDA unreachable at {}: {}", self.base_url, json::py_repr(&err_val))));
             }
         }
-        self.sid = json::get(&st, "sessionId").as_str().map(String::from);
+        self.sid = match st {
+            StatusFetch::Ok(sid) => sid,
+            StatusFetch::Err(_) => None,
+        };
         if !sid_is_set(&self.sid) {
             let caps = match bundle_id.filter(|b| !b.is_empty()) {
                 Some(b) => j!({"alwaysMatch": {"bundleId": b}}),
@@ -1482,15 +2509,16 @@ impl WdaClient {
     pub fn confirm_locked_state(&mut self, retries: u32) -> Result<bool> {
         let mut last_err = "unknown error".to_string();
         for attempt in 0..=retries {
-            let r = self.get("/wda/locked");
-            if r.is_object() && !json::has_err(&r) {
-                match json::get(&r, "value") {
-                    Value::Bool(true) => return Ok(true),
-                    Value::Bool(false) => return Ok(false),
-                    other => last_err = format!("malformed /wda/locked value ({})", py_type_name(other)),
-                }
-            } else {
-                last_err = "error querying /wda/locked".to_string();
+            match self.req_typed_with_deadline("GET", "/wda/locked", DEFAULT_TIMEOUT, None, |b| {
+                serde_json::from_slice::<RawLockedResp>(b)
+            }) {
+                TypedHttpResult::Ok(RawLockedResp { is_object: true, has_err: false, value }) => match value {
+                    LockedVal::Bool(true) => return Ok(true),
+                    LockedVal::Bool(false) => return Ok(false),
+                    LockedVal::NoneType => last_err = "malformed /wda/locked value (NoneType)".to_string(),
+                    LockedVal::Other(tn) => last_err = format!("malformed /wda/locked value ({tn})"),
+                },
+                _ => last_err = "error querying /wda/locked".to_string(),
             }
             if attempt < retries {
                 clock::sleep(0.08);
@@ -1503,15 +2531,14 @@ impl WdaClient {
     /// locked=true from `/wda/locked` as the FINAL read. Ok(false) when explicitly
     /// unlocked; a redacted RuntimeError if SpringBoard cannot be confirmed.
     pub fn confirm_springboard_locked(&mut self, retries: u32) -> Result<bool> {
-        let app_r = self.get("/wda/activeAppInfo");
         let mut active_bid = String::new();
-        if app_r.is_object() && !json::has_err(&app_r) {
-            let val = json::get(&app_r, "value");
-            if val.is_object() {
-                let b = json::get(val, "bundleId");
-                if json::truthy(b) {
-                    active_bid = json::py_str(b);
-                }
+        if let TypedHttpResult::Ok(RawActiveAppResp { is_object: true, has_err: false, bundle_id }) = self
+            .req_typed_with_deadline("GET", "/wda/activeAppInfo", DEFAULT_TIMEOUT, None, |b| {
+                serde_json::from_slice::<RawActiveAppResp>(b)
+            })
+        {
+            if json::truthy(&bundle_id) {
+                active_bid = json::py_str(&bundle_id);
             }
         }
         // Final read is always /wda/locked so Face ID unlocking during activeAppInfo
@@ -1578,8 +2605,7 @@ impl WdaClient {
                     None if self.fast_ui == Some(false) => break,
                     _ => {}
                 }
-                let r_lk = self.get("/wda/locked");
-                if r_lk.is_object() && !json::has_err(&r_lk) && json::get(&r_lk, "value") == &Value::Bool(false) {
+                if self.is_unlocked_fast() {
                     return Ok(true);
                 }
                 let eff_elapsed = (clock::now() - t0).max(virtual_elapsed);
@@ -1640,8 +2666,7 @@ impl WdaClient {
         let mut v_virtual = 0.0_f64;
         let v_max = 1.2;
         loop {
-            let r_v = self.get("/wda/locked");
-            if r_v.is_object() && !json::has_err(&r_v) && json::get(&r_v, "value") == &Value::Bool(false) {
+            if self.is_unlocked_fast() {
                 return Ok(true);
             }
             let eff = (clock::now() - v_t0).max(v_virtual);
@@ -1699,10 +2724,7 @@ pub fn is_unsupported_route(res: &Value) -> bool {
     }
 }
 
-/// L950-983: `(locked, bundleId, size)` from one wda-turbo v6 `GET
-/// /wda/fastPreflight`, or None so the caller re-reads all three with the stock
-/// endpoints. A definitively missing route is remembered for this WDA session.
-pub fn fast_preflight(client: &mut WdaClient, sid: &str) -> Option<(bool, String, Value)> {
+fn fast_preflight_typed(client: &mut WdaClient, sid: &str) -> Option<(bool, String, serde_json::Number, serde_json::Number)> {
     let cached = client.load_session_cache_arc();
     if cached.get("base_url").and_then(Value::as_str) == Some(client.base_url.as_str())
         && cached.get("sid").and_then(Value::as_str) == Some(sid)
@@ -1710,48 +2732,44 @@ pub fn fast_preflight(client: &mut WdaClient, sid: &str) -> Option<(bool, String
     {
         return None;
     }
-    let response = client.get(&format!("/session/{sid}/wda/fastPreflight"));
-    if is_unsupported_route(&response) {
-        let mut upd = serde_json::Map::new();
-        upd.insert("fast_preflight".into(), Value::Bool(false));
-        client.save_session_cache(upd);
-        return None;
-    }
-    if !response.is_object() || json::has_err_key(&response) {
-        return None;
-    }
-    let value = json::get(&response, "value");
-    let locked = match json::get(value, "locked") {
-        Value::Bool(b) if value.is_object() => *b,
-        _ => return None,
-    };
-    let size = json::get(value, "size");
-    let bundle = match json::get(value, "bundleId") {
-        Value::String(s) if !s.trim().is_empty() => s.clone(),
-        _ => return None,
-    };
-    if !size.is_object() {
-        return None;
-    }
-    for key in ["width", "height"] {
-        // WDA reads an integral rectangle; orientation may swap the axes.
-        let Value::Number(n) = json::get(size, key) else { return None };
-        let f = if let Some(i) = n.as_i64() {
-            i as f64
-        } else if let Some(u) = n.as_u64() {
-            u as f64
-        } else {
-            let f = n.as_f64()?;
-            if !f.is_finite() || f.fract() != 0.0 {
+    let path = format!("/session/{sid}/wda/fastPreflight");
+    match client.req_typed_with_deadline("GET", &path, DEFAULT_TIMEOUT, None, |b| {
+        serde_json::from_slice::<RawFastPreflightResp>(b)
+    }) {
+        TypedHttpResult::HttpError { status } if UNSUPPORTED_ROUTE_STATUS.contains(&(status as i64)) => {
+            let mut upd = serde_json::Map::new();
+            upd.insert("fast_preflight".into(), Value::Bool(false));
+            client.save_session_cache(upd);
+            None
+        }
+        TypedHttpResult::Ok(resp) => {
+            let unsupported = resp.err_code.is_some_and(|c| UNSUPPORTED_ROUTE_STATUS.contains(&c))
+                || resp.value.unsupported_err;
+            if unsupported {
+                let mut upd = serde_json::Map::new();
+                upd.insert("fast_preflight".into(), Value::Bool(false));
+                client.save_session_cache(upd);
                 return None;
             }
-            f
-        };
-        if f <= 0.0 {
-            return None;
+            if !resp.is_object || resp.has_err_key || !resp.value.is_object || !resp.value.size.is_object {
+                return None;
+            }
+            let locked = resp.value.locked?;
+            let bundle = resp.value.bundle_id.filter(|s| !s.trim().is_empty())?;
+            let width = resp.value.size.width?;
+            let height = resp.value.size.height?;
+            Some((locked, bundle, width, height))
         }
+        _ => None,
     }
-    Some((locked, bundle, size.clone()))
+}
+
+/// L950-983: `(locked, bundleId, size)` from one wda-turbo v6 `GET
+/// /wda/fastPreflight`, or None so the caller re-reads all three with the stock
+/// endpoints. A definitively missing route is remembered for this WDA session.
+pub fn fast_preflight(client: &mut WdaClient, sid: &str) -> Option<(bool, String, Value)> {
+    let (locked, bundle, w, h) = fast_preflight_typed(client, sid)?;
+    Some((locked, bundle, j!({"width": Value::Number(w), "height": Value::Number(h)})))
 }
 
 /// The preflight JSON object (Python `cmd_preflight` without the print), so tests
@@ -1762,24 +2780,37 @@ pub fn preflight_value(client: &mut WdaClient, stock: bool) -> Result<Value> {
     let mut snapshot = None;
     if let Some(s) = sid.as_deref().filter(|s| !s.is_empty()) {
         if !stock && client.turbo != Some(false) {
-            snapshot = fast_preflight(client, s);
+            snapshot = fast_preflight_typed(client, s);
         }
     }
-    let (locked, app, sz) = match snapshot {
-        Some((locked, app, sz)) => (Value::Bool(locked), Value::String(app), sz),
+    let (locked, app, w, h) = match snapshot {
+        Some((locked, app, w, h)) => (Value::Bool(locked), Value::String(app), Value::Number(w), Value::Number(h)),
         None => {
-            let locked = json::get(&client.get("/wda/locked"), "value").clone();
-            let app = json::get(json::get(&client.get("/wda/activeAppInfo"), "value"), "bundleId").clone();
-            let sid_s = sid.clone().unwrap_or_else(|| "None".to_string());
-            let r = client.get(&format!("/session/{sid_s}/window/size"));
-            let v = json::get(&r, "value");
-            let sz = if json::truthy(v) { v.clone() } else { j!({}) };
-            (locked, app, sz)
+            let locked = match client.req_typed_with_deadline("GET", "/wda/locked", DEFAULT_TIMEOUT, None, |b| {
+                serde_json::from_slice::<RawValueField>(b)
+            }) {
+                TypedHttpResult::Ok(RawValueField(v)) => v,
+                _ => Value::Null,
+            };
+            let app = match client.req_typed_with_deadline("GET", "/wda/activeAppInfo", DEFAULT_TIMEOUT, None, |b| {
+                serde_json::from_slice::<RawActiveAppResp>(b)
+            }) {
+                TypedHttpResult::Ok(r) => r.bundle_id,
+                _ => Value::Null,
+            };
+            let sid_s = sid.as_deref().unwrap_or("None");
+            let ws_path = format!("/session/{sid_s}/window/size");
+            let (w, h) = match client.req_typed_with_deadline("GET", &ws_path, DEFAULT_TIMEOUT, None, |b| {
+                serde_json::from_slice::<RawWindowSizeResp>(b)
+            }) {
+                TypedHttpResult::Ok(r) => (r.width, r.height),
+                _ => (Value::Null, Value::Null),
+            };
+            (locked, app, w, h)
         }
     };
-    let (w, h) = (json::get(&sz, "width"), json::get(&sz, "height"));
-    if json::truthy(w) && json::truthy(h) {
-        if let (Some(wi), Some(hi)) = (py_int(w), py_int(h)) {
+    if json::truthy(&w) && json::truthy(&h) {
+        if let (Some(wi), Some(hi)) = (py_int(&w), py_int(&h)) {
             let mut upd = serde_json::Map::new();
             upd.insert("screen_pt".into(), j!([wi, hi]));
             client.save_session_cache(upd);
@@ -1792,7 +2823,7 @@ pub fn preflight_value(client: &mut WdaClient, stock: bool) -> Result<Value> {
         "session_id": sid,
         "locked": locked,
         "active_app": app,
-        "screen_pt": [w.clone(), h.clone()],
+        "screen_pt": [w, h],
         "elapsed_ms": json::round_to(dt, 1),
     }))
 }
@@ -1974,6 +3005,30 @@ mod transport_tests {
         assert!(Arc::ptr_eq(&m1, &m2), "unchanged session cache file should reuse Arc");
         assert_eq!(m1.get("screen_pt"), Some(&j!([430, 932])));
 
+        // Saving identical values skips redundant disk rewrite and keeps validated Arc.
+        let mut same_upd = serde_json::Map::new();
+        same_upd.insert("screen_pt".into(), j!([430, 932]));
+        c.save_session_cache(same_upd);
+        let m2b = c.load_session_cache_arc();
+        assert!(Arc::ptr_eq(&m1, &m2b), "no-op save_session_cache should not rewrite or evict");
+
+        // Saving a changed value writes to disk and invalidates cache entry.
+        let mut diff_upd = serde_json::Map::new();
+        diff_upd.insert("screen_pt".into(), j!([390, 844]));
+        c.save_session_cache(diff_upd);
+        assert!(
+            SESSION_CACHE
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .is_none(),
+            "changed save_session_cache must invalidate cache entry"
+        );
+        let m2c = c.load_session_cache_arc();
+        assert!(!Arc::ptr_eq(&m1, &m2c));
+        assert_eq!(m2c.get("screen_pt"), Some(&j!([390, 844])));
+
         // External in-place overwrite with identical inode, length, and nanosecond mtime invalidates cache.
         let path = c.session_cache_file();
         let body_a = r#"{"base_url":"http://127.0.0.1:8100","sid":"sid-1","screen_pt":[390,844],"extra":true}"#;
@@ -2015,5 +3070,63 @@ mod transport_tests {
         assert_eq!(c.load_session_cache_arc().get("settings_applied"), Some(&j!(true)));
         c.invalidate_session_cache(None);
         assert!(c.load_session_cache().is_empty());
+    }
+
+    #[test]
+    fn typed_wda_metadata_parsers_match_edge_cases() {
+        // /status with extra nested fields and error key
+        let st: RawStatusResp = serde_json::from_slice(
+            br#"{"sessionId":"s1","value":{"ready":true,"os":{"version":"18.2"}}}"#,
+        )
+        .unwrap();
+        assert!(st.is_object && !st.has_err);
+        assert_eq!(st.session_id.as_deref(), Some("s1"));
+        let st_non_obj: RawStatusResp = serde_json::from_slice(br#"[1,2,3]"#).unwrap();
+        assert!(!st_non_obj.is_object);
+
+        // /wda/locked strict bool vs non-bool vs error
+        let lk: RawLockedResp = serde_json::from_slice(br#"{"value":true,"sessionId":"s1"}"#).unwrap();
+        assert_eq!(lk.value, LockedVal::Bool(true));
+        let lk_str: RawLockedResp = serde_json::from_slice(br#"{"value":"true"}"#).unwrap();
+        assert_eq!(lk_str.value, LockedVal::Other("str"));
+        let lk_err: RawLockedResp = serde_json::from_slice(br#"{"error":500,"value":false}"#).unwrap();
+        assert!(lk_err.has_err);
+
+        // /wda/fastPreflight preserves float vs integer JSON number representations
+        let fp: RawFastPreflightResp = serde_json::from_slice(
+            br#"{"value":{"locked":false,"bundleId":"com.apple.Preferences","size":{"width":812.0,"height":375}}}"#,
+        )
+        .unwrap();
+        assert!(fp.is_object && !fp.has_err_key && fp.value.is_object && fp.value.size.is_object);
+        assert_eq!(fp.value.locked, Some(false));
+        assert_eq!(fp.value.bundle_id.as_deref(), Some("com.apple.Preferences"));
+        assert!(fp.value.size.width.as_ref().unwrap().is_f64());
+        assert_eq!(fp.value.size.width.as_ref().unwrap().as_f64(), Some(812.0));
+        assert_eq!(fp.value.size.height.as_ref().unwrap().as_i64(), Some(375));
+
+        // Fractional / non-positive / boolean sizes rejected cleanly
+        let fp_bad: RawFastPreflightResp = serde_json::from_slice(
+            br#"{"value":{"locked":false,"bundleId":"com.apple.Preferences","size":{"width":812.5,"height":true}}}"#,
+        )
+        .unwrap();
+        assert!(fp_bad.value.size.width.is_none());
+        assert!(fp_bad.value.size.height.is_none());
+
+        // Unsupported route error code & value.error string detection
+        let fp_404: RawFastPreflightResp =
+            serde_json::from_slice(br#"{"error":404,"value":{"error":"unknown command"}}"#).unwrap();
+        assert_eq!(fp_404.err_code, Some(404));
+        assert!(fp_404.value.unsupported_err);
+
+        // /wda/activeAppInfo and /window/size
+        let app: RawActiveAppResp = serde_json::from_slice(
+            br#"{"value":{"pid":123,"bundleId":"com.apple.springboard","name":"SpringBoard"}}"#,
+        )
+        .unwrap();
+        assert_eq!(app.bundle_id, j!("com.apple.springboard"));
+        let ws: RawWindowSizeResp =
+            serde_json::from_slice(br#"{"value":{"width":430,"height":932}}"#).unwrap();
+        assert_eq!(ws.width, j!(430));
+        assert_eq!(ws.height, j!(932));
     }
 }

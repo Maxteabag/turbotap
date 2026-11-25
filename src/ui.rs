@@ -1814,7 +1814,7 @@ pub fn strip_alert_meta(mut ctl: Vec<Control>) -> Vec<Control> {
 
 pub fn is_springboard_ui(app_name: &str, bundle_id: &str) -> bool {
     bundle_id == crate::wda::SPRINGBOARD
-        || (bundle_id.is_empty() && crate::text::casefold(app_name.trim()) == "springboard")
+        || (bundle_id.is_empty() && app_name.trim().eq_ignore_ascii_case("springboard"))
 }
 
 
@@ -2021,6 +2021,29 @@ pub fn parse_switch_state(val: &Value) -> Option<bool> {
     match val {
         Value::Null => None,
         Value::Bool(b) => Some(*b),
+        Value::Number(n) if !n.is_f64() => match n.as_i64() {
+            Some(1) => Some(true),
+            Some(0) => Some(false),
+            _ => None,
+        },
+        Value::String(s) if s.is_ascii() => {
+            let t = s.trim();
+            if t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("on")
+                || t.eq_ignore_ascii_case("yes")
+            {
+                Some(true)
+            } else if t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("off")
+                || t.eq_ignore_ascii_case("no")
+            {
+                Some(false)
+            } else {
+                None
+            }
+        }
         _ => match casefold(&clean_text(&json::py_str(val))).as_str() {
             "1" | "true" | "on" | "yes" => Some(true),
             "0" | "false" | "off" | "no" => Some(false),
@@ -2035,6 +2058,10 @@ pub fn is_wda_disabled_value(val: &Value) -> bool {
         Value::Null => false,
         Value::Bool(b) => !b,
         Value::Number(n) => n.as_f64() == Some(0.0),
+        Value::String(s) if s.is_ascii() => {
+            let t = s.trim();
+            t.eq_ignore_ascii_case("0") || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("no")
+        }
         _ => matches!(casefold(json::py_str(val).trim()).as_str(), "0" | "false" | "no"),
     }
 }
