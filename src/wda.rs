@@ -108,6 +108,9 @@ impl Conn {
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept-Encoding: identity\r\n");
         if let Some(b) = body {
             head.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        } else if ["POST", "PUT", "PATCH"].iter().any(|m| method.eq_ignore_ascii_case(m)) {
+            // http.client sends an explicit zero length for body-carrying methods.
+            head.push_str("Content-Length: 0\r\n");
         }
         for (k, v) in headers {
             head.push_str(k);
@@ -285,6 +288,11 @@ pub fn pool_enabled() -> bool {
 /// Number of idle pooled connections (tests/diagnostics).
 pub fn pool_len() -> usize {
     POOL.lock().unwrap().as_ref().map(|m| m.values().map(Vec::len).sum()).unwrap_or(0)
+}
+
+/// Idle pooled connections for one `(host, port)` (tests/diagnostics).
+pub fn pool_len_for(host: &str, port: u16) -> usize {
+    POOL.lock().unwrap().as_ref().and_then(|m| m.get(&(host.to_string(), port)).map(Vec::len)).unwrap_or(0)
 }
 
 /// Close every pooled connection but keep pooling enabled.
@@ -570,7 +578,7 @@ impl WdaClient {
                     if attempt == 1 || (sent && !idempotent) {
                         let msg = match e.kind() {
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "timed out".to_string(),
-                            _ => e.to_string(),
+                            _ => py_os_error(&e),
                         };
                         return Err(msg);
                     }
@@ -669,16 +677,133 @@ impl WdaClient {
 }
 
 // ---------------------------------------------------------------------------
-// Session, fast routes and fallbacks (cli.py L485-931): to be ported
+// Session, fast routes and fallbacks (cli.py L485-931)
 // ---------------------------------------------------------------------------
+
+/// Python `type(v).__name__` for a JSON value.
+fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// Python `float(x or 0)` for a cached timestamp (unparseable -> 0.0).
+fn py_float_or_zero(v: &Value) -> f64 {
+    if !json::truthy(v) {
+        return 0.0;
+    }
+    match v {
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::Bool(b) => f64::from(u8::from(*b)),
+        Value::String(s) => s.trim().parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Python `int(x)` for a JSON number (floats truncate toward zero).
+fn py_int(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f.trunc() as i64)),
+        Value::Bool(b) => Some(i64::from(*b)),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Python `str(OSError)` style: `[Errno N] <strerror>` for OS errors.
+fn py_os_error(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(n) => {
+            let s = e.to_string();
+            let desc = s.strip_suffix(&format!(" (os error {n})")).unwrap_or(&s);
+            format!("[Errno {n}] {desc}")
+        }
+        None => e.to_string(),
+    }
+}
+
+/// Python `base64.b64decode(s)` (non-validating: characters outside the alphabet
+/// are discarded before decoding).
+fn py_b64decode(s: &str) -> std::result::Result<Vec<u8>, String> {
+    use base64::Engine;
+    let clean: String = s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')).collect();
+    base64::engine::general_purpose::STANDARD.decode(clean.as_bytes()).map_err(|e| match e {
+        base64::DecodeError::InvalidPadding | base64::DecodeError::InvalidLength(_) => "Incorrect padding".to_string(),
+        other => other.to_string(),
+    })
+}
+
+fn sid_is_set(sid: &Option<String>) -> bool {
+    sid.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+}
 
 impl WdaClient {
     /// Python `ensure_session` (L485-527): /status (ping + restart WDA on the Mac when
     /// unreachable), create a session if needed, apply fast `/appium/settings` once
     /// per session per [`crate::config::SESSION_SETTINGS_TTL`].
     pub fn ensure_session(&mut self, bundle_id: Option<&str>, apply_fast_settings: bool) -> Result<Option<String>> {
-        let _ = (bundle_id, apply_fast_settings);
-        todo!("port cli.py L485-527 ensure_session")
+        let mut st = self.req("GET", "/status", None, 4.0, None);
+        if json::has_err(&st) {
+            // Wake idle iOS Wi-Fi with one ICMP ping before assuming WDA died.
+            let (host, _) = parse_host_port(&self.base_url);
+            if !host.is_empty() {
+                std::process::Command::new("ping")
+                    .args(["-c", "1", "-W", "2", host.as_str()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map_err(|e| Error::Os(format!("{}: 'ping'", py_os_error(&e))))?;
+                st = self.req("GET", "/status", None, 6.0, None);
+            }
+        }
+        if json::has_err(&st) {
+            crate::errln!("WDA not responding; restarting WebDriverAgentRunner on the Mac host...");
+            self.start_wda_on_mac(false)?;
+            st = self.req("GET", "/status", None, 8.0, None);
+            if json::has_err(&st) {
+                return Err(Error::runtime(format!("WDA unreachable at {}: {}", self.base_url, json::py_repr(&st))));
+            }
+        }
+        self.sid = json::get(&st, "sessionId").as_str().map(String::from);
+        if !sid_is_set(&self.sid) {
+            let caps = match bundle_id.filter(|b| !b.is_empty()) {
+                Some(b) => j!({"alwaysMatch": {"bundleId": b}}),
+                None => j!({"alwaysMatch": {}}),
+            };
+            let s = self.post("/session", &j!({"capabilities": caps}));
+            let top = json::get(&s, "sessionId");
+            let sid = if json::truthy(top) { top } else { json::get(json::get(&s, "value"), "sessionId") };
+            self.sid = sid.as_str().map(String::from);
+        }
+        if apply_fast_settings && sid_is_set(&self.sid) {
+            let cached = self.load_session_cache();
+            let g = |k: &str| cached.get(k).unwrap_or(&json::NULL);
+            let settings_fresh = g("base_url").as_str() == Some(self.base_url.as_str())
+                && g("sid").as_str() == self.sid.as_deref()
+                && g("settings_applied") == &Value::Bool(true)
+                && (clock::wall() - py_float_or_zero(g("settings_ts"))) < crate::config::SESSION_SETTINGS_TTL;
+            if !settings_fresh {
+                let path = self.spath("/appium/settings");
+                let r = self.post(
+                    &path,
+                    &j!({"settings": {"snapshotMaxDepth": 150, "waitForIdleTimeout": 0, "screenshotQuality": 2}}),
+                );
+                if !json::has_err(&r) {
+                    let mut upd = serde_json::Map::new();
+                    upd.insert("settings_applied".into(), Value::Bool(true));
+                    upd.insert("settings_ts".into(), j!(clock::wall()));
+                    self.save_session_cache(upd);
+                }
+            }
+        }
+        Ok(self.sid.clone())
     }
 
     /// Python `start_wda_on_mac` (L529-541) using the embedded deploy script + patch
@@ -687,19 +812,63 @@ impl WdaClient {
         crate::deploy::run_deploy_script(&self.base_url, &self.udid, self.device_key.as_deref(), build)
     }
 
-    /// L556-580. Coordinate tap (or long-press with `duration`), strict deadline.
+    /// L556-580. Coordinate tap (or long-press with `duration`), strict deadline:
+    /// with an absolute monotonic `deadline` the fast probe is capped and no fallback
+    /// POST is dispatched once it expired.
     pub fn fast_tap(&mut self, x: i64, y: i64, duration: Option<f64>, deadline: Option<f64>) -> Value {
-        let _ = (x, y, duration, deadline);
-        todo!("port cli.py L556-580 fast_tap")
+        let mut body = j!({"x": x, "y": y});
+        if let Some(d) = duration {
+            body["duration"] = j!(d);
+        }
+        if self.turbo != Some(false) {
+            if deadline.is_some_and(|d| clock::now() >= d) {
+                return json::deadline_value();
+            }
+            let r = self.req_with_deadline("POST", "/wda/fastTap", Some(&body), DEFAULT_TIMEOUT, deadline);
+            if !json::has_err(&r) {
+                self.turbo = Some(true);
+                return r;
+            }
+            if !json::err_is(&r, 404) {
+                return r;
+            }
+            self.turbo = Some(false);
+        }
+        if deadline.is_some_and(|d| clock::now() >= d) {
+            return json::deadline_value();
+        }
+        let path = if duration.is_some() { self.spath("/wda/touchAndHold") } else { self.spath("/wda/tap") };
+        self.req_with_deadline("POST", &path, Some(&body), DEFAULT_TIMEOUT, deadline)
     }
 
-    /// L582-601.
+    /// L582-601. `/wda/fastDoubleTap` (wda-turbo v4), stock `/wda/doubleTap` on 404.
     pub fn fast_double_tap(&mut self, x: i64, y: i64, interval: Option<f64>, duration: Option<f64>) -> Value {
-        let _ = (x, y, interval, duration);
-        todo!("port cli.py L582-601 fast_double_tap")
+        let mut body = j!({"x": x, "y": y});
+        if let Some(i) = interval {
+            body["interval"] = j!(i);
+        }
+        if let Some(d) = duration {
+            body["duration"] = j!(d);
+        }
+        if self.turbo != Some(false) && self.fast_double_tap != Some(false) {
+            let r = self.post("/wda/fastDoubleTap", &body);
+            if r.is_object() {
+                if !json::has_err(&r) {
+                    self.fast_double_tap = Some(true);
+                    return r;
+                }
+                if !json::err_is(&r, 404) {
+                    return r;
+                }
+            }
+            self.fast_double_tap = Some(false);
+        }
+        let path = self.spath("/wda/doubleTap");
+        self.post(&path, &j!({"x": x, "y": y}))
     }
 
-    /// L603-647. `explicit_pos`: None = infer from x/y presence.
+    /// L603-647. `explicit_pos`: None = infer from x/y presence. A non-finite or
+    /// non-positive scale is `Error::Value`.
     pub fn fast_pinch(
         &mut self,
         x: Option<i64>,
@@ -709,46 +878,213 @@ impl WdaClient {
         radius: Option<f64>,
         explicit_pos: Option<bool>,
     ) -> Result<Value> {
-        let _ = (x, y, scale, duration, radius, explicit_pos);
-        todo!("port cli.py L603-647 fast_pinch (ValueError -> Error::Value)")
+        let sc = scale;
+        if !(sc > 0.0 && sc.is_finite()) {
+            return Err(Error::value(format!("pinch scale must be finite and > 0, got {}", json::py_float(scale))));
+        }
+        let has_explicit_pos = explicit_pos.unwrap_or(x.is_some() && y.is_some());
+        let mut body = j!({"scale": sc, "duration": duration});
+        if let (Some(px), Some(py)) = (x, y) {
+            body["x"] = j!(px);
+            body["y"] = j!(py);
+        }
+        if let Some(r) = radius {
+            body["radius"] = j!(r);
+        }
+        if self.turbo != Some(false) && self.fast_pinch != Some(false) {
+            let r = self.post("/wda/fastPinch", &body);
+            if r.is_object() {
+                if !json::has_err(&r) {
+                    self.fast_pinch = Some(true);
+                    return Ok(r);
+                }
+                if !json::err_is(&r, 404) {
+                    return Ok(r);
+                }
+            }
+            self.fast_pinch = Some(false);
+        }
+        if has_explicit_pos {
+            let (Some(px), Some(py)) = (x, y) else {
+                // Python int(None) raises TypeError here.
+                return Err(Error::value("int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"));
+            };
+            return Ok(j!({
+                "error": "unsupported operation",
+                "body": format!(
+                    "positioned zoom (@{px},{py}) requires wda-turbo v4 (/wda/fastPinch); \
+                     stock /wda/pinch only zooms the screen center (omit @X,Y for centered fallback)"
+                ),
+            }));
+        }
+        let vel = if sc >= 1.0 { 1.0 } else { -1.0 };
+        let path = self.spath("/wda/pinch");
+        let fb = self.post(&path, &j!({"scale": sc, "velocity": vel}));
+        if json::has_err(&fb) {
+            let b = json::get(&fb, "body");
+            let detail = if json::truthy(b) { b } else { json::get(&fb, "error") };
+            return Ok(j!({
+                "error": json::get(&fb, "error").clone(),
+                "body": format!(
+                    "/wda/fastPinch unavailable (requires wda-turbo v4) and stock /wda/pinch fallback failed: {}",
+                    json::py_str(detail)
+                ),
+            }));
+        }
+        Ok(fb)
     }
 
-    /// L649-674. Defaults: interval 0.09, duration 0.02.
+    /// L649-674. One synthesized multi-tap via `/wda/fastTapBatch`; sequential
+    /// [`fast_tap`](Self::fast_tap) on 404. Python defaults: interval 0.09, duration 0.02.
     pub fn fast_tap_batch(&mut self, points: &[(i64, i64)], interval: f64, duration: f64) -> Value {
-        let _ = (points, interval, duration);
-        todo!("port cli.py L649-674 fast_tap_batch")
+        if points.is_empty() {
+            return json::ok_null();
+        }
+        let pts: Vec<Value> = points.iter().map(|&(px, py)| j!([px, py])).collect();
+        let body = j!({"points": pts, "interval": interval, "duration": duration});
+        if self.turbo != Some(false) && self.fast_tap_batch != Some(false) {
+            let r = self.post("/wda/fastTapBatch", &body);
+            if r.is_object() {
+                if !json::has_err(&r) {
+                    self.fast_tap_batch = Some(true);
+                    return r;
+                }
+                if !json::err_is(&r, 404) {
+                    return r;
+                }
+            }
+            self.fast_tap_batch = Some(false);
+        }
+        let mut last = json::ok_null();
+        let dur_arg = if duration != 0.02 { Some(duration) } else { None };
+        for (idx, &(px, py)) in points.iter().enumerate() {
+            last = self.fast_tap(px, py, dur_arg, None);
+            if json::has_err(&last) {
+                return last;
+            }
+            if idx + 1 < points.len() && interval > 0.0 {
+                clock::sleep(interval);
+            }
+        }
+        last
     }
 
-    /// L676-701.
+    /// L676-701. `/wda/fastKeys` (wda-turbo v3+), stock `/wda/keys` only on a
+    /// definitive 404 (never replays an accepted request).
     pub fn fast_keys(&mut self, text: &str, frequency: Option<i64>) -> Value {
-        let _ = (text, frequency);
-        todo!("port cli.py L676-701 fast_keys")
+        let freq = match frequency {
+            Some(f) if f != 0 => Some(f),
+            _ => crate::config::typing_freq(),
+        };
+        if self.turbo != Some(false) && self.fast_keys != Some(false) {
+            let mut body = j!({"value": text});
+            if let Some(f) = freq {
+                body["frequency"] = j!(f);
+            }
+            let r = self.post("/wda/fastKeys", &body);
+            if !r.is_object() {
+                return json::error_value("invalid response from /wda/fastKeys");
+            }
+            if !json::has_err(&r) {
+                self.fast_keys = Some(true);
+                return r;
+            }
+            if !json::err_is(&r, 404) {
+                return r;
+            }
+            self.fast_keys = Some(false);
+        }
+        let chars: Vec<Value> = text.chars().map(|c| Value::String(c.to_string())).collect();
+        let mut legacy = j!({"value": chars});
+        if let Some(f) = freq {
+            legacy["frequency"] = j!(f);
+        }
+        let path = self.spath("/wda/keys");
+        self.post(&path, &legacy)
     }
 
-    /// L703-741.
+    /// L703-741. `/wda/fastLaunch` (wda-turbo v5); on 404 optional terminate +
+    /// `launchUnattached`, then `activate` only on a confirmed no-effect rejection.
     pub fn fast_launch(&mut self, bundle_id: &str, terminate: bool) -> Value {
-        let _ = (bundle_id, terminate);
-        todo!("port cli.py L703-741 fast_launch")
+        let bid = bundle_id;
+        let body = j!({"bundleId": bid, "terminate": terminate});
+        if self.turbo != Some(false) && self.fast_launch != Some(false) {
+            let r = self.post("/wda/fastLaunch", &body);
+            if !r.is_object() {
+                return json::error_value("invalid response from /wda/fastLaunch");
+            }
+            if !json::has_err(&r) {
+                self.fast_launch = Some(true);
+                return r;
+            }
+            if !json::err_is(&r, 404) {
+                return r;
+            }
+            self.fast_launch = Some(false);
+        }
+        if terminate {
+            let path = self.spath("/wda/apps/terminate");
+            let term = self.post(&path, &j!({"bundleId": bid}));
+            if json::has_err(&term) {
+                return term;
+            }
+        }
+        let r = self.post("/wda/apps/launchUnattached", &j!({"bundleId": bid}));
+        if !r.is_object() || !json::has_err(&r) {
+            return r;
+        }
+        let b = json::get(&r, "body");
+        let body_txt = if json::truthy(b) { json::py_str(b).to_lowercase() } else { String::new() };
+        let confirmed_no_effect = json::err_is(&r, 404)
+            || body_txt.contains("lsapplicationworkspace failed")
+            || body_txt.contains("unknown command")
+            || body_txt.contains("unhandled endpoint");
+        if !confirmed_no_effect {
+            return r;
+        }
+        let path = self.spath("/wda/apps/activate");
+        self.post(&path, &j!({"bundleId": bid}))
     }
 
-    /// L743-747.
+    /// L743-747. Long-press via fast_tap with `duration` (clamped to >= 0.1 s).
     pub fn long_press(&mut self, x: i64, y: i64, duration: f64) -> Value {
         self.fast_tap(x, y, Some(duration.max(0.1)), None)
     }
 
-    /// L749-761.
+    /// L749-761. Read the general pasteboard (base64 -> UTF-8, lossy).
     pub fn get_pasteboard(&mut self, content_type: &str) -> Result<String> {
-        let _ = content_type;
-        todo!("port cli.py L749-761 get_pasteboard")
+        let r = self.post("/wda/getPasteboard", &j!({"contentType": content_type}));
+        if !r.is_object() || json::has_err(&r) {
+            return Err(Error::runtime(format!("getPasteboard failed: {}", json::py_repr(&r))));
+        }
+        let v = json::get(&r, "value");
+        if !json::truthy(v) {
+            return Ok(String::new());
+        }
+        let Some(raw_b64) = v.as_str() else {
+            return Err(Error::runtime(format!(
+                "getPasteboard invalid base64: argument should be a bytes-like object or ASCII string, not '{}'",
+                py_type_name(v)
+            )));
+        };
+        match py_b64decode(raw_b64) {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) => Err(Error::runtime(format!("getPasteboard invalid base64: {e}"))),
+        }
     }
 
-    /// L763-772.
+    /// L763-772. Write UTF-8 text to the general pasteboard.
     pub fn set_pasteboard(&mut self, text: &str, content_type: &str) -> Result<Value> {
-        let _ = (text, content_type);
-        todo!("port cli.py L763-772 set_pasteboard")
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let r = self.post("/wda/setPasteboard", &j!({"content": encoded, "contentType": content_type}));
+        if !r.is_object() || json::has_err(&r) {
+            return Err(Error::runtime(format!("setPasteboard failed: {}", json::py_repr(&r))));
+        }
+        Ok(r)
     }
 
-    /// L774-788.
+    /// L774-788. Poll for an element and click it; returns its id or None on timeout.
     pub fn wait_click(
         &mut self,
         predicate: Option<&str>,
@@ -757,25 +1093,209 @@ impl WdaClient {
         poll: f64,
         post_wait: f64,
     ) -> Option<String> {
-        let _ = (predicate, class_chain, timeout, poll, post_wait);
-        todo!("port cli.py L774-788 wait_click")
+        let deadline = clock::wall() + timeout;
+        let chain = class_chain.filter(|c| !c.is_empty());
+        let using = if chain.is_some() { "class chain" } else { "predicate string" };
+        let val = match chain {
+            Some(c) => j!(c),
+            None => predicate.map(|p| j!(p)).unwrap_or(Value::Null),
+        };
+        while clock::wall() < deadline {
+            let path = self.spath("/element");
+            let res = self.post(&path, &j!({"using": using, "value": val}));
+            let eid = json::get(json::get(&res, "value"), "ELEMENT");
+            if json::truthy(eid) {
+                let eid = json::py_str(eid);
+                let path = self.spath(&format!("/element/{eid}/click"));
+                self.post(&path, &j!({}));
+                if post_wait != 0.0 {
+                    clock::sleep(post_wait);
+                }
+                return Some(eid);
+            }
+            clock::sleep(poll);
+        }
+        None
     }
 
-    /// L790-808.
+    /// L790-808. Strict `GET /wda/locked`: Ok(true) only on explicit `true`,
+    /// Ok(false) only on explicit `false`; a redacted RuntimeError after bounded
+    /// retries on transport/HTTP errors or malformed values.
     pub fn confirm_locked_state(&mut self, retries: u32) -> Result<bool> {
-        let _ = retries;
-        todo!("port cli.py L790-808 _confirm_locked_state")
+        let mut last_err = "unknown error".to_string();
+        for attempt in 0..=retries {
+            let r = self.get("/wda/locked");
+            if r.is_object() && !json::has_err(&r) {
+                match json::get(&r, "value") {
+                    Value::Bool(true) => return Ok(true),
+                    Value::Bool(false) => return Ok(false),
+                    other => last_err = format!("malformed /wda/locked value ({})", py_type_name(other)),
+                }
+            } else {
+                last_err = "error querying /wda/locked".to_string();
+            }
+            if attempt < retries {
+                clock::sleep(0.08);
+            }
+        }
+        Err(Error::runtime(format!("Unable to confirm lock state ({last_err})")))
     }
 
-    /// L810-828.
+    /// L810-828. SpringBoard provenance from `/wda/activeAppInfo`, then explicit
+    /// locked=true from `/wda/locked` as the FINAL read. Ok(false) when explicitly
+    /// unlocked; a redacted RuntimeError if SpringBoard cannot be confirmed.
     pub fn confirm_springboard_locked(&mut self, retries: u32) -> Result<bool> {
-        let _ = retries;
-        todo!("port cli.py L810-828 _confirm_springboard_locked")
+        let app_r = self.get("/wda/activeAppInfo");
+        let mut active_bid = String::new();
+        if app_r.is_object() && !json::has_err(&app_r) {
+            let val = json::get(&app_r, "value");
+            if val.is_object() {
+                let b = json::get(val, "bundleId");
+                if json::truthy(b) {
+                    active_bid = json::py_str(b);
+                }
+            }
+        }
+        // Final read is always /wda/locked so Face ID unlocking during activeAppInfo
+        // (even while SpringBoard Home Screen stays foreground) exits cleanly.
+        if !self.confirm_locked_state(retries)? {
+            return Ok(false);
+        }
+        if active_bid == SPRINGBOARD {
+            return Ok(true);
+        }
+        Err(Error::runtime("Passcode keypad unavailable: unable to confirm SpringBoard lock screen"))
     }
 
-    /// L830-931. Returns true when this call unlocked the phone. Never echoes digits.
+    fn press_home(&mut self) {
+        let path = self.spath("/wda/pressButton");
+        self.post(&path, &j!({"name": "home"}));
+    }
+
+    /// L830-931. Returns true when this call unlocked the phone (or it unlocked
+    /// while we worked). Never echoes passcode digits.
     pub fn unlock_phone(&mut self) -> Result<bool> {
-        todo!("port cli.py L830-931 unlock_phone")
+        self.ensure_session(None, false)?;
+        if !self.confirm_locked_state(0)? {
+            return Ok(false);
+        }
+        let passcode: Vec<char> = crate::config::get_passcode()?.chars().collect();
+        self.press_home();
+        let mut key_map: Option<HashMap<char, (i64, i64)>> = None;
+        let mut second_home_sent = false;
+        if self.turbo != Some(false) && self.fast_ui != Some(false) {
+            let t0 = clock::now();
+            let mut virtual_elapsed = 0.0_f64;
+            let poll_max = 5.0;
+            loop {
+                let eff_elapsed = (clock::now() - t0).max(virtual_elapsed);
+                let rem = poll_max - eff_elapsed;
+                if rem <= 0.0 {
+                    break;
+                }
+                if !second_home_sent && eff_elapsed >= 0.45 {
+                    self.press_home();
+                    second_home_sent = true;
+                }
+                let (ctl, _, bundle_id) =
+                    crate::ui::fetch_ui_controls_full(self, (430, 932), false, None, 0, false, Some(rem.min(1.5)));
+                match ctl {
+                    Some(ctl) if bundle_id == SPRINGBOARD => {
+                        let mut km: HashMap<char, (i64, i64)> = HashMap::new();
+                        for c in &ctl {
+                            if c.kind == "Key" && !c.is_disabled() {
+                                let mut it = c.label.chars();
+                                if let (Some(ch), None) = (it.next(), it.next()) {
+                                    if ch.is_numeric() {
+                                        km.entry(ch).or_insert((c.x, c.y));
+                                    }
+                                }
+                            }
+                        }
+                        if !passcode.is_empty() && passcode.iter().all(|d| km.contains_key(d)) {
+                            key_map = Some(km);
+                            break;
+                        }
+                    }
+                    None if self.fast_ui == Some(false) => break,
+                    _ => {}
+                }
+                let r_lk = self.get("/wda/locked");
+                if r_lk.is_object() && !json::has_err(&r_lk) && json::get(&r_lk, "value") == &Value::Bool(false) {
+                    return Ok(true);
+                }
+                let eff_elapsed = (clock::now() - t0).max(virtual_elapsed);
+                let rem = poll_max - eff_elapsed;
+                if rem <= 0.0 {
+                    break;
+                }
+                let dt = rem.min(0.12);
+                clock::sleep(dt);
+                virtual_elapsed += dt;
+            }
+        }
+        if let Some(km) = key_map {
+            // Require explicit boolean True right before dispatching digits so Face ID
+            // or a /wda/locked transport failure never sends passcode taps blindly.
+            if !self.confirm_locked_state(1)? {
+                return Ok(true);
+            }
+            let pts: Vec<(i64, i64)> = passcode.iter().filter_map(|d| km.get(d).copied()).collect();
+            check_wda_ok(self.fast_tap_batch(&pts, 0.12, 0.02), "unlock", true)?;
+        } else {
+            if !second_home_sent {
+                clock::sleep(0.5);
+                self.press_home();
+                clock::sleep(2.8);
+            }
+            // Screen-size-agnostic XCUIElementTypeKey lookup (works on any iPhone model).
+            // Verify SpringBoard bundle + locked=True (as the final read) immediately
+            // before EACH digit lookup and EACH click.
+            for d in &passcode {
+                if !self.confirm_springboard_locked(1)? {
+                    return Ok(true);
+                }
+                let path = self.spath("/element");
+                let el = self.post(
+                    &path,
+                    &j!({"using": "predicate string", "value": format!("type == 'XCUIElementTypeKey' AND name == '{d}'")}),
+                );
+                let eid = json::get(json::get(&el, "value"), "ELEMENT");
+                if !json::truthy(eid) {
+                    // Face ID or the home press may have already unlocked the device.
+                    if !self.confirm_locked_state(1)? {
+                        return Ok(true);
+                    }
+                    return Err(Error::runtime("Passcode keypad not found on screen")); // never echo digits
+                }
+                let eid = json::py_str(eid);
+                if !self.confirm_springboard_locked(1)? {
+                    return Ok(true);
+                }
+                let path = self.spath(&format!("/element/{eid}/click"));
+                let res = self.post(&path, &j!({}));
+                check_wda_ok(res, "unlock", true)?;
+                clock::sleep(0.1);
+            }
+        }
+        let v_t0 = clock::now();
+        let mut v_virtual = 0.0_f64;
+        let v_max = 1.2;
+        loop {
+            let r_v = self.get("/wda/locked");
+            if r_v.is_object() && !json::has_err(&r_v) && json::get(&r_v, "value") == &Value::Bool(false) {
+                return Ok(true);
+            }
+            let eff = (clock::now() - v_t0).max(v_virtual);
+            let rem = v_max - eff;
+            if rem <= 0.0 {
+                break;
+            }
+            let dt = rem.min(0.08);
+            clock::sleep(dt);
+            v_virtual += dt;
+        }
+        Err(Error::runtime("iPhone is still locked after entering passcode"))
     }
 }
 
@@ -810,16 +1330,109 @@ pub fn is_unsupported_route(res: &Value) -> bool {
     }
 }
 
-/// L950-983: `(locked, bundleId, size)` from one `/wda/fastPreflight`, or None.
+/// L950-983: `(locked, bundleId, size)` from one wda-turbo v6 `GET
+/// /wda/fastPreflight`, or None so the caller re-reads all three with the stock
+/// endpoints. A definitively missing route is remembered for this WDA session.
 pub fn fast_preflight(client: &mut WdaClient, sid: &str) -> Option<(bool, String, Value)> {
-    let _ = (client, sid);
-    todo!("port cli.py L950-983 _fast_preflight")
+    let cached = client.load_session_cache();
+    if cached.get("base_url").and_then(Value::as_str) == Some(client.base_url.as_str())
+        && cached.get("sid").and_then(Value::as_str) == Some(sid)
+        && cached.get("fast_preflight") == Some(&Value::Bool(false))
+    {
+        return None;
+    }
+    let response = client.get(&format!("/session/{sid}/wda/fastPreflight"));
+    if is_unsupported_route(&response) {
+        let mut upd = serde_json::Map::new();
+        upd.insert("fast_preflight".into(), Value::Bool(false));
+        client.save_session_cache(upd);
+        return None;
+    }
+    if !response.is_object() || json::has_err_key(&response) {
+        return None;
+    }
+    let value = json::get(&response, "value");
+    let locked = match json::get(value, "locked") {
+        Value::Bool(b) if value.is_object() => *b,
+        _ => return None,
+    };
+    let size = json::get(value, "size");
+    let bundle = match json::get(value, "bundleId") {
+        Value::String(s) if !s.trim().is_empty() => s.clone(),
+        _ => return None,
+    };
+    if !size.is_object() {
+        return None;
+    }
+    for key in ["width", "height"] {
+        // WDA reads an integral rectangle; orientation may swap the axes.
+        let Value::Number(n) = json::get(size, key) else { return None };
+        let f = if let Some(i) = n.as_i64() {
+            i as f64
+        } else if let Some(u) = n.as_u64() {
+            u as f64
+        } else {
+            let f = n.as_f64()?;
+            if !f.is_finite() || f.fract() != 0.0 {
+                return None;
+            }
+            f
+        };
+        if f <= 0.0 {
+            return None;
+        }
+    }
+    Some((locked, bundle, size.clone()))
+}
+
+/// The preflight JSON object (Python `cmd_preflight` without the print), so tests
+/// can read it without capturing stdout.
+pub fn preflight_value(client: &mut WdaClient, stock: bool) -> Result<Value> {
+    let t0 = clock::now();
+    let sid = client.ensure_session(None, true)?;
+    let mut snapshot = None;
+    if let Some(s) = sid.as_deref().filter(|s| !s.is_empty()) {
+        if !stock && client.turbo != Some(false) {
+            snapshot = fast_preflight(client, s);
+        }
+    }
+    let (locked, app, sz) = match snapshot {
+        Some((locked, app, sz)) => (Value::Bool(locked), Value::String(app), sz),
+        None => {
+            let locked = json::get(&client.get("/wda/locked"), "value").clone();
+            let app = json::get(json::get(&client.get("/wda/activeAppInfo"), "value"), "bundleId").clone();
+            let sid_s = sid.clone().unwrap_or_else(|| "None".to_string());
+            let r = client.get(&format!("/session/{sid_s}/window/size"));
+            let v = json::get(&r, "value");
+            let sz = if json::truthy(v) { v.clone() } else { j!({}) };
+            (locked, app, sz)
+        }
+    };
+    let (w, h) = (json::get(&sz, "width"), json::get(&sz, "height"));
+    if json::truthy(w) && json::truthy(h) {
+        if let (Some(wi), Some(hi)) = (py_int(w), py_int(h)) {
+            let mut upd = serde_json::Map::new();
+            upd.insert("screen_pt".into(), j!([wi, hi]));
+            client.save_session_cache(upd);
+        }
+    }
+    let dt = (clock::now() - t0) * 1000.0;
+    Ok(j!({
+        "ok": true,
+        "wda_url": client.base_url,
+        "session_id": sid,
+        "locked": locked,
+        "active_app": app,
+        "screen_pt": [w.clone(), h.clone()],
+        "elapsed_ms": json::round_to(dt, 1),
+    }))
 }
 
 /// L986-1009: prints the preflight JSON line.
 pub fn cmd_preflight(client: &mut WdaClient, stock: bool) -> Result<()> {
-    let _ = (client, stock);
-    todo!("port cli.py L986-1009 cmd_preflight")
+    let v = preflight_value(client, stock)?;
+    crate::outln!("{}", json::dumps(&v));
+    Ok(())
 }
 
 /// L1012-1014.

@@ -5,11 +5,14 @@
 //!   against it.
 //! - [`fake_reader::FakeReader`]: deterministic `Reader` double (Python `FakeReader`).
 //! - image helpers (`solid_img`, `box_img`, `encode_image_bytes`) and `make_line`.
+pub mod as_bin;
+pub mod capture;
 pub mod fake_reader;
+pub mod loopback;
 pub mod mock_wda;
 
 pub use fake_reader::FakeReader;
-pub use mock_wda::{ekey, Dyn, MockState, MockWda, Seq};
+pub use mock_wda::{ekey, router_json, Dyn, MockState, MockWda, RouterReply, RouterServer, Seq};
 
 use crate::image::{Frame, GrayImage};
 use crate::text::{Line, Word};
@@ -133,6 +136,41 @@ pub fn virtual_clock() -> (Arc<crate::clock::VirtualClock>, crate::clock::HookGu
     let c = Arc::new(crate::clock::VirtualClock::default());
     let g = crate::clock::install(c.clone());
     (c, g)
+}
+
+/// Process-wide lock + restore for environment variables (Python
+/// `mock.patch.dict(os.environ, ...)`). Env vars are global and Rust tests run in
+/// parallel threads, so every test that sets one holds this guard.
+pub struct EnvGuard {
+    saved: Vec<(String, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set (`Some`) or remove (`None`) each variable until the guard drops.
+pub fn set_env(vars: &[(&str, Option<&str>)]) -> EnvGuard {
+    let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut saved = Vec::new();
+    for (k, v) in vars {
+        saved.push((k.to_string(), std::env::var_os(k)));
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    EnvGuard { saved, _lock: lock }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in self.saved.drain(..).rev() {
+            match v {
+                Some(v) => std::env::set_var(&k, v),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

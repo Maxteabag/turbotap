@@ -251,3 +251,394 @@ fn test_fold_accents_and_diacritic_folded_find_text() {
     let m_rx_exact = ft(&[make_line("P\u{e5}", 20.0, 120.0, 80.0, 140.0)], "re:^P\u{e5}$").expect("match");
     assert_eq!(m_rx_exact.rank, 0);
 }
+
+// ---------------------------------------------------------------------------
+// StripSlicingAndOcrTests (the ScreenReader._cuts tests; the tesseract-mock tests
+// need the ocr helper's `tsv_hook` / `ocr_raw_hook` and live in
+// /var/tmp/turbotap-rust/textui-ocr-hook-tests.rs until ocr.rs is merged)
+// ---------------------------------------------------------------------------
+
+use crate::image::{box_diff, frame_reacted, thumb_diff, GrayImage};
+use crate::ocr::ScreenReader;
+use crate::testutil::{box_img, copy_img, solid_img};
+
+fn reader(workers: usize) -> ScreenReader {
+    ScreenReader::new(1.5, Some(workers), 11, false)
+}
+
+fn cuts_of(r: &ScreenReader, img: &GrayImage) -> Vec<u32> {
+    r.cuts(img.w, img.h, &img.data)
+}
+
+#[test]
+fn test_cuts_prefer_uniform_blank_rows_over_textured_rows() {
+    let (w, h) = (100u32, 300u32);
+    let mut img = GrayImage::new(w, h, 255);
+    // Fill most rows around y=150 (1/2 of height) with high-contrast stripes,
+    // leaving a single clean blank row at y=162.
+    for y in 110..190 {
+        if y == 162 {
+            continue;
+        }
+        for x in (0..w).step_by(4) {
+            img.put(x, y, 0);
+        }
+    }
+    let r = reader(2);
+    let cuts = cuts_of(&r, &img);
+    assert_eq!(cuts[0], 0);
+    assert_eq!(*cuts.last().unwrap(), h);
+    assert_eq!(cuts[1], 162);
+}
+
+#[test]
+fn test_cuts_monotonic_on_short_images() {
+    let img = solid_img(240, (80, 40));
+    let r = reader(4);
+    let cuts = cuts_of(&r, &img);
+    assert_eq!(cuts, vec![0, 40]);
+    assert!(cuts.windows(2).all(|p| p[0] < p[1]));
+
+    // Short band (< 180 px tall) uses 1 strip to skip thread overhead
+    // and avoid slicing text lines into tiny slivers.
+    let band = solid_img(240, (603, 150));
+    let reader6 = reader(6);
+    assert_eq!(cuts_of(&reader6, &band), vec![0, 150]);
+
+    // Full-height wide image still splits cleanly into `workers` strips.
+    let full = solid_img(240, (603, 1311));
+    let full_cuts = cuts_of(&reader6, &full);
+    assert_eq!(full_cuts.len(), 7);
+    assert_eq!(full_cuts[0], 0);
+    assert_eq!(*full_cuts.last().unwrap(), 1311);
+    assert!(full_cuts.windows(2).all(|p| p[0] < p[1]));
+}
+
+// ---------------------------------------------------------------------------
+// FrameReactedTests
+// ---------------------------------------------------------------------------
+
+fn reacted(a: &GrayImage, b: &GrayImage, x: f64, y: f64, scale: f64) -> bool {
+    frame_reacted(Some(a), Some(b), Some(x), Some(y), scale)
+}
+
+#[test]
+fn test_identical_and_jpeg_noise_frames_rejected() {
+    let base = solid_img(200, (240, 480));
+    assert!(!reacted(&base, &copy_img(&base), 120.0, 240.0, 1.0));
+
+    // Uniform ±1 compression noise stays well below global (>1.0) and peak-cell (>=14) thresholds.
+    let noisy = solid_img(201, (240, 480));
+    assert!(!reacted(&base, &noisy, 120.0, 240.0, 1.0));
+}
+
+#[test]
+fn test_localized_digit_change_triggers_peak_cell_detector() {
+    let before = solid_img(20, (240, 480));
+    // A single bright digit block (12x22 px) in the upper display (below 6% status bar):
+    // global mean diff is tiny (< 1.0), tap point is far away at bottom keypad,
+    // yet the 24x48 grid peak cell diff is >= 14.
+    let after = box_img(20, &[((192, 90, 204, 112), 240)], (240, 480));
+    assert!(thumb_diff(Some(&before), Some(&after)) < 1.0);
+    assert!(reacted(&before, &after, 60.0, 400.0, 1.0));
+}
+
+#[test]
+fn test_status_bar_only_change_ignored_by_grid() {
+    let before = solid_img(240, (240, 480));
+    // Change strictly inside top 6% (y < 28 px) simulates status-bar clock tick.
+    let after = box_img(240, &[((20, 4, 70, 22), 10)], (240, 480));
+    assert!(!reacted(&before, &after, 120.0, 300.0, 1.0));
+}
+
+#[test]
+fn test_local_tap_box_and_global_transition_trigger() {
+    let before = solid_img(240, (240, 480));
+    // Subtle highlight strictly around tap point (diff 11 inside 50x34 box ->
+    // local _box_diff ~4.1 > 2.5, while peak grid cell stays <= 11 < 14 and global mean < 1.0).
+    let local = box_img(240, &[((95, 218, 145, 252), 229)], (240, 480));
+    assert!(thumb_diff(Some(&before), Some(&local)) < 1.0);
+    assert!(reacted(&before, &local, 120.0, 235.0, 1.0));
+
+    // Global shift > 1.0 mean diff triggers even without peak >= 14.
+    let shifted = solid_img(236, (240, 480));
+    assert!(reacted(&before, &shifted, 120.0, 235.0, 1.0));
+}
+
+#[test]
+fn test_radio_dot_toggle_left_of_tap_triggers_on_first_frame() {
+    // Realistic Safari HTML radio-button toggle on an iPhone-sized frame:
+    // tapping the label at x=120, y=400 fills an 8x8px radio dot 30pt to the left.
+    // Global mean diff and local _box_diff mean both stay below threshold,
+    // while the 4x4-averaged local tap-row peak catches the dot immediately.
+    let before = solid_img(245, (390, 844));
+    let after = box_img(245, &[((86, 396, 93, 403), 100)], (390, 844));
+    assert!(thumb_diff(Some(&before), Some(&after)) < 1.0);
+    assert!(box_diff(Some(&before), Some(&after), 120.0, 400.0, 1.0, 45.0, 25.0, 0) <= 2.5);
+    assert!(reacted(&before, &after, 120.0, 400.0, 1.0));
+
+    // Same check at default 1.5x OCR scale (dot 35pt left of tap point).
+    let before_15 = solid_img(245, (585, 1266));
+    let after_15 = box_img(245, &[((124, 594, 134, 604), 110)], (585, 1266));
+    assert!(box_diff(Some(&before_15), Some(&after_15), 120.0, 400.0, 1.5, 45.0, 25.0, 0) <= 2.5);
+    assert!(reacted(&before_15, &after_15, 120.0, 400.0, 1.5));
+}
+
+/// Python `random.Random(seed)` (MT19937, `init_by_array([seed])`) with `randint`,
+/// so the noise frame is byte-identical to the Python test's.
+struct PyRandom {
+    mt: [u32; 624],
+    idx: usize,
+}
+
+impl PyRandom {
+    fn new(seed: u32) -> PyRandom {
+        let mut mt = [0u32; 624];
+        mt[0] = 19650218;
+        for i in 1..624 {
+            mt[i] = 1812433253u32.wrapping_mul(mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_add(i as u32);
+        }
+        let key = [seed];
+        let (mut i, mut j) = (1usize, 0usize);
+        for _ in 0..624.max(key.len()) {
+            mt[i] = (mt[i] ^ (mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1664525)).wrapping_add(key[j]).wrapping_add(j as u32);
+            i += 1;
+            j += 1;
+            if i >= 624 {
+                mt[0] = mt[623];
+                i = 1;
+            }
+            if j >= key.len() {
+                j = 0;
+            }
+        }
+        for _ in 0..623 {
+            mt[i] = (mt[i] ^ (mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1566083941)).wrapping_sub(i as u32);
+            i += 1;
+            if i >= 624 {
+                mt[0] = mt[623];
+                i = 1;
+            }
+        }
+        mt[0] = 0x8000_0000;
+        PyRandom { mt, idx: 624 }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        if self.idx >= 624 {
+            for k in 0..624 {
+                let y = (self.mt[k] & 0x8000_0000) | (self.mt[(k + 1) % 624] & 0x7fff_ffff);
+                let mut v = self.mt[(k + 397) % 624] ^ (y >> 1);
+                if y & 1 != 0 {
+                    v ^= 0x9908_b0df;
+                }
+                self.mt[k] = v;
+            }
+            self.idx = 0;
+        }
+        let mut y = self.mt[self.idx];
+        self.idx += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c_5680;
+        y ^= (y << 15) & 0xefc6_0000;
+        y ^ (y >> 18)
+    }
+
+    /// `randint(a, b)` = `a + _randbelow(b - a + 1)` (getrandbits rejection sampling).
+    fn randint(&mut self, a: i64, b: i64) -> i64 {
+        let n = (b - a + 1) as u64;
+        let k = 64 - n.leading_zeros();
+        loop {
+            let r = (self.next_u32() >> (32 - k)) as u64;
+            if r < n {
+                return a + r as i64;
+            }
+        }
+    }
+}
+
+#[test]
+fn test_random_jpeg_noise_ringing_and_status_bar_near_top_rejected() {
+    let (w, h) = (240u32, 480u32);
+    let base = solid_img(200, (w, h));
+    let mut rng = PyRandom::new(42);
+    let noisy_bytes: Vec<u8> = (0..w * h).map(|_| (200 + rng.randint(-3, 3)) as u8).collect();
+    let noisy = GrayImage::from_raw(w, h, noisy_bytes);
+    assert!(!reacted(&base, &noisy, 120.0, 240.0, 1.0));
+
+    // 1px JPEG ringing (+-8) around a sharp edge inside the tap neighborhood stays False.
+    let mut ring = (*base).clone();
+    for dx in -40i64..40 {
+        ring.put((120 + dx) as u32, 240, 208);
+        ring.put((120 + dx) as u32, 241, 192);
+    }
+    assert!(!reacted(&base, &ring, 120.0, 240.0, 1.0));
+
+    // Status-bar clock tick (y < 6% = 28px) must still be ignored even when
+    // the tap point is right below the status bar (y=36, where y-18=18 < 28).
+    let clock_tick = box_img(200, &[((100, 8, 140, 22), 20)], (w, h));
+    assert!(!reacted(&base, &clock_tick, 120.0, 36.0, 1.0));
+}
+
+// ---------------------------------------------------------------------------
+// StripSlicingAndOcrTests that mock tesseract / _ocr_raw (need ocr.rs from
+// feat/rust-v1-ocr: ScreenReader.tsv_hook / ocr_raw_hook). Append to
+// src/tests/test_ocr_and_matching.rs once ocr.rs is merged.
+// ---------------------------------------------------------------------------
+
+use crate::ocr::{OcrRawHook, ReadOpts, Reader, TsvHook};
+use std::sync::{Arc, Mutex};
+
+fn tsv_for_word(word: &str) -> String {
+    let (x, y, w, h, conf) = (10, 5, 40, 14, 95);
+    format!(
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+         5\t1\t1\t1\t1\t1\t{x}\t{y}\t{w}\t{h}\t{conf}\t{word}\n"
+    )
+}
+
+fn mean(data: &[u8]) -> f64 {
+    data.iter().map(|&v| v as f64).sum::<f64>() / data.len() as f64
+}
+
+/// Python `mock.patch("turbotap.cli.tesseract_tsv", side_effect=fake)` with
+/// `_tess_lib -> None`: records `(sauvola, mean)` and answers one word.
+fn fake_tsv(word: &'static str) -> (TsvHook, Arc<Mutex<Vec<(bool, f64)>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let hook: TsvHook = Arc::new(move |raw: &[u8], _w, _h, _psm, sauvola| {
+        s2.lock().unwrap().push((sauvola, mean(raw)));
+        Ok(tsv_for_word(word))
+    });
+    (hook, seen)
+}
+
+#[test]
+fn test_ocr_raw_large_strip_histogram_contrast_dark_blank_and_memoryview() {
+    let mut r = reader(2);
+    let (w, h) = (603u32, 218u32); // n_samp = (603*218)//19 ~= 6918 >= 256 -> histogram path
+    let (hook, seen) = fake_tsv("OK");
+    r.tsv_hook = Some(hook);
+
+    // 1. Uniform blank large strip -> skipped for both Otsu and Sauvola.
+    let blank_large = solid_img(210, (w, h));
+    // 2. Very-low-contrast 2-level strip -> skipped for Otsu (min_contrast=4), OCR'd for Sauvola (min_contrast=1).
+    let low2_img = box_img(200, &[((50, 50, 350, 150), 198)], (w, h));
+    // 3. Low-contrast 12-level strip -> OCR'd for BOTH Otsu and Sauvola.
+    let low12_img = box_img(200, &[((50, 50, 350, 150), 188)], (w, h));
+    // 4. Dark-mode large strip (bg=20, fg=240) -> pre-inverted (mean > 180).
+    let dark_large = box_img(20, &[((50, 50, 350, 150), 240)], (w, h));
+    // 5. Light mixed-polarity large strip (bg=235, dark pill=20) -> NOT inverted (mean > 180).
+    let light_mixed = box_img(235, &[((50, 50, 200, 120), 20)], (w, h));
+
+    assert!(r.ocr_raw(&blank_large.data, w, h, false).unwrap().is_empty());
+    assert!(r.ocr_raw(&blank_large.data, w, h, true).unwrap().is_empty());
+    assert!(seen.lock().unwrap().is_empty());
+
+    assert!(r.ocr_raw(&low2_img.data, w, h, false).unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap().len(), 0);
+    let res_low2_s = r.ocr_raw(&low2_img.data, w, h, true).unwrap();
+    assert_eq!(res_low2_s[0][0].0, "OK");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    seen.lock().unwrap().clear();
+    let res_low12_o = r.ocr_raw(&low12_img.data, w, h, false).unwrap();
+    let res_low12_s = r.ocr_raw(&low12_img.data, w, h, true).unwrap();
+    assert_eq!(res_low12_o[0][0].0, "OK");
+    assert_eq!(res_low12_s[0][0].0, "OK");
+    assert_eq!(seen.lock().unwrap().iter().map(|s| s.0).collect::<Vec<_>>(), vec![false, true]);
+
+    seen.lock().unwrap().clear();
+    r.ocr_raw(&dark_large.data, w, h, false).unwrap();
+    r.ocr_raw(&light_mixed.data, w, h, false).unwrap();
+    // Python's memoryview input: in Rust a borrowed sub-slice of another buffer.
+    let dark_buf = dark_large.data.to_vec();
+    let light_buf = light_mixed.data.to_vec();
+    r.ocr_raw(&dark_buf[..], w, h, false).unwrap();
+    r.ocr_raw(&light_buf[..], w, h, false).unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    for (_, m) in seen.iter() {
+        assert!(*m > 180.0);
+    }
+}
+
+#[test]
+fn test_blank_strip_skips_ocr_backend() {
+    let mut r = reader(2);
+    // Slight uniform gradient (< 16 range) is treated as blank.
+    let blank = solid_img(200, (100, 40));
+    let (hook, seen) = fake_tsv("X");
+    r.tsv_hook = Some(hook);
+    let res = r.ocr_raw(&blank.data, 100, 40, false).unwrap();
+    assert!(res.is_empty());
+    assert!(seen.lock().unwrap().is_empty()); // mock_tsv.assert_not_called()
+}
+
+#[test]
+fn test_dark_strip_pre_inverted_while_light_mixed_polarity_not_inverted() {
+    let mut r = reader(2);
+    // Dark-mode strip: dark background (20) with bright text box (240) -> mean < 120.
+    let dark_img = box_img(20, &[((10, 10, 40, 20), 240)], (100, 40));
+    // Mixed-polarity light screen: light background (235) with one dark pill (20) -> mean >= 120.
+    let light_mixed = box_img(235, &[((10, 10, 40, 20), 20)], (100, 40));
+    let (hook, seen) = fake_tsv("Settings");
+    r.tsv_hook = Some(hook);
+
+    let lines_dark = r.ocr_raw(&dark_img.data, 100, 40, false).unwrap();
+    let lines_light = r.ocr_raw(&light_mixed.data, 100, 40, false).unwrap();
+
+    assert_eq!(lines_dark[0][0].0, "Settings");
+    assert_eq!(lines_light[0][0].0, "Settings");
+    let seen = seen.lock().unwrap();
+    // Dark strip was inverted before OCR (mean flipped from ~37 to ~218).
+    assert!(seen[0].1 > 180.0);
+    // Light mixed-polarity strip was NOT inverted (mean stayed high > 180).
+    assert!(seen[1].1 > 180.0);
+}
+
+#[test]
+fn test_strip_hash_cache_reuses_unchanged_strips_and_separates_sauvola() {
+    let _c = crate::testutil::isolated_cache();
+    let mock = crate::testutil::MockWda::start(crate::testutil::MockState::default());
+    let mut client = mock.client();
+    let mut r = ScreenReader::new(1.0, Some(2), 11, false);
+    let img1 = box_img(255, &[((10, 20, 60, 40), 0), ((10, 160, 60, 180), 0)], (100, 200));
+    // bottom strip changed only
+    let img2 = box_img(255, &[((10, 20, 60, 40), 0), ((15, 165, 70, 185), 0)], (100, 200));
+
+    let calls: Arc<Mutex<Vec<(u32, u32, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let c2 = calls.clone();
+    let hook: OcrRawHook = Arc::new(move |_raw: &[u8], w, h, sauvola| {
+        c2.lock().unwrap().push((w, h, sauvola));
+        Ok(vec![vec![("Item".to_string(), 10, 10, 50, 24)]])
+    });
+    r.ocr_raw_hook = Some(hook);
+    let n = |c: &Arc<Mutex<Vec<(u32, u32, bool)>>>| c.lock().unwrap().len();
+
+    // First read: both strips miss cache (2 OCR calls).
+    let lines1 = r.read(&mut client, ReadOpts::img(img1.clone())).unwrap();
+    assert_eq!(lines1.len(), 2);
+    assert_eq!(n(&calls), 2);
+
+    // Identical frame: 0 additional OCR calls.
+    r.read(&mut client, ReadOpts::img(img1.clone())).unwrap();
+    assert_eq!(n(&calls), 2);
+
+    // Bottom strip edited: only 1 new strip OCR'd.
+    r.read(&mut client, ReadOpts::img(img2.clone())).unwrap();
+    assert_eq!(n(&calls), 3);
+
+    // Sauvola pass uses a distinct cache key prefix so it does not collide with Otsu.
+    r.read(&mut client, ReadOpts { img: Some(img1.clone()), sauvola: true, ..Default::default() }).unwrap();
+    assert_eq!(n(&calls), 5);
+    let last2: Vec<bool> = calls.lock().unwrap()[3..].iter().map(|c| c.2).collect();
+    assert_eq!(last2, vec![true, true]);
+
+    // Cache eviction (> 512 entries) clears before building `todo` without a missing key.
+    for i in 0..520 {
+        r.cache.insert(format!("dummy-{i}").into_bytes(), Vec::new());
+    }
+    let lines_after_evict = r.read(&mut client, ReadOpts::img(img1.clone())).unwrap();
+    assert_eq!(lines_after_evict.len(), 2);
+}
