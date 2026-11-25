@@ -41,7 +41,7 @@ def main():
         static = run(endpoint, params, 20, [], 0.35)
         verify(client, "0", display_y)
         params.update(x0=0, y0=display_y-30, x1=screen[0], y1=display_y+30)
-        digits = "7474"
+        digits = "747"
         cropped = run(endpoint, params, 20, [layout[digit] for digit in digits], 0.35)
         verify(client, digits, display_y)
         print(json.dumps(dict(full=static, display=cropped, final_readout_verified=True)))
