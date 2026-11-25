@@ -246,3 +246,16 @@ On the same 7 + 4 task as Jev, five randomized trials per stock v0.9.0 arm start
 | tapel | 5/5 | 2194.3 | 2309.6 |
 | batch | 5/5 | 1942.7 | 2045.7 |
 | fixed | 5/5 | 692.1 | 804.3 |
+
+## Native app screen agreement
+
+For each Clock and Settings snapshot, the benchmark matched recognized lines to stable accessibility labels containing at least three characters. An exact normalized string had to fall within 25 vertical points of the matching node. This is an agreement score: some accessibility labels describe controls using words that are absent from the pixels. Repeated trials on the same screen reuse reference labels. Aggregates omit screen content.
+
+| App | Engine | Stable trials / 6 | Label matches / references | Median recognition plus capture ms |
+|---|---|---:|---:|---:|
+| clock | host | 6/6 | 48/78 | 91.6 |
+| clock | fast | 6/6 | 53/78 | 141.6 |
+| clock | accurate | 6/6 | 60/78 | 250.0 |
+| settings | host | 6/6 | 36/138 | 98.4 |
+| settings | fast | 6/6 | 60/138 | 147.6 |
+| settings | accurate | 6/6 | 72/138 | 265.5 |
