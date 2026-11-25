@@ -120,7 +120,17 @@ class Observer:
         return reply
 
 
-def serve(path, limit):
+def make_observer(upstream):
+    if upstream == "calculator":
+        # Silence native OCR diagnostics too. Only fixed error messages go to stdout.
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), 2)
+        from calculator import CalculatorObserver
+        return CalculatorObserver()
+    return Observer()
+
+
+def serve(path, limit, upstream):
     parent = path.parent.stat()
     if parent.st_uid != os.getuid() or parent.st_mode & 0o077:
         raise ValueError("use a socket inside a user-owned mode 0700 directory")
@@ -140,7 +150,7 @@ def serve(path, limit):
                 reply = {"error": "request or observation failed"}
             self.wfile.write(encode(reply))
 
-    observer = Observer()
+    observer = make_observer(upstream)
     try:
         with socketserver.UnixStreamServer(str(path), Handler) as server:
             try:
@@ -165,14 +175,16 @@ if __name__ == "__main__":
     client = modes.add_parser("observe")
     client.add_argument("socket", type=Path)
     client.add_argument("--base")
-    modes.add_parser("once")
+    once = modes.add_parser("once")
+    for mode in (once, start):
+        mode.add_argument("--upstream", choices=("synthetic", "calculator"), default="synthetic")
     args = p.parse_args()
     if args.mode == "serve":
-        serve(args.socket, args.limit)
+        serve(args.socket, args.limit, args.upstream)
     elif args.mode == "observe":
         sys.stdout.buffer.write(encode(request(args.socket, args.base)))
     else:
-        observer = Observer()
+        observer = make_observer(args.upstream)
         try:
             sys.stdout.buffer.write(encode(observer.observe(None)))
         finally:

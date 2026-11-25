@@ -36,3 +36,26 @@ For concurrent readers with overlapping requests that policy increases full
 responses. Fixture row keys are stable only for this fixed layout. A real
 reordering or duplicate-label workload would need separate identity and
 reconstruction measurements before adopting deltas.
+
+## Optional Calculator upstream
+
+With an explicit HTTP `WDA_URL` already exported, an existing WDA session,
+Calculator continuously foreground on an unlocked device, and patched binary
+fastScreenshot support, run from the checkout root:
+
+```sh
+WDA_URL="${WDA_URL:?export the approved WDA HTTP origin}" python experimental/daemon/compare_calculator.py --samples 5
+```
+
+This makes up to 11 captures (one daemon warmup and five alternating-order
+pairs). Both arms launch a fresh Python command each sample. One constructs
+the v0.9.0 WDAClient and single-worker ScreenReader, the other calls their
+persistent instances through the Unix socket. Both capture a new image and
+clear OCR strip results after each sample. Output contains elapsed milliseconds.
+A failure aborts the run. Nothing launches Calculator or creates a WDA session.
+The adapter requires Calculator immediately before and after the non-atomic
+display capture; both checks sample the foreground bundle, so cannot detect a
+switch away and back between them or an OS overlay. No pixel, label, digest,
+identifier, or device diagnostic is returned. Only the synthetic adapter
+supports graph/delta output. Use `serve SOCKET --upstream calculator` or
+`once --upstream calculator` with lab.py for individual observations.
