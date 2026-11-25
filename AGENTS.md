@@ -14,6 +14,19 @@ name and the same personal email as the Git author email. Never use an ECIT work
 email for either a local commit or a GitHub squash merge. Verify both identities
 from the resulting commits.
 
+## XPS build slot
+
+Run Cargo builds and tests on `xps15` only. Use the shared build slot for every
+Cargo invocation there, including review and release verification:
+
+```sh
+flock /var/tmp/clarp-build/lock nice -n 19 cargo <subcommand> [args...]
+```
+
+The lock is shared with Clarp Host release builds. Run at most one build or test
+invocation at a time. If the slot is busy, let the current build finish and use
+a durable continuation instead of waiting in the foreground.
+
 ## Agent instruction files
 
 `AGENTS.md` is canonical. `CLAUDE.md` and `GEMINI.md` are symlinks to it.
