@@ -1210,7 +1210,8 @@ impl<R: Reader> Flow<R> {
                 }
             }
         }
-        while !already_stable {
+        if !already_stable {
+          loop {
             let cur_img: Option<Frame>;
             if let Some(pimg) = pending_img.take() {
                 lines = self.read_img(&pimg)?;
@@ -1273,6 +1274,7 @@ impl<R: Reader> Flow<R> {
                     }
                 }
             }
+          }
         }
         if let Some(p) = probes.as_ref() {
             let fut_fresh = fut.is_some()
