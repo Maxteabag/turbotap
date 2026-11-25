@@ -35,12 +35,13 @@ turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" t
 Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `assert:`, `assertnot:`, `alert:text`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
 
 For on-device text recognition, run `turbotap vision-ocr --mode accurate` against a runner with
-the optional [Vision patch](docs/EXPERIMENTAL_VISION.md). It captures one full-resolution PNG of
+the optional [Vision patch](docs/EXPERIMENTAL_VISION.md). By default it captures one full-resolution PNG of
 the main screen and returns JSON with `mode` and `lines`. The screenshot stays on the phone.
 Each line contains `text`, Vision’s `confidence` (0–1), and `x`, `y`, `width`, `height` as
 fractions of the oriented screenshot, measured from its top left. Accurate mode (the default
 for this command) enables language correction. Use `--mode fast` for fast recognition without
-correction. A successful read with no recognized text returns `"lines": []`. Missing patch,
+correction. With the current overlay, `--scale 0.5` uses direct CGImage capture and halves
+each input dimension. Normalized boxes still refer to the whole screen. A successful read with no recognized text returns `"lines": []`. Missing patch,
 capture failures, and invalid results exit nonzero. Existing OCR commands use host Tesseract.
 
 ## Requirements

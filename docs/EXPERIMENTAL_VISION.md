@@ -28,6 +28,53 @@ On a fused read, the runner captures the screenshot, collects the same AX payloa
 
 `value.timing` reports monotonic elapsed milliseconds. `captureMs` includes screenshot capture and PNG creation, `axMs` includes the fastUI collection and optional wait (zero for fastOCR), and `recognitionMs` includes Vision setup, recognition and extraction of the line results. `totalMs` spans those operations up to result assembly. The caller measures HTTP round-trip time separately.
 
+## Enable Vision from an installed Python package
+
+Use the Linux control host and Python environment where TurboTap is installed. The commands below
+assume a configured device with a working TurboTap runner and its previous build still on the Mac.
+Keep the previous device, signing, source and DerivedData settings for rollback. Run one deployment
+at a time because the deploy script uses a shared patch staging path on the Mac.
+
+From Bash, combine the two installed patches against the pinned upstream revision. The source
+checkout in this step is disposable and local to the control host.
+
+```bash
+set -euo pipefail
+assets=$(python -c 'from turbotap.cli import asset_dir; print(asset_dir("patches"))')
+pin=d17782422d55ff1e5e0ceb74eb1fd509cc0c35b6
+scratch=$(mktemp -d)
+git clone -q --no-checkout https://github.com/appium/WebDriverAgent.git "$scratch/source"
+git -C "$scratch/source" checkout -q --detach "$pin"
+git -C "$scratch/source" apply --index "$assets/wda-turbo.patch"
+git -C "$scratch/source" apply --index "$assets/wda-vision.patch"
+git -C "$scratch/source" diff --cached --binary HEAD > "$scratch/vision.patch"
+```
+
+Build in separate Mac directories and start the Vision runner on the configured device. This
+replaces the running WDA session. The environment overrides apply only to this deployment.
+
+```bash
+run=$(basename "$scratch")
+WDA_REF="$pin" WDA_PATCH="$scratch/vision.patch" \
+  WDA_SRC="/var/tmp/wda-vision-src-$run" WDA_DD="/var/tmp/wda-vision-dd-$run" \
+  python -m turbotap deploy
+python -m turbotap vision-ocr --mode accurate --scale 0.5
+```
+
+The last command verifies that the runner confirms direct CGImage input at half width and
+height. An explicit scale of 1 uses full-size CGImage. Omit the flag to use full-size PNG,
+including on older Vision overlays. On one multilingual device fixture, accurate recognition
+at half size recovered 72 of 72 expected matches, compared with 66 at full size. Choose a
+scale based on the text size and content of your screens.
+
+To restore the previous TurboTap runner, use its original environment and the preserved build.
+Verify a read on the same device.
+
+```bash
+python -m turbotap deploy --no-build
+python -m turbotap preflight
+```
+
 ## Build without signing or running
 
 On a Mac with Xcode selected, run the following in Bash from this TurboTap checkout. Set `WDA_REPO` to a local WDA Git clone containing the pinned commit. This uses a new scratch checkout and DerivedData directory. It also produces the cumulative patch required by the deploy script.

@@ -5241,7 +5241,13 @@ def cmd_ocr(client, args):
 
 
 def cmd_vision_ocr(client, args):
-    status, _, body = client.req_raw("POST", "/wda/fastOCR", {"mode": args.mode, "capture": "png"})
+    # Original Vision overlays accept only mode and use full-resolution PNG.
+    payload = {"mode": args.mode}
+    if args.scale is not None:
+        if not 0 < args.scale <= 1:
+            raise RuntimeError("--scale must be a number greater than zero and at most one")
+        payload.update(capture="cgimage", scale=args.scale)
+    status, _, body = client.req_raw("POST", "/wda/fastOCR", payload)
     unsupported = "WDA lacks /wda/fastOCR. Use a runner built with patches/wda-vision.patch."
     if status in (404, 405, 501):
         raise RuntimeError(unsupported)
@@ -5255,6 +5261,8 @@ def cmd_vision_ocr(client, args):
     if isinstance(value, dict) and "error" in value:
         if value["error"] in ("unknown command", "unknown method", "unsupported operation"):
             raise RuntimeError(unsupported)
+        if args.scale is not None and value["error"] == "invalid argument":
+            raise RuntimeError("WDA rejected scaled capture. Update the Vision patch or omit --scale.")
         raise RuntimeError(f"Vision OCR failed: {value.get('message') or value['error']}")
     if not 200 <= status < 300:
         raise RuntimeError(f"/wda/fastOCR failed (HTTP {status})")
@@ -5262,6 +5270,11 @@ def cmd_vision_ocr(client, args):
             or value.get("mode") != args.mode or not isinstance(value.get("lines"), list)):
         raise RuntimeError("Invalid /wda/fastOCR response: expected the requested mode and a lines array")
 
+    if args.scale is not None:
+        image = value.get("image")
+        if (not isinstance(image, dict) or image.get("capture") != "cgimage"
+                or type(image.get("scale")) not in (int, float) or image["scale"] != args.scale):
+            raise RuntimeError("WDA did not confirm scaled CGImage capture. Update the Vision patch or omit --scale.")
     lines = []
     fields = ("x", "y", "width", "height", "confidence")
     for i, line in enumerate(value["lines"]):
@@ -5572,6 +5585,8 @@ def _main():
     vision = sub.add_parser("vision-ocr", help="read the full screen as JSON using the optional WDA Vision patch")
     vision.add_argument("--mode", choices=("fast", "accurate"), default="accurate",
                         help="accurate uses language correction (default), fast disables it")
+    vision.add_argument("--scale", type=float, metavar="FACTOR",
+                        help="use direct CGImage at this fraction of each dimension (0 < factor <= 1)")
     sp_tap_ocr = sub.add_parser("tap-ocr")
     sp_tap_ocr.add_argument("text")
     sub.add_parser("tree")
