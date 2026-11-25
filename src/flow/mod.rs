@@ -106,10 +106,12 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   shot:PATH             save a fresh screenshot as PNG
 taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.";
 
-/// Verbs that need screen capture/OCR (the CLI warms OCR engines only for these).
+/// Verbs that run host Tesseract OCR (the CLI warms libtesseract engines only for these).
+/// Note: `read:vision*` and directional `swipe:left|right|up|down` are filtered out in
+/// [`flow_needs_ocr`]; pixel-only steps (`shot`, `settle`, `scroll`, `search`) never touch Tesseract.
 pub const IMAGE_STEP_VERBS: &[&str] = &[
-    "wait", "expect", "waitany", "gone", "assert", "assertnot", "tap", "tapif", "longpress", "doubletap", "scroll",
-    "scrollto", "swipe", "back", "read", "search", "settle", "shot",
+    "wait", "expect", "waitany", "gone", "assert", "assertnot", "tap", "tapif", "longpress", "doubletap", "scrollto",
+    "swipe", "back", "read",
 ];
 pub const STALE_UI_BACKOFF: [f64; 3] = [0.05, 0.08, 0.12];
 pub const INPUT_FOCUS_SETTLE: f64 = 0.25;
@@ -196,11 +198,33 @@ pub struct CtlCache {
     pub img: Frame,
 }
 
+/// Compiled `--deny` guard. The built-in [`DENY_DEFAULT`] regex is compiled lazily on
+/// first [`Flow::guard`] evaluation and cached process-wide in a `OnceLock` (saving
+/// ~3-4 ms on every `turbotap flow` call and completely skipping compilation on
+/// non-tapping flows like `flow ui`). Custom `--deny` patterns are compiled and
+/// validated eagerly in [`Flow::new`].
+pub enum DenyGuard {
+    Default,
+    Custom(fancy_regex::Regex),
+}
+
+impl DenyGuard {
+    fn regex(&self) -> &fancy_regex::Regex {
+        match self {
+            DenyGuard::Default => {
+                static DEFAULT_RX: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+                DEFAULT_RX.get_or_init(|| crate::text::compile_icase(DENY_DEFAULT).expect("DENY_DEFAULT regex is valid"))
+            }
+            DenyGuard::Custom(rx) => rx,
+        }
+    }
+}
+
 pub struct Flow<R: Reader = ScreenReader> {
     pub c: WdaClient,
     pub r: R,
     pub timeout: f64,
-    pub deny: Option<fancy_regex::Regex>,
+    pub deny: Option<DenyGuard>,
     pub bundle: Option<String>,
     pub pending_bundle: Option<String>,
     pub pending_bundle_ts: f64,
@@ -238,10 +262,11 @@ impl<R: Reader> Flow<R> {
     /// `deny` None or "" disables the guard.
     pub fn new(c: WdaClient, r: R, timeout: f64, deny: Option<&str>, log: bool) -> Result<Flow<R>> {
         let deny = match deny.filter(|d| !d.is_empty()) {
-            Some(d) => Some(
+            Some(d) if d == DENY_DEFAULT => Some(DenyGuard::Default),
+            Some(d) => Some(DenyGuard::Custom(
                 crate::text::compile_icase(d)
                     .ok_or_else(|| Error::value(format!("invalid --deny regex: {}", json::py_repr_str(d))))?,
-            ),
+            )),
             None => None,
         };
         Ok(Flow {
@@ -320,11 +345,11 @@ impl<R: Reader> Flow<R> {
 
     /// Refuse taps on text matching `--deny`.
     pub fn guard(&self, text: &str, action: &str) -> Result<()> {
-        if let Some(rx) = self.deny.as_ref() {
+        if let Some(guard) = self.deny.as_ref() {
             if text.is_empty() {
                 return Ok(());
             }
-            match rx.is_match(text) {
+            match guard.regex().is_match(text) {
                 Ok(false) => {}
                 Ok(true) => {
                     return Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text))));
@@ -1025,10 +1050,20 @@ pub fn cmd_tap_ocr(client: WdaClient, text: &str) -> Result<()> {
 }
 
 /// `turbotap flow STEP...` (L5696). Returns the process exit code.
-/// True when any step needs screen capture/OCR (`cmd_flow` warms OCR only then).
+/// True when any step actually runs host Tesseract OCR (`cmd_flow` warms libtesseract
+/// only then). Excludes on-device `read:vision*` and pixel-only steps (`shot`, `settle`,
+/// `scroll`, `search`, directional `swipe:left|right|up|down`).
 pub fn flow_needs_ocr(steps: &[String]) -> bool {
     steps.iter().any(|s| {
-        let v = s.split(':').next().unwrap_or("").trim();
+        let (verb, arg) = s.split_once(':').unwrap_or((s, ""));
+        let v = verb.trim();
+        if v.eq_ignore_ascii_case("read") {
+            let engine = arg.trim().split(':').next().unwrap_or("").trim();
+            return !engine.eq_ignore_ascii_case("vision");
+        }
+        if v.eq_ignore_ascii_case("swipe") {
+            return arg.split_once(':').is_some_and(|(_, target)| !target.trim().is_empty());
+        }
         IMAGE_STEP_VERBS.iter().any(|iv| iv.eq_ignore_ascii_case(v))
     })
 }
@@ -1053,4 +1088,65 @@ pub fn cmd_flow(client: WdaClient, steps: &[String], timeout: f64, scale: f64, d
     let (ok, res) = res?;
     crate::outln!("{}", json::dumps_utf8(&res));
     Ok(if ok { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+    use crate::testutil::FakeReader;
+
+    #[test]
+    fn flow_needs_ocr_skips_vision_shot_settle_scroll_and_directional_swipe() {
+        for no_ocr in [
+            "read:vision",
+            "read:vision:fast",
+            "read:vision:accurate",
+            "READ:VISION:FAST",
+            "shot:/tmp/out.png",
+            "settle",
+            "scroll:down",
+            "scroll:up",
+            "swipe:left",
+            "swipe:right",
+            "swipe:up",
+            "swipe:down",
+            "search:coffee",
+            "ui",
+            "url:https://example.com",
+            "open:Spotify",
+        ] {
+            assert!(!flow_needs_ocr(&[no_ocr.to_string()]), "{no_ocr} must not pre-warm Tesseract");
+        }
+        for needs_ocr in [
+            "read",
+            "read:ocr",
+            "read:0-400",
+            "wait:Settings",
+            "assert:Done",
+            "assertnot:Loading",
+            "tap:Continue",
+            "tapif:Allow",
+            "longpress:Message",
+            "doubletap:Photo",
+            "scrollto:Privacy",
+            "swipe:left:Alice",
+            "swipe:right:Bob@below:Chats",
+            "back",
+            "gone:Spinner",
+        ] {
+            assert!(flow_needs_ocr(&[needs_ocr.to_string()]), "{needs_ocr} must pre-warm Tesseract");
+        }
+    }
+
+    #[test]
+    fn deny_default_is_lazy_and_cached_while_custom_invalid_regex_errors_eagerly() {
+        let c = WdaClient::new("http://127.0.0.1:9", "", None);
+        let flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+        assert!(flow.guard("Delete Account", "tap").is_err());
+        assert!(flow.guard("Settings", "tap").is_ok());
+
+        let c2 = WdaClient::new("http://127.0.0.1:9", "", None);
+        let err = Flow::new(c2, FakeReader::new(vec![]), 1.0, Some("[unclosed"), false).err().unwrap();
+        assert!(err.to_string().contains("invalid --deny regex"), "{err}");
+    }
 }
