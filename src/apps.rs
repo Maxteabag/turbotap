@@ -63,6 +63,7 @@ fn run_capture(cmd: &[String], timeout: f64) -> Result<String> {
     let Some((prog, args)) = cmd.split_first() else {
         return Err(Error::value("empty command"));
     };
+    crate::config::guard_remote(&format!("running {prog}"))?;
     let mut child = Command::new(prog)
         .args(args)
         .stdin(Stdio::null())
