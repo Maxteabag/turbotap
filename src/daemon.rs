@@ -644,6 +644,7 @@ struct BaselineState {
     entries: Vec<(OsString, OsString)>,
     index: HashMap<OsString, usize>,
     seen: Vec<bool>,
+    mutated: Vec<bool>,
     deltas: Vec<(OsString, Option<OsString>)>,
 }
 
@@ -654,8 +655,8 @@ impl BaselineState {
         for (i, (k, _)) in entries.iter().enumerate() {
             index.insert(k.clone(), i);
         }
-        let seen = vec![false; entries.len()];
-        BaselineState { entries, index, seen, deltas: Vec::with_capacity(16) }
+        let n = entries.len();
+        BaselineState { entries, index, seen: vec![false; n], mutated: vec![false; n], deltas: Vec::with_capacity(16) }
     }
 }
 
@@ -797,13 +798,15 @@ impl Server {
     /// so `serve_forever()` can answer `ping` right after `bind()`. The first `run` request
     /// (or `close()`) joins the warm-up thread before touching process env/cwd or OCR.
     fn warm_async(&mut self) {
+        self.warm_async_with(|| crate::ocr::set_warm_ocr(true));
+    }
+
+    pub(crate) fn warm_async_with<F: FnOnce() + Send + 'static>(&mut self, f: F) {
         crate::wda::set_pool_enabled(true);
         crate::ocr::ensure_omp_thread_limit();
         self.warmed = true;
         self.inner.warm_pending.store(true, Ordering::Release);
-        let h = std::thread::spawn(|| {
-            crate::ocr::set_warm_ocr(true);
-        });
+        let h = std::thread::spawn(f);
         *self.inner.warm_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
 
@@ -1352,12 +1355,22 @@ fn run(inner: &Inner, conn: &UnixStream, reader: &mut FastLines, req: ServerReq<
         }
         // Ensure background OCR warm-up finishes before mutating env/cwd for the first request.
         join_warm(inner);
+        if inner.stopping.load(Ordering::SeqCst) {
+            return send(conn, &j!({"error": "stopping"}));
+        }
         send_bytes(conn, b"{\"ready\":true}\n")?;
         if (GO_TIMEOUT - FIRST_REPLY_TIMEOUT).abs() > f64::EPSILON {
             conn.set_read_timeout(secs(GO_TIMEOUT))?;
         }
         let mut go_scratch = Vec::new();
         if !reader.read_go(&mut go_scratch)? {
+            return Ok(());
+        }
+        if inner.stopping.load(Ordering::SeqCst) {
+            // Client already committed (`go` sent); return a terminal cancellation rather
+            // than dropping the socket or dispatching work after stop was acknowledged.
+            let _ = send(conn, &j!({"err": "turbotap: daemon stopped before running request\n"}));
+            send_exit(conn, 1);
             return Ok(());
         }
         conn.set_read_timeout(None)?;
@@ -1536,6 +1549,7 @@ fn apply_request_env(baseline: &mut BaselineState, target: &[(Cow<'_, str>, Cow<
     let omp_key = OsStr::new("OMP_THREAD_LIMIT");
     let omp_default = OsStr::new("1");
     baseline.seen.fill(false);
+    baseline.mutated.fill(false);
     baseline.deltas.clear();
     let mut config_changed = false;
     let mut omp_in_target = false;
@@ -1546,12 +1560,14 @@ fn apply_request_env(baseline: &mut BaselineState, target: &[(Cow<'_, str>, Cow<
             omp_in_target = true;
         }
         if let Some(&idx) = baseline.index.get(ks) {
-            let already_seen = std::mem::replace(&mut baseline.seen[idx], true);
-            if (already_seen || baseline.entries[idx].1.as_os_str() != vs) && valid_os_env_entry(ks, vs) {
+            baseline.seen[idx] = true;
+            let already_mutated = baseline.mutated[idx];
+            if (already_mutated || baseline.entries[idx].1.as_os_str() != vs) && valid_os_env_entry(ks, vs) {
                 if is_config_env_key(ks) {
                     config_changed = true;
                 }
-                if !already_seen {
+                if !already_mutated {
+                    baseline.mutated[idx] = true;
                     baseline
                         .deltas
                         .push((baseline.entries[idx].0.clone(), Some(baseline.entries[idx].1.clone())));

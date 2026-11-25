@@ -664,6 +664,9 @@ fn decode_jpeg_fast(bytes: &[u8]) -> Option<GrayImage> {
                 if buf.len() < needed {
                     buf.resize(needed, 0);
                 }
+                // Zero the full destination slice before decoding so a truncated or
+                // prematurely terminated JPEG can never expose pixels from a prior frame.
+                buf[..needed].fill(0);
                 let ok = dec.decode_into(&mut buf[..needed]).is_ok();
                 if ok {
                     rgba_to_l24(&buf[..needed], &mut out);
@@ -962,6 +965,46 @@ mod img_opt_tests {
             let want: Vec<u8> = rgba.chunks_exact(4).map(l24).collect();
             assert_eq!(got, want, "rgba_to_l24 mismatch at len={len}");
         }
+    }
+
+    /// PR #13 review: a partially decoded / damaged JPEG must never expose pixels from
+    /// an earlier frame via the reused thread-local RGBA scratch buffer.
+    #[test]
+    fn damaged_color_jpeg_never_leaks_prior_frame_pixels() {
+        let make_solid_jpeg = |r: u8, g: u8, b: u8| -> Vec<u8> {
+            let (w, h) = (160u32, 240u32);
+            let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+            for _ in 0..(w * h) {
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+            let mut jpeg = Vec::new();
+            let mut enc = ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75);
+            enc.encode(&rgb, w, h, ::image::ExtendedColorType::Rgb8).unwrap();
+            jpeg
+        };
+        let seed_white = make_solid_jpeg(250, 250, 250);
+        let seed_black = make_solid_jpeg(10, 10, 10);
+
+        // Build a damaged color JPEG with a premature second SOS marker mid-scan (0xFF 0xDA)
+        // followed by EOI (0xFF 0xD9) so permissive decoding stops partway through the frame.
+        let mut damaged = make_solid_jpeg(120, 140, 160);
+        let sos_pos = damaged.windows(2).position(|w| w == [0xFF, 0xDA]).expect("SOS marker");
+        let cut = (sos_pos + 64).min(damaged.len().saturating_sub(4));
+        damaged.truncate(cut);
+        damaged.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0xFF, 0xD9]);
+
+        // Prime scratch with bright white frame, then decode damaged JPEG.
+        let _ = GrayImage::decode(&seed_white).unwrap();
+        let after_white = GrayImage::decode(&damaged).expect("damaged jpeg after white seed");
+
+        // Prime scratch with dark black frame, then decode the exact same damaged JPEG.
+        let _ = GrayImage::decode(&seed_black).unwrap();
+        let after_black = GrayImage::decode(&damaged).expect("damaged jpeg after black seed");
+
+        assert_eq!(
+            after_white, after_black,
+            "damaged JPEG decode leaked pixels from previous frame in reused scratch buffer"
+        );
     }
 
     #[test]
