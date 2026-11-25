@@ -1,17 +1,19 @@
 """Run against a foreground Calculator with WDA_URL and the baseline on PYTHONPATH.
 
 timeout 120 python experimental/profile_baseline.py > samples.jsonl
-No frame, label, app state, identifier or URL is emitted.
+Device-command timings include a small Python bootstrap that guards the selected
+CLI’s normal session setup before running its module entry point. Help uses an
+unmodified CLI launch. Both arms drain stdout and stderr through process exit.
+Only metric names and elapsed times are printed.
 """
 import io
 import json
 import os
 import random
-import subprocess
-import sys
 import time
 
 from PIL import Image
+from profile_session import open_existing_session, run_cli
 from turbotap import cli
 
 
@@ -24,13 +26,12 @@ def sample(name, fn):
 
 
 def cold(*args):
-    subprocess.run([sys.executable, "-m", "turbotap", *args], timeout=14,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    run_cli(*args, timeout=14)
 
 
 def main():
     client = cli.WDAClient(os.environ["WDA_URL"], os.getenv("WDA_UDID", ""))
-    client.ensure_session()
+    open_existing_session(client)
     reader = cli.ScreenReader(client, warm_ocr=False)
     rng = random.Random(42)
     for _ in range(10):

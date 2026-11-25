@@ -6,6 +6,8 @@ import time
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from profile_session import session_id
 from turbotap.cli import ScreenReader, WDAClient
 
 
@@ -56,10 +58,7 @@ class CalculatorObserver:
         deadline = time.monotonic() + 4
         if not self.source.sid:
             # Only borrow an existing session. Never launch, configure or repair.
-            sid = self.transport.req("GET", "/status", deadline=deadline).get("sessionId")
-            if not isinstance(sid, str) or not sid.isascii() or not sid.replace("-", "").isalnum():
-                raise RuntimeError("existing session required")
-            self.source.sid = sid
+            self.source.sid = session_id(self.transport.req("GET", "/status", deadline=deadline))
         try:
             img = self.reader.grab(deadline=deadline)
             with img:

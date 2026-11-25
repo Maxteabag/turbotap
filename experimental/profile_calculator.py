@@ -8,6 +8,7 @@ import os
 import random
 import time
 
+from profile_session import open_existing_session
 from turbotap.cli import ScreenReader, WDAClient
 
 
@@ -21,7 +22,7 @@ def anchors(client):
 
 def main():
     client = WDAClient(os.environ["WDA_URL"], os.getenv("WDA_UDID", ""))
-    client.ensure_session()
+    open_existing_session(client)
     reader = ScreenReader(client)
     scales = [0.75, 1.0, 1.25, 1.5, 2.0] * 8
     random.Random(194).shuffle(scales)

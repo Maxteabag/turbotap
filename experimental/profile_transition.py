@@ -16,6 +16,7 @@ from pathlib import Path
 
 from PIL import Image, ImageChops
 from profile_stream import get_frame
+from profile_session import open_existing_session
 from turbotap.cli import WDAClient
 
 sys.path.insert(0, str(Path(__file__).with_name("jev")))
@@ -108,7 +109,7 @@ def trial(c, arm):
 
 def main():
     client = WDAClient(os.environ["WDA_URL"])
-    client.ensure_session()
+    open_existing_session(client)
     arms = ["pull", "stream"] * 8
     random.Random(19).shuffle(arms)
     for arm in arms:

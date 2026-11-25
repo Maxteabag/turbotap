@@ -53,13 +53,16 @@ Use the same command with `EXPECT_FALLBACK=1` on stock or base WDA to measure
 the unsupported-route cost. The benchmark requires a reachable runner.
 
 ```bash
-PYTHONPATH=src python - <<'PY'
+PYTHONPATH=src:experimental python - <<'PY'
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 from types import SimpleNamespace
 from statistics import median, quantiles
 import json, os
+from profile_session import guard_session_setup
 from turbotap import cli
+
+guard_session_setup()
 
 class TracedClient(cli.WDAClient):
     fallback_read = False

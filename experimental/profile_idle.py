@@ -8,12 +8,13 @@ import os
 import random
 import time
 
+from profile_session import open_existing_session
 from turbotap.cli import WDAClient
 
 
 def main():
     client = WDAClient(os.environ["WDA_URL"])
-    client.ensure_session()
+    open_existing_session(client)
     delays = [0, 0.05, 0.25, 1, 3] * 8
     random.Random(19).shuffle(delays)
     for index, delay in enumerate(delays):

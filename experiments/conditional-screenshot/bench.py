@@ -6,10 +6,15 @@ import json
 import math
 import statistics
 import time
+import sys
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experimental"))
+from profile_session import check_http_session
 
 def etag(body):
     return '"' + hashlib.sha256(body).hexdigest() + '"'
@@ -155,6 +160,7 @@ def main():
     params = dict(raw=True, quality=args.quality, scale=args.scale)
     if args.rect:
         params.update(zip(("x0", "y0", "x1", "y1"), args.rect))
+    check_http_session(args.url)
     endpoint = Endpoint(args.url)
     try:
         result = run(endpoint, params, args.static, args.tap, args.settle)

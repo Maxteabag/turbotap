@@ -4,8 +4,12 @@ import os
 import re
 import secrets
 import sys
+from pathlib import Path
 import time
 import unicodedata
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from profile_session import session_id
 
 from planner import TASKS, query
 
@@ -127,6 +131,7 @@ def main():
         sys.exit("TYPESAFE_API_KEY required")
     from turbotap.cli import WDAClient, resolve_device_settings
     client = WDAClient(*resolve_device_settings())
+    client.sid = session_id(client.req("GET", "/status", timeout=4))
     for mode in ("deterministic", "jev"):
         print(json.dumps(run(client, mode, key)), flush=True)
 

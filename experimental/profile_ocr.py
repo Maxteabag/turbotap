@@ -14,6 +14,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from profile_session import open_existing_session
 from turbotap.cli import ScreenReader, WDAClient
 
 WORDS = ("Moonlight", "Bjørn", "Ålesund", "Gjøvik", "Blåbær", "Ærlig",
@@ -23,7 +24,7 @@ WORDS = ("Moonlight", "Bjørn", "Ålesund", "Gjøvik", "Blåbær", "Ærlig",
 def main():
     base = os.environ["WDA_URL"]
     client = WDAClient(base, os.environ.get("WDA_UDID", ""))
-    sid = client.ensure_session()
+    sid = open_existing_session(client)
     app = client.req("GET", "/wda/activeAppInfo")["value"]["bundleId"]
     if app.casefold() != "com.apple.calculator":
         raise SystemExit("start in Calculator")

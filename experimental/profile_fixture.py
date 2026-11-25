@@ -7,13 +7,12 @@ import argparse
 import json
 import os
 import random
-import subprocess
-import sys
 import time
 import unicodedata
 
 from profile_ocr import WORDS
 from vision_provenance import effective_image
+from profile_session import open_existing_session, run_cli
 from turbotap.cli import ScreenReader, WDAClient
 
 BROWSERS = {"com.apple.mobilesafari", "com.google.chrome.ios", "com.brave.ios.browser",
@@ -29,7 +28,7 @@ def main():
     parser.add_argument("--capture-study", action="store_true")
     args = parser.parse_args()
     client = WDAClient(os.environ["WDA_URL"], os.environ.get("WDA_UDID", ""))
-    sid = client.ensure_session()
+    sid = open_existing_session(client)
     def active():
         return client.req("GET", "/wda/activeAppInfo")["value"]["bundleId"].casefold()
     if active() != "com.apple.calculator":
@@ -86,8 +85,7 @@ def main():
             seen = tokens(lines)
             print(json.dumps(dict(arm=arm, ms=elapsed, found=[w for w in WORDS if w.casefold() in seen], **provenance)), flush=True)
     finally:
-        subprocess.run([sys.executable,"-m","turbotap","flow","open:com.apple.calculator"],
-                       capture_output=True, timeout=12, check=True)
+        run_cli("flow", "open:com.apple.calculator", timeout=12)
         end = time.monotonic() + 3
         while active() != "com.apple.calculator":
             if time.monotonic() >= end:

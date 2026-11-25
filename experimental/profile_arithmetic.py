@@ -7,10 +7,10 @@ import json
 import os
 from pathlib import Path
 import random
-import subprocess
 import sys
 import time
 
+from profile_session import open_existing_session, run_cli
 from turbotap.cli import WDAClient
 
 sys.path.insert(0, str(Path(__file__).with_name("jev")))
@@ -19,7 +19,7 @@ from parent_e2e import RunStopped, observe, prepare, verify
 
 def main():
     c = WDAClient(os.environ["WDA_URL"])
-    c.ensure_session()
+    open_existing_session(c)
     arms = ["tapel", "batch", "fixed"] * 5
     random.Random(74).shuffle(arms)
     for arm in arms:
@@ -41,8 +41,7 @@ def main():
             prefix = "tapbatch:fixed:" if arm == "fixed" else "tapbatch:"
             args = [prefix+",".join(steps)]
         start = time.perf_counter_ns()
-        run = subprocess.run([sys.executable, "-m", "turbotap", "flow", *args],
-                             capture_output=True, timeout=18)
+        run = run_cli("flow", *args, timeout=18, check=False)
         executed = time.perf_counter_ns()
         verified = False
         if run.returncode == 0:

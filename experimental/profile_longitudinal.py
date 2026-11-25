@@ -13,6 +13,7 @@ import random
 import time
 
 from PIL import Image
+from profile_session import session_id
 from turbotap.cli import ScreenReader, WDAClient
 from profile_vision import get_reference
 
@@ -23,9 +24,7 @@ def main():
     args = parser.parse_args()
     c = WDAClient(os.environ["WDA_URL"], os.getenv("WDA_UDID", ""))
     # Use only an existing runner. An overnight measurement must not repair it.
-    c.sid = c.req("GET", "/status", timeout=4).get("sessionId")
-    if not c.sid:
-        raise RuntimeError("existing WDA session required")
+    c.sid = session_id(c.req("GET", "/status", timeout=4))
     reader = ScreenReader(c)
     arms = [(quality, fresh) for quality in (0.25, 0.6, 0.9)
             for fresh in (False, True)] * 8

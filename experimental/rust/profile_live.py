@@ -9,6 +9,10 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from profile_session import check_http_session
+
+check_http_session(os.environ["WDA_URL"])
 operations = sys.argv[1:] or ["preflight", "screenshot", "fastUI", "flow"]
 for rep in range(8):
     for operation in operations:

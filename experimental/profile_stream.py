@@ -11,6 +11,7 @@ import time
 import urllib.request
 
 from PIL import Image
+from profile_session import open_existing_session
 from turbotap.cli import WDAClient
 
 
@@ -38,7 +39,7 @@ def get_frame(response):
 
 def main():
     client = WDAClient(os.environ["WDA_URL"])
-    client.ensure_session()
+    open_existing_session(client)
     for active in (False, True, True, False):
         if client.req("GET", "/wda/activeAppInfo")["value"]["bundleId"].casefold() != "com.apple.calculator":
             raise SystemExit("Calculator must be active")

@@ -9,6 +9,7 @@ import os
 import random
 import time
 
+from profile_session import open_existing_session
 from turbotap.cli import ScreenReader, WDAClient
 from vision_provenance import effective_image
 
@@ -29,7 +30,7 @@ def main():
     parser.add_argument("--capture-study", action="store_true")
     args = parser.parse_args()
     client = WDAClient(os.environ["WDA_URL"], os.getenv("WDA_UDID", ""))
-    client.ensure_session()
+    open_existing_session(client)
     reader = ScreenReader(client)
     arms = ["host", "fastOCR fast", "fastOCR accurate", "fastRead fast", "fastRead accurate"] * 10
     if args.capture_study:

@@ -12,6 +12,9 @@ from bench import Endpoint, run
 from turbotap.cli import WDAClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experimental" / "jev"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experimental"))
+from profile_session import open_existing_session
+
 from parent_e2e import observe, prepare, verify
 
 
@@ -31,7 +34,7 @@ class KeyChecked(Endpoint):
 
 def main():
     client = WDAClient(os.environ["WDA_URL"])
-    client.ensure_session()
+    open_existing_session(client)
     display_y = prepare(client)
     layout, _ = observe(client)
     screen = client.req("GET", "/wda/fastUI")["screen"]

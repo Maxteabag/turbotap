@@ -9,12 +9,13 @@ import os
 import random
 import time
 
+from profile_session import open_existing_session
 from turbotap.cli import ScreenReader, WDAClient, _parse_fast_ui
 
 
 def main():
     client = WDAClient(os.environ['WDA_URL'], os.environ.get('WDA_UDID', ''))
-    client.ensure_session()
+    open_existing_session(client)
     side = client._side_client()
     reader = ScreenReader(client)
 

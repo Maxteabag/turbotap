@@ -5,25 +5,31 @@ summary contains no identifiers or dimensions. Keep device state stable.
 """
 import argparse
 import json
-import subprocess
-import sys
 import time
 
-
-TRACE = """
-from turbotap import cli
+import subprocess
 import sys
-accepted = None
-original = cli._fast_preflight
-def observed(client, sid):
-    global accepted
-    result = original(client, sid)
-    accepted = result is not None
-    return result
-cli._fast_preflight = observed
-cli.main()
-print("lab-route=" + {None: "stock", False: "fallback", True: "accepted"}[accepted], file=sys.stderr)
-"""
+
+from profile_session import guard_session_setup
+
+
+def child():
+    from turbotap import cli
+
+    guard_session_setup()
+    original = cli._fast_preflight
+    route = "stock"
+
+    def observed(client, sid):
+        nonlocal route
+        result = original(client, sid)
+        route = "accepted" if result is not None else "fallback"
+        return result
+
+    cli._fast_preflight = observed
+    sys.argv.pop(1)
+    cli.main()
+    print("lab-route=" + route, file=sys.stderr)
 
 
 def main():
@@ -33,7 +39,7 @@ def main():
     for rep in range(12):
         previous = None
         for fast in (False, True)[::1 if rep % 2 == 0 else -1]:
-            cmd = [sys.executable, "-c", TRACE, "preflight"] + (["--fast"] if fast else [])
+            cmd = [sys.executable, __file__, "--child", "preflight"] + (["--fast"] if fast else [])
             start = time.perf_counter()
             proc = subprocess.run(cmd, capture_output=True, timeout=12, check=True)
             wall = (time.perf_counter()-start)*1000
@@ -50,4 +56,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--child"]:
+        child()
+    else:
+        main()

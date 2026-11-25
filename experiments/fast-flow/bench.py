@@ -7,8 +7,12 @@ import os
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 import time
 from urllib.parse import urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experimental"))
+from profile_session import session_id
 
 CALCULATOR = "com.apple.calculator"
 ABSENT = "__turbotap_absent_calculator_label__"
@@ -66,7 +70,7 @@ def delayed_launch(command, due):
     time.sleep(max(0, due - time.monotonic()))
     sent = time.monotonic()
     # Command arguments and device diagnostics stay out of benchmark output.
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    result = subprocess.run(command, capture_output=True,
                             timeout=12, check=False)
     if result.returncode:
         raise RuntimeError("Independent Calculator launch failed")
@@ -134,6 +138,7 @@ def main():
         if args.launch_host:
             command = ["ssh", "-oBatchMode=yes", "--", args.launch_host, shlex.join(command)]
     client = Client(os.environ["WDA_URL"])
+    session_id(client.call("/status"))
     if command:
         # devicectl uses the canonical case from the device's app metadata.
         bundle = client.call(FAST_UI).get("bundleId", "")

@@ -129,6 +129,7 @@ def measure(engines, frames):
 
 def calculator_frames(n):
     from calculator import CalculatorObserver
+    from profile_session import session_id
     upstream = CalculatorObserver()
     def anchors(deadline):
         tree = upstream.transport.req("GET", "/wda/fastUI", deadline=deadline)
@@ -141,10 +142,7 @@ def calculator_frames(n):
             raise RuntimeError("ten anchors required")
         return points
     try:
-        sid = upstream.transport.req("GET", "/status", timeout=3).get("sessionId")
-        if not isinstance(sid, str) or not sid.isascii() or not sid.replace("-", "").isalnum():
-            raise RuntimeError("existing session required")
-        upstream.source.sid = sid
+        upstream.source.sid = session_id(upstream.transport.req("GET", "/status", timeout=3))
         for _ in range(n):
             deadline = time.monotonic()+5
             before = anchors(deadline)
