@@ -197,3 +197,25 @@ The first run sampled the home screen before its transition completed. The corre
 
 - v5, median wall 845.5 ms, 3 HTTP requests and 1738 response bytes.
 - flow, median wall 867.4 ms, 1 HTTP requests and 199 response bytes.
+
+## Conditional screenshot responses
+
+Each request acquired a fresh JPEG. The conditional protocol sent the previous JPEG digest and reused its local bytes only on an exact validator match. The full-screen series includes status-bar changes. The display-only series excludes the status bar. Counts omit HTTP headers.
+
+| Region | Calls | Conditional hits | Body bytes, raw | Body bytes, conditional | Raw p50 ms | Conditional p50 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| full | 20 | 16 | 1220111 | 243985 | 34.9 | 31.2 |
+| display | 20 | 19 | 62180 | 3109 | 18.3 | 18.2 |
+
+Display-region reference comparisons after three taps: {'detected': 3, 'missed': 0, 'unstable_reference': 0, 'unchanged_reference': 0}. The harness verified the final Calculator readout independently.
+
+## Conventional model per turn
+
+Four synthetic checkpoints used the same option maps and correct prior key histories. Fresh Codex CLI processes took 11.60 s summed and made four correct choices, including abstention when the square-root key was absent. Jev took 0.86 s summed across the four recorded requests and made three correct choices. The fourth checkpoint was selected because Jev had failed it. The comparison illustrates latency and that failure mode. Four selected cases cannot estimate either model’s general accuracy. The full receipts and environment details are in experimental/jev/.
+
+## Preflight under rotation and lock
+
+The same twelve paired fresh-process calls per state compared all stable output fields. The operator restored the initial orientation after rotation and verified unlock and Calculator activation after the locked trial.
+
+- rotated, stock median 239.3 ms, combined median 229.0 ms, 12/12 matching pairs.
+- locked, stock median 146.4 ms, combined median 123.7 ms, 12/12 matching pairs.
