@@ -40,6 +40,36 @@ pub fn is_plain_send(label: &str) -> bool {
     PLAIN_SEND_LABELS.contains(&norm.as_str())
 }
 
+/// [`DENY_DEFAULT`] without its `\bsend\b` entry: a label `--allow-label` names may
+/// pass only if it does not match this (send is the only deny word in it).
+fn deny_without_send() -> &'static fancy_regex::Regex {
+    static RX: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    RX.get_or_init(|| {
+        let p = DENY_DEFAULT.replace(r"\bsend\b|", "");
+        assert!(!p.contains("send\\b|record"), "DENY_DEFAULT changed: update deny_without_send");
+        crate::text::compile_icase(&p).expect("deny pattern without send is valid")
+    })
+}
+
+/// `label` with surrounding and repeated whitespace removed, for exact
+/// `--allow-label` comparison (case and wording must match).
+pub(crate) fn norm_label(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// True when `label` is exactly one of the `--allow-label` values, `send` is the only
+/// built-in deny word in it, and it contains none of [`ICON_NAME_RISKY`] anywhere
+/// (the built-in `\bpay\b` does not match `payment`; this does). Money, destructive,
+/// call, mass-recipient, attachment and confirmation words are never let through.
+pub fn label_allowed_by_flag(label: &str, allow: &[String]) -> bool {
+    let l = norm_label(label);
+    let low = l.to_lowercase();
+    !l.is_empty()
+        && allow.iter().any(|a| norm_label(a) == l)
+        && matches!(deny_without_send().is_match(&l), Ok(false))
+        && !ICON_NAME_RISKY.iter().any(|w| low.contains(w))
+}
+
 /// Substrings that disqualify an element name from [`is_safe_icon_name`]: money,
 /// destructive, call/recording, mass-recipient, attachment and confirmation words.
 /// Matched anywhere in the lowercased name, so `sendtoall` and `small` both fail:
@@ -442,6 +472,31 @@ impl<R: Reader> Flow<R> {
             Ok(true) => {
                 let plain = is_plain_send(text);
                 let mut why: Vec<String> = Vec::new();
+                // --allow-label: an exact label, send its only deny word, the target's
+                // own label, the built-in default, and an --allow-app app in front.
+                let flagged = is_default && label_allowed_by_flag(text, &self.c.allow_labels);
+                if flagged && !plain {
+                    if let Err(note) = &relax {
+                        if !note.is_empty() {
+                            why.push(note.clone());
+                        }
+                    } else {
+                        match self.c.allow_label_foreground() {
+                            Ok(b) => {
+                                crate::errln!("turbotap: --allow-label let {} through in {b}", json::py_repr_str(text));
+                                return Ok(());
+                            }
+                            Err(fg) => why.push(format!("--allow-label: {fg}")),
+                        }
+                    }
+                    if why.is_empty() {
+                        why.push("the text is not the target's own label".into());
+                    }
+                    let mut msg = format!("refusing to {action} {}: matches --deny", json::py_repr_str(text));
+                    msg.push_str("; --allow-label not applied: ");
+                    msg.push_str(&why.join("; "));
+                    return Err(Error::flow(msg));
+                }
                 if !is_default {
                     if plain {
                         why.push("an explicit --deny is never relaxed".into());
