@@ -3236,6 +3236,13 @@ pub fn wda_error_reason(res: &Value) -> String {
     let msg = serde_json::from_str::<Value>(&txt)
         .ok()
         .and_then(|v| v.get("value").and_then(|x| x.get("message")).and_then(Value::as_str).map(str::to_string))
+        .or_else(|| {
+            // Not valid JSON (an unescaped quote): take the message field by its text.
+            let i = txt.find("\"message\"")?;
+            let rest = txt[i + 9..].trim_start().trim_start_matches(':').trim_start().strip_prefix('"')?;
+            let end = rest.find("\"traceback\"").map(|j| rest[..j].trim_end().trim_end_matches(',').trim_end()).unwrap_or(rest);
+            Some(end.trim_end_matches('"').to_string())
+        })
         .unwrap_or(txt);
     let one = msg.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() > 400 {

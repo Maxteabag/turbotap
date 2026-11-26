@@ -15,7 +15,8 @@ fn refused_body(bundle: &str) -> String {
     let msg = format!(
         "Error Domain=FBSOpenApplicationServiceErrorDomain Code=1 \"The request to open \\\"{bundle}\\\" failed.\"\n    UserInfo={{NSLocalizedFailureReason=The request was denied by service delegate (SBMainWorkspace).}}"
     );
-    format!("{{\n  \"value\" : {{\n    \"error\" : \"unknown error\",\n    \"message\" : \"{msg}\",\n    \"traceback\" : \"\"\n  }},\n  \"sessionId\" : \"s\"\n}}")
+    // WDA pretty-prints its JSON answer; serde's pretty form parses the same way.
+    serde_json::to_string_pretty(&json!({"value": {"error": "unknown error", "message": msg, "traceback": ""}, "sessionId": "s"})).unwrap()
 }
 
 fn mock_refusing(bundle: &'static str, front: &str) -> MockWda {
