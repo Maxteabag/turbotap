@@ -7,6 +7,14 @@ description: "Drive a physical iPhone headlessly over Wi-Fi with turbotap (patch
 
 Use `turbotap` to operate any app on a real iPhone over Wi-Fi without AirPlay screen mirroring, Bluetooth HID, or burning 20 seconds of LLM round-trip on every tap.
 
+## 0. A Longer Task, Start to Finish (posting, installing, filling a form)
+
+1. **Ready, bounded, one recovery.** `turbotap --device N preflight --require-ready` checks the lock state, front app, screen size and one small capture, and exits 1 with `not_ready` reasons. Do the one recovery it names (`turbotap unlock` once under the vault rule, or `turbotap deploy` once for an empty capture or no answer), run preflight once more, and stop with its reason if it is still not ready. Never loop on empty screenshots.
+2. **The app before anything else.** `open:BUNDLE` (or `launch:`) first, before preparing media or text: it fails at once with iOS's reason when the app is missing, restricted or not opened, and succeeds only when the app was seen in front. Install a missing app first, then continue.
+3. **Media: what is already there first, then only the allowed path.** Check the app's picker or Photos for the exact item (name, duration or date) and use it if it is there. Transfer only when it is not, and only over a path the task allows; never invent a new channel.
+4. **Wait on the exact control, not the clock.** For anything slow (a download, an upload, a server reply), poll `ui` once a second against the control's own position or label with a hard deadline, and act in the same moment it appears, checking the exact target again right before the press. No fixed sleeps between checks, no hand-measured coordinate boxes.
+5. **Receipt.** At the end, `turbotap --device N timings --receipt --since START --until END` splits the wall clock into the helper between steps, WDA, app wait and turbotap, with retries, failures and the longest gaps. Put it in the report: it shows where the minutes went.
+
 ## 1. Core Speed Rules (Read Before Running Anything)
 
 1. **Bundle steps into ONE `turbotap flow` command.** Never split `open:APP` and `tap:...` across LLM turns — each extra turn costs 15–25 s while a local `flow` step takes ~200–350 ms (session settings and screen size are cached per device in `~/.cache/turbotap/`).
@@ -80,6 +88,8 @@ turbotap flow open:Messenger search:Alice wait:'re:Alice\s+Smith'
 - **Never print secrets** (passcodes, PINs, passwords, OTPs, national IDs) in logs, chat, or shell arguments — pass them through `env:VAR` or `cmd:...`.
 
 ## 6. Timing log (`turbotap timings`)
+
+`turbotap --device N timings --receipt --since START [--until END]` gives one run's receipt: `wall_ms`, `split_ms` (`helper_between_steps`, `wda`, `app_wait`, `turbotap_own`, which add up to the wall clock), `retries`, `failures` and `longest_gaps` (the step before and after each). Large `helper_between_steps` is time between turbotap calls (agent thinking, shell sleeps, other tools), not turbotap.
 
 Every flow step and standalone command appends one JSON line to `~/.local/state/turbotap/timings.jsonl` (`TURBOTAP_TIMINGS=PATH` moves it, `TURBOTAP_TIMINGS=0` turns it off): step, safe argument (never typed text or credentials), `ms`, `wda_ms` (time in WDA requests), `sleep_ms`, `wda` round trips, `shots`, `tree` queries, bytes, `retries`, `req_ms` (time per request kind, to see where a step's time went), `target` (what a tap resolved to), app and ok/error. `turbotap timings --since 1h --by step|app|step+app` prints p50/p95/max per group plus the slowest and most retried steps. Use it after a session to find what to fix (see `turbotap-retro`).
 

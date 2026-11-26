@@ -333,6 +333,9 @@ impl DenyGuard {
     }
 }
 
+/// How long `open:`/`launch:` re-reads the front app while another app is still there.
+pub const OPEN_RECEIPT_GRACE: f64 = 1.0;
+
 pub struct Flow<R: Reader = ScreenReader> {
     pub c: WdaClient,
     pub r: R,
@@ -341,6 +344,8 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub bundle: Option<String>,
     pub pending_bundle: Option<String>,
     pub pending_bundle_ts: f64,
+    /// The app the last `open:`/`launch:` receipt saw in front, and when.
+    pub open_confirmed: Option<(String, f64)>,
     pub last_app_name: Option<String>,
     pub last_app_bundle: Option<String>,
     pub switched_from_app_name: Option<String>,
@@ -393,6 +398,7 @@ impl<R: Reader> Flow<R> {
             bundle: None,
             pending_bundle: None,
             pending_bundle_ts: 0.0,
+            open_confirmed: None,
             last_app_name: None,
             last_app_bundle: None,
             switched_from_app_name: None,
@@ -733,6 +739,36 @@ impl<R: Reader> Flow<R> {
         self.c.guard_result(res)
     }
 
+    /// The receipt for `open:`/`launch:`: one live foreground read right after WDA took
+    /// the request (XCTest's activate returns once the app is up). The app in front is
+    /// recorded, and the next step's wait for it takes that as its answer instead of
+    /// asking again. SpringBoard in front (an alert, a banner, a lock) keeps the old
+    /// behaviour; no answer too. Another app is read again for up to 1 s, then the step
+    /// fails naming it instead of reading or typing into the wrong app.
+    fn confirm_opened(&mut self, action: &str, bid: &str) -> Result<()> {
+        self.open_confirmed = None;
+        let end = clock::now() + OPEN_RECEIPT_GRACE;
+        loop {
+            match self.c.live_foreground_app(None) {
+                Ok(front) if front == bid => {
+                    self.open_confirmed = Some((front, clock::now()));
+                    return Ok(());
+                }
+                Ok(front) if front == crate::wda::SPRINGBOARD => return Ok(()),
+                Ok(front) => {
+                    if clock::now() >= end {
+                        return Err(Error::flow(format!(
+                            "{action}: WDA reported the app opened, but {} is in front, not {bid}",
+                            json::py_repr_str(&front)
+                        )));
+                    }
+                }
+                Err(_) => return Ok(()),
+            }
+            clock::sleep(0.1);
+        }
+    }
+
     fn guarded_step(&mut self, spec: &str, label: &str) -> Result<Option<Value>> {
         let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
         let verb = verb.trim().to_lowercase();
@@ -776,13 +812,22 @@ impl<R: Reader> Flow<R> {
                 self.c.ensure_allowed_target(&label, Some(&bid))?;
                 self.mark_action(false, false);
                 let bundle_changed = self.bundle.as_deref() != Some(bid.as_str());
-                if verb.as_ref() == "launch" {
-                    let r = self.c.fast_launch(&bid, true);
-                    check_wda_ok(r, &format!("launch:{bid}"), false)?;
+                // WDA's own error answer means iOS did not open the app: stop here with its
+                // reason instead of reading or typing into whatever is in front. No answer
+                // at all (a lost connection) keeps going; the next step's app check waits.
+                let r = if verb.as_ref() == "launch" {
+                    self.c.fast_launch(&bid, true)
                 } else {
                     let p = self.c.spath("/wda/apps/activate");
-                    self.c.post(&p, &j!({"bundleId": bid}));
+                    self.c.post(&p, &j!({"bundleId": bid}))
+                };
+                if crate::wda::wda_answered_error(&r) {
+                    return Err(crate::wda::app_open_error(&format!("{verb}:{bid}"), &bid, &r));
                 }
+                if verb.as_ref() == "launch" {
+                    check_wda_ok(r, &format!("launch:{bid}"), false)?;
+                }
+                self.confirm_opened(&format!("{verb}:{bid}"), &bid)?;
                 self.bundle = Some(bid.clone());
                 let now = clock::now();
                 if verb.as_ref() == "launch" || bundle_changed {
