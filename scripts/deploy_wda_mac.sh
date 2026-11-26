@@ -51,10 +51,15 @@ WDA_URL="${WDA_URL:-${CFG_URL:-}}"
 TEAM="${WDA_TEAM:-${CFG_TEAM:-}}"
 BUNDLE="${WDA_BUNDLE:-${CFG_BUNDLE:-}}"
 SRC="${WDA_SRC:-/var/tmp/WebDriverAgent}"
-DD="${WDA_DD:-/var/tmp/wda-dd}"
+# One DerivedData per device, so a build for one phone never rewrites the products another
+# phone's running runner uses. A --no-build deploy seeds it once from the shared one.
+DD="${WDA_DD:-/var/tmp/wda-dd-${WDA_UDID:-${IPHONE_UDID:-${CFG_UDID:-}}}}"
+SHARED_DD="${WDA_SHARED_DD:-/var/tmp/wda-dd}"
 UPSTREAM_REF="${WDA_REF:-d17782422d55ff1e5e0ceb74eb1fd509cc0c35b6}"  # appium/WebDriverAgent 16.14.0
 BUILD=1
 [[ "${1:-}" == "--no-build" ]] && BUILD=0
+PRINT_TARGET=0
+[[ "${1:-}" == "--print-target" ]] && PRINT_TARGET=1
 
 for req in UDID WDA_URL TEAM BUNDLE; do
   if [[ -z "${!req}" ]]; then
@@ -65,16 +70,24 @@ done
 
 # The runner listens on the configured URL's port (not a fixed 8100).
 PORT="${WDA_URL##*:}"; PORT="${PORT%%/*}"; [[ "$PORT" =~ ^[0-9]+$ ]] || PORT=8100
+HOST="${WDA_URL#*://}"; HOST="${HOST%%:*}"; HOST="${HOST%%/*}"
+if [[ "$PRINT_TARGET" == 1 ]]; then
+  # Offline: what a deploy for this device would use, without touching the Mac or the phone.
+  printf 'device=%s udid=%s url=%s host=%s port=%s mac=%s derived_data=%s runner_log=/var/tmp/wda-runner-%s.log build_log=/var/tmp/wda-turbo-build-%s.log\n' \
+    "${WDA_DEVICE:-default}" "$UDID" "$WDA_URL" "$HOST" "$PORT" "$MAC" "$DD" "$UDID" "$UDID"
+  exit 0
+fi
 # What answers before the restart, so the receipt can tell a new runner from the old one.
 wda_json() { { curl -fsS --max-time 3 "$WDA_URL$1" 2>/dev/null || true; } | python3 -c 'import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(0)
 v = d.get("value") if isinstance(d.get("value"), dict) else {}
-print(d.get("sessionId") or v.get("sessionId") or "", v.get("bundleId") or "", v.get("pid", ""), "answered", sep="|")' || true; }
+ios = v.get("ios") if isinstance(v.get("ios"), dict) else {}
+print(d.get("sessionId") or v.get("sessionId") or "", v.get("bundleId") or "", v.get("pid", ""), "answered", ios.get("ip") or "", sep="|")' || true; }
 OLD_SID="$(wda_json /status | cut -d"|" -f1)"
 RUN_OUT="$(mktemp /var/tmp/wda-deploy.XXXXXX)"; trap 'rm -f "$RUN_OUT"' EXIT
 scp -q "$PATCH" "$MAC:/var/tmp/wda-turbo.patch"
-ssh "$MAC" BUILD="$BUILD" UDID="$UDID" PORT="$PORT" TEAM="$TEAM" BUNDLE="$BUNDLE" REF="$UPSTREAM_REF" SRC="$SRC" DD="$DD" \
+ssh "$MAC" BUILD="$BUILD" UDID="$UDID" PORT="$PORT" SHARED_DD="$SHARED_DD" TEAM="$TEAM" BUNDLE="$BUNDLE" REF="$UPSTREAM_REF" SRC="$SRC" DD="$DD" \
   KCDIR="${WDA_KEYCHAIN_DIR:-}" XB="${WDA_XCODEBUILD:-}" bash -s <<'REMOTE' | tee "$RUN_OUT"
 set -euo pipefail
 [[ -n "$XB" && -x "$XB" ]] || XB=/Applications/Xcode-26.6.app/Contents/Developer/usr/bin/xcodebuild
@@ -145,20 +158,29 @@ open(p, "w").write(txt2)
 PYEOF
   fi
   if ! "$XB" build-for-testing -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
-      -destination generic/platform=iOS -derivedDataPath "$DD" "${SIGN[@]}" >/var/tmp/wda-turbo-build.log 2>&1; then
-    if [[ -n "${UUID:-}" ]] && grep -q "ProcessProductPackaging" /var/tmp/wda-turbo-build.log; then
+      -destination generic/platform=iOS -derivedDataPath "$DD" "${SIGN[@]}" >/var/tmp/wda-turbo-build-$UDID.log 2>&1; then
+    if [[ -n "${UUID:-}" ]] && grep -q "ProcessProductPackaging" /var/tmp/wda-turbo-build-$UDID.log; then
       for pdir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
         mkdir -p "$pdir"
         cp -f "$PROV" "$pdir/$UUID.mobileprovision"
       done
       "$XB" build-for-testing -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
-        -destination generic/platform=iOS -derivedDataPath "$DD" "${SIGN[@]}" >/var/tmp/wda-turbo-build.log 2>&1 \
-        || { tail -25 /var/tmp/wda-turbo-build.log; exit 1; }
+        -destination generic/platform=iOS -derivedDataPath "$DD" "${SIGN[@]}" >/var/tmp/wda-turbo-build-$UDID.log 2>&1 \
+        || { tail -25 /var/tmp/wda-turbo-build-$UDID.log; exit 1; }
     else
-      tail -25 /var/tmp/wda-turbo-build.log; exit 1
+      tail -25 /var/tmp/wda-turbo-build-$UDID.log; exit 1
     fi
   fi
   echo "build ok"
+fi
+# A --no-build deploy into a device's own DerivedData that has no build yet: copy the shared
+# one once (read-only for the runners that use it), so every device runs from its own copy.
+if [[ "$BUILD" != 1 ]] && ! ls "$DD"/Build/Products/*.xctestrun >/dev/null 2>&1; then
+  if ls "$SHARED_DD"/Build/Products/*.xctestrun >/dev/null 2>&1; then
+    mkdir -p "$DD" && ditto "$SHARED_DD" "$DD" && echo "seeded $DD from $SHARED_DD"
+  else
+    echo "no WebDriverAgent build in $DD or $SHARED_DD: run turbotap deploy (with a build) once" >&2; exit 1
+  fi
 fi
 # Stop any WebDriverAgentRunner test session for this device (no pkill -f).
 for pid in $(ps -axo pid=,command= | awk -v u="$UDID" '/xcodebuild/ && /WebDriverAgentRunner/ && /test-without-building/ && index($0,u) {print $1}'); do
@@ -193,18 +215,19 @@ for i in $(seq 1 60); do
     echo "WDA did not come up: runner pid $RPID for $UDID has exited; see $MAC:$LOG" >&2
     exit 1
   fi
-  IFS="|" read -r sid _ _ answered <<<"$(wda_json /status)"
+  IFS="|" read -r sid _ _ answered ip <<<"$(wda_json /status)"
   if [[ "$answered" != answered ]]; then why="no answer on $WDA_URL"
+  elif [[ -n "$ip" && "$HOST" =~ ^[0-9.]+$ && "$ip" != "$HOST" ]]; then why="the WDA at $WDA_URL reports device IP $ip, not $HOST (another phone's runner?)"
   elif [[ -n "$sid" && "$sid" == "$OLD_SID" ]]; then why="the old runner still answers (session $sid)"
   elif [[ -n "$sid" || -z "$OLD_SID" ]]; then
-    IFS="|" read -r _ bundle apid _ <<<"$(wda_json /wda/activeAppInfo)"
+    IFS="|" read -r _ bundle apid _ _ <<<"$(wda_json /wda/activeAppInfo)"
     if [[ -z "$bundle" || "$bundle" == local.pid.* || "$apid" == 0 ]]; then
       why="WDA answers but cannot read the foreground app (${bundle:-none}, pid ${apid:-?}): no UI-testing access"
       n41=$(( ${n41:-0} + 1 )); (( n41 >= 8 )) && break
     elif curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -d '{"x0":0,"x1":320,"y0":0,"y1":40}' \
          "$WDA_URL/wda/fastScreenshot" -o /dev/null 2>/dev/null; then
       if runner_ok; then
-        echo "wda-turbo up at $WDA_URL: runner pid $RPID for $UDID on $MAC, session ${sid:-new}, front app $bundle, log $MAC:$LOG"
+        echo "wda-turbo up at $WDA_URL: runner pid $RPID for $UDID on $MAC, session ${sid:-new}, device IP ${ip:-not reported}, front app $bundle, derived data $DD, log $MAC:$LOG"
         exit 0
       fi
       why="runner pid $RPID is not the one answering"
