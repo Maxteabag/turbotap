@@ -98,12 +98,25 @@ pub fn cmd_deploy(client: &mut WdaClient, no_build: bool) -> Result<()> {
     // If an existing WDA instance is reachable and the device is locked, unlock it
     // first: once the old runner stops, Xcode cannot launch WDA on a locked iPhone.
     // If a reachable device is known locked and unlock fails, abort before stopping
-    // the existing runner instead of leaving the phone unreachable.
+    // the existing runner instead of leaving the phone unreachable; unless that runner
+    // has no UI-testing access (error 41), when it is unusable anyway.
     let st = client.req("GET", "/status", None, 3.0, None);
     if st.is_object() && !crate::json::truthy(crate::json::get(&st, "error")) {
         let locked = client.req("GET", "/wda/locked", None, 4.0, None);
         if locked.is_object() && crate::json::get(&locked, "value") == &serde_json::Value::Bool(true) {
-            client.unlock_phone()?;
+            if let Err(e) = client.unlock_phone() {
+                // A runner without UI-testing access (XCTest error 41: the front app reads as
+                // local.pid.0) can neither unlock nor be used: stopping it loses nothing, and
+                // Xcode starts the new one at the next unlock.
+                let app = client.req("GET", "/wda/activeAppInfo", None, 4.0, None);
+                let bid = crate::json::get(crate::json::get(&app, "value"), "bundleId").as_str().unwrap_or("").to_string();
+                if !bid.starts_with("local.pid.") {
+                    return Err(e);
+                }
+                crate::errln!(
+                    "turbotap: warning: deploy: the phone is locked and the running WDA has no UI-testing access (XCTest error 41), so it cannot unlock it; restarting the runner anyway, Xcode starts it at the next unlock"
+                );
+            }
         }
     }
     client.start_wda_on_mac(!no_build)

@@ -377,6 +377,37 @@ fn test_cmd_deploy_aborts_before_restart_when_unlock_fails() {
     assert!(!e.to_string().contains("deploy script"), "{e:?}");
 }
 
+// cmd_deploy on a locked phone whose runner has no UI-testing access (XCTest error 41):
+// the unlock cannot work and the runner is unusable, so the restart goes ahead.
+#[test]
+fn test_cmd_deploy_restarts_an_error_41_runner_on_a_locked_phone() {
+    let _cache = isolated_cache();
+    let home = crate::testutil::TempDir::new("turbotap-test-home-");
+    let home_s = home.path().to_string_lossy().into_owned();
+    let _env = set_env(&[
+        ("HOME", Some(home_s.as_str())),
+        ("WDA_UDID", None),
+        ("WDA_PASSCODE", Some("0000")),
+        ("WDA_MAC_HOST", Some("turbotap-test-no-such-host.invalid")),
+    ]);
+    let m = MockWda::start(MockState {
+        locked: Seq::one(json!(true)),
+        active_app: Seq::one(json!("local.pid.0")),
+        ..Default::default()
+    });
+    let mut c = m.client();
+    let cap = crate::testutil::capture::Capture::start();
+    let res = {
+        let _v = crate::testutil::virtual_clock();
+        crate::deploy::cmd_deploy(&mut c, false)
+    };
+    // The deploy script was attempted (in a test build it is refused by guard_remote or
+    // fails as a subprocess), and the warning names why.
+    let e = res.unwrap_err();
+    assert!(matches!(e, Error::Subprocess { .. }) || e.to_string().contains("deploy script"), "{e:?}");
+    assert!(cap.stderr().contains("no UI-testing access"), "{}", cap.stderr());
+}
+
 // Gen 5: WDA v4 doubletap / zoom / fastTapBatch + OCR icon-noise stripping
 #[test]
 fn test_wda_v4_doubletap_zoom_and_icon_noise_ocr() {
