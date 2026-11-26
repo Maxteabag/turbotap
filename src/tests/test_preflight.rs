@@ -56,7 +56,10 @@ fn test_fast_read_matches_stock_fields_and_cache_with_one_request() {
         };
         let keys: std::collections::BTreeSet<_> = expected.as_object().unwrap().keys().cloned().collect();
         let want: std::collections::BTreeSet<_> =
-            ["ok", "wda_url", "session_id", "locked", "active_app", "screen_pt"].iter().map(|s| s.to_string()).collect();
+            ["ok", "wda_url", "session_id", "locked", "active_app", "screen_pt", "capture", "ready", "not_ready"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         assert_eq!(keys, want);
         // Python's two clients shared TEST_WDA_URL; here each mock server has its own
         // URL, so wda_url is checked per client and the rest compared directly.
@@ -195,4 +198,85 @@ fn test_cli_parses_stock_flag() {
     assert_eq!(crate::cli::run_cli(&argv), 0);
     assert!(fast_calls(&m).is_empty());
     assert_eq!(stock_calls(&m).len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Readiness: preflight said ok while every capture came back empty.
+// ---------------------------------------------------------------------------
+
+/// Isolated CLI env (temp HOME and state, no daemon, no timing log).
+fn cli_env() -> (crate::testutil::TempDir, crate::testutil::EnvGuard) {
+    let home = crate::testutil::TempDir::new("tt-ready-home-");
+    let (h, st) = (home.path().to_str().unwrap().to_string(), home.path().join("state").to_str().unwrap().to_string());
+    let env = crate::testutil::set_env(&[
+        ("HOME", Some(h.as_str())),
+        ("XDG_STATE_HOME", Some(st.as_str())),
+        ("TURBOTAP_DAEMON", None),
+        ("WDA_TURBO", None),
+        ("WDA_URL", None),
+        ("WDA_DEVICE", None),
+        ("TURBOTAP_TIMINGS", Some("0")),
+    ]);
+    (home, env)
+}
+
+fn preflight_cli(m: &MockWda, extra: &[&str]) -> (i32, serde_json::Value, String) {
+    let _env = cli_env();
+    let mut argv: Vec<String> = vec!["--no-daemon".into(), "--url".into(), m.url.clone(), "preflight".into(), "--stock".into()];
+    argv.extend(extra.iter().map(|s| s.to_string()));
+    let cap = crate::testutil::capture::Capture::start();
+    let code = crate::cli::run_cli(&argv);
+    let (out, err) = (cap.stdout(), cap.stderr());
+    let v = serde_json::from_str(out.lines().next().unwrap_or("{}")).unwrap_or(json!(null));
+    (code, v, err)
+}
+
+#[test]
+fn test_preflight_reports_ready_and_the_one_recovery_when_not() {
+    let _c = isolated_cache();
+    // Unlocked, answers, and a capture with pixels: ready.
+    let m = MockWda::start(MockState { locked: Seq::one(json!(false)), ..Default::default() });
+    let (code, v, err) = preflight_cli(&m, &["--require-ready"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(v["ready"], json!(true), "{v}");
+    assert_eq!(v["capture"], json!("ok"));
+    assert_eq!(v["not_ready"], json!([]));
+
+    // Locked: not ready, unlock once.
+    let m = MockWda::start(MockState { locked: Seq::one(json!(true)), ..Default::default() });
+    let (code, v, err) = preflight_cli(&m, &[]);
+    assert_eq!(code, 0, "without --require-ready preflight still exits 0: {err}");
+    assert_eq!(v["ready"], json!(false));
+    assert!(v["not_ready"].to_string().contains("turbotap unlock (one attempt)"), "{v}");
+
+    // Empty capture (screen off or runner unhealthy): not ready, deploy once; exit 1 with --require-ready.
+    let m = MockWda::start(MockState {
+        locked: Seq::one(json!(false)),
+        screenshot_b64: Some(Seq::one(String::new())),
+        ..Default::default()
+    });
+    let (code, v, err) = preflight_cli(&m, &["--require-ready"]);
+    assert_eq!(v["capture"], json!("empty"), "{v}");
+    assert_eq!(v["ready"], json!(false));
+    assert_ne!(code, 0);
+    assert!(err.contains("not ready: screen capture empty") && err.contains("turbotap deploy once"), "{err}");
+}
+
+#[test]
+fn test_an_empty_capture_says_why() {
+    let _c = isolated_cache();
+    for (locked, want) in [(true, "the phone is locked"), (false, "the screen may be off or the WDA runner unhealthy")] {
+        let m = MockWda::start(MockState {
+            locked: Seq::one(json!(locked)),
+            screenshot_b64: Some(Seq::one(String::new())),
+            ..Default::default()
+        });
+        let _env = cli_env();
+        let cap = crate::testutil::capture::Capture::start();
+        let argv: Vec<String> = ["--no-daemon", "--url", m.url.as_str(), "flow", "read:ocr"].iter().map(|s| s.to_string()).collect();
+        let code = crate::cli::run_cli(&argv);
+        let all = format!("{}{}", cap.stdout(), cap.stderr());
+        assert_ne!(code, 0);
+        assert!(all.contains("Empty screenshot response") && all.contains(want), "{locked}: {all}");
+    }
 }

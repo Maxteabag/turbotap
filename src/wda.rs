@@ -3381,6 +3381,9 @@ pub fn preflight_value(client: &mut WdaClient, stock: bool) -> Result<Value> {
             client.save_session_cache(upd);
         }
     }
+    // Preflight once said ok while every capture came back empty: try one, small.
+    let capture = capture_probe(client, stock);
+    let (ready, not_ready) = readiness(&locked, &app, &w, capture);
     let dt = (clock::now() - t0) * 1000.0;
     Ok(j!({
         "ok": true,
@@ -3389,14 +3392,74 @@ pub fn preflight_value(client: &mut WdaClient, stock: bool) -> Result<Value> {
         "locked": locked,
         "active_app": app,
         "screen_pt": [w, h],
+        "capture": capture,
+        "ready": ready,
+        "not_ready": not_ready,
         "elapsed_ms": json::round_to(dt, 1),
     }))
 }
 
+/// The error for a screenshot that came back empty, with its likely cause from one
+/// lock-state read (only on this failure path, so working captures pay nothing).
+pub fn empty_shot_error(c: &mut WdaClient) -> Error {
+    match c.confirm_locked_state(0) {
+        Ok(true) => Error::runtime("Empty screenshot response: the phone is locked (turbotap unlock, one attempt)"),
+        _ => Error::runtime(
+            "Empty screenshot response: the screen may be off or the WDA runner unhealthy \
+             (turbotap preflight; if it is not ready, turbotap deploy once)",
+        ),
+    }
+}
+
+/// One small capture for preflight: `ok` when WDA returns image bytes, else `empty`.
+fn capture_probe(client: &mut WdaClient, stock: bool) -> &'static str {
+    if !stock && client.turbo != Some(false) {
+        let body = j!({"quality": 0.3, "scale": 0.1, "raw": true});
+        let (status, ct, bytes) = client.req_raw("POST", "/wda/fastScreenshot", Some(&body), 5.0, None, None);
+        if status == 200 && !bytes.is_empty() {
+            // Image bytes, or (older wda-turbo) JSON with a non-empty base64 value.
+            let has_pixels = ct.to_lowercase().starts_with("image/")
+                || serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .and_then(|v| v.get("value").and_then(Value::as_str).map(|s| !s.is_empty()))
+                    == Some(true);
+            if has_pixels {
+                return "ok";
+            }
+        }
+    }
+    let res = client.req("GET", "/screenshot", None, 5.0, None);
+    if json::get(&res, "value").as_str().is_some_and(|s| !s.is_empty()) {
+        "ok"
+    } else {
+        "empty"
+    }
+}
+
+/// `ready` and what to do once when not: the phone is unlocked, WDA answers the lock
+/// state, front app and screen size, and a capture returns pixels.
+pub fn readiness(locked: &Value, app: &Value, w: &Value, capture: &str) -> (bool, Vec<Value>) {
+    let mut not_ready = Vec::new();
+    if locked.as_bool() == Some(true) {
+        not_ready.push(j!({"why": "locked", "recover": "turbotap unlock (one attempt), then preflight again"}));
+    }
+    if locked.is_null() || app.is_null() || w.is_null() {
+        not_ready.push(j!({"why": "no answer for lock state, front app or screen size", "recover": "turbotap deploy once (restarts the runner), then preflight again"}));
+    }
+    if capture != "ok" && locked.as_bool() != Some(true) {
+        not_ready.push(j!({"why": "screen capture empty (screen off or runner unhealthy)", "recover": "turbotap deploy once, then preflight again"}));
+    }
+    (not_ready.is_empty(), not_ready)
+}
+
 /// L986-1009: prints the preflight JSON line.
-pub fn cmd_preflight(client: &mut WdaClient, stock: bool) -> Result<()> {
+pub fn cmd_preflight(client: &mut WdaClient, stock: bool, require_ready: bool) -> Result<()> {
     let v = preflight_value(client, stock)?;
     crate::outln!("{}", json::dumps(&v));
+    if require_ready && v.get("ready") != Some(&Value::Bool(true)) {
+        let why: Vec<String> = v["not_ready"].as_array().into_iter().flatten().map(|n| format!("{} ({})", json::py_str(&n["why"]), json::py_str(&n["recover"]))).collect();
+        return Err(Error::flow(format!("not ready: {}", why.join("; "))));
+    }
     Ok(())
 }
 

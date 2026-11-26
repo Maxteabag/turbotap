@@ -198,10 +198,10 @@ pub fn build_command() -> Command {
         ))
         .arg(flag("no-daemon", "never use the daemon, even with TURBOTAP_DAEMON=1"))
         .subcommand(
-            Command::new("preflight").about("session, lock state, foreground app and screen size").arg(flag(
-                "stock",
-                "skip the combined wda-turbo v6 /wda/fastPreflight read and use the three stock reads",
-            )),
+            Command::new("preflight")
+                .about("session, lock state, foreground app, screen size, one small capture, and whether the phone is ready")
+                .arg(flag("stock", "skip the combined wda-turbo v6 /wda/fastPreflight read and use the three stock reads"))
+                .arg(flag("require-ready", "exit 1 after the JSON when not ready (locked, no answer, or an empty capture)")),
         )
         .subcommand(
             Command::new("daemon")
@@ -386,7 +386,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
             let (t0, req0) = (crate::clock::real_now(), client.stats);
             client.req_kinds.clear();
             let r = match cmd {
-                "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock")),
+                "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock"), b(sm, "require-ready")),
                 "unlock" => crate::wda::cmd_unlock(&mut client),
                 "ocr" => crate::ocr::cmd_ocr(&mut client, f(sm, "scale").unwrap_or(1.5), i(sm, "y0").unwrap_or(0), i(sm, "y1")),
                 "vision-ocr" => crate::vision::cmd_vision_ocr(
@@ -511,7 +511,7 @@ pub fn cmd_screenshot(client: &mut WdaClient, out: &str) -> Result<()> {
     let res = client.req("GET", "/screenshot", None, crate::wda::DEFAULT_TIMEOUT, None);
     let b64 = json::get(&res, "value");
     if !json::truthy(b64) {
-        return Err(Error::runtime("Empty screenshot response"));
+        return Err(crate::wda::empty_shot_error(client));
     }
     let Some(b64) = b64.as_str() else {
         return Err(Error::value(format!("argument should be a bytes-like object or ASCII string, not {}", json::py_repr(b64))));

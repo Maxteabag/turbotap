@@ -1550,7 +1550,7 @@ impl Reader for ScreenReader {
                     };
                     let b64 = match res.get("value") {
                         Some(Value::String(s)) if !s.is_empty() => s.clone(),
-                        _ => return Err(Error::runtime("Empty screenshot response")),
+                        _ => return Err(crate::wda::empty_shot_error(c)),
                     };
                     let bytes = base64::engine::general_purpose::STANDARD
                         .decode(b64.as_bytes())
@@ -1582,7 +1582,7 @@ impl Reader for ScreenReader {
             }
             return Ok(frame);
         }
-        Err(Error::runtime("Empty screenshot response"))
+        Err(crate::wda::empty_shot_error(c))
     }
 
     fn read(&mut self, c: &mut WdaClient, opts: ReadOpts) -> Result<Vec<Line>> {
