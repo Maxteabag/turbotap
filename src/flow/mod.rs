@@ -1369,7 +1369,11 @@ impl<R: Reader> Flow<R> {
             let (req0, slept0) = (self.c.stats, clock::slept_total());
             self.c.req_kinds.clear();
             self.step_retries = 0;
-            let outcome = self.step(spec);
+            // Between steps too, so a long read-only wait does not carry on to the next step.
+            let outcome = match self.c.stop_check() {
+                Err(r) => Err(Error::flow(format!("{r}; stopped before {}", safe_step(spec)))),
+                Ok(()) => self.step(spec),
+            };
             self.record_timing(spec, s0, req0, slept0, &outcome);
             match outcome {
                 Ok(res) => {
