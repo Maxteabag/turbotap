@@ -91,9 +91,11 @@ Deploy and start the patched WebDriverAgent on the iPhone (over SSH to the Mac i
 
 ```bash
 turbotap deploy              # clone, patch, build and start WDA; --no-build just restarts it
-turbotap preflight
+turbotap preflight           # add --require-ready to exit 1 when the phone is not ready
 turbotap unlock
 ```
+
+`preflight` reads the lock state, front app and screen size, takes one small capture, and reports `ready` with `not_ready` reasons and the one recovery to try (`unlock` when locked, `deploy` once when a capture comes back empty or WDA does not answer). An empty capture during a flow says the same: locked, or screen off / runner unhealthy.
 
 Full walkthrough and troubleshooting (finding your Team ID, trusting the dev cert on first launch, multiple phones, SSH keychain tips) are in [docs/SETUP.md](docs/SETUP.md).
 
@@ -134,7 +136,10 @@ Every flow step and standalone command appends one JSON line to `~/.local/state/
 turbotap timings --since 1h                # p50/p95/max per step kind, slowest and most retried steps
 turbotap timings --since 2026-11-26 --by app
 turbotap timings --by step+app --top 20
+turbotap --device NAME timings --receipt --since 45m --until 30m
 ```
+
+`--receipt` splits one run's wall clock into `helper_between_steps` (time between turbotap calls: the agent, shell sleeps, other tools), `wda`, `app_wait` (`sleep`/`wait`/`waitany`/`gone` steps and settle sleeps) and `turbotap_own`, which add up to the wall clock, plus retries, failures and the longest gaps with the steps around them.
 
 ### Warm daemon (optional)
 
@@ -158,6 +163,7 @@ By default, `turbotap` blocks taps on buttons matching `Send`, `Pay`, `Buy`, `De
 turbotap: app guard refused tap:Message: foreground app 'com.example.other' is not in allowlist [com.example.app] (use --allow-app <bundle_id> for this run)
 ```
 
+- `open:APP` / `launch:APP` stop with iOS's reason when WDA reports the app was not opened (not installed, restricted, locked), and read the front app once afterwards: another app in front for over a second fails the step instead of later steps reading or typing into it (SpringBoard, e.g. an alert, keeps the old behaviour). That read stands in for the next step's own app check, so a working `open:` costs no extra request in a typical flow.
 - `open:APP` / `launch:APP` check the target app instead, so a flow can start from the Home Screen: `open:com.example.app` works, opening an app that isn't listed is refused before anything is launched.
 - `url:` is refused while the guard is on: iOS decides which app receives a URL (any scheme, and even `https://` links can open another app as a universal link), so no list entry can vouch for it. Use `open:<bundle_id>` and navigate inside the app. The one exception is an app's own custom scheme named for the run: `--allow-url-scheme SCHEME` (repeatable) together with `--allow-app BUNDLE` lets `url:` open exactly that scheme while a live check confirms an `--allow-app` app is in front, never a system scheme (http, https, tel, sms, mailto, facetime, maps, App Store, settings, `x-apple…` and the like). Afterwards turbotap watches the front app for 0.8 s; if another app comes forward, the step fails and no further input is sent. The stop file still wins, and only the scheme is printed, never the URL (pairing links can carry tokens).
 - `unlock` may type the passcode on the lock screen, and `home` is always allowed.
@@ -165,7 +171,7 @@ turbotap: app guard refused tap:Message: foreground app 'com.example.other' is n
 - `--allow-app BUNDLE_ID` (repeatable, before or after `flow`/`tap-ocr`/`otp-type`) adds an app for one run; `TURBOTAP_ALLOWED_APPS=a,b` adds apps for every run in that environment. Neither can remove an app from the configured list, and with no config they turn the guard on by themselves.
 - `--no-deny` only turns off the label filter above. It never weakens the app guard.
 
-**Stop file.** Set `"stop_file": "/path/to/stop.file"` (per device under `devices.<name>`, or top-level for devices without their own) and/or `TURBOTAP_STOP_FILE=/path/to/stop.file`. While any of these paths exists on the machine running `turbotap`, `deploy`, `unlock`, `flow`, `tap-ocr` and `otp-type` stop at once with exit code 6, before any request to WDA, and nothing retries. Read-only commands (`preflight`, `ocr`, `tree`, `screenshot`, `vision-ocr`) still work. A symlink counts even if its target is missing, and if the path can't be checked (permissions, a file where a directory should be) or `config.json` can't be read, the commands are refused too. `--no-deny` and `--allow-app` don't change this, and the warm daemon checks it for every request. Create the file to freeze the phone, delete it to continue:
+**Stop file.** Set `"stop_file": "/path/to/stop.file"` (per device under `devices.<name>`, or top-level for devices without their own) and/or `TURBOTAP_STOP_FILE=/path/to/stop.file`. While any of these paths exists on the machine running `turbotap`, `deploy`, `unlock`, `flow`, `tap-ocr` and `otp-type` stop at once with exit code 6, before any request to WDA, and nothing retries. It is checked again right before every input request and between flow steps, so a stop file created while a command runs stops it before its next input, also with exit 6. Read-only commands (`preflight`, `ocr`, `tree`, `screenshot`, `vision-ocr`) still work. A symlink counts even if its target is missing, and if the path can't be checked (permissions, a file where a directory should be) or `config.json` can't be read, the commands are refused too. `--no-deny` and `--allow-app` don't change this, and the warm daemon checks it for every request. Create the file to freeze the phone, delete it to continue:
 
 ```bash
 touch ~/turbotap.stop      # with "stop_file": "~/turbotap.stop" in config.json
@@ -210,11 +216,13 @@ Other options:
 
 The command runs without a shell, so wrap it in `sh -c '...'` if you need a pipe.
 
-App PINs work the same way. `pintap:cmd:"security find-generic-password -w -s bank-pin"` or `pintap:env:APP_PIN` fetches the PIN locally and the step reports only `tapped 4 digits`. `type:`, `cleartype:` and `typedigits:` take `env:` (and `type:`/`cleartype:` also `cmd:`) for the same reason. Avoid writing the digits straight into a step like `pintap:1234`, since the agent then has them.
+App PINs work the same way. `pintap:cmd:"security find-generic-password -w -s bank-pin"` or `pintap:env:APP_PIN` fetches the PIN locally and the step reports only `tapped 4 digits`. `type:`, `cleartype:` and `typedigits:` take `env:` (and `type:`/`cleartype:` also `cmd:`) for the same reason. Avoid writing the digits straight into a step like `pintap:1234`, since the agent then has them. A secret from `env:`/`cmd:` goes only into the field meant for it: `cleartype:` picks the secure (password) field, or the focused one of several, and with no secure field the focused or only text field; it checks live that the target has keyboard focus and then writes the secret through that element (WDA's element value), so a focus change after the check cannot send it to another field; when the target is ambiguous or never gets focus it refuses with nothing sent. `type:env:`/`cmd:` writes through the focused element only when focus is known and is the password field (or, with none on screen, a text field), and refuses otherwise. If any of the secret still turns up in another field, that field is cleared and the step fails without echoing it; a failed read-back clears the field too. Output and errors of a flow that handled a secret withhold any string holding a piece of it. Ordinary text is typed as before.
 
 ### How does it read the screen, accessibility tree or screenshots?
 
 Both. `read` grabs a cropped, downscaled screenshot from the phone and OCRs it locally with `libtesseract` (`OEM_LSTM_ONLY`), split into strips that run in parallel in one process with dark-mode pre-inversion and strip caching (100-180ms cold, ~50ms cached). OCR sees everything that's drawn, including web views and apps with poor accessibility labels. It also pulls the accessibility tree via `/wda/fastUI` (158-198ms with `wda-turbo.patch`, or trimmed `/source` fallback in ~297ms) to catch what OCR misses: icon-only buttons, app keypad keys, unlabeled controls, switch states and exact field values. The agent gets the merged result as JSON text and tap targets, not images.
+
+`readfield:Body` returns one text input's exact value (blank lines included) and `assertfield:Body=file:post.txt` checks it, for proving what a form holds; a secure field is only reported by its length.
 
 `read:ocr` skips the tree when you only need text, `read:Y0-Y1` OCRs a single vertical band 3-4x faster, and `ui` or `readel:TEXT` give you just the tree.
 

@@ -309,6 +309,13 @@ impl<R: Reader> Flow<R> {
             self.pending_bundle = None;
             return false;
         }
+        // The open:/launch: receipt already saw it in front within this window.
+        if let Some((b, _)) = self.open_confirmed.take() {
+            if b == target {
+                self.pending_bundle = None;
+                return true;
+            }
+        }
         let mut eff_deadline = clock::now() + max_wait;
         if let Some(d) = deadline {
             eff_deadline = eff_deadline.min(d);

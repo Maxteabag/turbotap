@@ -18,6 +18,7 @@ use crate::wda::{check_wda_ok, WdaClient};
 use serde_json::{json as j, Value};
 
 pub mod act;
+pub mod fields;
 pub mod sense;
 pub mod tap;
 pub mod worker;
@@ -162,13 +163,19 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         X,Y (within 24 pt; controls only, never OCR text), checks its label
                         against --deny and taps that control's own centre, never the raw
                         point; returns the label; no control there is refused with the
-                        nearest labels
+                        nearest labels. tapat:X,Y=LABEL presses only the one enabled control
+                        labelled exactly LABEL there, read fresh; anything else is refused
+                        with nothing pressed
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys;
                         these are hardware-keyboard key events to whatever has focus
                         system-wide; a key step after which another app is in front prints
                         a warning (marks only, nothing is refused)
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
+  readfield:FIELD       the exact value of the input named FIELD (label, identifier or placeholder),
+                        blank lines included; read-only; a secure field gives only len=N
+  assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V, cmd:C); read-only;
+                        a secure field is checked by length only (iOS shows only bullets)
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
@@ -252,6 +259,10 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
 pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
     let verb = verb.trim();
+    if verb.eq_ignore_ascii_case("assertfield") {
+        let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+        return value.starts_with("env:") || value.starts_with("cmd:");
+    }
     CREDENTIAL_VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb))
         || ((verb.eq_ignore_ascii_case("type") || verb.eq_ignore_ascii_case("setclip"))
             && (arg.starts_with("env:") || arg.starts_with("cmd:")))
@@ -264,6 +275,14 @@ pub fn safe_step(spec: &str) -> String {
         return spec.to_string();
     };
     let trimmed = verb.trim();
+    if trimmed.eq_ignore_ascii_case("assertfield") {
+        // FIELD=VALUE: the field name is shown; the value only as env:NAME or file:PATH.
+        return match arg.split_once('=') {
+            Some((_, value)) if value.starts_with("env:") || value.starts_with("file:") => spec.to_string(),
+            Some((field, _)) => format!("{verb}:{field}=<redacted>"),
+            None => spec.to_string(),
+        };
+    }
     if !SECRET_ARG_VERBS.iter().any(|v| v.eq_ignore_ascii_case(trimmed)) || arg.starts_with("env:") {
         return spec.to_string();
     }
@@ -316,6 +335,9 @@ impl DenyGuard {
     }
 }
 
+/// How long `open:`/`launch:` re-reads the front app while another app is still there.
+pub const OPEN_RECEIPT_GRACE: f64 = 1.0;
+
 pub struct Flow<R: Reader = ScreenReader> {
     pub c: WdaClient,
     pub r: R,
@@ -327,6 +349,8 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub bundle: Option<String>,
     pub pending_bundle: Option<String>,
     pub pending_bundle_ts: f64,
+    /// The app the last `open:`/`launch:` receipt saw in front, and when.
+    pub open_confirmed: Option<(String, f64)>,
     pub last_app_name: Option<String>,
     pub last_app_bundle: Option<String>,
     pub switched_from_app_name: Option<String>,
@@ -386,6 +410,7 @@ impl<R: Reader> Flow<R> {
             bundle: None,
             pending_bundle: None,
             pending_bundle_ts: 0.0,
+            open_confirmed: None,
             last_app_name: None,
             last_app_bundle: None,
             switched_from_app_name: None,
@@ -584,6 +609,116 @@ impl<R: Reader> Flow<R> {
         }
     }
 
+    /// Element ids of one class on screen.
+    fn element_ids(&mut self, cls: &str) -> Vec<String> {
+        let els = self.find_elements(cls);
+        els.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.as_object()?.values().next().map(json::py_str))
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// The element with keyboard focus (`GET /element/active`), if WDA names one.
+    fn active_element_id(&mut self) -> Option<String> {
+        let p = self.c.spath("/element/active");
+        let r = self.c.get(&p);
+        if json::has_err(&r) {
+            return None;
+        }
+        let m = json::get(&r, "value").as_object()?.clone();
+        m.get("ELEMENT")
+            .or_else(|| m.get("element-6066-11e4-a52e-4f735466cecf"))
+            .map(json::py_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// True once `eid` has keyboard focus (live, up to `max_wait` s).
+    fn wait_focus_on(&mut self, eid: &str, max_wait: f64) -> bool {
+        let end = clock::now() + max_wait;
+        loop {
+            if self.active_element_id().as_deref() == Some(eid) {
+                return true;
+            }
+            if clock::now() >= end {
+                return false;
+            }
+            clock::sleep(0.1);
+        }
+    }
+
+    /// Where a secret (`cleartype:env:`/`cmd:`) may go: the secure field (of several,
+    /// only the one with focus); with no secure field on screen, the focused text field
+    /// or the only one (a one-time code). Anything else is refused before typing.
+    fn secret_target(&mut self) -> Result<(String, bool)> {
+        let secure = self.element_ids("XCUIElementTypeSecureTextField");
+        let active = self.active_element_id();
+        if !secure.is_empty() {
+            if let Some(a) = active.as_ref().filter(|a| secure.contains(a)) {
+                return Ok((a.clone(), true));
+            }
+            if secure.len() == 1 {
+                return Ok((secure[0].clone(), true));
+            }
+            return Err(Error::flow(
+                "cleartype: several secure fields on screen and none has focus; tap the intended one first (nothing typed)",
+            ));
+        }
+        let mut inputs = Vec::new();
+        for cls in ["XCUIElementTypeTextField", "XCUIElementTypeSearchField", "XCUIElementTypeTextView"] {
+            inputs.extend(self.element_ids(cls));
+        }
+        if let Some(a) = active.as_ref().filter(|a| inputs.contains(a)) {
+            return Ok((a.clone(), false));
+        }
+        if inputs.len() == 1 {
+            return Ok((inputs[0].clone(), false));
+        }
+        Err(Error::flow(if inputs.is_empty() {
+            "cleartype: no field on screen for the secret (nothing typed)"
+        } else {
+            "cleartype: no secure field and several text fields, none focused; tap the intended one first (nothing typed)"
+        }))
+    }
+
+    /// Type a secret through the element itself (WDA's element value): the runner puts
+    /// keyboard focus on that element and types into it, so a focus change after any
+    /// client-side check cannot send the keys to another field.
+    fn bound_write(&mut self, eid: &str, text: &str) -> Value {
+        let chars: Vec<Value> = text.chars().map(|c| Value::String(c.to_string())).collect();
+        let p = self.c.spath(&format!("/element/{eid}/value"));
+        self.c.post(&p, &j!({"text": text, "value": chars}))
+    }
+
+    /// Clear `eid` when its value holds the secret or a piece of it (3+ characters),
+    /// so a secret that landed in a visible field never stays on screen.
+    fn clear_if_holds_secret(&mut self, eid: &str, secret: &str) -> bool {
+        let p = self.c.spath(&format!("/element/{eid}/attribute/value"));
+        let r = self.c.get(&p);
+        let val = json::get(&r, "value").as_str().unwrap_or("").to_string();
+        let chars: Vec<char> = secret.chars().collect();
+        let k = chars.len().min(3);
+        let holds = k > 0 && (val.contains(secret) || chars.windows(k).any(|w| val.contains(&w.iter().collect::<String>())));
+        if holds {
+            let p = self.c.spath(&format!("/element/{eid}/clear"));
+            self.c.post(&p, &j!({}));
+        }
+        holds
+    }
+
+    /// Defence in depth after a bound write: if focus is now on another field and that
+    /// field holds any of the secret, it is cleared and the step fails (never echoing
+    /// what it held). Focus elsewhere with nothing of the secret there is fine.
+    fn check_focus_after_secret(&mut self, verb: &str, eid: &str, secret: &str) -> Result<()> {
+        match self.active_element_id() {
+            Some(a) if a != eid && self.clear_if_holds_secret(&a, secret) => Err(Error::flow(format!(
+                "{verb}: part of the secret reached another field, which was cleared; check the screen with ui before any retry, no screenshot or read first"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// After a `key:` step: one live `/wda/activeAppInfo`, and a warning on stderr when
     /// the app in front is no longer the one the flow opened (key events go to the
     /// system's focus, so an app change right after one is worth seeing). Marks only,
@@ -621,6 +756,36 @@ impl<R: Reader> Flow<R> {
         let res = self.guarded_step(spec, &label);
         self.c.guard_action = prev;
         self.c.guard_result(res)
+    }
+
+    /// The receipt for `open:`/`launch:`: one live foreground read right after WDA took
+    /// the request (XCTest's activate returns once the app is up). The app in front is
+    /// recorded, and the next step's wait for it takes that as its answer instead of
+    /// asking again. SpringBoard in front (an alert, a banner, a lock) keeps the old
+    /// behaviour; no answer too. Another app is read again for up to 1 s, then the step
+    /// fails naming it instead of reading or typing into the wrong app.
+    fn confirm_opened(&mut self, action: &str, bid: &str) -> Result<()> {
+        self.open_confirmed = None;
+        let end = clock::now() + OPEN_RECEIPT_GRACE;
+        loop {
+            match self.c.live_foreground_app(None) {
+                Ok(front) if front == bid => {
+                    self.open_confirmed = Some((front, clock::now()));
+                    return Ok(());
+                }
+                Ok(front) if front == crate::wda::SPRINGBOARD => return Ok(()),
+                Ok(front) => {
+                    if clock::now() >= end {
+                        return Err(Error::flow(format!(
+                            "{action}: WDA reported the app opened, but {} is in front, not {bid}",
+                            json::py_repr_str(&front)
+                        )));
+                    }
+                }
+                Err(_) => return Ok(()),
+            }
+            clock::sleep(0.1);
+        }
     }
 
     /// Before `key:return`/`key:enter` or text with a newline: a newline can submit
@@ -695,13 +860,22 @@ impl<R: Reader> Flow<R> {
                 self.c.ensure_allowed_target(&label, Some(&bid))?;
                 self.mark_action(false, false);
                 let bundle_changed = self.bundle.as_deref() != Some(bid.as_str());
-                if verb.as_ref() == "launch" {
-                    let r = self.c.fast_launch(&bid, true);
-                    check_wda_ok(r, &format!("launch:{bid}"), false)?;
+                // WDA's own error answer means iOS did not open the app: stop here with its
+                // reason instead of reading or typing into whatever is in front. No answer
+                // at all (a lost connection) keeps going; the next step's app check waits.
+                let r = if verb.as_ref() == "launch" {
+                    self.c.fast_launch(&bid, true)
                 } else {
                     let p = self.c.spath("/wda/apps/activate");
-                    self.c.post(&p, &j!({"bundleId": bid}));
+                    self.c.post(&p, &j!({"bundleId": bid}))
+                };
+                if crate::wda::wda_answered_error(&r) {
+                    return Err(crate::wda::app_open_error(&format!("{verb}:{bid}"), &bid, &r));
                 }
+                if verb.as_ref() == "launch" {
+                    check_wda_ok(r, &format!("launch:{bid}"), false)?;
+                }
+                self.confirm_opened(&format!("{verb}:{bid}"), &bid)?;
                 self.bundle = Some(bid.clone());
                 let now = clock::now();
                 if verb.as_ref() == "launch" || bundle_changed {
@@ -742,11 +916,16 @@ impl<R: Reader> Flow<R> {
                 self.tap_point(x, y, "", None)?;
             }
             "tapat" => {
-                let parts: Vec<&str> = arg.split(',').collect();
-                if parts.len() != 2 {
-                    return Err(Error::value(format!("tapat expects X,Y, got {}", json::py_repr_str(arg))));
+                // tapat:X,Y or tapat:X,Y=LABEL (press only a control labelled exactly LABEL).
+                let (coords, expect) = match arg.split_once('=') {
+                    Some((c, l)) => (c, Some(l)),
+                    None => (arg, None),
+                };
+                let parts: Vec<&str> = coords.split(',').collect();
+                if parts.len() != 2 || expect.is_some_and(|l| l.trim().is_empty()) {
+                    return Err(Error::value(format!("tapat expects X,Y or X,Y=LABEL, got {}", json::py_repr_str(arg))));
                 }
-                return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?)?);
+                return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?, expect)?);
             }
             "longpress" => return some(self.long_press_text(arg, 0.65)?.text),
             "longpressxy" => {
@@ -801,9 +980,42 @@ impl<R: Reader> Flow<R> {
                 if text.contains('\n') {
                     self.guard_submit("multi-line type:")?;
                 }
-                let r = self.c.fast_keys(&text, None);
+                // A secret only into the focused field when that is known and is the
+                // secure field (or, with no secure field, a text field), written through
+                // that element: never to whatever happens to have focus.
+                let target = if is_secret {
+                    let Some(a) = self.active_element_id() else {
+                        return Err(Error::flow("type: no field has keyboard focus for the secret (nothing typed)"));
+                    };
+                    let secure = self.element_ids("XCUIElementTypeSecureTextField");
+                    if !secure.is_empty() && !secure.contains(&a) {
+                        return Err(Error::flow(
+                            "type: the secret goes into a secure field, but focus is on another field; tap the password field first (nothing typed)",
+                        ));
+                    }
+                    if secure.is_empty() {
+                        let mut inputs = Vec::new();
+                        for cls in ["XCUIElementTypeTextField", "XCUIElementTypeSearchField", "XCUIElementTypeTextView"] {
+                            inputs.extend(self.element_ids(cls));
+                        }
+                        if !inputs.contains(&a) {
+                            return Err(Error::flow("type: focus is not on a text field for the secret (nothing typed)"));
+                        }
+                    }
+                    Some(a)
+                } else {
+                    None
+                };
+                let r = match target.as_deref() {
+                    Some(eid) => self.bound_write(eid, &text),
+                    None => self.c.fast_keys(&text, None),
+                };
                 let redact = is_secret || crate::wda::echoes_secret(&r, &text);
                 check_wda_ok(r, "type", redact)?;
+                if let Some(a) = target {
+                    clock::sleep(0.2);
+                    self.check_focus_after_secret("type", &a, &text)?;
+                }
             }
             "key" => {
                 let kname = arg.trim().to_lowercase();
@@ -825,6 +1037,8 @@ impl<R: Reader> Flow<R> {
                 return some(kname);
             }
             "cleartype" => return some(self.clear_type(&verb, arg)?),
+            "readfield" => return some(self.read_field(arg)?),
+            "assertfield" => return some(self.assert_field(arg)?),
             "dismisskb" => return some(self.dismiss_kb()?),
             "typedigits" => return some(self.type_digits(arg)?),
             "pintap" => return some(self.pin_tap(arg)?),
@@ -993,22 +1207,29 @@ impl<R: Reader> Flow<R> {
         let text = secret_arg(verb, arg)?;
         self.note_secret(&text);
         self.mark_action(false, true);
-        let mut els = Value::Array(vec![]);
-        let mut secure = false;
-        for (cls, is_sec) in [
-            ("XCUIElementTypeTextField", false),
-            ("XCUIElementTypeSecureTextField", true),
-            ("XCUIElementTypeSearchField", false),
-            ("XCUIElementTypeTextView", false),
-        ] {
-            els = self.find_elements(cls);
-            if json::truthy(&els) {
-                secure = is_sec;
-                break;
+        // A secret goes to the secure field (or the focused one), never just to the
+        // first text field: that put passwords into username fields.
+        let (eid, secure) = if is_secret {
+            self.secret_target()?
+        } else {
+            let mut els = Value::Array(vec![]);
+            let mut secure = false;
+            for (cls, is_sec) in [
+                ("XCUIElementTypeTextField", false),
+                ("XCUIElementTypeSecureTextField", true),
+                ("XCUIElementTypeSearchField", false),
+                ("XCUIElementTypeTextView", false),
+            ] {
+                els = self.find_elements(cls);
+                if json::truthy(&els) {
+                    secure = is_sec;
+                    break;
+                }
             }
-        }
-        let Some(eid) = Self::first_element_id(&els) else {
-            return Err(Error::flow("no TextField, SecureTextField, SearchField, or TextView on screen"));
+            let Some(eid) = Self::first_element_id(&els) else {
+                return Err(Error::flow("no TextField, SecureTextField, SearchField, or TextView on screen"));
+            };
+            (eid, secure)
         };
         let redact = is_secret || secure;
         let p = self.c.spath(&format!("/element/{eid}/clear"));
@@ -1024,10 +1245,18 @@ impl<R: Reader> Flow<R> {
         if text.contains('\n') {
             self.guard_submit("multi-line cleartype:")?;
         }
-        let r = self.c.fast_keys(&text, None);
+        // Right before the secret: the target itself must hold keyboard focus.
+        if is_secret && !self.wait_focus_on(&eid, 1.0) {
+            return Err(Error::flow("cleartype: the target field did not get keyboard focus (nothing typed)"));
+        }
+        // A secret is written through the target element, never sent to whatever has focus.
+        let r = if is_secret { self.bound_write(&eid, &text) } else { self.c.fast_keys(&text, None) };
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype", red)?;
         clock::sleep(0.20);
+        if is_secret {
+            self.check_focus_after_secret("cleartype", &eid, &text)?;
+        }
         if !secure {
             let p = self.c.spath(&format!("/element/{eid}/attribute/value"));
             let r = self.c.get(&p);
@@ -1041,6 +1270,11 @@ impl<R: Reader> Flow<R> {
                 json::get(&ph, "value").as_str().is_some_and(|p| p.trim() == val.trim())
             };
             if val != text && !placeholder_only {
+                // Never leave a wrong or partial secret visible for a retry or a screenshot.
+                if is_secret {
+                    let p = self.c.spath(&format!("/element/{eid}/clear"));
+                    self.c.post(&p, &j!({}));
+                }
                 return Err(Error::flow(format!(
                     "cleartype read-back mismatch (len {} vs {})",
                     val.chars().count(),
@@ -1159,7 +1393,22 @@ impl<R: Reader> Flow<R> {
                 out = out.replace(sec.as_str(), "<redacted>");
             }
         }
+        // A secret that ended up somewhere visible comes back in pieces too (a cut-off
+        // field value, an OCR misread): such a string is withheld whole.
+        if self.holds_secret_piece(&out) {
+            return "<redacted: may hold part of a secret>".to_string();
+        }
         out
+    }
+
+    /// True when `s` holds 5 characters in a row (the whole secret when shorter) of a
+    /// remembered secret of 4+ characters, ignoring case.
+    pub fn holds_secret_piece(&self, s: &str) -> bool {
+        let low = s.to_lowercase();
+        self.secrets.iter().any(|sec| {
+            let c: Vec<char> = sec.to_lowercase().chars().collect();
+            c.len() >= 4 && c.windows(c.len().min(5)).any(|w| low.contains(&w.iter().collect::<String>()))
+        })
     }
 
     /// Scrub every string value in an output value. Object keys are never touched:
@@ -1173,7 +1422,7 @@ impl<R: Reader> Flow<R> {
         }
         match v {
             Value::String(s) => {
-                if self.secrets.iter().any(|sec| s.contains(sec.as_str())) {
+                if self.secrets.iter().any(|sec| s.contains(sec.as_str())) || self.holds_secret_piece(s) {
                     *s = self.scrub(s);
                 }
             }
@@ -1227,7 +1476,11 @@ impl<R: Reader> Flow<R> {
             let (req0, slept0) = (self.c.stats, clock::slept_total());
             self.c.req_kinds.clear();
             self.step_retries = 0;
-            let outcome = self.step(spec);
+            // Between steps too, so a long read-only wait does not carry on to the next step.
+            let outcome = match self.c.stop_check() {
+                Err(r) => Err(Error::flow(format!("{r}; stopped before {}", safe_step(spec)))),
+                Ok(()) => self.step(spec),
+            };
             self.record_timing(spec, s0, req0, slept0, &outcome);
             match outcome {
                 Ok(res) => {

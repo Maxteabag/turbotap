@@ -1280,7 +1280,7 @@ fn test_deny_guard_blocks_default_dangerous_actions_unless_disabled() {
 fn test_launch_uses_fast_launch_preserves_state_invalidates_cache_and_propagates_errors() {
     let _cache = isolated_cache();
     let img = solid_img(220, (430, 932));
-    let c = MockWda::start(MockState::default());
+    let c = MockWda::start(MockState { active_app: Seq::one(json!("com.example.new")), ..Default::default() });
     let r = FakeReader::new(vec![fr(&img, &[])]);
     let mut flow = mk_flow(&c, &r, 8.0);
     // Seed cached controls and outgoing app state before launch:.
@@ -1292,10 +1292,13 @@ fn test_launch_uses_fast_launch_preserves_state_invalidates_cache_and_propagates
 
     let res = step_s(&mut flow, "launch:com.example.new");
     assert_eq!(res, "com.example.new");
+    // The launch, then the receipt's one live foreground read.
+    let calls = c.calls();
     assert_eq!(
-        *c.calls().last().unwrap(),
+        calls[calls.len() - 2],
         ("POST".to_string(), "/wda/fastLaunch".to_string(), json!({"bundleId": "com.example.new", "terminate": true}))
     );
+    assert_eq!(calls.last().unwrap().1, "/wda/activeAppInfo");
     assert!(flow.ctl_cache.is_none());
     assert_eq!(flow.bundle.as_deref(), Some("com.example.new"));
     assert_eq!(flow.pending_bundle.as_deref(), Some("com.example.new"));
@@ -1317,12 +1320,13 @@ fn test_launch_uses_fast_launch_preserves_state_invalidates_cache_and_propagates
     // Fallback on stock WDA (404 on /wda/fastLaunch -> terminate + launchUnattached).
     let mut st = MockState::default();
     st.fast_launch_404 = true;
+    st.active_app = Seq::one(json!("com.example.stock"));
     let c_stock = MockWda::start(st);
     let mut flow_stock = mk_flow(&c_stock, &FakeReader::new(vec![fr(&img, &[])]), 8.0);
     assert_eq!(step_s(&mut flow_stock, "launch:com.example.stock"), "com.example.stock");
     assert_eq!(
         c_stock.paths(),
-        vec!["/wda/fastLaunch", "/session/test-session-1/wda/apps/terminate", "/wda/apps/launchUnattached"]
+        vec!["/wda/fastLaunch", "/session/test-session-1/wda/apps/terminate", "/wda/apps/launchUnattached", "/wda/activeAppInfo"]
     );
     assert_eq!(flow_stock.bundle.as_deref(), Some("com.example.stock"));
     assert_eq!(flow_stock.pending_bundle.as_deref(), Some("com.example.stock"));
@@ -2794,6 +2798,51 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
     }
     assert_eq!(pts(&mock), vec![(380, 60)], "a refused tapat touched the screen");
     flow.close();
+}
+
+#[test]
+fn test_tapat_with_a_label_presses_only_that_exact_enabled_control() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let img = solid_img(240, (430, 932));
+    let run = |ui: Value, step: &str| {
+        let mock = MockWda::start(with_fast_ui(fui(ui)));
+        let r = FakeReader::new(vec![fr(&img, &[]), fr(&copy_img(&img), &[])]);
+        let mut flow = mk_flow(&mock, &r, 1.0);
+        let res = flow.step(step);
+        flow.close();
+        let pts: Vec<(i64, i64)> = mock.tapped_points().iter().map(|p| (p.0, p.1)).collect();
+        (res, pts)
+    };
+    let other_row = json!({"type": "Button", "label": "Ready", "x": 352, "y": 720});
+    // The control at the point reads Ready: pressed at its centre; another Ready elsewhere is ignored.
+    let (res, pts) = run(json!([{"type": "Button", "label": "Ready", "x": 352, "y": 590}, other_row]), "tapat:350,588=Ready");
+    assert_eq!(res.unwrap(), Some(json!("Ready")));
+    assert_eq!(pts, vec![(352, 590)]);
+    // It changed since it was read (now Busy): nothing pressed, though another Ready is
+    // on screen and a bare tapat would press the Busy control.
+    let (res, pts) = run(json!([{"type": "Button", "label": "Busy", "x": 352, "y": 590}, other_row]), "tapat:350,588=Ready");
+    match res {
+        Err(Error::Flow(m)) => assert!(m.contains("no control labelled exactly 'Ready' at 350,588 (now: 'Busy'"), "{m}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    assert!(pts.is_empty());
+    // Two Ready controls at the point: ambiguous, nothing pressed.
+    let (res, pts) = run(
+        json!([{"type": "Button", "label": "Ready", "x": 352, "y": 590}, {"type": "Button", "label": "Ready", "x": 360, "y": 600}]),
+        "tapat:352,590=Ready",
+    );
+    assert!(matches!(res, Err(Error::Flow(ref m)) if m.contains("several controls labelled 'Ready'")), "{res:?}");
+    assert!(pts.is_empty());
+    // Disabled, or only a different case: nothing pressed.
+    let (res, pts) = run(json!([{"type": "Button", "label": "Ready", "x": 352, "y": 590, "enabled": false}]), "tapat:352,590=Ready");
+    assert!(matches!(res, Err(Error::Flow(ref m)) if m.contains("is disabled")), "{res:?}");
+    assert!(pts.is_empty());
+    let (res, pts) = run(json!([{"type": "Button", "label": "ready", "x": 352, "y": 590}]), "tapat:352,590=Ready");
+    assert!(res.is_err() && pts.is_empty());
+    // An empty label is a usage error.
+    let (res, _) = run(json!([]), "tapat:352,590=");
+    assert!(res.is_err());
 }
 
 #[test]

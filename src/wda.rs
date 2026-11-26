@@ -733,6 +733,9 @@ impl ReqStats {
 pub const URL_LANDING_WATCH: f64 = 0.8;
 
 pub struct WdaClient {
+    /// Stop files re-checked before every input request (set by the CLI for commands
+    /// that touch the phone): a stop file created mid-run stops the next input.
+    pub stop_paths: Vec<std::path::PathBuf>,
     /// Caller-provided label patterns refused on top of the active --deny
     /// (`--deny-also`, config `deny_also`); compiled by the flow.
     pub deny_also: Vec<String>,
@@ -816,6 +819,7 @@ impl WdaClient {
         WdaClient {
             stats: ReqStats::default(),
             req_kinds: std::collections::BTreeMap::new(),
+            stop_paths: Vec::new(),
             deny_also: Vec::new(),
             last_foreground: None,
             base_url,
@@ -1145,7 +1149,26 @@ impl WdaClient {
     /// The request-level check every non-GET request passes before it is sent:
     /// Ok(true) send it, Ok(false) the caller's deadline ran out while checking (send
     /// nothing, report the deadline as usual), Err(refusal) send nothing.
+    /// Err(reason) when one of this run's stop files exists now.
+    pub fn stop_check(&self) -> std::result::Result<(), String> {
+        if self.stop_paths.is_empty() {
+            return Ok(());
+        }
+        crate::stop::check(&self.stop_paths).inspect_err(|_| crate::stop::mark_stopped())
+    }
+
     fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
+        // The user's brake first, with or without an app guard: a stop file created
+        // while a command runs stops it before its next input, not only at its start.
+        if !crate::guard::is_safe_method(method) && !self.stop_paths.is_empty() {
+            let kind = crate::guard::classify(path, body);
+            if !matches!(kind, crate::guard::RequestKind::ReadOnly) {
+                if let Err(r) = self.stop_check() {
+                    let what = self.guard_action.clone().unwrap_or_else(|| format!("{method} {}", path.split('?').next().unwrap_or(path)));
+                    return Err(format!("{r}; stopped before {what}"));
+                }
+            }
+        }
         if !self.app_guard_active() || crate::guard::is_safe_method(method) {
             return Ok(true);
         }
@@ -3232,6 +3255,47 @@ pub fn check_wda_ok(res: Value, action: &str, redact: bool) -> Result<Value> {
     Ok(res)
 }
 
+/// The readable reason in an error answer from WDA: its JSON body's `value.message`
+/// on one line, else the body text, else the error itself (at most 400 characters).
+pub fn wda_error_reason(res: &Value) -> String {
+    let body = json::get(res, "body");
+    let txt = if json::truthy(body) { json::py_str(body) } else { json::py_str(json::get(res, "error")) };
+    let msg = serde_json::from_str::<Value>(&txt)
+        .ok()
+        .and_then(|v| v.get("value").and_then(|x| x.get("message")).and_then(Value::as_str).map(str::to_string))
+        .or_else(|| {
+            // Not valid JSON (an unescaped quote): take the message field by its text.
+            let i = txt.find("\"message\"")?;
+            let rest = txt[i + 9..].trim_start().trim_start_matches(':').trim_start().strip_prefix('"')?;
+            let end = rest.find("\"traceback\"").map(|j| rest[..j].trim_end().trim_end_matches(',').trim_end()).unwrap_or(rest);
+            Some(end.trim_end_matches('"').to_string())
+        })
+        .unwrap_or(txt);
+    let one = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() > 400 {
+        one.chars().take(400).collect::<String>() + "…"
+    } else {
+        one
+    }
+}
+
+/// True when WDA itself answered with an error status (not a lost connection or a
+/// deadline, where nobody knows what happened on the phone).
+pub fn wda_answered_error(res: &Value) -> bool {
+    json::err_code(res).is_some_and(|c| c >= 400)
+}
+
+/// The error for an `open:`/`launch:` that iOS refused, with WDA's reason on one line.
+pub fn app_open_error(action: &str, bundle_id: &str, res: &Value) -> Error {
+    let reason = wda_error_reason(res);
+    let hint = if reason.contains("FBSOpenApplication") || reason.to_lowercase().contains("not installed") {
+        format!(" (iOS did not open {bundle_id}: check that it is installed and allowed on this device and that the phone is unlocked)")
+    } else {
+        String::new()
+    };
+    Error::flow(format!("{action} failed: {reason}{hint}"))
+}
+
 /// True when a WDA answer quotes `secret` back (raw or base64), so error messages
 /// built from it must be redacted.
 pub fn echoes_secret(res: &Value, secret: &str) -> bool {
@@ -3351,6 +3415,9 @@ pub fn preflight_value(client: &mut WdaClient, stock: bool) -> Result<Value> {
             client.save_session_cache(upd);
         }
     }
+    // Preflight once said ok while every capture came back empty: try one, small.
+    let capture = capture_probe(client, stock);
+    let (ready, not_ready) = readiness(&locked, &app, &w, capture);
     let dt = (clock::now() - t0) * 1000.0;
     Ok(j!({
         "ok": true,
@@ -3359,14 +3426,74 @@ pub fn preflight_value(client: &mut WdaClient, stock: bool) -> Result<Value> {
         "locked": locked,
         "active_app": app,
         "screen_pt": [w, h],
+        "capture": capture,
+        "ready": ready,
+        "not_ready": not_ready,
         "elapsed_ms": json::round_to(dt, 1),
     }))
 }
 
+/// The error for a screenshot that came back empty, with its likely cause from one
+/// lock-state read (only on this failure path, so working captures pay nothing).
+pub fn empty_shot_error(c: &mut WdaClient) -> Error {
+    match c.confirm_locked_state(0) {
+        Ok(true) => Error::runtime("Empty screenshot response: the phone is locked (turbotap unlock, one attempt)"),
+        _ => Error::runtime(
+            "Empty screenshot response: the screen may be off or the WDA runner unhealthy \
+             (turbotap preflight; if it is not ready, turbotap deploy once)",
+        ),
+    }
+}
+
+/// One small capture for preflight: `ok` when WDA returns image bytes, else `empty`.
+fn capture_probe(client: &mut WdaClient, stock: bool) -> &'static str {
+    if !stock && client.turbo != Some(false) {
+        let body = j!({"quality": 0.3, "scale": 0.1, "raw": true});
+        let (status, ct, bytes) = client.req_raw("POST", "/wda/fastScreenshot", Some(&body), 5.0, None, None);
+        if status == 200 && !bytes.is_empty() {
+            // Image bytes, or (older wda-turbo) JSON with a non-empty base64 value.
+            let has_pixels = ct.to_lowercase().starts_with("image/")
+                || serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .and_then(|v| v.get("value").and_then(Value::as_str).map(|s| !s.is_empty()))
+                    == Some(true);
+            if has_pixels {
+                return "ok";
+            }
+        }
+    }
+    let res = client.req("GET", "/screenshot", None, 5.0, None);
+    if json::get(&res, "value").as_str().is_some_and(|s| !s.is_empty()) {
+        "ok"
+    } else {
+        "empty"
+    }
+}
+
+/// `ready` and what to do once when not: the phone is unlocked, WDA answers the lock
+/// state, front app and screen size, and a capture returns pixels.
+pub fn readiness(locked: &Value, app: &Value, w: &Value, capture: &str) -> (bool, Vec<Value>) {
+    let mut not_ready = Vec::new();
+    if locked.as_bool() == Some(true) {
+        not_ready.push(j!({"why": "locked", "recover": "turbotap unlock (one attempt), then preflight again"}));
+    }
+    if locked.is_null() || app.is_null() || w.is_null() {
+        not_ready.push(j!({"why": "no answer for lock state, front app or screen size", "recover": "turbotap deploy once (restarts the runner), then preflight again"}));
+    }
+    if capture != "ok" && locked.as_bool() != Some(true) {
+        not_ready.push(j!({"why": "screen capture empty (screen off or runner unhealthy)", "recover": "turbotap deploy once, then preflight again"}));
+    }
+    (not_ready.is_empty(), not_ready)
+}
+
 /// L986-1009: prints the preflight JSON line.
-pub fn cmd_preflight(client: &mut WdaClient, stock: bool) -> Result<()> {
+pub fn cmd_preflight(client: &mut WdaClient, stock: bool, require_ready: bool) -> Result<()> {
     let v = preflight_value(client, stock)?;
     crate::outln!("{}", json::dumps(&v));
+    if require_ready && v.get("ready") != Some(&Value::Bool(true)) {
+        let why: Vec<String> = v["not_ready"].as_array().into_iter().flatten().map(|n| format!("{} ({})", json::py_str(&n["why"]), json::py_str(&n["recover"]))).collect();
+        return Err(Error::flow(format!("not ready: {}", why.join("; "))));
+    }
     Ok(())
 }
 

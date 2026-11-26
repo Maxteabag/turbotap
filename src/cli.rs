@@ -33,11 +33,20 @@ pub fn main_with(argv: &[String]) -> i32 {
 /// One CLI invocation in this process (the warm daemon calls this per request).
 /// Errors print `turbotap: <message>` to stderr and return 1.
 pub fn run_cli(argv: &[String]) -> i32 {
-    match main_inner(argv) {
+    crate::stop::take_stopped();
+    let r = main_inner(argv);
+    // A stop file that appeared mid-run ends the command like one present at start.
+    let stopped = crate::stop::take_stopped();
+    match r {
+        Ok(_) if stopped => crate::stop::STOP_EXIT,
         Ok(code) => code,
         Err(e) => {
             crate::errln!("turbotap: {e}");
-            1
+            if stopped {
+                crate::stop::STOP_EXIT
+            } else {
+                1
+            }
         }
     }
 }
@@ -212,10 +221,10 @@ pub fn build_command() -> Command {
         ))
         .arg(flag("no-daemon", "never use the daemon, even with TURBOTAP_DAEMON=1"))
         .subcommand(
-            Command::new("preflight").about("session, lock state, foreground app and screen size").arg(flag(
-                "stock",
-                "skip the combined wda-turbo v6 /wda/fastPreflight read and use the three stock reads",
-            )),
+            Command::new("preflight")
+                .about("session, lock state, foreground app, screen size, one small capture, and whether the phone is ready")
+                .arg(flag("stock", "skip the combined wda-turbo v6 /wda/fastPreflight read and use the three stock reads"))
+                .arg(flag("require-ready", "exit 1 after the JSON when not ready (locked, no answer, or an empty capture)")),
         )
         .subcommand(
             Command::new("daemon")
@@ -240,7 +249,12 @@ pub fn build_command() -> Command {
                 .arg(Arg::new("since").long("since").value_name("WHEN").help("30m, 2h, 1d, epoch seconds or YYYY-MM-DD[THH:MM] (UTC)"))
                 .arg(Arg::new("by").long("by").value_name("KEY").default_value("step").value_parser(["step", "app", "step+app"]))
                 .arg(Arg::new("file").long("file").value_name("PATH").help("read this log instead"))
-                .arg(Arg::new("top").long("top").value_name("N").value_parser(clap::value_parser!(usize)).default_value("10")),
+                .arg(Arg::new("top").long("top").value_name("N").value_parser(clap::value_parser!(usize)).default_value("10"))
+                .arg(flag(
+                    "receipt",
+                    "one run's wall clock split: helper/agent between steps, WDA, app wait, turbotap; retries, failures, longest gaps (with --since/--until and --device)",
+                ))
+                .arg(Arg::new("until").long("until").value_name("WHEN").help("with --receipt: end of the run (same forms as --since)")),
         )
         .subcommand(
             Command::new("install-skill")
@@ -361,6 +375,9 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         }
         "timings" => {
             let top = sm.get_one::<usize>("top").copied().unwrap_or(10);
+            if b(sm, "receipt") {
+                return crate::timings::cmd_timings_receipt(s(sm, "since"), s(sm, "until"), s(&m, "device"), s(sm, "file"), top);
+            }
             return crate::timings::cmd_timings(s(sm, "since"), s(sm, "by").unwrap_or("step"), s(sm, "file"), top);
         }
         "daemon" => {
@@ -397,6 +414,11 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     // --allow-label only ever works together with --allow-app in the same run.
     client.set_run_allow(allow_app_values(&m, sm), allow_label_values(&m, sm));
     client.set_allow_url_schemes(many_values(&m, sm, "allow-url-scheme"));
+    if crate::stop::STOP_CMDS.contains(&cmd) {
+        let keys: Vec<&str> = target.dev_key.iter().map(String::as_str).collect();
+        // Resolved by the start gate just above (an error there already refused).
+        client.stop_paths = crate::stop::paths_for(&keys).unwrap_or_default();
+    }
     client.deny_also = deny_also_values(&m, sm, target.dev_key.as_deref());
     match allowed {
         Ok(list) => client.set_allowed_apps(list),
@@ -408,7 +430,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
             let (t0, req0) = (crate::clock::real_now(), client.stats);
             client.req_kinds.clear();
             let r = match cmd {
-                "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock")),
+                "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock"), b(sm, "require-ready")),
                 "unlock" => crate::wda::cmd_unlock(&mut client),
                 "ocr" => crate::ocr::cmd_ocr(&mut client, f(sm, "scale").unwrap_or(1.5), i(sm, "y0").unwrap_or(0), i(sm, "y1")),
                 "vision-ocr" => crate::vision::cmd_vision_ocr(
@@ -533,7 +555,7 @@ pub fn cmd_screenshot(client: &mut WdaClient, out: &str) -> Result<()> {
     let res = client.req("GET", "/screenshot", None, crate::wda::DEFAULT_TIMEOUT, None);
     let b64 = json::get(&res, "value");
     if !json::truthy(b64) {
-        return Err(Error::runtime("Empty screenshot response"));
+        return Err(crate::wda::empty_shot_error(client));
     }
     let Some(b64) = b64.as_str() else {
         return Err(Error::value(format!("argument should be a bytes-like object or ASCII string, not {}", json::py_repr(b64))));

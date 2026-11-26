@@ -170,3 +170,65 @@ fn test_cleartype_with_no_text_accepts_a_placeholder_only_field() {
         other => panic!("expected mismatch, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// timings --receipt: one run's wall clock split by who spent it
+// ---------------------------------------------------------------------------
+
+fn line(end: f64, step: &str, ms: i64, wda_ms: i64, sleep_ms: i64, ok: bool, device: &str) -> Value {
+    json!({"ts": end, "step": step, "ms": ms, "wda_ms": wda_ms, "sleep_ms": sleep_ms, "ok": ok, "retries": u64::from(!ok), "device": device})
+}
+
+#[test]
+fn test_receipt_splits_helper_wda_app_wait_and_turbotap() {
+    let t = 1_800_000_000.0;
+    let lines = vec![
+        line(t + 1.0, "preflight", 1000, 900, 0, true, "a"),  // 0.0-1.0
+        line(t + 3.0, "open", 200, 150, 0, false, "a"),        // 2.8-3.0, after a 1.8 s gap
+        line(t + 4.5, "sleep", 1500, 0, 0, true, "a"),         // 3.0-4.5
+        line(t + 5.0, "read", 500, 100, 200, true, "a"),       // 4.5-5.0
+        line(t + 15.0, "wait", 2000, 300, 0, true, "a"),       // 13.0-15.0, after an 8 s gap
+        line(t + 9.0, "tap", 400, 200, 0, true, "b"),          // another device: left out
+    ];
+    let v = crate::timings::receipt(&lines, None, None, Some("a"), 3);
+    assert_eq!(v["steps"], json!(5));
+    assert_eq!(v["failed"], json!(1));
+    assert_eq!(v["retries"], json!(1));
+    assert_eq!(v["wall_ms"], json!(15000));
+    let s = &v["split_ms"];
+    assert_eq!(s["helper_between_steps"], json!(1800 + 8000));
+    assert_eq!(s["wda"], json!(900 + 150 + 100 + 300));
+    assert_eq!(s["app_wait"], json!(1500 + 200 + 1700));
+    assert_eq!(s["turbotap_own"], json!(100 + 50 + 200));
+    // The four parts add up to the wall clock.
+    let sum: i64 = ["helper_between_steps", "wda", "app_wait", "turbotap_own"].iter().map(|k| s[*k].as_i64().unwrap()).sum();
+    assert_eq!(sum, 15000);
+    assert_eq!(v["longest_gaps"][0]["ms"], json!(8000));
+    assert_eq!(v["longest_gaps"][0]["after"]["step"], json!("read"));
+    assert_eq!(v["longest_gaps"][0]["before"]["step"], json!("wait"));
+    // A window: only the steps that overlap it.
+    let w = crate::timings::receipt(&lines, Some(t + 2.9), Some(t + 4.0), Some("a"), 3);
+    assert_eq!(w["steps"], json!(2));
+}
+
+#[test]
+fn test_receipt_cli_reads_a_log_file() {
+    let dir = TempDir::new("tt-receipt-");
+    let path = dir.path().join("t.jsonl");
+    let t = 1_800_000_000.0;
+    let body: String = [line(t + 1.0, "open", 300, 200, 0, true, "a"), line(t + 4.0, "read", 500, 100, 0, true, "a")]
+        .iter()
+        .map(|l| l.to_string() + "\n")
+        .collect();
+    std::fs::write(&path, body).unwrap();
+    // run_cli syncs agent skills from $XDG_STATE_HOME: keep it off the real HOME.
+    let (h, st) = (dir.path().to_str().unwrap().to_string(), dir.path().join("state").to_str().unwrap().to_string());
+    let _env = set_env(&[("HOME", Some(h.as_str())), ("XDG_STATE_HOME", Some(st.as_str())), ("TURBOTAP_DAEMON", None)]);
+    let cap = crate::testutil::capture::Capture::start();
+    let argv: Vec<String> =
+        ["--device", "a", "timings", "--receipt", "--file", path.to_str().unwrap()].iter().map(|s| s.to_string()).collect();
+    assert_eq!(crate::cli::run_cli(&argv), 0);
+    let v: Value = serde_json::from_str(cap.stdout().lines().next().unwrap()).unwrap();
+    assert_eq!(v["steps"], json!(2));
+    assert_eq!(v["split_ms"]["helper_between_steps"], json!(2500));
+}

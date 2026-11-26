@@ -457,6 +457,12 @@ fn route(inner: &mut Inner, method: &str, path: &str, data: &Value) -> Value {
         };
         return json!({"value": v});
     }
+    if clean.ends_with("/element/active") && method == "GET" {
+        return match st.focused_eid.clone() {
+            Some(eid) => json!({"value": {"ELEMENT": eid}}),
+            None => json!({"error": 404, "body": "no such element"}),
+        };
+    }
     let parts: Vec<&str> = clean.splitn(6, '/').collect();
     // ["", "session", sid, "element", eid, sub...]
     if parts.len() == 6 && parts[1] == "session" && parts[3] == "element" {
@@ -492,6 +498,8 @@ fn route(inner: &mut Inner, method: &str, path: &str, data: &Value) -> Value {
             "attribute/label" => return json!({"value": st.element_labels.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/name" => return json!({"value": st.element_names.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/type" => return json!({"value": st.element_types.get(&eid).cloned().unwrap_or(Value::Null)}),
+            // GET /element/<id>/name: the element's type (W3C tag name).
+            "name" => return json!({"value": st.element_types.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/value" => {
                 let v = match st.element_values.get_mut(&eid) {
                     Some(d) => d.next(&Value::Null),

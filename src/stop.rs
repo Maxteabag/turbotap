@@ -82,6 +82,32 @@ pub fn check(paths: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
+thread_local! {
+    /// Set when a stop file appeared while a command was running and it stopped
+    /// before its next input; the CLI then exits [`STOP_EXIT`] like a stop at start.
+    static STOPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn mark_stopped() {
+    STOPPED.with(|s| s.set(true));
+}
+
+/// True (and cleared) when the command on this thread was stopped mid-run.
+pub fn take_stopped() -> bool {
+    STOPPED.with(|s| s.replace(false))
+}
+
+/// The stop files for these device keys (config and `TURBOTAP_STOP_FILE`), as the
+/// start gate resolves them; the client re-checks them before every input.
+pub fn paths_for(devices: &[&str]) -> Result<Vec<PathBuf>, String> {
+    let env_value = crate::config::env(ENV_STOP_FILE);
+    let cfg = crate::config::current();
+    if let Some(e) = cfg.load_error.as_ref() {
+        return Err(format!("config.json: {e}"));
+    }
+    stop_files(&cfg.raw, devices, env_value.as_deref())
+}
+
 /// The CLI check for subcommand `cmd`: Some(refusal message) when it must not run.
 /// `devices` are the device keys this invocation may address.
 pub fn refusal(cmd: &str, devices: &[&str]) -> Option<String> {
