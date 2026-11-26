@@ -91,9 +91,11 @@ Deploy and start the patched WebDriverAgent on the iPhone (over SSH to the Mac i
 
 ```bash
 turbotap deploy              # clone, patch, build and start WDA; --no-build just restarts it
-turbotap preflight
+turbotap preflight           # add --require-ready to exit 1 when the phone is not ready
 turbotap unlock
 ```
+
+`preflight` reads the lock state, front app and screen size, takes one small capture, and reports `ready` with `not_ready` reasons and the one recovery to try (`unlock` when locked, `deploy` once when a capture comes back empty or WDA does not answer). An empty capture during a flow says the same: locked, or screen off / runner unhealthy.
 
 Full walkthrough and troubleshooting (finding your Team ID, trusting the dev cert on first launch, multiple phones, SSH keychain tips) are in [docs/SETUP.md](docs/SETUP.md).
 
@@ -134,7 +136,10 @@ Every flow step and standalone command appends one JSON line to `~/.local/state/
 turbotap timings --since 1h                # p50/p95/max per step kind, slowest and most retried steps
 turbotap timings --since 2026-11-26 --by app
 turbotap timings --by step+app --top 20
+turbotap --device 15 timings --receipt --since 2026-11-26T10:30 --until 2026-11-26T10:45
 ```
+
+`--receipt` splits one run's wall clock into `helper_between_steps` (time between turbotap calls: the agent, shell sleeps, other tools), `wda`, `app_wait` (`sleep`/`wait`/`waitany`/`gone` steps and settle sleeps) and `turbotap_own`, which add up to the wall clock, plus retries, failures and the longest gaps with the steps around them.
 
 ### Warm daemon (optional)
 
@@ -158,6 +163,7 @@ By default, `turbotap` blocks taps on buttons matching `Send`, `Pay`, `Buy`, `De
 turbotap: app guard refused tap:Message: foreground app 'com.example.other' is not in allowlist [com.example.app] (use --allow-app <bundle_id> for this run)
 ```
 
+- `open:APP` / `launch:APP` stop with iOS's reason when WDA reports the app was not opened (not installed, restricted, locked), and read the front app once afterwards: another app in front for over a second fails the step instead of later steps reading or typing into it (SpringBoard, e.g. an alert, keeps the old behaviour). That read stands in for the next step's own app check, so a working `open:` costs no extra request in a typical flow.
 - `open:APP` / `launch:APP` check the target app instead, so a flow can start from the Home Screen: `open:com.example.app` works, opening an app that isn't listed is refused before anything is launched.
 - `url:` is refused while the guard is on: iOS decides which app receives a URL (any scheme, and even `https://` links can open another app as a universal link), so no list entry can vouch for it. Use `open:<bundle_id>` and navigate inside the app. The one exception is an app's own custom scheme named for the run: `--allow-url-scheme SCHEME` (repeatable) together with `--allow-app BUNDLE` lets `url:` open exactly that scheme while a live check confirms an `--allow-app` app is in front, never a system scheme (http, https, tel, sms, mailto, facetime, maps, App Store, settings, `x-apple…` and the like). Afterwards turbotap watches the front app for 0.8 s; if another app comes forward, the step fails and no further input is sent. The stop file still wins, and only the scheme is printed, never the URL (pairing links can carry tokens).
 - `unlock` may type the passcode on the lock screen, and `home` is always allowed.
