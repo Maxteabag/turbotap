@@ -22,7 +22,8 @@ Each turn costs seconds of thinking, so do each phase in ONE `flow` call and rea
 2. **Destination first** (community, channel, recipient), then `ui` again: the destination can change the composer (rules banners, required fields, which attachment types exist). Check here whether the attachment you need is offered at all; if not, say so instead of searching for it.
 3. **Attachment next**, if offered: pick the exact item (name, duration, date) in the picker in one flow.
 4. **Text last, each field in one flow:** `tap:<field>` then `type:<text>` (or `cleartype:`). Long text (120+ characters) is typed at 200 chars/s with a 24-character probe checked on the focused field and a read-back at the end; if it says the text "did not land" (the field moved, e.g. under a banner or the keyboard), tap the field again and retype only then.
-5. **Verify in one flow:** `assertfield:<title field>=file:TITLE.txt assertfield:<body field>=file:BODY.txt read` checks the exact text (blank lines included) and shows destination and attachment.
+5. **Verify in one flow:** `banner:dismiss assertfield:<title field>=file:TITLE.txt assertfield:<body field>=file:BODY.txt read` clears a notification banner first, checks the exact text (blank lines included) and shows destination and attachment. A field whose placeholder disappears once text is in can be named `#N` (the Nth text input from the top; an error lists them with their y); when WDA reports no value for it, the check reads the field's frame by OCR (visible lines, whitespace-insensitive).
+   With several rows of the same label (repeated chips or list rows), `tapat:X,Y=LABEL` presses the one nearest X,Y.
 6. **Stop at the draft.** Never press the composer's submit control (Post, Send, a top-bar Next in a filled composer) unless the user asked to publish.
 
 ## 1. Core Speed Rules (Read Before Running Anything)

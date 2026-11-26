@@ -184,6 +184,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
+  banner:dismiss        swipe away a notification banner over the app (only when SpringBoard
+                        is in front and the phone is unlocked; otherwise nothing is sent)
   alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
   scrollto:TEXT         scroll down (max 8x) until TEXT is visible; at the end of the list
@@ -1117,6 +1119,8 @@ impl<R: Reader> Flow<R> {
             "readfield" => return some(self.read_field(arg)?),
             "assertfield" => return some(self.assert_field(arg)?),
             "dismisskb" => return some(self.dismiss_kb()?),
+            "banner" if arg.trim() == "dismiss" => return some(self.dismiss_banner()?),
+            "banner" => return Err(Error::flow("banner: use banner:dismiss")),
             "typedigits" => return some(self.type_digits(arg)?),
             "pintap" => return some(self.pin_tap(arg)?),
             "alert" => {

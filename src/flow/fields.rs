@@ -37,6 +37,8 @@ fn element_ids(r: &Value) -> Vec<String> {
 /// A text input on screen.
 #[derive(Debug, Clone)]
 pub(crate) struct Field {
+    /// WDA element id (for an OCR read of its frame when it reports no value).
+    pub id: String,
     pub kind: String,
     /// How it was named in the step (messages only, never its value).
     pub name: String,
@@ -116,7 +118,38 @@ impl<R: Reader> Flow<R> {
                 names.push(n);
             }
         }
-        format!("{} {}", kind.trim_start_matches("XCUIElementType"), json::py_repr_str(&names.join(" / ")))
+        let y = self.field_rect(id).map(|r| format!(" at y={}", r.1 as i64)).unwrap_or_default();
+        format!("{} {}{y}", kind.trim_start_matches("XCUIElementType"), json::py_repr_str(&names.join(" / ")))
+    }
+
+    /// An element's frame (x, y, width, height) in points.
+    fn field_rect(&mut self, id: &str) -> Option<(f64, f64, f64, f64)> {
+        let p = self.c.spath(&format!("/element/{id}/rect"));
+        let r = self.c.get(&p);
+        let v = json::get(&r, "value");
+        let g = |k: &str| json::get(v, k).as_f64();
+        Some((g("x")?, g("y")?, g("width")?, g("height")?))
+    }
+
+    /// The text OCR sees inside the field's own frame, line by line (for an input whose
+    /// value WDA reports empty although text is shown). Only visible lines: blank lines
+    /// and text scrolled out of the field are not seen.
+    fn ocr_in_field(&mut self, id: &str) -> Option<String> {
+        let (x, y, w, h) = self.field_rect(id)?;
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let lines = self.r.read(&mut self.c, crate::ocr::ReadOpts::full()).ok()?;
+        let mut inside: Vec<_> = lines
+            .into_iter()
+            .filter(|l| {
+                let (cx, cy) = ((l.x0 + l.x1) / 2.0, (l.y0 + l.y1) / 2.0);
+                cx >= x && cx <= x + w && cy >= y && cy <= y + h
+            })
+            .collect();
+        inside.sort_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
+        let text = inside.iter().map(|l| l.text.trim()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
+        (!text.is_empty()).then_some(text)
     }
 
     /// The one input named `field` by its label, accessibility identifier or
@@ -126,6 +159,30 @@ impl<R: Reader> Flow<R> {
         let f = field.trim();
         if f.is_empty() {
             return Err(Error::flow(format!("{verb}: empty field name")));
+        }
+        // `#N`: the Nth text input on screen in reading order (top to bottom, then left
+        // to right), for an input with no label, identifier or placeholder left (some
+        // apps drop the placeholder once text is in).
+        if let Some(n) = f.strip_prefix('#').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n >= 1) {
+            let mut ids: Vec<(i64, i64, String)> = self
+                .field_ids(INPUT_TYPES_PRED)
+                .into_iter()
+                .map(|id| {
+                    let (x, y, _, _) = self.field_rect(&id).unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    (y as i64, x as i64, id)
+                })
+                .collect();
+            ids.sort();
+            let Some((_, _, id)) = ids.into_iter().nth(n - 1) else {
+                return Err(Error::flow(format!("{verb}: no text input #{n} on screen")));
+            };
+            return Ok(Field {
+                id: id.clone(),
+                kind: self.field_type(&id),
+                name: f.to_string(),
+                placeholder: self.field_attr(&id, "placeholderValue"),
+                value: self.field_attr(&id, "value"),
+            });
         }
         let lit = pred_lit(f);
         let exact = format!("{INPUT_TYPES_PRED} AND (label ==[c] {lit} OR name ==[c] {lit} OR placeholderValue ==[c] {lit})");
@@ -149,6 +206,7 @@ impl<R: Reader> Flow<R> {
             1 => {
                 let id = ids.remove(0);
                 Ok(Field {
+                    id: id.clone(),
                     kind: self.field_type(&id),
                     name: f.to_string(),
                     placeholder: self.field_attr(&id, "placeholderValue"),
@@ -186,6 +244,13 @@ impl<R: Reader> Flow<R> {
             return Ok(format!("len={n}"));
         }
         let v = f.content().to_string();
+        if v.is_empty() {
+            if let Some(o) = self.ocr_in_field(&f.id) {
+                let n = o.chars().count();
+                self.reads.push(j!({"field": f.name, "value": o, "len": n, "source": "ocr"}));
+                return Ok(o);
+            }
+        }
         self.reads.push(j!({"field": f.name, "value": v, "len": n}));
         Ok(v)
     }
@@ -211,7 +276,27 @@ impl<R: Reader> Flow<R> {
             }
             return Ok(format!("{}: len={n}", f.name));
         }
-        let got = f.content();
+        let got = f.content().to_string();
+        if got.is_empty() && !want.is_empty() {
+            // WDA reports no value although the field may show text: compare what OCR
+            // reads in the field's frame, whitespace-insensitive (OCR has no blank lines).
+            if let Some(o) = self.ocr_in_field(&f.id) {
+                let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+                let (a, b) = (norm(&o), norm(&want));
+                if a == b {
+                    return Ok(format!("{}: len={n} (read by OCR: the field reports no value)", f.name));
+                }
+                let i = first_diff(&a, &b);
+                let ctx = |s: &str| -> String { s.chars().skip(i.saturating_sub(10)).take(30).collect() };
+                return Err(Error::flow(format!(
+                    "assertfield: {} differs (read by OCR, the field reports no value; only visible lines): first difference at char {i}: got {} want {}",
+                    f.describe(),
+                    json::py_repr_str(&ctx(&a)),
+                    json::py_repr_str(&ctx(&b)),
+                )));
+            }
+        }
+        let got = got.as_str();
         if got != want {
             let i = first_diff(got, &want);
             let ctx = |s: &str| -> String { s.chars().skip(i.saturating_sub(10)).take(30).collect() };
@@ -240,6 +325,7 @@ mod unit {
     #[test]
     fn placeholder_echo_reads_as_empty() {
         let f = Field {
+            id: "b1".into(),
             kind: "XCUIElementTypeTextView".into(),
             name: "Body".into(),
             placeholder: "body text (optional)".into(),

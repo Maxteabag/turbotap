@@ -1,8 +1,10 @@
 //! Ported Python test suite (`tests/*.py`), one module per Python file.
 mod test_app_guard;
+mod test_banner;
 mod test_conditional_screenshot;
 mod test_deny_submit;
 mod test_daemon;
+mod test_field_fallbacks;
 mod test_fields;
 mod test_filled_controls;
 mod test_flow_runner;
