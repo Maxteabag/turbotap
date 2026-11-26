@@ -640,6 +640,15 @@ impl<R: Reader> Flow<R> {
         }))
     }
 
+    /// Type a secret through the element itself (WDA's element value): the runner puts
+    /// keyboard focus on that element and types into it, so a focus change after any
+    /// client-side check cannot send the keys to another field.
+    fn bound_write(&mut self, eid: &str, text: &str) -> Value {
+        let chars: Vec<Value> = text.chars().map(|c| Value::String(c.to_string())).collect();
+        let p = self.c.spath(&format!("/element/{eid}/value"));
+        self.c.post(&p, &j!({"text": text, "value": chars}))
+    }
+
     /// Clear `eid` when its value holds the secret or a piece of it (3+ characters),
     /// so a secret that landed in a visible field never stays on screen.
     fn clear_if_holds_secret(&mut self, eid: &str, secret: &str) -> bool {
@@ -656,17 +665,14 @@ impl<R: Reader> Flow<R> {
         holds
     }
 
-    /// After a secret was typed: focus must still be on `eid`. If a popup or autofill
-    /// moved it, the field that got the keys is cleared and the step fails.
+    /// Defence in depth after a bound write: if focus is now on another field and that
+    /// field holds any of the secret, it is cleared and the step fails (never echoing
+    /// what it held). Focus elsewhere with nothing of the secret there is fine.
     fn check_focus_after_secret(&mut self, verb: &str, eid: &str, secret: &str) -> Result<()> {
         match self.active_element_id() {
-            Some(a) if a != eid => {
-                let cleared = self.clear_if_holds_secret(&a, secret);
-                Err(Error::flow(format!(
-                    "{verb}: focus moved to another field while typing the secret{}; check the screen before any retry, no screenshot first",
-                    if cleared { " (that field was cleared)" } else { "" }
-                )))
-            }
+            Some(a) if a != eid && self.clear_if_holds_secret(&a, secret) => Err(Error::flow(format!(
+                "{verb}: part of the secret reached another field, which was cleared; check the screen with ui before any retry, no screenshot or read first"
+            ))),
             _ => Ok(()),
         }
     }
@@ -856,11 +862,11 @@ impl<R: Reader> Flow<R> {
                 self.wait_input_focus();
                 self.last_tap_type = None;
                 self.mark_action(false, true);
-                // A secret only into a field that has focus, and into the secure field
-                // when there is one: never into a username field next to it.
-                let focus = if is_secret {
-                    let active = self.active_element_id();
-                    let Some(a) = active else {
+                // A secret only into the focused field when that is known and is the
+                // secure field (or, with no secure field, a text field), written through
+                // that element: never to whatever happens to have focus.
+                let target = if is_secret {
+                    let Some(a) = self.active_element_id() else {
                         return Err(Error::flow("type: no field has keyboard focus for the secret (nothing typed)"));
                     };
                     let secure = self.element_ids("XCUIElementTypeSecureTextField");
@@ -869,14 +875,26 @@ impl<R: Reader> Flow<R> {
                             "type: the secret goes into a secure field, but focus is on another field; tap the password field first (nothing typed)",
                         ));
                     }
+                    if secure.is_empty() {
+                        let mut inputs = Vec::new();
+                        for cls in ["XCUIElementTypeTextField", "XCUIElementTypeSearchField", "XCUIElementTypeTextView"] {
+                            inputs.extend(self.element_ids(cls));
+                        }
+                        if !inputs.contains(&a) {
+                            return Err(Error::flow("type: focus is not on a text field for the secret (nothing typed)"));
+                        }
+                    }
                     Some(a)
                 } else {
                     None
                 };
-                let r = self.c.fast_keys(&text, None);
+                let r = match target.as_deref() {
+                    Some(eid) => self.bound_write(eid, &text),
+                    None => self.c.fast_keys(&text, None),
+                };
                 let redact = is_secret || crate::wda::echoes_secret(&r, &text);
                 check_wda_ok(r, "type", redact)?;
-                if let Some(a) = focus {
+                if let Some(a) = target {
                     clock::sleep(0.2);
                     self.check_focus_after_secret("type", &a, &text)?;
                 }
@@ -1105,7 +1123,8 @@ impl<R: Reader> Flow<R> {
         if is_secret && !self.wait_focus_on(&eid, 1.0) {
             return Err(Error::flow("cleartype: the target field did not get keyboard focus (nothing typed)"));
         }
-        let r = self.c.fast_keys(&text, None);
+        // A secret is written through the target element, never sent to whatever has focus.
+        let r = if is_secret { self.bound_write(&eid, &text) } else { self.c.fast_keys(&text, None) };
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype", red)?;
         clock::sleep(0.20);
