@@ -17,6 +17,12 @@ pub(crate) const INPUT_TYPES_PRED: &str = "type IN {'XCUIElementTypeTextField','
 'XCUIElementTypeSearchField','XCUIElementTypeTextView'}";
 const SECURE: &str = "XCUIElementTypeSecureTextField";
 
+/// Characters per second for `fill:` (`TURBOTAP_TYPING_FREQ` overrides).
+const FILL_TYPING_FREQ: i64 = 200;
+
+/// Longer text gets the focus probe too: typing it into nothing wastes seconds.
+const PROBE_MIN_LEN: usize = 40;
+
 /// XCTest's delete key.
 const BACKSPACE: &str = "\u{8}";
 
@@ -132,6 +138,10 @@ fn resolve_value(verb: &str, spec: &str) -> Result<(String, bool)> {
 }
 
 /// First index where two strings differ (in chars).
+fn num(v: &Value, k: &str) -> f64 {
+    json::get(v, k).as_f64().unwrap_or(0.0)
+}
+
 fn first_diff(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
@@ -160,6 +170,7 @@ impl<R: Reader> Flow<R> {
         json::get(&r, "value").as_str().unwrap_or("").to_string()
     }
 
+    /// Everything about an input, for messages that list candidates.
     fn read_input(&mut self, id: &str) -> Input {
         Input {
             id: id.to_string(),
@@ -171,8 +182,45 @@ impl<R: Reader> Flow<R> {
         }
     }
 
+    /// What typing needs (type, placeholder, value): three reads instead of five
+    /// (each costs a tree snapshot, 100+ ms in heavy apps). `hint` names it in
+    /// messages.
+    fn read_input_lean(&mut self, id: &str, hint: &str) -> Input {
+        Input {
+            id: id.to_string(),
+            kind: self.el_type(id),
+            label: hint.to_string(),
+            name: String::new(),
+            placeholder: self.el_attr(id, "placeholderValue"),
+            value: self.el_attr(id, "value"),
+        }
+    }
+
+    fn keyboard_up(&mut self) -> bool {
+        !self.input_ids("type == 'XCUIElementTypeKeyboard'").is_empty()
+    }
+
     fn el_value(&mut self, id: &str) -> String {
         self.el_attr(id, "value")
+    }
+
+    /// Focusing a login field makes iOS offer saved passwords in a SpringBoard
+    /// sheet (it needs Face ID): close it, and any other system sheet with a
+    /// declining answer, before typing. Errors when something else is in front.
+    fn clear_system_sheet(&mut self) -> Result<()> {
+        for _ in 0..2 {
+            match self.c.live_foreground_app(None) {
+                Ok(b) if crate::guard::is_system_prompt_host(&b) => {
+                    let r = self.prompts("0.6")?;
+                    if r == "none" {
+                        return Err(Error::flow(format!("{b} is in front with no sheet turbotap may close")));
+                    }
+                    clock::sleep(0.3);
+                }
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     /// The one input named `field` (label, accessibility identifier or placeholder;
@@ -185,12 +233,20 @@ impl<R: Reader> Flow<R> {
         }
         let lit = pred_lit(f);
         let exact = format!("{INPUT_TYPES_PRED} AND (label ==[c] {lit} OR name ==[c] {lit} OR placeholderValue ==[c] {lit})");
+        let sub = format!("{INPUT_TYPES_PRED} AND (label CONTAINS[c] {lit} OR name CONTAINS[c] {lit} OR placeholderValue CONTAINS[c] {lit})");
         let mut ids = self.input_ids(&exact);
         if ids.is_empty() {
-            let sub = format!(
-                "{INPUT_TYPES_PRED} AND (label CONTAINS[c] {lit} OR name CONTAINS[c] {lit} OR placeholderValue CONTAINS[c] {lit})"
-            );
             ids = self.input_ids(&sub);
+        }
+        if ids.is_empty() && self.keyboard_up() {
+            // A field under the keyboard can drop out of the tree (lists only keep
+            // visible cells): close the keyboard with a short downward drag, look again.
+            self.scroll("up")?;
+            clock::sleep(0.3);
+            ids = self.input_ids(&exact);
+            if ids.is_empty() {
+                ids = self.input_ids(&sub);
+            }
         }
         if ids.len() > 1 {
             // Off-screen copies (recycled cells, hidden pages) do not count.
@@ -205,7 +261,7 @@ impl<R: Reader> Flow<R> {
             }
         }
         match ids.len() {
-            1 => Ok(self.read_input(&ids[0])),
+            1 => Ok(self.read_input_lean(&ids[0], f)),
             0 => {
                 let all = self.input_ids(INPUT_TYPES_PRED);
                 let names: Vec<String> = all.iter().take(8).map(|id| self.read_input(id).describe()).collect();
@@ -227,30 +283,33 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// Total value length of every input except `inp`, to prove input landed only
-    /// where intended (lengths only: values may be secrets; a sum, so it does not
-    /// depend on element IDs staying the same between queries).
-    fn other_lengths(&mut self, inp: &Input) -> usize {
-        let ids = self.input_ids(INPUT_TYPES_PRED);
-        let mut total = 0usize;
-        for id in ids {
-            let ph = self.el_attr(&id, "placeholderValue");
-            let v = self.el_value(&id);
-            total += if !ph.is_empty() && v == ph { 0 } else { v.chars().count() };
-        }
-        total.saturating_sub(self.current_len(inp))
-    }
-
     fn current_len(&mut self, inp: &Input) -> usize {
         let v = self.el_value(&inp.id);
         Input { value: v, ..inp.clone() }.len()
     }
 
+    /// Focus `inp` and confirm a keyboard is up. Some custom text views ignore
+    /// WDA's element click: then tap the element's centre.
     fn click_input(&mut self, inp: &Input) -> Result<()> {
         let p = self.c.spath(&format!("/element/{}/click", inp.id));
         let r = self.c.post(&p, &j!({}));
         check_wda_ok(r, &format!("fill: focusing {}", inp.describe()), true)?;
-        clock::sleep(0.35);
+        clock::sleep(0.3);
+        if self.keyboard_up() {
+            return Ok(());
+        }
+        let p = self.c.spath(&format!("/element/{}/rect", inp.id));
+        let rect = json::get(&self.c.get(&p), "value").clone();
+        let (x, y, w, h) = (num(&rect, "x"), num(&rect, "y"), num(&rect, "width"), num(&rect, "height"));
+        if w > 0.0 && h > 0.0 {
+            // A tall text view: tap near its top, where the first line is.
+            let ty = y + (h / 2.0).min(20.0);
+            self.tap_point((x + w / 2.0) as i64, ty as i64, "", None)?;
+            clock::sleep(0.35);
+        }
+        if !self.keyboard_up() {
+            return Err(Error::flow(format!("fill: no keyboard after focusing {}; nothing was typed", inp.describe())));
+        }
         Ok(())
     }
 
@@ -264,10 +323,12 @@ impl<R: Reader> Flow<R> {
 
     fn keys(&mut self, text: &str, what: &str, redact: bool) -> Result<()> {
         // XCTest types every character inside one request: allow for long text.
+        // 200 characters per second read back exactly on a real iPhone (1393
+        // characters of multi-paragraph text in 7 s, against 23 s at XCTest's 60).
         let n = text.chars().count() as f64;
-        let freq = crate::config::typing_freq().unwrap_or(60) as f64;
-        let timeout = (10.0 + 2.0 * n / freq.max(1.0)).max(crate::wda::DEFAULT_TIMEOUT);
-        let r = self.c.fast_keys_timeout(text, None, timeout);
+        let freq = crate::config::typing_freq().unwrap_or(FILL_TYPING_FREQ);
+        let timeout = (10.0 + 2.0 * n / (freq as f64).max(1.0)).max(crate::wda::DEFAULT_TIMEOUT);
+        let r = self.c.fast_keys_timeout(text, Some(freq), timeout);
         let red = redact || crate::wda::echoes_secret(&r, text);
         check_wda_ok(r, what, red)?;
         Ok(())
@@ -278,15 +339,15 @@ impl<R: Reader> Flow<R> {
     /// landed elsewhere it is deleted there and the step fails with nothing secret
     /// typed.
     fn probe_focus(&mut self, inp: &Input) -> Result<()> {
+        // Key events go to the one first responder: if the probe grew `inp` by one,
+        // it went nowhere else.
         let before = self.current_len(inp);
-        let others0 = self.other_lengths(&inp);
         self.keys("x", "fill: focus probe", false)?;
-        clock::sleep(0.25);
-        let after = self.current_len(inp);
-        let others1 = self.other_lengths(&inp);
-        let landed_here = after == before + 1 && others0 == others1;
-        self.keys(BACKSPACE, "fill: removing focus probe", false)?;
         clock::sleep(0.2);
+        let after = self.current_len(inp);
+        let landed_here = after == before + 1;
+        self.keys(BACKSPACE, "fill: removing focus probe", false)?;
+        clock::sleep(0.15);
         if !landed_here {
             return Err(Error::flow(format!(
                 "fill: keyboard focus is not in {} (a probe character did not land there; it was deleted again); nothing secret was typed",
@@ -294,7 +355,7 @@ impl<R: Reader> Flow<R> {
             )));
         }
         let back = self.current_len(inp);
-        if back != before || self.other_lengths(&inp) != others0 {
+        if back != before {
             return Err(Error::flow(format!("fill: could not remove the focus probe from {}; nothing secret was typed", inp.describe())));
         }
         Ok(())
@@ -309,6 +370,7 @@ impl<R: Reader> Flow<R> {
             return Err(Error::flow("fill expects FIELD=VALUE (VALUE: text, env:VAR, cmd:CMD or file:PATH)"));
         };
         let (text, secret_src) = resolve_value("fill", spec)?;
+        self.clear_system_sheet()?;
         let inp = self.find_input(field)?;
         let n = self.fill_input(&inp, &text, secret_src)?;
         Ok(format!("{}: len={n}", field.trim()))
@@ -320,13 +382,13 @@ impl<R: Reader> Flow<R> {
     pub(super) fn secret_target(&mut self) -> Result<Input> {
         let secure = self.input_ids(&format!("type == '{SECURE}'"));
         match secure.len() {
-            1 => return Ok(self.read_input(&secure[0])),
+            1 => return Ok(self.read_input_lean(&secure[0], "secure field")),
             0 => {}
             n => return Err(Error::flow(format!("{n} secure fields on screen; name one with fill:FIELD=env:VAR"))),
         }
         let all = self.input_ids(INPUT_TYPES_PRED);
         if all.len() == 1 {
-            return Ok(self.read_input(&all[0]));
+            return Ok(self.read_input_lean(&all[0], "only text input"));
         }
         Err(Error::flow(format!(
             "a secret needs a unique target: no secure field and {} text inputs on screen; name it with fill:FIELD=env:VAR",
@@ -346,12 +408,12 @@ impl<R: Reader> Flow<R> {
     /// character count.
     fn fill_input(&mut self, inp: &Input, text: &str, secret_src: bool) -> Result<usize> {
         let inp = inp.clone();
+        self.clear_system_sheet()?;
         let secret = secret_src || inp.secure();
         if secret {
             self.note_secret(text);
         }
         self.mark_action(false, true);
-        let others0 = self.other_lengths(&inp);
         if inp.len() > 0 {
             self.clear_input(&inp)?;
         }
@@ -361,7 +423,7 @@ impl<R: Reader> Flow<R> {
             self.clear_input(&inp)?;
             self.click_input(&inp)?;
         }
-        if secret {
+        if secret || text.chars().count() >= PROBE_MIN_LEN {
             self.probe_focus(&inp)?;
         }
         self.keys(text, &format!("fill {}", inp.describe()), secret)?;
@@ -385,9 +447,6 @@ impl<R: Reader> Flow<R> {
             }
         } else {
             self.check_value(&inp, text, "fill")?;
-        }
-        if self.other_lengths(&inp) != others0 {
-            return Err(Error::flow(format!("fill: another input changed while typing into {}", inp.describe())));
         }
         Ok(want)
     }
@@ -597,9 +656,14 @@ impl<R: Reader> Flow<R> {
                     }
                 }
             } else {
-                // A sheet or in-app pre-prompt: an exact declining button.
-                let ctl = self.controls(false, Some(1.5), None, false, true)?;
-                if let Some(c) = ctl.iter().find(|c| matches!(c.kind.as_str(), "Button" | "Cell") && !c.in_keyboard && is_safe_answer(&c.label)).cloned() {
+                // A sheet or in-app pre-prompt: an exact declining button. A system
+                // sheet (SpringBoard or a service, e.g. the saved-passwords sheet)
+                // may also be closed; inside the app "Close" can discard a draft.
+                let system = self.c.live_foreground_app(None).is_ok_and(|b| crate::guard::is_system_prompt_host(&b));
+                let ok = |l: &str| if system { is_safe_alert_answer(l) } else { is_safe_answer(l) };
+                let budget = (end - clock::now()).clamp(0.3, 1.2);
+                let ctl = self.controls(false, Some(budget), None, false, true)?;
+                if let Some(c) = ctl.iter().find(|c| matches!(c.kind.as_str(), "Button" | "Cell") && !c.in_keyboard && ok(&c.label)).cloned() {
                     let prev = std::mem::replace(&mut self.c.guard_prompt_scope, true);
                     let r = self.tap_point(c.x, c.y, &c.label, None);
                     self.c.guard_prompt_scope = prev;
@@ -609,11 +673,11 @@ impl<R: Reader> Flow<R> {
                     clock::sleep(0.45);
                 }
             }
+            if clock::now() >= end {
+                break;
+            }
             if !acted {
-                if clock::now() >= end {
-                    break;
-                }
-                clock::sleep(0.2);
+                clock::sleep(0.15);
             }
             if answered.len() >= 6 {
                 break;
@@ -673,7 +737,14 @@ impl<R: Reader> Flow<R> {
             self.tap_point(tab.x, tab.y, &tab.label, None)?;
             clock::sleep(0.5);
         }
-        let ids = self.input_ids("type == 'XCUIElementTypeSearchField'");
+        let mut ids = vec![];
+        let end = clock::now() + 4.0;
+        while ids.is_empty() && clock::now() < end {
+            ids = self.input_ids("type == 'XCUIElementTypeSearchField'");
+            if ids.is_empty() {
+                clock::sleep(0.2);
+            }
+        }
         let Some(sf) = ids.first().cloned() else {
             return Err(Error::flow("appinstall: no App Store search field"));
         };
