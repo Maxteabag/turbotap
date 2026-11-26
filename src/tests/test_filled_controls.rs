@@ -59,9 +59,10 @@ fn otsu(raw: &[u8]) -> u8 {
     t
 }
 
-/// Stands in for Tesseract with one global threshold: the label is the rarest gray
-/// level (at least 0.2 % of the buffer); it is read only when the buffer's Otsu
-/// threshold puts it on the other side from the pixels around it.
+/// Stands in for Tesseract with one global threshold. Labels are the connected regions
+/// of the rarest gray level (at least 0.2 % of the buffer); each is read only when the
+/// buffer's Otsu threshold puts it on the other side from the pixels around it. A wide
+/// bar reads "Title", any other label "Continue".
 fn global_threshold_ocr(raw: &[u8], w: u32, h: u32, _sauvola: bool) -> crate::error::Result<Vec<RawWords>> {
     let (w, h) = (w as usize, h as usize);
     let mut bins = [0usize; 8];
@@ -74,31 +75,53 @@ fn global_threshold_ocr(raw: &[u8], w: u32, h: u32, _sauvola: bool) -> crate::er
     }
     let label_bin = *present.iter().min_by_key(|&&b| bins[b]).unwrap();
     let is_label = |v: u8| (v >> 5) as usize == label_bin;
-    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
-    for y in 0..h {
-        for x in 0..w {
-            if is_label(raw[y * w + x]) {
-                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
-            }
-        }
-    }
     let t = otsu(raw);
     let side = |v: u8| v > t;
-    let label_side = side(raw[y0 * w + x0]);
-    let (mut same, mut ring) = (0usize, 0usize);
-    for y in y0.saturating_sub(3)..(y1 + 3).min(h) {
-        for x in x0.saturating_sub(3)..(x1 + 3).min(w) {
-            let v = raw[y * w + x];
-            if !is_label(v) {
-                ring += 1;
-                same += (side(v) == label_side) as usize;
+    let mut seen = vec![false; w * h];
+    let mut out: Vec<RawWords> = Vec::new();
+    for start in 0..w * h {
+        if seen[start] || !is_label(raw[start]) {
+            continue;
+        }
+        // One connected label region (4-neighbours) and its bounding box.
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+        let mut stack = vec![start];
+        seen[start] = true;
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % w, i / w);
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+            let mut push = |j: usize| {
+                if !seen[j] && is_label(raw[j]) {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            };
+            if x > 0 { push(i - 1); }
+            if x + 1 < w { push(i + 1); }
+            if y > 0 { push(i - w); }
+            if y + 1 < h { push(i + w); }
+        }
+        if (x1 - x0) * (y1 - y0) * 1000 < raw.len() {
+            continue; // specks
+        }
+        let label_side = side(raw[y0 * w + x0]);
+        let (mut same, mut ring) = (0usize, 0usize);
+        for y in y0.saturating_sub(3)..(y1 + 3).min(h) {
+            for x in x0.saturating_sub(3)..(x1 + 3).min(w) {
+                let v = raw[y * w + x];
+                if !is_label(v) {
+                    ring += 1;
+                    same += (side(v) == label_side) as usize;
+                }
             }
         }
+        if ring == 0 || same * 2 >= ring {
+            continue; // merged with its surroundings: nothing to read
+        }
+        let text = if x1 - x0 > 8 * (y1 - y0) { "Title" } else { "Continue" };
+        out.push(vec![(text.to_string(), x0 as i64, y0 as i64, x1 as i64, y1 as i64)]);
     }
-    if ring == 0 || same * 2 >= ring {
-        return Ok(Vec::new()); // merged with its surroundings: nothing to read
-    }
-    Ok(vec![vec![("Continue".to_string(), x0 as i64, y0 as i64, x1 as i64, y1 as i64)]])
+    Ok(out)
 }
 
 struct OcrHook;
@@ -182,8 +205,8 @@ fn test_full_read_also_returns_the_button_label() {
     let (code, v, err) = wrapper_read(&mock, "read:ocr");
     assert_eq!(code, 0, "{err}");
     let lines = lines_of(&v);
-    assert!(lines.iter().any(|(_, x, y)| (x - 201).abs() <= 3 && (y - 756).abs() <= 3), "{lines:?}");
-    assert!(lines.iter().any(|(_, _, y)| (y - 140).abs() <= 3), "the page text is still read: {lines:?}");
+    assert!(lines.iter().any(|(t, x, y)| t == "Continue" && (x - 201).abs() <= 3 && (y - 756).abs() <= 3), "{lines:?}");
+    assert!(lines.iter().any(|(t, _, y)| t == "Title" && (y - 140).abs() <= 3), "the page text is still read: {lines:?}");
 }
 
 #[test]

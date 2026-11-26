@@ -492,9 +492,12 @@ pub fn filled_controls(raw: &[u8], w: usize, h: usize) -> Vec<FilledControl> {
         if rh < 10 {
             continue;
         }
-        // Columns filled in at least 90 % of the run's rows.
+        // Columns filled in at least 90 % of the run's top and bottom margin rows: a
+        // label sits in the middle and may match the page (white text, white page).
+        let m = (rh / 6).max(2);
+        let edge_rows: Vec<usize> = (ya..ya + m).chain(yb - m..yb).collect();
         let full: Vec<bool> = (0..w)
-            .map(|x| (ya..yb).filter(|&r| far(raw[r * w + x], bg)).count() * 10 >= rh * 9)
+            .map(|x| edge_rows.iter().filter(|&&r| far(raw[r * w + x], bg)).count() * 10 >= edge_rows.len() * 9)
             .collect();
         let mut x = 0;
         while x < w && out.len() < 4 {
