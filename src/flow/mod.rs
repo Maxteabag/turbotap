@@ -140,7 +140,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
   alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
-  scrollto:TEXT         scroll down (max 8x) until TEXT is visible (scrollto:up:TEXT scrolls up)
+  scrollto:TEXT         scroll down (max 8x) until TEXT is visible; at the end of the list
+                        it turns and searches back up (scrollto:up:TEXT / scrollto:down:TEXT
+                        scroll one way only)
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
   swipe:left|right:TEXT horizontal row swipe on TEXT's row (damped 80%->30% / 20%->70% to reveal
                         row actions without triggering full-width destructive delete)
@@ -190,6 +192,9 @@ pub fn is_url_scheme(s: &str) -> bool {
 /// Verbs whose argument is text typed or tapped into the device (PINs, passwords,
 /// clipboard contents). Their inline values and `cmd:` command lines never appear in
 /// flow output; `env:VAR` names are shown.
+/// `cleartype:` read-back: wait before each read of the field's value.
+const CLEARTYPE_READBACK: [f64; 4] = [0.0, 0.08, 0.12, 0.2];
+
 pub const SECRET_ARG_VERBS: &[&str] = &["pintap", "typedigits", "cleartype", "type", "setclip"];
 
 /// Verbs whose value is always a credential (PINs, passwords), in any form.
@@ -293,6 +298,9 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub reads: Vec<Value>,
     /// Print one JSON line per finished step to stderr.
     pub log: bool,
+    /// Step-level retries in the current step (re-queries, stale-tree backoffs), for
+    /// the timing log; reset before each step.
+    pub step_retries: u64,
     pub ui_worker: Option<UiWorker>,
     pub last_action_ts: f64,
     pub last_action_is_typing: bool,
@@ -340,6 +348,7 @@ impl<R: Reader> Flow<R> {
             last_tap_ts: 0.0,
             reads: Vec::new(),
             log,
+            step_retries: 0,
             ui_worker: None,
             last_action_ts: 0.0,
             last_action_is_typing: false,
@@ -715,7 +724,7 @@ impl<R: Reader> Flow<R> {
                 self.scroll(dir)?;
             }
             "scrollto" => {
-                let mut direction = "down".to_string();
+                let mut direction = "auto".to_string();
                 let mut target = arg;
                 if let Some((pfx, rest)) = arg.split_once(':') {
                     let p = pfx.trim().to_lowercase();
@@ -846,21 +855,7 @@ impl<R: Reader> Flow<R> {
         let text = secret_arg(verb, arg)?;
         self.note_secret(&text);
         self.mark_action(false, true);
-        let mut els = Value::Array(vec![]);
-        let mut secure = false;
-        for (cls, is_sec) in [
-            ("XCUIElementTypeTextField", false),
-            ("XCUIElementTypeSecureTextField", true),
-            ("XCUIElementTypeSearchField", false),
-            ("XCUIElementTypeTextView", false),
-        ] {
-            els = self.find_elements(cls);
-            if json::truthy(&els) {
-                secure = is_sec;
-                break;
-            }
-        }
-        let Some(eid) = Self::first_element_id(&els) else {
+        let Some((eid, secure)) = self.find_text_input() else {
             return Err(Error::flow("no TextField, SecureTextField, SearchField, or TextView on screen"));
         };
         let redact = is_secret || secure;
@@ -877,12 +872,25 @@ impl<R: Reader> Flow<R> {
         let r = self.c.fast_keys(&text, None);
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype", red)?;
-        clock::sleep(0.20);
-        if !secure {
+        if secure {
+            clock::sleep(0.20);
+        } else {
+            // Read back at once and re-read briefly while the field catches up, instead
+            // of a fixed 0.2 s wait before one read (same 0.2 s+ budget at worst).
             let p = self.c.spath(&format!("/element/{eid}/attribute/value"));
-            let r = self.c.get(&p);
-            let v = json::get(&r, "value");
-            let val = if json::truthy(v) { json::py_str(v) } else { String::new() };
+            let mut val = String::new();
+            for (i, wait) in CLEARTYPE_READBACK.iter().enumerate() {
+                if i > 0 {
+                    self.step_retries += 1;
+                }
+                clock::sleep(*wait);
+                let r = self.c.get(&p);
+                let v = json::get(&r, "value");
+                val = if json::truthy(v) { json::py_str(v) } else { String::new() };
+                if val == text {
+                    break;
+                }
+            }
             if val != text {
                 return Err(Error::flow(format!(
                     "cleartype read-back mismatch (len {} vs {})",
@@ -892,6 +900,45 @@ impl<R: Reader> Flow<R> {
             }
         }
         Ok(format!("len={}", text.chars().count()))
+    }
+
+    /// The text input `cleartype:` writes to, and whether it is secure. One predicate
+    /// query for all four input types (one tree walk instead of up to four class
+    /// searches; a chat composer is a TextView, which the class order checked last).
+    /// One match: its type decides `secure`. None, several, or a runner that rejects
+    /// the predicate: the class order TextField, SecureTextField, SearchField, TextView.
+    fn find_text_input(&mut self) -> Option<(String, bool)> {
+        const ORDER: [(&str, bool); 4] = [
+            ("XCUIElementTypeTextField", false),
+            ("XCUIElementTypeSecureTextField", true),
+            ("XCUIElementTypeSearchField", false),
+            ("XCUIElementTypeTextView", false),
+        ];
+        let pred = format!("type IN {{{}}}", ORDER.iter().map(|(c, _)| format!("'{c}'")).collect::<Vec<_>>().join(", "));
+        let p = self.c.spath("/elements");
+        let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));
+        // An empty answer falls back too: a runner that does not map `type` in an IN
+        // predicate would answer [] rather than an error.
+        if let Some(els) = json::get(&r, "value").as_array().filter(|_| json::get(&r, "error").is_null()) {
+            if els.len() == 1 {
+                if let Some(eid) = Self::first_element_id(&Value::Array(els.clone())) {
+                    let tp = self.c.spath(&format!("/element/{eid}/attribute/type"));
+                    let t = self.c.get(&tp);
+                    if let Some(kind) = json::get(&t, "value").as_str() {
+                        if let Some((_, sec)) = ORDER.iter().find(|(c, _)| *c == kind) {
+                            return Some((eid, *sec));
+                        }
+                    }
+                }
+            }
+        }
+        for (cls, is_sec) in ORDER {
+            let els = self.find_elements(cls);
+            if let Some(eid) = Self::first_element_id(&els) {
+                return Some((eid, is_sec));
+            }
+        }
+        None
     }
 
     fn type_digits(&mut self, arg: &str) -> Result<String> {
@@ -1067,7 +1114,11 @@ impl<R: Reader> Flow<R> {
                     self.note_secret(arg);
                 }
             }
-            match self.step(spec) {
+            let (req0, slept0) = (self.c.stats, clock::slept_total());
+            self.step_retries = 0;
+            let outcome = self.step(spec);
+            self.record_timing(spec, s0, req0, slept0, outcome.as_ref().err());
+            match outcome {
                 Ok(res) => {
                     let mut item = serde_json::Map::new();
                     item.insert("step".into(), j!(safe_step(spec)));
@@ -1138,6 +1189,30 @@ impl<R: Reader> Flow<R> {
         });
         self.scrub_value(&mut res);
         Ok((true, res))
+    }
+}
+
+impl<R: Reader> Flow<R> {
+    /// Append the finished step to the timing log ([`crate::timings`]). Uses only
+    /// counters and state already held: no request.
+    fn record_timing(&self, spec: &str, s0: f64, req0: crate::wda::ReqStats, slept0: f64, err: Option<&Error>) {
+        if crate::timings::log_path().is_none() {
+            return;
+        }
+        let err_s = err.map(|e| e.to_string());
+        let dev = self.c.device_key.clone().filter(|d| !d.is_empty()).or_else(|| Some(self.c.udid.clone()).filter(|u| !u.is_empty()));
+        let rec = crate::timings::StepRecord {
+            device: dev.as_deref(),
+            spec,
+            ms: (clock::real_now() - s0) * 1000.0,
+            sleep_ms: (clock::slept_total() - slept0) * 1000.0,
+            retries: self.step_retries,
+            req: self.c.stats.since(&req0),
+            bundle: self.bundle.as_deref(),
+            ok: err.is_none(),
+            error: err_s.as_deref(),
+        };
+        crate::timings::append(&rec.to_value(|t| self.scrub(t)));
     }
 }
 

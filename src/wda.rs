@@ -646,7 +646,70 @@ fn remove_session_cache_entry(key: &Path) {
 // WDA client
 // ---------------------------------------------------------------------------
 
+/// Counters for requests sent by one [`WdaClient`]; a flow step's numbers are the
+/// difference of two snapshots ([`ReqStats::since`]). Counting is a few integer adds
+/// per request, never an extra request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReqStats {
+    /// Requests put on the wire (each attempt counts).
+    pub requests: u64,
+    /// Resends after a transport failure.
+    pub retries: u64,
+    /// Request body bytes sent.
+    pub bytes_out: u64,
+    /// Response body bytes received.
+    pub bytes_in: u64,
+    /// Screenshot requests.
+    pub shots: u64,
+    /// Accessibility tree / element queries.
+    pub tree: u64,
+    /// Microseconds spent in requests (connect, send, wait, read).
+    pub wda_us: u64,
+}
+
+impl ReqStats {
+    /// `self - before`, field by field.
+    pub fn since(&self, before: &ReqStats) -> ReqStats {
+        ReqStats {
+            requests: self.requests.saturating_sub(before.requests),
+            retries: self.retries.saturating_sub(before.retries),
+            bytes_out: self.bytes_out.saturating_sub(before.bytes_out),
+            bytes_in: self.bytes_in.saturating_sub(before.bytes_in),
+            shots: self.shots.saturating_sub(before.shots),
+            tree: self.tree.saturating_sub(before.tree),
+            wda_us: self.wda_us.saturating_sub(before.wda_us),
+        }
+    }
+
+    /// Add another client's counters (a side connection used for one step).
+    pub fn add(&mut self, o: &ReqStats) {
+        self.requests += o.requests;
+        self.retries += o.retries;
+        self.bytes_out += o.bytes_out;
+        self.bytes_in += o.bytes_in;
+        self.shots += o.shots;
+        self.tree += o.tree;
+        self.wda_us += o.wda_us;
+    }
+
+    fn note_send(&mut self, path: &str, body: Option<&[u8]>, attempt: usize) {
+        self.requests += 1;
+        if attempt > 0 {
+            self.retries += 1;
+        }
+        self.bytes_out += body.map_or(0, |b| b.len() as u64);
+        let p = path.split('?').next().unwrap_or(path);
+        if p.contains("creenshot") {
+            self.shots += 1;
+        } else if p.ends_with("/source") || p.contains("/element") || p.ends_with("/fastUI") {
+            self.tree += 1;
+        }
+    }
+}
+
 pub struct WdaClient {
+    /// Requests sent on this client's connection (for the per-step timing log).
+    pub stats: ReqStats,
     pub base_url: String,
     pub udid: String,
     pub device_key: Option<String>,
@@ -711,6 +774,7 @@ impl WdaClient {
         let (host, port) = parse_host_port(&base_url);
         let turbo = if crate::config::env("WDA_TURBO").as_deref() == Some("0") { Some(false) } else { None };
         WdaClient {
+            stats: ReqStats::default(),
             base_url,
             udid: udid.to_string(),
             device_key: device_key.map(String::from),
@@ -1154,6 +1218,7 @@ impl WdaClient {
                 eff_timeout = timeout.min(rem).max(0.05);
             }
             let mut sent = false;
+            let t_req = std::time::Instant::now();
             let res: std::io::Result<(u16, Option<T>, Option<String>)> = (|| {
                 self.ensure_conn(eff_timeout)?;
                 #[cfg(test)]
@@ -1167,13 +1232,18 @@ impl WdaClient {
                     }
                 }
                 sent = true;
+                self.stats.note_send(path, body, attempt);
                 self.conn
                     .as_mut()
                     .unwrap()
                     .request_borrowed(method, path, body, headers, capture_err_body, &mut parser)
             })();
+            self.stats.wda_us += t_req.elapsed().as_micros() as u64;
             match res {
-                Ok(r) => return Ok(Some(r)),
+                Ok(r) => {
+                    self.stats.bytes_in += self.conn.as_ref().map_or(0, |c| c.body_buf.len() as u64);
+                    return Ok(Some(r));
+                }
                 Err(e) if e.to_string() == "__deadline__" => return Ok(None),
                 Err(e) => {
                     self.conn = None;
@@ -1222,6 +1292,7 @@ impl WdaClient {
                 eff_timeout = timeout.min(rem).max(0.05);
             }
             let mut sent = false;
+            let t_req = std::time::Instant::now();
             let res: std::io::Result<(HttpResponse, Option<T>)> = (|| {
                 self.ensure_conn(eff_timeout)?;
                 #[cfg(test)]
@@ -1235,6 +1306,7 @@ impl WdaClient {
                     }
                 }
                 sent = true;
+                self.stats.note_send(path, body, attempt);
                 let resp = self.conn.as_mut().unwrap().request_inner(method, path, body, headers, collect_headers)?;
                 let parsed = if resp.status < 400 {
                     parser(&resp.body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -1243,8 +1315,12 @@ impl WdaClient {
                 };
                 Ok((resp, parsed))
             })();
+            self.stats.wda_us += t_req.elapsed().as_micros() as u64;
             match res {
-                Ok(r) => return Ok(Some(r)),
+                Ok(r) => {
+                    self.stats.bytes_in += r.0.body.len() as u64;
+                    return Ok(Some(r));
+                }
                 Err(e) if e.to_string() == "__deadline__" => return Ok(None),
                 Err(e) => {
                     self.conn = None;

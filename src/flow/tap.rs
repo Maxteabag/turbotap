@@ -1087,7 +1087,12 @@ impl<R: Reader> Flow<R> {
             format!("label CONTAINS[c] {q} OR name CONTAINS[c] {q}"),
         ];
         let end = clock::wall() + timeout.filter(|t| *t != 0.0).unwrap_or(self.timeout);
+        let mut pass = 0u64;
         while clock::wall() < end {
+            if pass > 0 {
+                self.step_retries += 1;
+            }
+            pass += 1;
             for pred in &preds {
                 let p = self.c.spath("/element");
                 let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));

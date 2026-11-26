@@ -561,6 +561,10 @@ impl<R: Reader> Flow<R> {
     /// without an OCR hit.
     pub fn scroll_to(&mut self, label: &str, where_: Option<&str>, max_swipes: usize, direction: &str) -> Result<Match> {
         let direction = if direction.is_empty() { "down".to_string() } else { direction.trim().to_lowercase() };
+        // "auto" (a `scrollto:TEXT` step without a direction): down first, and at the
+        // end of the list without a hit, once back up past the start.
+        let auto = direction == "auto";
+        let mut direction = if auto { "down".to_string() } else { direction };
         if direction != "down" && direction != "up" {
             return Err(Error::flow(format!("scrollto:{direction}? use down|up")));
         }
@@ -578,23 +582,25 @@ impl<R: Reader> Flow<R> {
         let (_, sh) = self.act_pt_size()?;
         let status_y = 54.max((sh as f64 * 0.06) as i64);
         let mut seen: Option<Vec<String>> = None;
-        for i in 0..=max_swipes {
-            let lines = if i > 0 {
+        let (mut i, mut limit, mut first, mut reversed) = (0usize, max_swipes, true, false);
+        loop {
+            let lines = if !first {
                 let img = self.r.last();
                 self.r.read(&mut self.c, ReadOpts { img, ..ReadOpts::full() })?
             } else {
                 self.act_fresh_lines()?
             };
             let m = find_text(&lines, &label, DEFAULT_FUZZY, wh);
-            let texts: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
-            let at_end = seen.as_ref() == Some(&texts);
+            // Content lines only: the status bar clock must not hide the end of a list.
+            let texts: Vec<String> = lines.iter().filter(|l| l.y() >= status_y).map(|l| l.text.clone()).collect();
+            let at_end = seen.as_ref().is_some_and(|prev| same_page(prev, &texts));
             // If scrolling down reveals the target clipped under the iOS bottom home
             // indicator / tab bar (y > sh - 55), scroll one more step into the tappable
             // middle of the viewport (unless already at the end of the list or scoped).
             if let Some(mm) = m.as_ref() {
-                let clipped = direction == "down" && wh.is_none() && mm.y > sh - 55 && i < max_swipes && !at_end;
+                let clipped = direction == "down" && wh.is_none() && mm.y > sh - 55 && i < limit && !at_end;
                 if !clipped {
-                    let just_launched = i == 0
+                    let just_launched = first
                         && self.pending_bundle_ts != 0.0
                         && (clock::now() - self.pending_bundle_ts) < 1.5;
                     if !just_launched {
@@ -603,9 +609,7 @@ impl<R: Reader> Flow<R> {
                     return Ok(mm.clone());
                 }
             }
-            if m.is_none()
-                && ((i == 0 && !lines.iter().any(|l| l.y() >= status_y)) || at_end || i == max_swipes)
-            {
+            if m.is_none() && ((first && !lines.iter().any(|l| l.y() >= status_y)) || at_end || i == limit) {
                 let all = self.controls(true, None, None, false, false)?;
                 let ctl = scope_controls(&all, &lines, wh);
                 if let Some(cm) = find_control_match(&ctl, &label, Some(ui::WAIT_UI_TYPES), true) {
@@ -613,16 +617,28 @@ impl<R: Reader> Flow<R> {
                     return Ok(cm);
                 }
             }
-            if at_end || i == max_swipes {
+            first = false;
+            if at_end || i == limit {
                 if let Some(mm) = m {
                     return Ok(mm);
                 }
-                break; // nothing moved or swipe limit reached
+                if auto && at_end && !reversed {
+                    // Bottom reached: back up over what was passed, then up to
+                    // max_swipes beyond where the step started.
+                    reversed = true;
+                    direction = "up".to_string();
+                    limit = i + max_swipes;
+                    i = 0;
+                } else {
+                    break; // nothing moved or swipe limit reached
+                }
             }
             seen = Some(texts);
             self.scroll(&direction)?;
+            i += 1;
         }
-        Err(Error::flow(format!("{} not found while scrolling {direction}", json::py_repr_str(&label))))
+        let dir = if reversed { "down and back up".to_string() } else { direction };
+        Err(Error::flow(format!("{} not found while scrolling {dir}", json::py_repr_str(&label))))
     }
 
     /// `_find_search` inside `search`.
@@ -907,4 +923,27 @@ impl<R: Reader> Flow<R> {
         clock::sleep(0.3);
         Ok("dismissed".to_string())
     }
+}
+
+/// True when two OCR pages (content lines, top to bottom) show the same place in a
+/// list: identical, or at least 4 lines with 85% of them shared. One scroll stride
+/// keeps at most about half the lines, so a moving list never passes; OCR jitter on
+/// a line cut by a bar or the scroll indicator no longer hides the end of a list.
+pub(crate) fn same_page(a: &[String], b: &[String]) -> bool {
+    if a == b {
+        return true;
+    }
+    let n = a.len().max(b.len());
+    if n < 4 {
+        return false;
+    }
+    let mut pool: Vec<&String> = a.iter().collect();
+    let mut common = 0usize;
+    for t in b {
+        if let Some(k) = pool.iter().position(|x| *x == t) {
+            pool.swap_remove(k);
+            common += 1;
+        }
+    }
+    common as f64 >= 0.85 * n as f64
 }

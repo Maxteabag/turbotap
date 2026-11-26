@@ -39,6 +39,7 @@ pub mod out;
 pub mod skills;
 pub mod stop;
 pub mod text;
+pub mod timings;
 pub mod ui;
 pub mod vision;
 pub mod wda;

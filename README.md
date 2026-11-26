@@ -126,6 +126,16 @@ The last five rows were measured on an iPhone 17 during the overnight lab in [PR
 
 **Host-side Rust vs Python `v0.10.0` overhead (offline mock-WDA benchmarks, separate from the iPhone 17 numbers above):** moving to the optimized Rust binary cut CLI startup from ~43ms to **~1.3ms**, `daemon start` from ~409ms (Python) / ~326ms (`v1.0.0`) to **~3.9ms** (async OCR warm-up overlapping socket readiness), non-OCR flows (`ui`, `read:vision`, `shot`, `settle`) to **~2–6ms** and **~12 MB RSS** (-97% vs ~414 MB), warm daemon request overhead to **~1.9–2.1ms**, and warm daemon OCR to **~24–28ms** (~2.2× faster than Python `v0.10.0`).
 
+### Timing log
+
+Every flow step and standalone command appends one JSON line to `~/.local/state/turbotap/timings.jsonl` (`$XDG_STATE_HOME` is honoured; `TURBOTAP_TIMINGS=PATH` moves it, `TURBOTAP_TIMINGS=0` turns it off). A line has the step and its argument (only for label, app, direction and coordinate steps: typed text and credentials are never written), `ms`, `wda_ms` (time spent in WDA requests), `sleep_ms`, `wda` (round trips), `shots`, `tree` (element and source queries), `bytes_in`/`bytes_out`, `retries`, the app in front as last known (no extra request) and `ok`/`error`. The log rotates to `timings.jsonl.1` at 16 MB.
+
+```sh
+turbotap timings --since 1h                # p50/p95/max per step kind, slowest and most retried steps
+turbotap timings --since 2026-11-26 --by app
+turbotap timings --by step+app --top 20
+```
+
 ### Warm daemon (optional)
 
 When an agent runs many separate `turbotap` commands rather than one `flow`, each new process pays for a new WDA connection and Tesseract engine loading. `turbotap daemon start` keeps one process warm on a private Unix socket (`~/.cache/turbotap/daemon.sock`, mode 0600, in a user-only directory). It exits after 15 idle minutes (`--idle SECONDS`). Add `--daemon` to a command, or set `TURBOTAP_DAEMON=1`, to route through it. Each request runs with the caller's environment and working directory, and gets a fresh WDA client, screen reader and flow, so nothing about sessions, frames or app switches carries over between calls. If the daemon is not running, is out of date, or does not confirm a request, the command runs in-process as usual. `turbotap daemon status` and `turbotap daemon stop` manage it.
@@ -164,7 +174,7 @@ rm ~/turbotap.stop
 
 `tap:TEXT` prefers a button, app keypad `Key`, or link labelled exactly `TEXT` over a longer OCR line (`tap:"Sign In"` won't hit `Sign in with another account`), and deprioritizes iOS status-bar matches (`y < 54`) behind in-app text unless targeted explicitly. `wait:TEXT` is OCR-first and falls back to the accessibility tree for low-contrast or colored buttons, while `gone:TEXT` polls until a spinner or sheet disappears. Tapping a switch row's label flips the switch itself, and `Next`/`Previous` pick the form's button over the keyboard toolbar's copy. When a step fails, the JSON lists the visible text and the top 30 interactive controls with their exact labels.
 
-You can narrow down targets relative to other text on screen (`tap:"Alice@below:Chats"`, `tap:"Alice@y>300"`) or match dynamic text with `re:REGEX` in `wait:`, `waitany:`, `assert:`, `assertnot:`, `tap:`, and `scrollto:`. OCR matching folds Unicode/Nordic diacritics (`å`↔`a`, `ø`↔`o`, `æ`↔`ae`, `é`↔`e`, etc.) as a lower-priority fallback when exact diacritics are missed by Tesseract, and `scrollto:` falls back to accessibility controls on blank-OCR or end-of-list frames. `alert:text` reads an active system alert, and `read`/`ui` surface active SpringBoard alerts immediately after `open:`/`launch:` instead of stalling on stale-app retries.
+You can narrow down targets relative to other text on screen (`tap:"Alice@below:Chats"`, `tap:"Alice@y>300"`) or match dynamic text with `re:REGEX` in `wait:`, `waitany:`, `assert:`, `assertnot:`, `tap:`, and `scrollto:`. OCR matching folds Unicode/Nordic diacritics (`å`↔`a`, `ø`↔`o`, `æ`↔`ae`, `é`↔`e`, etc.) as a lower-priority fallback when exact diacritics are missed by Tesseract, and `scrollto:` falls back to accessibility controls on blank-OCR or end-of-list frames. `scrollto:TEXT` without a direction turns at the end of the list and searches back up past where it started; `scrollto:up:TEXT` and `scrollto:down:TEXT` scroll one way only. `alert:text` reads an active system alert, and `read`/`ui` surface active SpringBoard alerts immediately after `open:`/`launch:` instead of stalling on stale-app retries.
 
 Formatted iOS text fields (phone numbers, OTPs, IDs) tend to drop characters when pasted all at once. `type:` waits for brief keyboard focus after tapping an input, `key:return|backspace|tab|space|escape` sends control keys cleanly, `cleartype:TEXT` clears (`TextField`, `SecureTextField`, `SearchField`, `TextView`) and checks what landed, `dismisskb` closes the keyboard across localized labels in one lookup, and `typedigits:env:CODE` types one digit at a time. For banking or MDM PIN pads that iOS blacks out in screenshots, `pintap:env:APP_PIN` taps the keypad directly.
 
