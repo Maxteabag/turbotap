@@ -725,6 +725,9 @@ impl ReqStats {
     }
 }
 
+/// How long `url:` (with `--allow-url-scheme`) watches the app in front after opening.
+pub const URL_LANDING_WATCH: f64 = 0.8;
+
 pub struct WdaClient {
     /// Requests sent on this client's connection (for the per-step timing log).
     pub stats: ReqStats,
@@ -761,6 +764,8 @@ pub struct WdaClient {
     pub run_allowed_apps: Vec<String>,
     /// Exact labels given with `--allow-label` in this run.
     pub allow_labels: Vec<String>,
+    /// Custom URL schemes given with `--allow-url-scheme` in this run (lowercased).
+    pub allow_url_schemes: Vec<String>,
     /// First app guard refusal in this invocation (sticky: later input is refused).
     pub guard_refusal: Option<String>,
     /// Label of the action in progress, used in guard refusals (a flow step, a command).
@@ -820,6 +825,7 @@ impl WdaClient {
             allowed_apps: Vec::new(),
             run_allowed_apps: Vec::new(),
             allow_labels: Vec::new(),
+            allow_url_schemes: Vec::new(),
             guard_refusal: None,
             guard_action: None,
             guard_unlock_scope: false,
@@ -846,12 +852,64 @@ impl WdaClient {
         self.allow_labels = labels;
     }
 
+    /// The `--allow-url-scheme` schemes given for this run (lowercased; system schemes
+    /// never take effect, see [`crate::guard::is_custom_scheme`]).
+    pub fn set_allow_url_schemes(&mut self, schemes: Vec<String>) {
+        self.allow_url_schemes = schemes.iter().map(|s| s.trim().trim_end_matches(':').trim_end_matches("//").trim_end_matches(':').to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+    }
+
+    /// For `--allow-url-scheme`: `Ok(scheme)` when `url`'s scheme was named with the flag
+    /// and is a custom scheme, `--allow-app` was given and a live check confirms that
+    /// app is in front; else `Err(why not)`.
+    fn url_scheme_permitted(&mut self, url: &str) -> std::result::Result<String, String> {
+        let scheme = crate::guard::url_scheme(url).ok_or_else(|| "the URL has no valid scheme".to_string())?;
+        if !self.allow_url_schemes.iter().any(|s| s == &scheme) {
+            return Err(format!("scheme {} was not given with --allow-url-scheme", json::py_repr_str(&scheme)));
+        }
+        if !crate::guard::is_custom_scheme(&scheme) {
+            return Err(format!("{} is a system scheme and is never opened this way", json::py_repr_str(&scheme)));
+        }
+        self.run_allow_foreground("--allow-url-scheme").map(|_| scheme)
+    }
+
+    /// After `url:` was let through by `--allow-url-scheme`: watch the app in front for
+    /// a moment (live). Another app than one given with `--allow-app` coming forward
+    /// stops the run (a sticky app-guard refusal: no further input), naming that app.
+    pub fn confirm_url_landed(&mut self, action: &str) -> Result<()> {
+        let end = clock::now() + URL_LANDING_WATCH;
+        loop {
+            match self.live_foreground_app(None) {
+                Ok(b) if self.run_allowed_apps.iter().any(|a| a == &b) => {}
+                Ok(b) => {
+                    crate::errln!("turbotap: warning: {action} brought {} to the front; stopping input", json::py_repr_str(&b));
+                    return Err(self.guard_refuse(format!(
+                        "app guard refused further input after {action}: {} came to the front, not an --allow-app app",
+                        json::py_repr_str(&b)
+                    )));
+                }
+                Err(e) => {
+                    return Err(self.guard_refuse(format!("app guard refused further input after {action}: {e}")));
+                }
+            }
+            if clock::now() >= end {
+                return Ok(());
+            }
+            clock::sleep(0.15);
+        }
+    }
+
     /// For `--allow-label`: `Ok(bundle)` when the app guard is on and a live
     /// `/wda/activeAppInfo` names an app given with `--allow-app` in this run (not
     /// only one from config), else `Err(why not)`.
     pub fn allow_label_foreground(&mut self) -> std::result::Result<String, String> {
+        self.run_allow_foreground("--allow-label")
+    }
+
+    /// [`WdaClient::allow_label_foreground`] for any per-run flag that needs an
+    /// `--allow-app` app confirmed in front; `flag` names it in the reason.
+    pub fn run_allow_foreground(&mut self, flag: &str) -> std::result::Result<String, String> {
         if self.run_allowed_apps.is_empty() {
-            return Err("--allow-label works only together with --allow-app".into());
+            return Err(format!("{flag} works only together with --allow-app"));
         }
         let b = self.foreground_status()?;
         if self.run_allowed_apps.iter().any(|a| a == &b) {
@@ -1012,11 +1070,26 @@ impl WdaClient {
     /// `url:` is refused whenever the guard is on: WDA's `/url` hands the URL to iOS,
     /// which picks the receiving app (any scheme, and https universal links), so no
     /// allowlist entry can vouch for where the input lands.
-    pub fn ensure_url_allowed(&mut self, action: &str) -> Result<()> {
+    /// With `--allow-url-scheme`, a custom scheme named for this run passes while an
+    /// `--allow-app` app is confirmed in front (live); see [`WdaClient::confirm_url_landed`].
+    pub fn ensure_url_allowed(&mut self, action: &str, url: Option<&str>) -> Result<()> {
         if !self.app_guard_active() {
             return Ok(());
         }
         self.guard_precheck(action)?;
+        if let (Some(u), false) = (url, self.allow_url_schemes.is_empty()) {
+            match self.url_scheme_permitted(u) {
+                Ok(scheme) => {
+                    // The scheme only: a pairing URL can carry a token.
+                    crate::errln!("turbotap: --allow-url-scheme opened a {scheme}: URL");
+                    return Ok(());
+                }
+                Err(why) => {
+                    let msg = format!("{}; --allow-url-scheme not applied: {why}", crate::guard::refuse_url(action, &self.allowed_apps));
+                    return Err(self.guard_refuse(msg));
+                }
+            }
+        }
         Err(self.guard_refuse(crate::guard::refuse_url(action, &self.allowed_apps)))
     }
 
@@ -1035,7 +1108,12 @@ impl WdaClient {
         let label = self.guard_action.clone().unwrap_or_else(|| format!("{method} {}", path.split('?').next().unwrap_or(path)));
         let r = match kind {
             RequestKind::TargetApp(t) => self.ensure_allowed_target(&label, t.as_deref()),
-            RequestKind::Url => self.ensure_url_allowed(&label),
+            RequestKind::Url => {
+                let url = body
+                    .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+                    .and_then(|v| v.get("url").and_then(Value::as_str).map(str::to_string));
+                self.ensure_url_allowed(&label, url.as_deref())
+            }
             // A caller deadline that ends before the foreground check answers means
             // "nothing sent, deadline exceeded" (e.g. tapif: skips cleanly).
             _ => return self.check_foreground(&label, deadline).map_err(|e| e.to_string()),
@@ -1062,6 +1140,7 @@ impl WdaClient {
         side.allowed_apps = self.allowed_apps.clone();
         side.run_allowed_apps = self.run_allowed_apps.clone();
         side.allow_labels = self.allow_labels.clone();
+        side.allow_url_schemes = self.allow_url_schemes.clone();
         side.guard_policy_error = self.guard_policy_error.clone();
         side.pinned_addrs = self.pinned_addrs.clone();
         side.copy_probes_from(self);

@@ -129,6 +129,24 @@ fn allow_label_arg() -> Arg {
     )
 }
 
+fn allow_url_scheme_arg() -> Arg {
+    Arg::new("allow-url-scheme").long("allow-url-scheme").value_name("SCHEME").action(ArgAction::Append).help(
+        "let url: open this exact custom scheme (e.g. myapp) for this run while the app guard is on, only together \
+         with --allow-app and while that app is confirmed in front before and after (repeatable; never http, https, \
+         tel, sms, mailto or other system schemes)",
+    )
+}
+
+fn many_values(m: &ArgMatches, sm: &ArgMatches, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for mm in [m, sm] {
+        if let Ok(Some(v)) = mm.try_get_many::<String>(name) {
+            out.extend(v.cloned());
+        }
+    }
+    out
+}
+
 /// `--allow-label` values given before and after the subcommand.
 fn allow_label_values(m: &ArgMatches, sm: &ArgMatches) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -173,6 +191,7 @@ pub fn build_command() -> Command {
         .arg(Arg::new("udid").long("udid").value_name("UDID").help("device UDID (or WDA_UDID / config.json)"))
         .arg(allow_app_arg())
         .arg(allow_label_arg())
+        .arg(allow_url_scheme_arg())
         .arg(flag(
             "daemon",
             "run through the warm local daemon when it is running (or TURBOTAP_DAEMON=1); falls back to this process otherwise",
@@ -259,7 +278,8 @@ pub fn build_command() -> Command {
                 .arg(Arg::new("no-deny").long("no-deny").action(ArgAction::SetTrue))
                 .arg(flag("quiet", "no per-step progress on stderr"))
                 .arg(allow_app_arg())
-                .arg(allow_label_arg()),
+                .arg(allow_label_arg())
+                .arg(allow_url_scheme_arg()),
         )
         .subcommand(
             Command::new("otp-type")
@@ -355,6 +375,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     client.pin_addrs(target.addrs.clone());
     // --allow-label only ever works together with --allow-app in the same run.
     client.set_run_allow(allow_app_values(&m, sm), allow_label_values(&m, sm));
+    client.set_allow_url_schemes(many_values(&m, sm, "allow-url-scheme"));
     match allowed {
         Ok(list) => client.set_allowed_apps(list),
         // A broken config.json or an unresolvable device never means "no guard".
