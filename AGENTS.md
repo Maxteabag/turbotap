@@ -23,6 +23,10 @@ in the middle of a bench round mixes two builds in its rows and voids the round
 (26 Nov 2026: the v1.5.0 install at 05:01 voided phone-r12's `scrollabove`).
 If neither answers within 10 minutes, install and say so.
 
+Release lines and status go to `teabag`, not to the front desk (Hazel): her queue
+is for real blockers only she or Peter can solve, and finished end results,
+preferably passed on through `teabag`.
+
 ## Rust build host
 
 Run all Rust builds and Cargo tests on `ai-swarm` through `buildbox-cargo`.
