@@ -136,7 +136,7 @@ Every flow step and standalone command appends one JSON line to `~/.local/state/
 turbotap timings --since 1h                # p50/p95/max per step kind, slowest and most retried steps
 turbotap timings --since 2026-11-26 --by app
 turbotap timings --by step+app --top 20
-turbotap --device 15 timings --receipt --since 2026-11-26T10:30 --until 2026-11-26T10:45
+turbotap --device NAME timings --receipt --since 45m --until 30m
 ```
 
 `--receipt` splits one run's wall clock into `helper_between_steps` (time between turbotap calls: the agent, shell sleeps, other tools), `wda`, `app_wait` (`sleep`/`wait`/`waitany`/`gone` steps and settle sleeps) and `turbotap_own`, which add up to the wall clock, plus retries, failures and the longest gaps with the steps around them.
