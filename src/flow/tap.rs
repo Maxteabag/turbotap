@@ -1127,9 +1127,10 @@ impl<R: Reader> Flow<R> {
     /// disabled one: refused, naming the nearest labels.
     ///
     /// `tapat:X,Y=LABEL` presses only a control labelled exactly LABEL (case and all):
-    /// the one enabled control with that label within the radius, read fresh in this
-    /// step. None there (the control changed since it was read), several, or a disabled
-    /// one: refused with nothing sent, naming what is there now.
+    /// the enabled control with that label within the radius nearest the point, read
+    /// fresh in this step (repeated rows with the same label: the nearest; one control
+    /// listed twice: that one). None there (the control changed since it was read), two
+    /// equally near at different places, or a disabled one: refused with nothing sent.
     pub fn tap_at(&mut self, x: i64, y: i64, expect: Option<&str>) -> Result<String> {
         self.wait_active_app(1.5, 0.03, None);
         let ctl = self.tap_ctl(None)?;
@@ -1143,10 +1144,20 @@ impl<R: Reader> Flow<R> {
                 v.iter().take(3).map(|c| format!("{} ({},{})", json::py_repr_str(&c.label), c.x, c.y)).collect()
             };
             let now = if there.is_empty() { "nothing labelled".to_string() } else { there.join(", ") };
+            // Several with that label (repeated rows, or one control listed twice): the one
+            // nearest the point. Only two equally near at different places stay ambiguous.
+            let mut exact = exact;
+            exact.sort_by_key(|c| d2(c));
             let c = match exact.as_slice() {
-                [c] => (*c).clone(),
                 [] => return Err(Error::flow(format!("no control labelled exactly {} at {x},{y} (now: {now}); nothing pressed", json::py_repr_str(want)))),
-                _ => return Err(Error::flow(format!("several controls labelled {} at {x},{y}; nothing pressed", json::py_repr_str(want)))),
+                [c] => (*c).clone(),
+                [a, b, ..] if d2(a) == d2(b) && (a.x, a.y) != (b.x, b.y) => {
+                    return Err(Error::flow(format!(
+                        "several controls labelled {} equally near {x},{y} ({},{} and {},{}); nothing pressed: give the point of the one you mean",
+                        json::py_repr_str(want), a.x, a.y, b.x, b.y
+                    )))
+                }
+                [a, ..] => (*a).clone(),
             };
             if c.is_disabled() {
                 return Err(Error::flow(format!("{} at {x},{y} is disabled; nothing pressed", json::py_repr_str(&c.label))));
