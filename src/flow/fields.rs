@@ -310,8 +310,9 @@ impl<R: Reader> Flow<R> {
         self.fill_keys("x", "fill: focus probe", false)?;
         clock::sleep(0.2);
         let after = self.field_value_len(f);
-        // The target reports nothing: did the probe land in another input instead?
-        let landed_elsewhere = after == 0 && others_before.is_some_and(|b| self.other_inputs_len(f) > b);
+        // The target reports nothing: did the probe land in another input instead? Any
+        // change counts: an empty field echoing its placeholder ("Title") shrinks to "x".
+        let landed_elsewhere = after == 0 && others_before.is_some_and(|b| self.other_inputs_len(f) != b);
         self.fill_keys(BACKSPACE, "fill: removing focus probe", false)?;
         clock::sleep(0.15);
         if before == 0 && after == 0 && !secret && !landed_elsewhere {

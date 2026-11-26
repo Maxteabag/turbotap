@@ -280,3 +280,15 @@ fn test_an_empty_capture_says_why() {
         assert!(all.contains("Empty screenshot response") && all.contains(want), "{locked}: {all}");
     }
 }
+
+#[test]
+fn test_no_ui_testing_access_is_named_with_its_recovery() {
+    // XCTest error 41: WDA answers, the front app reads as local.pid.0.
+    let (ready, not_ready) = crate::wda::readiness(&json!(false), &json!("local.pid.0"), &json!(430), "empty");
+    assert!(!ready);
+    let text = serde_json::to_string(&not_ready).unwrap();
+    assert!(text.contains("error 41") && text.contains("deploy --no-build") && text.contains("Enable UI Automation"), "{text}");
+    // A real front app is not flagged.
+    let (_, nr) = crate::wda::readiness(&json!(false), &json!("com.example.app"), &json!(430), "ok");
+    assert!(nr.is_empty(), "{nr:?}");
+}

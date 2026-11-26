@@ -3486,6 +3486,14 @@ pub fn readiness(locked: &Value, app: &Value, w: &Value, capture: &str) -> (bool
     if locked.is_null() || app.is_null() || w.is_null() {
         not_ready.push(j!({"why": "no answer for lock state, front app or screen size", "recover": "turbotap deploy once (restarts the runner), then preflight again"}));
     }
+    // XCTest error 41 ("Not authorized for performing UI testing actions"): the runner
+    // answers, but every UI call fails and the front app reads as local.pid.0.
+    if app.as_str().is_some_and(|a| a.starts_with("local.pid.")) {
+        not_ready.push(j!({
+            "why": "WDA has no UI-testing access (XCTest error 41: front app reads as local.pid.0)",
+            "recover": "turbotap deploy --no-build once while the phone is unlocked and not in use (it restarts the runner and retries once); if it stays: on the phone, Settings > Developer > Enable UI Automation off and on"
+        }));
+    }
     if capture != "ok" && locked.as_bool() != Some(true) {
         not_ready.push(j!({"why": "screen capture empty (screen off or runner unhealthy)", "recover": "turbotap deploy once, then preflight again"}));
     }
