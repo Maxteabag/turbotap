@@ -63,9 +63,19 @@ for req in UDID WDA_URL TEAM BUNDLE; do
   fi
 done
 
+# The runner listens on the configured URL's port (not a fixed 8100).
+PORT="${WDA_URL##*:}"; PORT="${PORT%%/*}"; [[ "$PORT" =~ ^[0-9]+$ ]] || PORT=8100
+# What answers before the restart, so the receipt can tell a new runner from the old one.
+wda_json() { { curl -fsS --max-time 3 "$WDA_URL$1" 2>/dev/null || true; } | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+v = d.get("value") if isinstance(d.get("value"), dict) else {}
+print(d.get("sessionId") or v.get("sessionId") or "", v.get("bundleId") or "", v.get("pid", ""), "answered", sep="|")' || true; }
+OLD_SID="$(wda_json /status | cut -d"|" -f1)"
+RUN_OUT="$(mktemp /var/tmp/wda-deploy.XXXXXX)"; trap 'rm -f "$RUN_OUT"' EXIT
 scp -q "$PATCH" "$MAC:/var/tmp/wda-turbo.patch"
-ssh "$MAC" BUILD="$BUILD" UDID="$UDID" TEAM="$TEAM" BUNDLE="$BUNDLE" REF="$UPSTREAM_REF" SRC="$SRC" DD="$DD" \
-  KCDIR="${WDA_KEYCHAIN_DIR:-}" XB="${WDA_XCODEBUILD:-}" bash -s <<'REMOTE'
+ssh "$MAC" BUILD="$BUILD" UDID="$UDID" PORT="$PORT" TEAM="$TEAM" BUNDLE="$BUNDLE" REF="$UPSTREAM_REF" SRC="$SRC" DD="$DD" \
+  KCDIR="${WDA_KEYCHAIN_DIR:-}" XB="${WDA_XCODEBUILD:-}" bash -s <<'REMOTE' | tee "$RUN_OUT"
 set -euo pipefail
 [[ -n "$XB" && -x "$XB" ]] || XB=/Applications/Xcode-26.6.app/Contents/Developer/usr/bin/xcodebuild
 [[ -x "$XB" ]] || XB=xcodebuild
@@ -156,17 +166,60 @@ for pid in $(ps -axo pid=,command= | awk -v u="$UDID" '/xcodebuild/ && /WebDrive
 done
 sleep 2
 cd "$SRC"
+# One log per device, kept across restarts (the previous run moves to .1), so a
+# restart never wipes the evidence of why the last runner stopped working.
+LOG="/var/tmp/wda-runner-$UDID.log"
+[ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
 nohup "$XB" test-without-building -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
-  -destination "id=$UDID" -derivedDataPath "$DD" "${SIGN[@]}" USE_PORT=8100 \
-  >/var/tmp/wda-direct.log 2>&1 </dev/null &
-echo "runner started pid $!"
+  -destination "id=$UDID" -derivedDataPath "$DD" "${SIGN[@]}" USE_PORT="$PORT" \
+  >"$LOG" 2>&1 </dev/null &
+echo "runner started pid $! (log $LOG)"
+echo "RUNNER_PID=$!"
 REMOTE
-for _ in $(seq 1 60); do
-  if curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -d '{"x0":0,"x1":320,"y0":0,"y1":40}' \
-       "$WDA_URL/wda/fastScreenshot" -o /dev/null 2>/dev/null; then
-    echo "wda-turbo up at $WDA_URL"; exit 0
+RPID="$(sed -n 's/^RUNNER_PID=//p' "$RUN_OUT" | tail -1)"
+LOG="/var/tmp/wda-runner-$UDID.log"
+[[ -n "$RPID" ]] || { echo "the Mac did not report a runner pid; see $MAC:$LOG" >&2; exit 1; }
+# Receipt: 'up' only when the runner we just started is alive and bound to this UDID, the
+# configured URL answers with a session other than the one before, and WDA can read the
+# foreground app (a runner without UI-testing access answers screenshots but reports
+# local.pid.0 / pid 0 there).
+runner_ok() {
+  local cmd; cmd="$(ssh "$MAC" "ps -o command= -p $RPID" 2>/dev/null)" || return 1
+  [[ "$cmd" == *xcodebuild*test-without-building*"id=$UDID"* ]]
+}
+why="no answer on $WDA_URL"
+for i in $(seq 1 60); do
+  if (( i % 10 == 0 )) && ! runner_ok; then
+    echo "WDA did not come up: runner pid $RPID for $UDID has exited; see $MAC:$LOG" >&2
+    exit 1
+  fi
+  IFS="|" read -r sid _ _ answered <<<"$(wda_json /status)"
+  if [[ "$answered" != answered ]]; then why="no answer on $WDA_URL"
+  elif [[ -n "$sid" && "$sid" == "$OLD_SID" ]]; then why="the old runner still answers (session $sid)"
+  elif [[ -n "$sid" || -z "$OLD_SID" ]]; then
+    IFS="|" read -r _ bundle apid _ <<<"$(wda_json /wda/activeAppInfo)"
+    if [[ -z "$bundle" || "$bundle" == local.pid.* || "$apid" == 0 ]]; then
+      why="WDA answers but cannot read the foreground app (${bundle:-none}, pid ${apid:-?}): no UI-testing access"
+    elif curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -d '{"x0":0,"x1":320,"y0":0,"y1":40}' \
+         "$WDA_URL/wda/fastScreenshot" -o /dev/null 2>/dev/null; then
+      if runner_ok; then
+        echo "wda-turbo up at $WDA_URL: runner pid $RPID for $UDID on $MAC, session ${sid:-new}, front app $bundle, log $MAC:$LOG"
+        exit 0
+      fi
+      why="runner pid $RPID is not the one answering"
+    else why="screenshots fail"
+    fi
   fi
   sleep 1
 done
-echo "WDA did not come up; see $MAC:/var/tmp/wda-direct.log" >&2
+# Runner alive but nothing answers: a locked phone keeps Xcode at "Testing started" until it
+# is unlocked by hand (it then starts by itself). Ask the device (read-only) and the log.
+if [[ "$why" == "no answer on $WDA_URL" ]] && runner_ok; then
+  lock="$(ssh "$MAC" "xcrun devicectl device info lockState --device '$UDID' 2>/dev/null | grep -i passcodeRequired; grep -c 'to Continue' '$LOG' 2>/dev/null" 2>/dev/null || true)"
+  if grep -qi 'passcodeRequired.*true' <<<"$lock" || grep -qx '[1-9][0-9]*' <<<"$(tail -1 <<<"$lock")"; then
+    echo "WDA did not come up: the phone $UDID is locked. Xcode waits for an unlock (runner pid $RPID stays alive) and the runner starts by itself afterwards; see $MAC:$LOG" >&2
+    exit 3
+  fi
+fi
+echo "WDA did not come up after 60 s: $why; see $MAC:$LOG" >&2
 exit 1
