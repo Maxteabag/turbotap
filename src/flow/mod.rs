@@ -498,6 +498,11 @@ impl<R: Reader> Flow<R> {
     /// says why the plain-Send exception did not apply (element check, explicit
     /// `--deny`, foreground check), so the caller can see what to fix.
     pub fn guard_relax(&mut self, text: &str, action: &str, relax: std::result::Result<(), String>) -> Result<()> {
+        // Submit-like controls over a filled draft: marked always, refused in
+        // --draft-only mode (independent of --deny / --no-deny).
+        if !text.is_empty() {
+            self.draft_guard(text, action)?;
+        }
         let Some(guard) = self.deny.as_ref() else {
             return Ok(());
         };

@@ -793,6 +793,8 @@ pub struct WdaClient {
     pub guard_prompt_scope: bool,
     /// Wall time this process last wrote the last-input file.
     pub last_input_mark: f64,
+    /// `--draft-only`: refuse submit-like taps over a filled draft.
+    pub draft_only: bool,
     /// Set when the guard policy could not be read (invalid, unreadable or unstable
     /// config.json): every input is refused with this reason; reads still work.
     pub guard_policy_error: Option<String>,
@@ -853,6 +855,7 @@ impl WdaClient {
             guard_unlock_scope: false,
             guard_prompt_scope: false,
             last_input_mark: 0.0,
+            draft_only: false,
             guard_policy_error: None,
             pinned_addrs: None,
             #[cfg(test)]

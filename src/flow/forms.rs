@@ -146,7 +146,67 @@ fn first_diff(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
+/// Labels that can submit a finished draft: Post/Publish/Submit-like ones, and
+/// Next/Done/Continue/Share, which some composers use for their last step (a real
+/// post once went out through a top-bar Next).
+pub fn may_submit_label(label: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^\s*(next|done|continue|share|share now|post|post now|publish|submit|upload|tweet|reply|create post)\s*$|\b(publish|submit)\b",
+        )
+        .unwrap()
+    })
+    .is_match(label)
+}
+
+/// True for `--draft-only` / `TURBOTAP_DRAFT_ONLY=1`.
+pub fn draft_only_mode(client_flag: bool) -> bool {
+    client_flag || crate::config::env("TURBOTAP_DRAFT_ONLY").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
 impl<R: Reader> Flow<R> {
+    /// Before tapping `text`: when it [`may_submit_label`] and a text field on screen
+    /// holds a draft, always warn on stderr (marking), and in draft-only mode refuse
+    /// unless `--allow-label` names exactly this label. Draft-only is opt-in, for
+    /// test runs and "prepare but don't post" tasks; nothing changes without it
+    /// except the warning.
+    pub(super) fn draft_guard(&mut self, text: &str, action: &str) -> Result<()> {
+        if !may_submit_label(text) || !self.draft_on_screen() {
+            return Ok(());
+        }
+        let allowed = self.c.allow_labels.iter().any(|l| norm_label(l) == norm_label(text));
+        if draft_only_mode(self.c.draft_only) && !allowed {
+            return Err(Error::flow(format!(
+                "refusing to {action} {} in draft-only mode: a filled draft is on screen and this control can submit it; \
+                 pass --allow-label {} only if the user asked to publish",
+                json::py_repr_str(text),
+                json::py_repr_str(text)
+            )));
+        }
+        crate::errln!(
+            "turbotap: warning: {action} {} with a filled draft on screen: in a composer this can publish (use --draft-only for test runs)",
+            json::py_repr_str(text)
+        );
+        Ok(())
+    }
+
+    /// A text field or text view with content (not just its placeholder).
+    fn draft_on_screen(&mut self) -> bool {
+        let ids = self.input_ids("type IN {'XCUIElementTypeTextField','XCUIElementTypeTextView'}");
+        for id in ids.iter().take(6) {
+            let v = self.el_value(id);
+            if v.trim().is_empty() {
+                continue;
+            }
+            let ph = self.el_attr(id, "placeholderValue");
+            if ph.is_empty() || v != ph {
+                return true;
+            }
+        }
+        false
+    }
+
     fn input_ids(&mut self, pred: &str) -> Vec<String> {
         let p = self.c.spath("/elements");
         let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));
@@ -823,6 +883,16 @@ mod unit {
             assert!(!is_safe_answer(a) && !is_safe_alert_answer(a), "{a}");
         }
         assert!(!is_safe_answer("Close") && is_safe_alert_answer("Close"));
+    }
+
+    #[test]
+    fn submit_like_labels() {
+        for l in ["Next", " next ", "Done", "Post", "Publish now", "Submit form", "Share", "Continue"] {
+            assert!(may_submit_label(l), "{l}");
+        }
+        for l in ["Next keyboard", "Add video", "Title", "Posts", "Shared albums", "Done editing?x"] {
+            assert!(!may_submit_label(l), "{l}");
+        }
     }
 
     #[test]

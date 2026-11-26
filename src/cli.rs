@@ -302,6 +302,7 @@ pub fn build_command() -> Command {
                 .arg(float_arg("scale").default_value("1.5").help("OCR px per point"))
                 .arg(Arg::new("deny").long("deny").help("regex of tap labels to refuse"))
                 .arg(Arg::new("no-deny").long("no-deny").action(ArgAction::SetTrue))
+                .arg(flag("draft-only", "refuse Next/Done/Share/Post/Submit-like taps while a filled draft is on screen (test runs, prepare-but-don't-post tasks); --allow-label EXACT lets one through"))
                 .arg(flag("quiet", "no per-step progress on stderr"))
                 .arg(allow_app_arg())
                 .arg(allow_label_arg())
@@ -451,6 +452,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
                     None => Some(crate::flow::DENY_DEFAULT),
                 }
             };
+            client.draft_only = b(sm, "draft-only");
             return crate::flow::cmd_flow(
                 client,
                 &steps,
