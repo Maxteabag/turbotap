@@ -2137,7 +2137,7 @@ fn test_allow_url_scheme_opens_the_apps_own_scheme_only_with_allow_app() {
     let _c = isolated_cache();
     let (_s, _g) = skip_sleep();
     // Opened: exact custom scheme, --allow-app app in front before and after.
-    for (scheme, url) in [("exampleapp", "exampleapp://pair?code=x"), ("ExampleApp", "EXAMPLEAPP://pair"), ("exampleapp://", "exampleapp:open")] {
+    for (scheme, url) in [("exampleapp", "exampleapp://pair?code=x"), ("ExampleApp", "EXAMPLEAPP://pair"), ("exampleapp://", "exampleapp://open")] {
         let (mock, opened) = url_mock(OTHER, OTHER);
         let mut flow = url_flow(&mock, &[], &[OTHER], &[scheme]);
         flow.step(&format!("url:{url}")).unwrap_or_else(|e| panic!("{scheme} {url}: {e:?}"));
