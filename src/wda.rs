@@ -24,6 +24,10 @@ use std::time::Duration;
 pub const DEFAULT_TIMEOUT: f64 = 25.0;
 pub const SPRINGBOARD: &str = "com.apple.springboard";
 
+/// How long the app guard re-checks (live, sending nothing) when SpringBoard is in
+/// front before an input, since a notification banner makes it active for a moment.
+pub const BANNER_RECHECK: f64 = 1.0;
+
 // ---------------------------------------------------------------------------
 // Raw HTTP/1.1 connection
 // ---------------------------------------------------------------------------
@@ -1054,7 +1058,30 @@ impl WdaClient {
         if expired(deadline) {
             return Ok(false);
         }
-        match self.live_foreground_app(deadline) {
+        let mut first = self.live_foreground_app(deadline);
+        // A notification banner makes SpringBoard active for a moment. Re-check (live,
+        // nothing is sent meanwhile) for up to BANNER_RECHECK before refusing; every
+        // wait is printed with what was in front, so a real takeover still shows.
+        if matches!(&first, Ok(b) if b == SPRINGBOARD) && !self.guard_unlock_scope && !self.allowed_apps.iter().any(|a| a == SPRINGBOARD) {
+            let t0 = clock::now();
+            let end = deadline.map_or(t0 + BANNER_RECHECK, |d| d.min(t0 + BANNER_RECHECK));
+            while clock::now() < end {
+                clock::sleep(0.2f64.min((end - clock::now()).max(0.0)));
+                first = self.live_foreground_app(deadline);
+                if !matches!(&first, Ok(b) if b == SPRINGBOARD) {
+                    break;
+                }
+            }
+            let after = match &first {
+                Ok(b) => json::py_repr_str(b),
+                Err(e) => e.clone(),
+            };
+            crate::errln!(
+                "turbotap: {SPRINGBOARD} was in front before {action} (a banner?); re-checked for {} ms: {after} in front",
+                ((clock::now() - t0) * 1000.0).round() as i64
+            );
+        }
+        match first {
             Ok(b) if self.allowed_apps.iter().any(|a| a == &b) => Ok(true),
             Ok(b) if self.guard_unlock_scope && b == SPRINGBOARD => Ok(true),
             Ok(b) => Err(self.guard_refuse(crate::guard::refuse_foreground(action, &b, &self.allowed_apps))),
