@@ -822,12 +822,26 @@ impl WdaClient {
     /// no earlier refusal) and a live `/wda/activeAppInfo` right now names an
     /// allowlisted app. Never refuses or records anything itself.
     pub fn foreground_confirmed_allowed(&mut self) -> bool {
-        if self.allowed_apps.is_empty() || self.guard_policy_error.is_some() || self.guard_refusal.is_some() {
-            return false;
+        self.foreground_status().is_ok()
+    }
+
+    /// [`WdaClient::foreground_confirmed_allowed`] with the reason: `Ok(bundle)` when a
+    /// live `/wda/activeAppInfo` names an allowlisted app, else `Err(why not)`. No
+    /// request is made when the guard is off, broken or already refused.
+    pub fn foreground_status(&mut self) -> std::result::Result<String, String> {
+        if self.guard_policy_error.is_some() {
+            return Err("app guard config error".into());
+        }
+        if self.allowed_apps.is_empty() {
+            return Err("app guard off (no allowed_apps; add the app there or pass --allow-app BUNDLE)".into());
+        }
+        if self.guard_refusal.is_some() {
+            return Err("an earlier step in this run was refused by the app guard".into());
         }
         match self.live_foreground_app(None) {
-            Ok(b) => self.allowed_apps.iter().any(|a| a == &b),
-            Err(_) => false,
+            Ok(b) if self.allowed_apps.iter().any(|a| a == &b) => Ok(b),
+            Ok(b) => Err(format!("{} is not in allowed_apps", json::py_repr_str(&b))),
+            Err(e) => Err(format!("unconfirmed ({e})")),
         }
     }
 
