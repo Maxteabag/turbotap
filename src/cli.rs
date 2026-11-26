@@ -33,11 +33,20 @@ pub fn main_with(argv: &[String]) -> i32 {
 /// One CLI invocation in this process (the warm daemon calls this per request).
 /// Errors print `turbotap: <message>` to stderr and return 1.
 pub fn run_cli(argv: &[String]) -> i32 {
-    match main_inner(argv) {
+    crate::stop::take_stopped();
+    let r = main_inner(argv);
+    // A stop file that appeared mid-run ends the command like one present at start.
+    let stopped = crate::stop::take_stopped();
+    match r {
+        Ok(_) if stopped => crate::stop::STOP_EXIT,
         Ok(code) => code,
         Err(e) => {
             crate::errln!("turbotap: {e}");
-            1
+            if stopped {
+                crate::stop::STOP_EXIT
+            } else {
+                1
+            }
         }
     }
 }
@@ -376,6 +385,11 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     // --allow-label only ever works together with --allow-app in the same run.
     client.set_run_allow(allow_app_values(&m, sm), allow_label_values(&m, sm));
     client.set_allow_url_schemes(many_values(&m, sm, "allow-url-scheme"));
+    if crate::stop::STOP_CMDS.contains(&cmd) {
+        let keys: Vec<&str> = target.dev_key.iter().map(String::as_str).collect();
+        // Resolved by the start gate just above (an error there already refused).
+        client.stop_paths = crate::stop::paths_for(&keys).unwrap_or_default();
+    }
     match allowed {
         Ok(list) => client.set_allowed_apps(list),
         // A broken config.json or an unresolvable device never means "no guard".

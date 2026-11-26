@@ -733,6 +733,9 @@ impl ReqStats {
 pub const URL_LANDING_WATCH: f64 = 0.8;
 
 pub struct WdaClient {
+    /// Stop files re-checked before every input request (set by the CLI for commands
+    /// that touch the phone): a stop file created mid-run stops the next input.
+    pub stop_paths: Vec<std::path::PathBuf>,
     /// Requests sent on this client's connection (for the per-step timing log).
     pub stats: ReqStats,
     /// The app a live `/wda/activeAppInfo` last named (for the timing log; never used
@@ -813,6 +816,7 @@ impl WdaClient {
         WdaClient {
             stats: ReqStats::default(),
             req_kinds: std::collections::BTreeMap::new(),
+            stop_paths: Vec::new(),
             last_foreground: None,
             base_url,
             udid: udid.to_string(),
@@ -1141,7 +1145,26 @@ impl WdaClient {
     /// The request-level check every non-GET request passes before it is sent:
     /// Ok(true) send it, Ok(false) the caller's deadline ran out while checking (send
     /// nothing, report the deadline as usual), Err(refusal) send nothing.
+    /// Err(reason) when one of this run's stop files exists now.
+    pub fn stop_check(&self) -> std::result::Result<(), String> {
+        if self.stop_paths.is_empty() {
+            return Ok(());
+        }
+        crate::stop::check(&self.stop_paths).inspect_err(|_| crate::stop::mark_stopped())
+    }
+
     fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
+        // The user's brake first, with or without an app guard: a stop file created
+        // while a command runs stops it before its next input, not only at its start.
+        if !crate::guard::is_safe_method(method) && !self.stop_paths.is_empty() {
+            let kind = crate::guard::classify(path, body);
+            if !matches!(kind, crate::guard::RequestKind::ReadOnly) {
+                if let Err(r) = self.stop_check() {
+                    let what = self.guard_action.clone().unwrap_or_else(|| format!("{method} {}", path.split('?').next().unwrap_or(path)));
+                    return Err(format!("{r}; stopped before {what}"));
+                }
+            }
+        }
         if !self.app_guard_active() || crate::guard::is_safe_method(method) {
             return Ok(true);
         }
