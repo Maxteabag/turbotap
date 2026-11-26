@@ -49,7 +49,7 @@ cargo install --git https://github.com/Maxteabag/turbotap.git
 turbotap install-skill
 ```
 
-That's it: `turbotap` is one standalone binary with the skills, the WebDriverAgent patch and the deploy script built in, so you don't need a clone and there is no Python runtime. `install-skill` puts the skills in `~/.agents/skills` and `~/.claude/skills` (whichever exist; add `--codex` or `--dir DIR` for other agents), prints where they went, and refreshes them by itself after you upgrade with `cargo install --force --git https://github.com/Maxteabag/turbotap.git`. `npx skills add Maxteabag/turbotap` installs just the skills too. In a clone, `cargo build --release` puts the binary at `target/release/turbotap`.
+That's it: `turbotap` is one standalone binary with the skills, the WebDriverAgent patch and the deploy script built in, so you don't need a clone and there is no Python runtime. `install-skill` puts the skills in `~/.agents/skills` and `~/.claude/skills` (whichever exist; add `--codex` or `--dir DIR` for other agents), prints where they went, and refreshes them by itself after you upgrade with `cargo install --force --git https://github.com/Maxteabag/turbotap.git`. `npx skills add Maxteabag/turbotap` installs just the skills too. In a clone, `cargo build --release` puts the binary at `target/release/turbotap`. `turbotap --version` (or `-V`) prints the installed version.
 
 Install Tesseract (used for local screen reading). `turbotap` loads `libtesseract` at runtime, so it builds and runs without it; without the library it falls back to the `tesseract` binary, and without either only local OCR is unavailable:
 
