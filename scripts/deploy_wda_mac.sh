@@ -200,6 +200,7 @@ for i in $(seq 1 60); do
     IFS="|" read -r _ bundle apid _ <<<"$(wda_json /wda/activeAppInfo)"
     if [[ -z "$bundle" || "$bundle" == local.pid.* || "$apid" == 0 ]]; then
       why="WDA answers but cannot read the foreground app (${bundle:-none}, pid ${apid:-?}): no UI-testing access"
+      n41=$(( ${n41:-0} + 1 )); (( n41 >= 8 )) && break
     elif curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -d '{"x0":0,"x1":320,"y0":0,"y1":40}' \
          "$WDA_URL/wda/fastScreenshot" -o /dev/null 2>/dev/null; then
       if runner_ok; then
@@ -220,6 +221,16 @@ if [[ "$why" == "no answer on $WDA_URL" ]] && runner_ok; then
     echo "WDA did not come up: the phone $UDID is locked. Xcode waits for an unlock (runner pid $RPID stays alive) and the runner starts by itself afterwards; see $MAC:$LOG" >&2
     exit 3
   fi
+fi
+# No UI-testing access (XCTest error 41) usually clears with one fresh runner: stop this one
+# and run the whole deploy once more (the restart path kills it by UDID and starts anew).
+if [[ "$why" == *"no UI-testing access"* && -z "${WDA_DEPLOY_RETRIED:-}" ]]; then
+  echo "runner pid $RPID has no UI-testing access (XCTest error 41); restarting it once" >&2
+  WDA_DEPLOY_RETRIED=1 exec bash "$0" --no-build
+fi
+if [[ "$why" == *"no UI-testing access"* ]]; then
+  echo "WDA did not come up: still no UI-testing access after a fresh runner (XCTest error 41). On the phone: Settings > Developer > Enable UI Automation off and on, then turbotap deploy --no-build; see $MAC:$LOG" >&2
+  exit 4
 fi
 echo "WDA did not come up after 60 s: $why; see $MAC:$LOG" >&2
 exit 1
