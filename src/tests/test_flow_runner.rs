@@ -2792,3 +2792,19 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
     assert_eq!(pts(&mock), vec![(372, 66), (120, 110)], "a refused tapat touched the screen");
     flow.close();
 }
+
+#[test]
+fn test_flow_ending_with_open_returns_once_the_app_is_in_front() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mut st = MockState::default();
+    st.active_app = Seq::of(vec![json!("com.example.prev"), json!("com.example.prev"), json!("com.example.target")]);
+    let mock = MockWda::start(st);
+    let mut flow = mk_flow(&mock, &FakeReader::new(vec![]), 1.0);
+    let (ok, _) = flow.run_outcome(&["open:com.example.target".to_string()]).unwrap();
+    assert!(ok);
+    assert_eq!(flow.pending_bundle, None, "flow returned before the app came to the front");
+    let calls = mock.paths().iter().filter(|p| p.as_str() == "/wda/activeAppInfo").count();
+    assert!(calls >= 3, "{calls}");
+    flow.close();
+}

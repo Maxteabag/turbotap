@@ -1190,6 +1190,12 @@ impl<R: Reader> Flow<R> {
                 Err(e) => return Err(self.scrub_error(e)),
             }
         }
+        // A flow that ends right after open:/launch: (no read or tap to wait lazily)
+        // returns once the app is in front, so the caller's next command does not see
+        // the previous app.
+        if self.pending_bundle.is_some() {
+            self.wait_active_app(1.5, 0.03, None);
+        }
         let reads = if take_reads { std::mem::take(&mut self.reads) } else { self.reads.clone() };
         let mut res = j!({
             "ok": true,
