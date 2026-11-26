@@ -1125,10 +1125,35 @@ impl<R: Reader> Flow<R> {
     /// step: no separate `read` to map a point to a label, and no second lookup by
     /// label that could hit another copy of it. No labelled control there, or a
     /// disabled one: refused, naming the nearest labels.
-    pub fn tap_at(&mut self, x: i64, y: i64) -> Result<String> {
+    ///
+    /// `tapat:X,Y=LABEL` presses only a control labelled exactly LABEL (case and all):
+    /// the one enabled control with that label within the radius, read fresh in this
+    /// step. None there (the control changed since it was read), several, or a disabled
+    /// one: refused with nothing sent, naming what is there now.
+    pub fn tap_at(&mut self, x: i64, y: i64, expect: Option<&str>) -> Result<String> {
         self.wait_active_app(1.5, 0.03, None);
         let ctl = self.tap_ctl(None)?;
         let d2 = |c: &Control| (c.x - x).pow(2) + (c.y - y).pow(2);
+        let near = |c: &&Control| (c.x - x).abs() <= TAPAT_RADIUS && (c.y - y).abs() <= TAPAT_RADIUS;
+        if let Some(want) = expect {
+            let exact: Vec<&Control> = ctl.iter().filter(near).filter(|c| c.label == want).collect();
+            let there: Vec<String> = {
+                let mut v: Vec<&Control> = ctl.iter().filter(near).filter(|c| !c.label.trim().is_empty()).collect();
+                v.sort_by_key(|c| d2(c));
+                v.iter().take(3).map(|c| format!("{} ({},{})", json::py_repr_str(&c.label), c.x, c.y)).collect()
+            };
+            let now = if there.is_empty() { "nothing labelled".to_string() } else { there.join(", ") };
+            let c = match exact.as_slice() {
+                [c] => (*c).clone(),
+                [] => return Err(Error::flow(format!("no control labelled exactly {} at {x},{y} (now: {now}); nothing pressed", json::py_repr_str(want)))),
+                _ => return Err(Error::flow(format!("several controls labelled {} at {x},{y}; nothing pressed", json::py_repr_str(want)))),
+            };
+            if c.is_disabled() {
+                return Err(Error::flow(format!("{} at {x},{y} is disabled; nothing pressed", json::py_repr_str(&c.label))));
+            }
+            self.tap_point(c.x, c.y, &c.label, None)?;
+            return Ok(c.label);
+        }
         let hit = ctl
             .iter()
             .filter(|c| !c.label.trim().is_empty() && (c.x - x).abs() <= TAPAT_RADIUS && (c.y - y).abs() <= TAPAT_RADIUS)
