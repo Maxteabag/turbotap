@@ -226,7 +226,6 @@ impl<R: Reader> Flow<R> {
                     name: f.to_string(),
                     placeholder: self.field_attr(&id, "placeholderValue"),
                     value: self.field_attr(&id, "value"),
-                    id,
                 })
             }
             0 => {
