@@ -162,7 +162,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         X,Y (within 24 pt; controls only, never OCR text), checks its label
                         against --deny and taps that control's own centre, never the raw
                         point; returns the label; no control there is refused with the
-                        nearest labels
+                        nearest labels. tapat:X,Y=LABEL presses only the one enabled control
+                        labelled exactly LABEL there, read fresh; anything else is refused
+                        with nothing pressed
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys;
                         these are hardware-keyboard key events to whatever has focus
@@ -696,11 +698,16 @@ impl<R: Reader> Flow<R> {
                 self.tap_point(x, y, "", None)?;
             }
             "tapat" => {
-                let parts: Vec<&str> = arg.split(',').collect();
-                if parts.len() != 2 {
-                    return Err(Error::value(format!("tapat expects X,Y, got {}", json::py_repr_str(arg))));
+                // tapat:X,Y or tapat:X,Y=LABEL (press only a control labelled exactly LABEL).
+                let (coords, expect) = match arg.split_once('=') {
+                    Some((c, l)) => (c, Some(l)),
+                    None => (arg, None),
+                };
+                let parts: Vec<&str> = coords.split(',').collect();
+                if parts.len() != 2 || expect.is_some_and(|l| l.trim().is_empty()) {
+                    return Err(Error::value(format!("tapat expects X,Y or X,Y=LABEL, got {}", json::py_repr_str(arg))));
                 }
-                return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?)?);
+                return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?, expect)?);
             }
             "longpress" => return some(self.long_press_text(arg, 0.65)?.text),
             "longpressxy" => {
