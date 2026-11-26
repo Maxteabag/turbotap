@@ -14,6 +14,15 @@ name and the same personal email as the Git author email. Never use an ECIT work
 email for either a local commit or a GitHub squash merge. Verify both identities
 from the resulting commits.
 
+## Installing a release while the phone team is measuring
+
+Before installing a new turbotap on a machine that drives the test iPhone (the
+EliteBook, laptopstudio), send one line to `correctness-loop` and `rivals` with
+the version, and install between their measurement rounds. A binary that changes
+in the middle of a bench round mixes two builds in its rows and voids the round
+(26 Nov 2026: the v1.5.0 install at 05:01 voided phone-r12's `scrollabove`).
+If neither answers within 10 minutes, install and say so.
+
 ## Rust build host
 
 Run all Rust builds and Cargo tests on `ai-swarm` through `buildbox-cargo`.
