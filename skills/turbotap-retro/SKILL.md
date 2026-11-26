@@ -36,13 +36,35 @@ turbotap preflight                               # when a phone is reachable
 - Run a harmless `flow` that touches the changed code path (`read`, navigation, a reversible toggle that you set back) when a device is available, or unit/offline tests for parser/OCR changes when offline.
 - Never re-trigger real sends, payments, sign-ins or other external actions to test a retro patch.
 
-## 4. Privacy check, then commit and push
+## 4. Privacy check, then commit and open a pull request
+
+The skills and docs ship in a public binary, and every pushed commit stays public, so check **each outgoing commit**, not only the final diff: a detail added in one commit and removed in a later one is invisible in the combined diff but still published. Run this check before every push to a public remote. It never prints matched text, only the commit and the line numbers in that commit's patch, so a real value is not copied into your terminal log or chat. It exits 0 when nothing matched, 1 when lines need review, and 2 when `git fetch`, `git rev-list`, `git show` or the pattern itself failed (so it also stops a `set -e` script):
 
 ```bash
-git diff | grep -nE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-F]{8}-[0-9A-F]{16}|@[a-z0-9-]+\.[a-z]{2,}' || echo clean
+(
+  PAT='([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-F]{8}-[0-9A-F]{16}|@[a-z0-9-]+\.[a-z]{2,}|(rbw|bw|op|pass|security) (get|find|item)|--folder|passcode|password|pin\b|\b(my|his|her|their) (phone|iphone)'
+  fail() { echo "privacy check FAILED: $*" >&2; exit 2; }
+  git fetch -q origin || fail "git fetch"
+  commits=$(git rev-list --reverse origin/main..HEAD) || fail "git rev-list"
+  [ -n "$commits" ] || { echo "privacy check: no outgoing commits"; exit 0; }
+  status=0
+  for c in $commits; do
+    patch=$(git show --format= --no-color "$c") || fail "git show $c"
+    rc=0; hits=$(printf '%s\n' "$patch" | grep -nE "$PAT") || rc=$?
+    case $rc in
+      0) echo "review commit $(git rev-parse --short "$c"), patch lines: $(printf '%s\n' "$hits" | cut -d: -f1 | tr '\n' ' ')"; status=1 ;;
+      1) ;;
+      *) fail "grep exit $rc (bad pattern?)" ;;
+    esac
+  done
+  [ "$status" = 0 ] && echo "privacy check: no matches in $(printf '%s\n' "$commits" | wc -l) commits"
+  exit "$status"
+)
 ```
 
-Review every hit. Placeholder values such as `192.168.1.50`, `example.com`, or `000081XX-...` are fine, and real ones are not. Verify commit author identity (`git config user.name` / `user.email`), commit only the files you changed with a conventional message (`perf(tap): ...`, `fix(flow): ...`), and push. If you installed `turbotap` from Git, reinstall it so the fix is live (installed skills refresh themselves on the next run):
+Look at each reported line only in a private editor that nobody else sees (for example `git show --format= SHA | vim -R -`, then jump to the line). Never replay it with `git diff`, `git show`, `sed`, `grep` or `cat` in an agent's terminal, and never paste it into chat or a PR: that puts the value in the same logs this check keeps it out of. Placeholder values such as `192.168.1.50`, `example.com`, `000081XX-...` or `your-secret-manager get iphone-passcode` are fine, and real ones are not; a real one has to come out of every commit that adds it (rewrite the branch before pushing), not just out of the last one. The pattern check cannot see the rest, so read each commit for: people's names, which device belongs to whom or which device number to use, real vault entry or folder names, host and agent names, team rules or approvals ("X said it is always OK"), and app-specific labels presented as a generic step. Those belong in the user's private config or private skills, not here.
+
+Verify commit author identity (`git config user.name` / `user.email`), commit only the files you changed with a conventional message (`perf(tap): ...`, `fix(flow): ...`) on a branch, push the branch and open a pull request so the diff is reviewed before it reaches `main`. After it merges, if you installed `turbotap` from Git, reinstall it so the fix is live (installed skills refresh themselves on the next run):
 
 ```bash
 cargo install --force --git https://github.com/Maxteabag/turbotap.git
