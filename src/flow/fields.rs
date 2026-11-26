@@ -320,9 +320,11 @@ impl<R: Reader> Flow<R> {
     /// `env:VAR` / `cmd:CMD` (secret). The field is cleared, focused (element click,
     /// then a tap in its own frame if no keyboard came up) and, for secrets, secure
     /// fields and text of 40+ characters, proven focused with one probe character.
-    /// Typed at 200 characters per second. Secrets and secure fields are checked by
-    /// length, everything else is read back exactly. A field missing while the
-    /// keyboard is up is looked for again after a short downward drag closes it.
+    /// Text is typed at 200 characters per second; a secret is written through the
+    /// element and followed by the focus check of `type:`/`cleartype:`. Secrets and
+    /// secure fields are checked by length (a mismatch clears the field), everything
+    /// else is read back exactly. A field missing while the keyboard is up is looked
+    /// for again after a short downward drag closes it.
     pub fn fill(&mut self, arg: &str) -> Result<String> {
         let Some((field, spec)) = arg.split_once('=') else {
             return Err(Error::flow("fill expects FIELD=VALUE (VALUE: text, file:PATH, env:VAR or cmd:CMD)"));
@@ -332,8 +334,11 @@ impl<R: Reader> Flow<R> {
             Ok(f) => f,
             Err(e) if e.to_string().contains("no text input named") && self.keyboard_up() => {
                 // Lists keep only visible cells: a field under the keyboard can drop
-                // out of the tree. Close the keyboard with a short drag, look again.
-                self.scroll("up")?;
+                // out of the tree. Close the keyboard with a short downward drag (80
+                // pt, mid-screen; interactive keyboard dismissal), look again.
+                let (w, h) = self.r.pt_size(&mut self.c, false, None)?;
+                let y0 = h * 2 / 5;
+                self.drag(w / 2, y0, w / 2, y0 + 80, 0.15, 0.0)?;
                 clock::sleep(0.3);
                 self.find_field("fill", field)?
             }
@@ -361,19 +366,32 @@ impl<R: Reader> Flow<R> {
         if secret || want >= PROBE_MIN_LEN {
             self.probe_focus(&f)?;
         }
-        self.fill_keys(&text, &format!("fill {}", f.describe()), secret)?;
+        if secret {
+            // Through the element itself (as type:/cleartype: since #26): a focus
+            // change after the probe (an autofill or password sheet) cannot redirect
+            // it; then make sure no other field got any of it.
+            let r = self.bound_write(&f.id, &text);
+            check_wda_ok(r, &format!("fill {}", f.describe()), true)?;
+            self.check_focus_after_secret("fill", &f.id, &text)?;
+        } else {
+            self.fill_keys(&text, &format!("fill {}", f.describe()), false)?;
+        }
         clock::sleep(0.25);
         let v = self.field_attr(&f.id, "value");
         let got = Field { value: v, ..f.clone() };
         let got = got.content();
-        if f.secure() {
-            if got.chars().count() != want {
-                return Err(Error::flow(format!("fill: {} holds {} characters, expected {want}", f.describe(), got.chars().count())));
-            }
-        } else if got != text {
-            if secret {
-                return Err(Error::flow(format!("fill: {} read-back mismatch (len {} vs {want})", f.describe(), got.chars().count())));
-            }
+        let n_got = got.chars().count();
+        let secret_wrong = if f.secure() { n_got != want } else { secret && got != text };
+        if secret_wrong {
+            // Never leave a wrong or partial secret in the field.
+            let p = self.c.spath(&format!("/element/{}/clear", f.id));
+            self.c.post(&p, &j!({}));
+            return Err(Error::flow(format!(
+                "fill: {} read-back mismatch (len {n_got} vs {want}); the field was cleared",
+                f.describe()
+            )));
+        }
+        if !secret && got != text {
             let i = first_diff(got, &text);
             let ctx = |s: &str| -> String { s.chars().skip(i.saturating_sub(10)).take(30).collect() };
             return Err(Error::flow(format!(

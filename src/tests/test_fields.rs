@@ -257,6 +257,30 @@ fn fill_checks_a_secure_field_by_length() {
     let _env = set_env(&[("TT_FILL_SECRET", Some("hunter22"))]);
     let r = f.step("fill:Password=env:TT_FILL_SECRET").unwrap().unwrap();
     assert_eq!(r, json!("Password: len=8"));
+    // The secret went through the element's own value route, never as system keys.
+    assert!(keys_typed(&mock).iter().all(|(t, _)| t != "hunter22"));
+    let writes = mock.calls_to("/session/");
+    assert!(writes.iter().any(|(m, p, d)| m == "POST" && p.ends_with("/element/p1/value") && d["text"] == json!("hunter22")));
+    f.close();
+}
+
+#[test]
+fn fill_clears_a_secure_field_whose_length_is_wrong() {
+    let mut st = typing_composer();
+    st.elements_map.insert(ekey(&["predicate string", &exact("Password")]), vec![json!({"ELEMENT": "p1"})]);
+    let mock = MockWda::start(st);
+    // The field drops a character (a formatter, a lost key).
+    mock.set_custom_handler(|st, _m, path, _d| {
+        path.ends_with("/element/p1/value").then(|| {
+            st.set_element_value("p1", Dyn::one(json!("\u{2022}\u{2022}\u{2022}")));
+            json!({"value": null})
+        })
+    });
+    let mut f = flow(&mock);
+    let _env = set_env(&[("TT_FILL_SECRET", Some("hunter22"))]);
+    let e = f.step("fill:Password=env:TT_FILL_SECRET").unwrap_err().to_string();
+    assert!(e.contains("the field was cleared") && !e.contains("hunter22"), "{e}");
+    assert!(mock.calls_to("/session/").iter().any(|(m, p, _)| m == "POST" && p.ends_with("/element/p1/clear")));
     f.close();
 }
 
