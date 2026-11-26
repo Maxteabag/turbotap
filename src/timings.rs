@@ -27,6 +27,7 @@ pub const ARG_VERBS: &[&str] = &[
     "tap", "tapel", "tapif", "tapbatch", "tapxy", "tapat", "wait", "waitany", "gone", "assert", "assertnot", "open", "launch",
     "swipe", "scroll", "scrollto", "read", "readel", "toggle", "slider", "longpress", "longpressxy", "doubletap",
     "doubletapxy", "zoom", "key", "sleep", "alert", "search", "dismisskb", "back", "home", "settle", "ui", "shot",
+    "totp", "prompts", "appinstall",
     "preflight", "unlock", "ocr", "vision-ocr", "tree", "screenshot",
 ];
 
@@ -67,6 +68,11 @@ pub fn step_kind_arg(spec: &str) -> (String, Option<String>) {
         Some((v, a)) => (v.trim().to_ascii_lowercase(), Some(a)),
         None => (spec.trim().to_ascii_lowercase(), None),
     };
+    // `fill:FIELD=VALUE`: the field name only.
+    if verb == "fill" || verb == "assertfield" {
+        let field = arg.and_then(|a| a.split_once('=').map(|(f, _)| f.chars().take(60).collect::<String>()));
+        return (verb, field);
+    }
     // `read:ocr`, `read:vision`, `read:0-400`: keep the mode, it is what makes the time.
     let arg = arg
         .filter(|_| ARG_VERBS.contains(&verb.as_str()))

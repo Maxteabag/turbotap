@@ -18,6 +18,7 @@ use crate::wda::{check_wda_ok, WdaClient};
 use serde_json::{json as j, Value};
 
 pub mod act;
+pub mod forms;
 pub mod sense;
 pub mod tap;
 pub mod worker;
@@ -168,7 +169,18 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         these are hardware-keyboard key events to whatever has focus
                         system-wide; a key step after which another app is in front prints
                         a warning (marks only, nothing is refused)
-  cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
+  cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back;
+                        a secret (env:/cmd:) goes only into the one SecureTextField (or the only input)
+  fill:FIELD=VALUE      the input named FIELD (label, identifier or placeholder) only: clear, focus,
+                        type, verify. VALUE: text, env:V / cmd:C (secret: focus probe + length check,
+                        never printed) or file:PATH (exact multi-line text, one trailing newline dropped)
+  assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V); read-only
+  totp:APP=ENTRY        read ENTRY's code in authenticator APP, come back, type it into the code field
+                        (waits for a fresh code under 8 s left; the code is never printed)
+  prompts[:SECS]        answer permission prompts with a declining choice (Ask App Not to Track,
+                        Don't Allow, Not Now, Don't Share, ...) for SECS (default 1.5); never allows
+  appinstall:NAME[@S]   App Store: search NAME, skip ads, Get/Redownload, wait up to S s (300) for Open
+  @RECIPE               the steps saved in ~/.config/turbotap/recipes/RECIPE.flow (${VAR} from env)
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
@@ -233,6 +245,10 @@ pub fn is_url_scheme(s: &str) -> bool {
 /// flow output; `env:VAR` names are shown.
 pub const SECRET_ARG_VERBS: &[&str] = &["pintap", "typedigits", "cleartype", "type", "setclip"];
 
+/// `VERB:FIELD=VALUE` steps: the value is typed (`fill:`) or compared
+/// (`assertfield:`); a literal value never appears in output.
+pub const FIELD_VALUE_VERBS: &[&str] = &["fill", "assertfield"];
+
 /// Verbs whose value is always a credential (PINs, passwords), in any form.
 pub const CREDENTIAL_VERBS: &[&str] = &["pintap", "typedigits", "cleartype"];
 
@@ -252,6 +268,13 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
 pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
     let verb = verb.trim();
+    if verb.eq_ignore_ascii_case("totp") {
+        return true;
+    }
+    if FIELD_VALUE_VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb)) {
+        let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+        return value.starts_with("env:") || value.starts_with("cmd:");
+    }
     CREDENTIAL_VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb))
         || ((verb.eq_ignore_ascii_case("type") || verb.eq_ignore_ascii_case("setclip"))
             && (arg.starts_with("env:") || arg.starts_with("cmd:")))
@@ -264,6 +287,14 @@ pub fn safe_step(spec: &str) -> String {
         return spec.to_string();
     };
     let trimmed = verb.trim();
+    if FIELD_VALUE_VERBS.iter().any(|v| v.eq_ignore_ascii_case(trimmed)) {
+        // FIELD=VALUE: the field name is shown; the value only as env:NAME or file:PATH.
+        return match arg.split_once('=') {
+            Some((_, value)) if value.starts_with("env:") || value.starts_with("file:") => spec.to_string(),
+            Some((field, _)) => format!("{verb}:{field}=<redacted>"),
+            None => spec.to_string(),
+        };
+    }
     if !SECRET_ARG_VERBS.iter().any(|v| v.eq_ignore_ascii_case(trimmed)) || arg.starts_with("env:") {
         return spec.to_string();
     }
@@ -354,6 +385,8 @@ pub struct Flow<R: Reader = ScreenReader> {
     /// `mock.patch.object(flow, "changed_since", return_value=...)`).
     #[cfg(test)]
     pub changed_since_hook: Option<bool>,
+    /// The one automatic UI-testing recovery of this run has been used.
+    pub recovered_ui_testing: bool,
 }
 
 impl<R: Reader> Flow<R> {
@@ -398,6 +431,7 @@ impl<R: Reader> Flow<R> {
             secrets: Vec::new(),
             #[cfg(test)]
             changed_since_hook: None,
+            recovered_ui_testing: false,
         })
     }
 
@@ -773,6 +807,11 @@ impl<R: Reader> Flow<R> {
                 return some(kname);
             }
             "cleartype" => return some(self.clear_type(&verb, arg)?),
+            "fill" => return some(self.fill(arg)?),
+            "assertfield" => return some(self.assert_field(arg)?),
+            "totp" => return some(self.totp(arg)?),
+            "prompts" => return some(self.prompts(arg)?),
+            "appinstall" => return some(self.app_install(arg)?),
             "dismisskb" => return some(self.dismiss_kb()?),
             "typedigits" => return some(self.type_digits(arg)?),
             "pintap" => return some(self.pin_tap(arg)?),
@@ -883,6 +922,43 @@ impl<R: Reader> Flow<R> {
         Ok(None)
     }
 
+    /// After a failed step: when the runner has lost UI-testing authorization
+    /// (error 41), recover once per run ([`WdaClient::recover_ui_testing`]), bring
+    /// the flow's app back and rerun the step if it is safe to repeat (reads, waits,
+    /// opens and steps that clear before typing). Other steps fail with a note that
+    /// WDA is back, so nothing is sent twice. `TURBOTAP_AUTO_RECOVER=0` turns it off.
+    fn recover_after_failure(&mut self, spec: &str) -> Option<Result<Option<Value>>> {
+        if self.recovered_ui_testing || crate::config::env("TURBOTAP_AUTO_RECOVER").is_some_and(|v| v.trim() == "0") {
+            return None;
+        }
+        if !self.c.ui_testing_lost() {
+            return None;
+        }
+        self.recovered_ui_testing = true;
+        if let Err(e) = self.c.recover_ui_testing() {
+            return Some(Err(Error::flow(format!("{e}"))));
+        }
+        if let Some(b) = self.bundle.clone().filter(|b| b != crate::wda::SPRINGBOARD) {
+            let p = self.c.spath("/wda/apps/activate");
+            self.c.post(&p, &j!({"bundleId": b}));
+            clock::sleep(0.8);
+        }
+        self.mark_action(false, false);
+        let verb = spec.split_once(':').map(|(v, _)| v).unwrap_or(spec).trim().to_lowercase();
+        const REPEATABLE: &[&str] = &[
+            "open", "launch", "wait", "expect", "waitany", "gone", "assert", "assertnot", "read", "readel", "ui", "shot",
+            "fill", "assertfield", "prompts", "appinstall", "home", "unlock", "settle",
+        ];
+        if REPEATABLE.contains(&verb.as_str()) {
+            crate::errln!("turbotap: WDA recovered; repeating {}", safe_step(spec));
+            return Some(self.step(spec));
+        }
+        Some(Err(Error::flow(format!(
+            "WDA lost UI-testing authorization during {} and was recovered (runner restarted); check the screen, then rerun from this step",
+            safe_step(spec)
+        ))))
+    }
+
     fn add_alert_meta(&self, entry: &mut serde_json::Map<String, Value>) {
         if let Some(t) = self.last_alert_text.as_ref().filter(|t| !t.is_empty()) {
             entry.insert("alert".into(), j!(t));
@@ -940,6 +1016,10 @@ impl<R: Reader> Flow<R> {
         let is_secret = arg.starts_with("env:") || arg.starts_with("cmd:");
         let text = secret_arg(verb, arg)?;
         self.note_secret(&text);
+        if is_secret {
+            // Never "the first field": a password once went into a username field.
+            return self.clear_type_secret(&text);
+        }
         self.mark_action(false, true);
         let mut els = Value::Array(vec![]);
         let mut secure = false;
@@ -1172,7 +1252,17 @@ impl<R: Reader> Flow<R> {
             let (req0, slept0) = (self.c.stats, clock::slept_total());
             self.c.req_kinds.clear();
             self.step_retries = 0;
-            let outcome = self.step(spec);
+            // A touch where it does nothing if the phone sat idle (agent thinking):
+            // Auto-Lock would cost the runner its UI-testing access.
+            if !matches!(self.c.keep_awake(crate::wda::keepawake_idle()), "busy") {
+                self.mark_action(false, false);
+            }
+            let mut outcome = self.step(spec);
+            if outcome.as_ref().is_err_and(|e| !matches!(e, Error::AppGuard(_))) {
+                if let Some(r) = self.recover_after_failure(spec) {
+                    outcome = r;
+                }
+            }
             self.record_timing(spec, s0, req0, slept0, &outcome);
             match outcome {
                 Ok(res) => {

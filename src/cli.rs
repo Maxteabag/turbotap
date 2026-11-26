@@ -22,6 +22,15 @@ pub fn main_entry() -> i32 {
 /// Python `main(argv)`: forward to the warm daemon when requested and it confirms
 /// the request, otherwise run here.
 pub fn main_with(argv: &[String]) -> i32 {
+    // `@NAME` recipe steps expand here, with this process's environment.
+    let expanded = match crate::recipes::expand_argv(argv) {
+        Ok(a) => a,
+        Err(e) => {
+            crate::errln!("turbotap: {e}");
+            return 1;
+        }
+    };
+    let argv = expanded.as_slice();
     if daemon_requested(argv) {
         if let Some(code) = crate::daemon::forward(argv) {
             return code;
@@ -43,7 +52,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
 }
 
 /// Subcommands that always run in the calling process (never in the daemon).
-pub const DAEMON_LOCAL_CMDS: &[&str] = &["daemon", "install-skill", "deploy"];
+pub const DAEMON_LOCAL_CMDS: &[&str] = &["daemon", "install-skill", "deploy", "uninstall", "recipes", "keepawake"];
 const GLOBAL_VALUE_OPTS: &[&str] = &["--url", "--device", "--udid", "--allow-app"];
 
 /// `(subcommand, --daemon seen, --no-daemon seen, other option seen)` from the
@@ -247,6 +256,23 @@ pub fn build_command() -> Command {
                 .arg(flag("no-build", "only restart the existing build")),
         )
         .subcommand(
+            Command::new("keepawake")
+                .about("keep the phone from auto-locking while an agent works: a no-op touch whenever turbotap sent nothing for --idle s")
+                .arg(float_arg("for").default_value("600").help("how long to run (s)"))
+                .arg(float_arg("idle").default_value("15").help("touch after this many idle seconds (keep it under the phone's Auto-Lock time)"))
+                .arg(flag("no-unlock", "do not unlock with the passcode source if the phone locks anyway")),
+        )
+        .subcommand(
+            Command::new("recipes")
+                .about("list saved flow recipes (~/.config/turbotap/recipes/*.flow; run one with 'flow @NAME'), or print one")
+                .arg(Arg::new("name").value_name("NAME")),
+        )
+        .subcommand(
+            Command::new("uninstall")
+                .about("remove an app from the phone by exact bundle ID (devicectl on the Mac host)")
+                .arg(Arg::new("bundle_id").value_name("BUNDLE_ID").required(true)),
+        )
+        .subcommand(
             Command::new("ocr")
                 .arg(float_arg("scale").default_value("1.5").help("OCR px per point"))
                 .arg(int_arg("y0").default_value("0").help("crop band top (pt)"))
@@ -342,6 +368,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
             let top = sm.get_one::<usize>("top").copied().unwrap_or(10);
             return crate::timings::cmd_timings(s(sm, "since"), s(sm, "by").unwrap_or("step"), s(sm, "file"), top);
         }
+        "recipes" => return crate::recipes::cmd_recipes(s(sm, "name")),
         "daemon" => {
             return crate::daemon::cmd_daemon(s(sm, "action").unwrap_or("status"), f(sm, "idle"), b(sm, "foreground"));
         }
@@ -401,6 +428,11 @@ fn main_inner(argv: &[String]) -> Result<i32> {
             r?
         }
         "deploy" => crate::deploy::cmd_deploy(&mut client, b(sm, "no-build"))?,
+        "keepawake" => {
+            let keys: Vec<&str> = target.dev_key.iter().map(String::as_str).collect();
+            return crate::wda::cmd_keepawake(&mut client, f(sm, "for").unwrap_or(600.0), f(sm, "idle").unwrap_or(15.0), !b(sm, "no-unlock"), &keys);
+        }
+        "uninstall" => crate::devicectl::cmd_uninstall(&client.udid.clone(), &url, &client.cache_dir.clone(), s(sm, "bundle_id").unwrap_or(""))?,
         "tap-ocr" => crate::flow::cmd_tap_ocr(client, s(sm, "text").unwrap_or(""))?,
         "flow" => {
             let steps: Vec<String> = sm.get_many::<String>("steps").map(|v| v.cloned().collect()).unwrap_or_default();

@@ -19,7 +19,7 @@ pub const STOP_EXIT: i32 = 6;
 pub const ENV_STOP_FILE: &str = "TURBOTAP_STOP_FILE";
 
 /// Subcommands the stop file blocks.
-pub const STOP_CMDS: &[&str] = &["deploy", "unlock", "flow", "tap-ocr", "otp-type"];
+pub const STOP_CMDS: &[&str] = &["deploy", "unlock", "flow", "tap-ocr", "otp-type", "uninstall", "keepawake"];
 
 fn push_path(out: &mut Vec<PathBuf>, p: &str) {
     let p = p.trim();

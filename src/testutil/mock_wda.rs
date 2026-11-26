@@ -182,7 +182,16 @@ impl MockState {
                 Some(Dyn::Seq(s)) => s.peek().as_str().unwrap_or("").to_string(),
                 _ => String::new(),
             };
-            self.element_values.insert(eid, Dyn::one(json!(format!("{cur}{text}"))));
+            // XCTest's delete key removes the last character.
+            let mut out = cur;
+            for ch in text.chars() {
+                if ch == '\u{8}' {
+                    out.pop();
+                } else {
+                    out.push(ch);
+                }
+            }
+            self.element_values.insert(eid, Dyn::one(json!(out)));
         }
     }
 }
@@ -492,6 +501,7 @@ fn route(inner: &mut Inner, method: &str, path: &str, data: &Value) -> Value {
             "attribute/label" => return json!({"value": st.element_labels.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/name" => return json!({"value": st.element_names.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/type" => return json!({"value": st.element_types.get(&eid).cloned().unwrap_or(Value::Null)}),
+            "name" => return json!({"value": st.element_types.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/value" => {
                 let v = match st.element_values.get_mut(&eid) {
                     Some(d) => d.next(&Value::Null),

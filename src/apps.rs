@@ -60,7 +60,7 @@ fn json_error(out: &str, e: serde_json::Error) -> Error {
 }
 
 /// `subprocess.run(cmd, capture_output=True, text=True, timeout=...)` -> stdout.
-fn run_capture(cmd: &[String], timeout: f64) -> Result<String> {
+pub(crate) fn run_capture(cmd: &[String], timeout: f64) -> Result<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let Some((prog, args)) = cmd.split_first() else {
@@ -109,7 +109,7 @@ fn run_capture(cmd: &[String], timeout: f64) -> Result<String> {
 }
 
 /// Python `shlex.quote`.
-fn py_shlex_quote(s: &str) -> String {
+pub(crate) fn py_shlex_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }

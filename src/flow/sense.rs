@@ -253,6 +253,11 @@ fn alert_text_on(c: &mut WdaClient, deadline: Option<f64>) -> Option<String> {
     }
 }
 
+/// The active system alert's button labels (empty without an alert).
+pub(crate) fn alert_buttons(c: &mut WdaClient, deadline: Option<f64>) -> Vec<String> {
+    alert_buttons_on(c, deadline)
+}
+
 /// Python `_active_alert_buttons` on any client.
 fn alert_buttons_on(c: &mut WdaClient, deadline: Option<f64>) -> Vec<String> {
     let path = c.spath("/wda/alert/buttons");

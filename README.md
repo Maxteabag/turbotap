@@ -28,8 +28,20 @@ turbotap flow open:Spotify tap:"Your Library" tap:"Liked Songs@y>150" wait:songs
 # Open Weather and read the forecast (~0.6-1.1s)
 turbotap flow open:Weather read
 
-# Search the App Store for Angry Birds and install it
-turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" tap:Get
+# Install an app from the App Store (skips ads, waits until it reads Open), then sign in
+turbotap flow appinstall:"Angry Birds 2" launch:"Angry Birds 2" prompts:2
+turbotap flow fill:"Email or username=env:USERNAME" fill:Password=cmd:"rbw get example.com me" tap:Continue \
+  totp:Authenticator="Example account" tap:"Check code"
+
+# Fill a multi-line text field from a file and check it read back exactly
+turbotap flow fill:"Body text=file:post.txt" assertfield:"Body text=file:post.txt"
+
+# Replay a saved recipe (one step per line in ~/.config/turbotap/recipes/NAME.flow)
+turbotap recipes
+TITLE_FILE=title.txt turbotap flow @example-compose read
+
+# Remove an app (exact bundle ID, via devicectl on the Mac)
+turbotap uninstall com.example.app
 ```
 
 Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`/`tapbatch:fixed:`, `read:vision`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `assert:`, `assertnot:`, `alert:text`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
@@ -223,6 +235,10 @@ Both. `read` grabs a cropped, downscaled screenshot from the phone and OCRs it l
 Yes, `turbotap unlock` or the `unlock` step in a flow. It does nothing if the phone is already unlocked. It finds the keypad keys by their `XCUIElementTypeKey` names instead of screen coordinates, so it works on any iPhone screen size.
 
 The phone can auto-lock and sleep between tasks. WebDriverAgent keeps running, and when iOS has put Wi-Fi to sleep `turbotap` sends one ping to wake it before giving up, so start a task with `unlock` and carry on.
+
+Screenshots and tree reads don't count as activity for iOS's idle timer, so with a short Auto-Lock the phone can lock while an agent is thinking. `turbotap keepawake --for 900 &` prevents that without touching the Auto-Lock setting: whenever no turbotap command has sent input for 15 s (`--idle`), it touches the bottom edge of the screen (the home-indicator strip, where a tap does nothing), and unlocks once with your passcode source if the phone locks anyway. Flows do the same before a step after an idle gap and while `appinstall:` waits for a download (`TURBOTAP_KEEPAWAKE=0` turns it off).
+
+If WebDriverAgent loses UI-testing access ("Not authorized for performing UI testing actions", XCTest error 41: screenshots come back empty and the front app reads `local.pid.0`), a flow restarts that device's runner once by itself (`deploy --no-build`), unlocks with the new runner and repeats the step when it is safe to repeat (`TURBOTAP_AUTO_RECOVER=0` turns this off). The one case it can't fix remotely is a phone that is locked at that moment: a runner in that state can't type the passcode, and Xcode won't start a new one on a locked iPhone, so `turbotap` says so (it checks with devicectl) and someone has to unlock it by hand once.
 
 ### Do I need a Mac, or does it talk to the iPhone directly?
 

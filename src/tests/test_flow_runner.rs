@@ -1201,6 +1201,13 @@ fn test_picker_key_cleartype_typedigits_and_clipboard() {
     let mut st = MockState::default();
     st.elements_map.insert("XCUIElementTypePickerWheel".into(), vec![json!({"ELEMENT": "w0"}), json!({"ELEMENT": "w1"})]);
     st.elements_map.insert("XCUIElementTypeTextField".into(), vec![json!({"ELEMENT": "tf1"})]);
+    // A secret cleartype looks for its one target by predicate (no secure field here:
+    // the only input).
+    st.elements_map.insert(
+        crate::testutil::mock_wda::ekey(&["predicate string", crate::flow::forms::INPUT_TYPES_PRED]),
+        vec![json!({"ELEMENT": "tf1"})],
+    );
+    st.element_types.insert("tf1".into(), json!("XCUIElementTypeTextField"));
     st.set_element_value("tf1", Dyn::one(json!("")));
     let c = MockWda::start(st);
     let r = FakeReader::new(vec![]);

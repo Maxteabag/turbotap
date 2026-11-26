@@ -22,6 +22,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 pub const DEFAULT_TIMEOUT: f64 = 25.0;
+
+/// `/wda/activeAppInfo` bundle ID while the runner has no UI-testing access.
+pub const LOST_BUNDLE: &str = "local.pid.0";
+
+/// Why a runner without UI-testing access cannot be recovered remotely right now.
+pub const LOST_LOCKED_MSG: &str = "WDA lost UI-testing authorization (error 41) and the phone is locked \
+(devicectl: passcodeRequired): a runner cannot type the passcode in that state and Xcode cannot start \
+a new one on a locked iPhone. Unlock the phone by hand once (Face ID is enough), then run \
+'turbotap deploy --no-build'";
 pub const SPRINGBOARD: &str = "com.apple.springboard";
 
 /// How long the app guard re-checks (live, sending nothing) when SpringBoard is in
@@ -779,6 +788,11 @@ pub struct WdaClient {
     pub guard_action: Option<String>,
     /// Set while `unlock_phone` runs: SpringBoard may receive the passcode taps.
     guard_unlock_scope: bool,
+    /// Set by `prompts` for one tap on a declining answer: a permission prompt is
+    /// drawn by SpringBoard or a system service, not the guarded app.
+    pub guard_prompt_scope: bool,
+    /// Wall time this process last wrote the last-input file.
+    pub last_input_mark: f64,
     /// Set when the guard policy could not be read (invalid, unreadable or unstable
     /// config.json): every input is refused with this reason; reads still work.
     pub guard_policy_error: Option<String>,
@@ -837,6 +851,8 @@ impl WdaClient {
             guard_refusal: None,
             guard_action: None,
             guard_unlock_scope: false,
+            guard_prompt_scope: false,
+            last_input_mark: 0.0,
             guard_policy_error: None,
             pinned_addrs: None,
             #[cfg(test)]
@@ -1062,7 +1078,11 @@ impl WdaClient {
         // A notification banner makes SpringBoard active for a moment. Re-check (live,
         // nothing is sent meanwhile) for up to BANNER_RECHECK before refusing; every
         // wait is printed with what was in front, so a real takeover still shows.
-        if matches!(&first, Ok(b) if b == SPRINGBOARD) && !self.guard_unlock_scope && !self.allowed_apps.iter().any(|a| a == SPRINGBOARD) {
+        if matches!(&first, Ok(b) if b == SPRINGBOARD)
+            && !self.guard_unlock_scope
+            && !self.guard_prompt_scope
+            && !self.allowed_apps.iter().any(|a| a == SPRINGBOARD)
+        {
             let t0 = clock::now();
             let end = deadline.map_or(t0 + BANNER_RECHECK, |d| d.min(t0 + BANNER_RECHECK));
             while clock::now() < end {
@@ -1084,6 +1104,7 @@ impl WdaClient {
         match first {
             Ok(b) if self.allowed_apps.iter().any(|a| a == &b) => Ok(true),
             Ok(b) if self.guard_unlock_scope && b == SPRINGBOARD => Ok(true),
+            Ok(b) if self.guard_prompt_scope && crate::guard::is_system_prompt_host(&b) => Ok(true),
             Ok(b) => {
                 let mut msg = crate::guard::refuse_foreground(action, &b, &self.allowed_apps);
                 // SpringBoard in front is often a locked phone: say so (one read, only
@@ -1142,11 +1163,17 @@ impl WdaClient {
     /// Ok(true) send it, Ok(false) the caller's deadline ran out while checking (send
     /// nothing, report the deadline as usual), Err(refusal) send nothing.
     fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
-        if !self.app_guard_active() || crate::guard::is_safe_method(method) {
+        if crate::guard::is_safe_method(method) {
             return Ok(true);
         }
         use crate::guard::RequestKind;
         let kind = crate::guard::classify(path, body);
+        if !matches!(kind, RequestKind::ReadOnly) {
+            self.mark_input();
+        }
+        if !self.app_guard_active() {
+            return Ok(true);
+        }
         if matches!(kind, RequestKind::ReadOnly | RequestKind::Home) {
             return Ok(true);
         }
@@ -2709,6 +2736,140 @@ impl WdaClient {
         Ok(self.sid.clone())
     }
 
+    /// `<cache>/last-input-<device>`: when any turbotap process last sent input to
+    /// this phone (epoch seconds), so `keepawake` and long waits know how long the
+    /// phone has been idle.
+    pub fn last_input_path(&self) -> PathBuf {
+        let key = if self.udid.is_empty() { self.base_url.clone() } else { self.udid.clone() };
+        self.cache_dir.join(format!("last-input-{}", sanitize_key(&key)))
+    }
+
+    /// Screen size in points: the session cache, else `/window/size`.
+    pub fn screen_pt_cached(&mut self) -> Option<(i64, i64)> {
+        let cached = self.load_session_cache_arc();
+        if let Some(a) = cached.get("screen_pt").and_then(Value::as_array) {
+            if let (Some(w), Some(h)) = (a.first().and_then(Value::as_i64), a.get(1).and_then(Value::as_i64)) {
+                if w > 0 && h > 0 {
+                    return Some((w, h));
+                }
+            }
+        }
+        let p = self.spath("/window/size");
+        let r = self.req("GET", &p, None, 4.0, None);
+        let v = json::get(&r, "value");
+        let w = json::get(v, "width").as_f64()? as i64;
+        let h = json::get(v, "height").as_f64()? as i64;
+        (w > 0 && h > 0).then_some((w, h))
+    }
+
+    /// Record that input is being sent now (the file at most every 2 s).
+    pub fn mark_input(&mut self) {
+        let now = clock::real_wall();
+        if now - self.last_input_mark < 2.0 {
+            return;
+        }
+        self.last_input_mark = now;
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+        let _ = std::fs::write(self.last_input_path(), format!("{now:.3}"));
+    }
+
+    /// Seconds since any turbotap process last sent input to this phone.
+    /// No record yet counts as not idle (nothing to keep awake for).
+    pub fn idle_secs(&self) -> f64 {
+        let t = std::fs::read_to_string(self.last_input_path()).ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
+        let last = t.max(self.last_input_mark);
+        if last <= 0.0 {
+            return 0.0;
+        }
+        (clock::real_wall() - last).max(0.0)
+    }
+
+    /// Keep the phone from idling into Auto-Lock: when nothing was sent for
+    /// `idle_after` seconds, send one touch where it does nothing (the bottom edge,
+    /// the home-indicator strip, away from any control). iOS resets its idle timer on
+    /// touches, not on screenshots or tree reads, and once the phone auto-locks the
+    /// runner loses UI-testing access (error 41) and can no longer unlock it. Only
+    /// while an allowed app (or the Home Screen) is in front with no alert; never
+    /// counts as a guard refusal. Returns what it did.
+    pub fn keep_awake(&mut self, idle_after: f64) -> &'static str {
+        if idle_after <= 0.0 || self.idle_secs() < idle_after {
+            return "busy";
+        }
+        let front = match self.live_foreground_app(None) {
+            Ok(b) => b,
+            Err(_) => return "unknown-front",
+        };
+        if front == LOST_BUNDLE {
+            return "lost";
+        }
+        let allowed = !self.app_guard_active() || self.allowed_apps.iter().any(|a| a == &front) || front == SPRINGBOARD;
+        if !allowed {
+            return "skipped-front";
+        }
+        let alert = self.req("GET", &self.spath("/alert/text"), None, 3.0, None);
+        if !json::has_err(&alert) && json::get(&alert, "value").as_str().is_some_and(|t| !t.trim().is_empty()) {
+            return "skipped-alert";
+        }
+        let (w, h) = match self.screen_pt_cached() {
+            Some(p) => p,
+            None => return "no-size",
+        };
+        let (x, y) = (w / 2, h - 2);
+        // The guard's own check would refuse SpringBoard: this touch is a no-op
+        // there, so let it through for this one request.
+        let prev = std::mem::replace(&mut self.guard_prompt_scope, true);
+        let r = self.fast_tap(x, y, None, None);
+        self.guard_prompt_scope = prev;
+        self.mark_input();
+        if json::has_err(&r) {
+            "tap-failed"
+        } else {
+            "touched"
+        }
+    }
+
+    /// True when WDA answers but has lost UI-testing authorization ("Not authorized
+    /// for performing UI testing actions", XCTest error 41): every snapshot,
+    /// screenshot and tap then fails, `/wda/activeAppInfo` reports `local.pid.0`
+    /// with pid 0 and `/wda/locked` is not trustworthy. Two reads 0.3 s apart must
+    /// agree (an app switch can report pid 0 for a moment).
+    pub fn ui_testing_lost(&mut self) -> bool {
+        for i in 0..2 {
+            let r = self.req("GET", "/wda/activeAppInfo", None, 4.0, None);
+            let v = json::get(&r, "value");
+            let lost = json::get(v, "bundleId").as_str() == Some(LOST_BUNDLE) && json::get(v, "pid").as_i64() == Some(0);
+            if !lost {
+                return false;
+            }
+            if i == 0 {
+                clock::sleep(0.3);
+            }
+        }
+        true
+    }
+
+    /// One scoped recovery from [`WdaClient::ui_testing_lost`]: restart only this
+    /// device's runner (`deploy --no-build`), open a new session and unlock with the
+    /// fresh runner if the phone is locked. A runner cannot start on a locked iPhone
+    /// and a runner without UI-testing access cannot type the passcode, so a locked
+    /// phone (devicectl's `passcodeRequired`) is reported instead of restarting.
+    pub fn recover_ui_testing(&mut self) -> Result<()> {
+        if let Ok(Some(true)) = crate::devicectl::passcode_required(&self.udid) {
+            return Err(Error::runtime(LOST_LOCKED_MSG));
+        }
+        crate::errln!("turbotap: WDA lost UI-testing authorization (error 41); restarting this device's runner once (deploy --no-build)");
+        self.start_wda_on_mac(false)?;
+        self.sid = None;
+        self.ensure_session(None, true)?;
+        if self.ui_testing_lost() {
+            return Err(Error::runtime("WDA still has no UI-testing authorization after one runner restart; check the phone (Settings > Developer > Enable UI Automation) and the Mac's Xcode"));
+        }
+        if self.confirm_locked_state(0).unwrap_or(false) {
+            self.unlock_phone()?;
+        }
+        Ok(())
+    }
+
     /// Python `start_wda_on_mac` (L529-541) using the embedded deploy script + patch
     /// ([`crate::deploy`]).
     pub fn start_wda_on_mac(&mut self, build: bool) -> Result<()> {
@@ -2878,6 +3039,12 @@ impl WdaClient {
     /// L676-701. `/wda/fastKeys` (wda-turbo v3+), stock `/wda/keys` only on a
     /// definitive 404 (never replays an accepted request).
     pub fn fast_keys(&mut self, text: &str, frequency: Option<i64>) -> Value {
+        self.fast_keys_timeout(text, frequency, DEFAULT_TIMEOUT)
+    }
+
+    /// [`WdaClient::fast_keys`] with a request timeout sized for long text (XCTest
+    /// types at `frequency` characters per second, all inside one request).
+    pub fn fast_keys_timeout(&mut self, text: &str, frequency: Option<i64>, timeout: f64) -> Value {
         let freq = match frequency {
             Some(f) if f != 0 => Some(f),
             _ => crate::config::typing_freq(),
@@ -2887,7 +3054,7 @@ impl WdaClient {
             if let Some(f) = freq {
                 body["frequency"] = j!(f);
             }
-            let r = self.post("/wda/fastKeys", &body);
+            let r = self.req("POST", "/wda/fastKeys", Some(&body), timeout, None);
             if !r.is_object() {
                 return json::error_value("invalid response from /wda/fastKeys");
             }
@@ -2906,7 +3073,7 @@ impl WdaClient {
             legacy["frequency"] = j!(f);
         }
         let path = self.spath("/wda/keys");
-        self.post(&path, &legacy)
+        self.req("POST", &path, Some(&legacy), timeout, None)
     }
 
     /// L703-741. `/wda/fastLaunch` (wda-turbo v5); on 404 optional terminate +
@@ -3367,6 +3534,63 @@ pub fn cmd_preflight(client: &mut WdaClient, stock: bool) -> Result<()> {
 }
 
 /// L1012-1014.
+/// Idle seconds after which turbotap touches the phone to keep it awake
+/// (`TURBOTAP_KEEPAWAKE`, default 15; 0 turns it off).
+pub fn keepawake_idle() -> f64 {
+    crate::config::env("TURBOTAP_KEEPAWAKE").and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(15.0).max(0.0)
+}
+
+/// `turbotap keepawake [--for SECS] [--idle SECS] [--no-unlock]`: for SECS (default
+/// 600), touch the phone where it does nothing whenever no turbotap process sent
+/// input for `--idle` seconds, so it never idles into Auto-Lock between agent turns
+/// or during builds (iOS's Auto-Lock setting is left alone). If the phone locks
+/// anyway while the runner still has UI-testing access, it unlocks it once with the
+/// configured passcode source (`--no-unlock` to skip). Stops on the stop file (exit
+/// 6) and when the runner has lost UI-testing access (exit 1).
+pub fn cmd_keepawake(client: &mut WdaClient, secs: f64, idle: f64, unlock: bool, keys: &[&str]) -> Result<i32> {
+    client.ensure_session(None, false)?;
+    let end = clock::real_now() + secs.max(1.0);
+    let idle = if idle > 0.0 { idle } else { 15.0 };
+    if client.idle_secs() <= 0.0 {
+        // No input recorded yet: count the phone as idle now, so the first touch
+        // comes at once instead of after Auto-Lock may already have struck.
+        let _ = std::fs::create_dir_all(&client.cache_dir);
+        let _ = std::fs::write(client.last_input_path(), format!("{:.3}", clock::real_wall() - idle - 1.0));
+    }
+    let (mut touches, mut last) = (0u64, String::new());
+    while clock::real_now() < end {
+        if let Some(msg) = crate::stop::refusal("keepawake", keys) {
+            crate::errln!("turbotap: {msg}");
+            return Ok(crate::stop::STOP_EXIT);
+        }
+        if client.idle_secs() >= idle {
+            if unlock && client.confirm_locked_state(0).unwrap_or(false) && !client.ui_testing_lost() {
+                crate::errln!("turbotap: keepawake: the phone locked; unlocking once");
+                client.unlock_phone()?;
+            }
+            let r = client.keep_awake(idle);
+            if r == "lost" {
+                let locked = crate::devicectl::passcode_required(&client.udid).ok().flatten();
+                crate::errln!(
+                    "turbotap: keepawake: WDA lost UI-testing authorization{}",
+                    if locked == Some(true) { format!("; {LOST_LOCKED_MSG}") } else { "; run 'turbotap deploy --no-build'".to_string() }
+                );
+                return Ok(1);
+            }
+            if r == "touched" {
+                touches += 1;
+            }
+            if r != last && r != "busy" {
+                crate::errln!("turbotap: keepawake: {r}");
+                last = r.to_string();
+            }
+        }
+        clock::real_sleep(2.0);
+    }
+    crate::outln!("{}", json::dumps(&j!({"ok": true, "touches": touches, "secs": secs})));
+    Ok(0)
+}
+
 pub fn cmd_unlock(client: &mut WdaClient) -> Result<()> {
     let was_locked = client.unlock_phone()?;
     crate::outln!("{}", json::dumps(&j!({"ok": true, "unlocked_now": was_locked, "locked": false})));

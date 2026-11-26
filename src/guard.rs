@@ -569,8 +569,16 @@ pub fn refuse_policy(action: &str, reason: &str) -> String {
 pub const INPUT_VERBS: &[&str] = &[
     "tap", "tapif", "tapbatch", "toggle", "tapel", "tapxy", "tapat", "longpress", "longpressxy", "doubletap", "doubletapxy", "zoom",
     "type", "key", "cleartype", "dismisskb", "typedigits", "pintap", "scroll", "scrollto", "swipe", "picker", "slider",
-    "setclip", "back", "search",
+    "setclip", "back", "search", "fill", "totp",
 ];
+
+/// SpringBoard or an Apple system service (`...UIService`, `...ViewService`) that
+/// draws permission prompts over the app. Only `prompts` uses this, for one tap on
+/// a declining answer.
+pub fn is_system_prompt_host(bundle: &str) -> bool {
+    bundle == crate::wda::SPRINGBOARD
+        || (bundle.starts_with("com.apple.") && (bundle.ends_with("UIService") || bundle.ends_with("ViewService") || bundle.ends_with("Service")))
+}
 
 /// True when flow step `verb:arg` sends input to the foreground app.
 pub fn step_is_input(verb: &str, arg: &str) -> bool {

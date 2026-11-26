@@ -100,11 +100,29 @@ pub fn cmd_deploy(client: &mut WdaClient, no_build: bool) -> Result<()> {
     // If a reachable device is known locked and unlock fails, abort before stopping
     // the existing runner instead of leaving the phone unreachable.
     let st = client.req("GET", "/status", None, 3.0, None);
+    let mut lost = false;
     if st.is_object() && !crate::json::truthy(crate::json::get(&st, "error")) {
-        let locked = client.req("GET", "/wda/locked", None, 4.0, None);
-        if locked.is_object() && crate::json::get(&locked, "value") == &serde_json::Value::Bool(true) {
+        // A runner without UI-testing access reports a lock state it cannot see and
+        // cannot type a passcode: restart it without the unlock step.
+        lost = client.ui_testing_lost();
+        if lost {
+            crate::errln!("turbotap: the running WDA has lost UI-testing authorization (error 41); restarting it without the unlock step");
+            if let Ok(Some(true)) = crate::devicectl::passcode_required(&client.udid) {
+                crate::errln!("turbotap: the phone is locked (devicectl): Xcode starts the new runner only once someone unlocks it by hand");
+            }
+        } else {
+            let locked = client.req("GET", "/wda/locked", None, 4.0, None);
+            if locked.is_object() && crate::json::get(&locked, "value") == &serde_json::Value::Bool(true) {
+                client.unlock_phone()?;
+            }
+        }
+    }
+    client.start_wda_on_mac(!no_build)?;
+    if lost {
+        client.sid = None;
+        if client.ensure_session(None, false).is_ok() && client.confirm_locked_state(0).unwrap_or(false) {
             client.unlock_phone()?;
         }
     }
-    client.start_wda_on_mac(!no_build)
+    Ok(())
 }
