@@ -197,21 +197,6 @@ pub fn is_url_scheme(s: &str) -> bool {
 /// Verbs whose argument is text typed or tapped into the device (PINs, passwords,
 /// clipboard contents). Their inline values and `cmd:` command lines never appear in
 /// flow output; `env:VAR` names are shown.
-/// `cleartype:`'s input classes, in the order it prefers them (secure: no read-back).
-const TEXT_INPUT_ORDER: [(&str, bool); 4] = [
-    ("XCUIElementTypeTextField", false),
-    ("XCUIElementTypeSecureTextField", true),
-    ("XCUIElementTypeSearchField", false),
-    ("XCUIElementTypeTextView", false),
-];
-
-/// `cleartype:` reads at most this many matched inputs' types before narrowing the
-/// query or falling back to one class search per class.
-const TEXT_INPUT_TYPE_READS: usize = 6;
-
-/// `cleartype:` read-back: wait before each read of the field's value.
-const CLEARTYPE_READBACK: [f64; 4] = [0.0, 0.08, 0.12, 0.2];
-
 pub const SECRET_ARG_VERBS: &[&str] = &["pintap", "typedigits", "cleartype", "type", "setclip"];
 
 /// Verbs whose value is always a credential (PINs, passwords), in any form.
@@ -879,7 +864,21 @@ impl<R: Reader> Flow<R> {
         let text = secret_arg(verb, arg)?;
         self.note_secret(&text);
         self.mark_action(false, true);
-        let Some((eid, secure)) = self.find_text_input() else {
+        let mut els = Value::Array(vec![]);
+        let mut secure = false;
+        for (cls, is_sec) in [
+            ("XCUIElementTypeTextField", false),
+            ("XCUIElementTypeSecureTextField", true),
+            ("XCUIElementTypeSearchField", false),
+            ("XCUIElementTypeTextView", false),
+        ] {
+            els = self.find_elements(cls);
+            if json::truthy(&els) {
+                secure = is_sec;
+                break;
+            }
+        }
+        let Some(eid) = Self::first_element_id(&els) else {
             return Err(Error::flow("no TextField, SecureTextField, SearchField, or TextView on screen"));
         };
         let redact = is_secret || secure;
@@ -896,25 +895,12 @@ impl<R: Reader> Flow<R> {
         let r = self.c.fast_keys(&text, None);
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype", red)?;
-        if secure {
-            clock::sleep(0.20);
-        } else {
-            // Read back at once and re-read briefly while the field catches up, instead
-            // of a fixed 0.2 s wait before one read (same 0.2 s+ budget at worst).
+        clock::sleep(0.20);
+        if !secure {
             let p = self.c.spath(&format!("/element/{eid}/attribute/value"));
-            let mut val = String::new();
-            for (i, wait) in CLEARTYPE_READBACK.iter().enumerate() {
-                if i > 0 {
-                    self.step_retries += 1;
-                }
-                clock::sleep(*wait);
-                let r = self.c.get(&p);
-                let v = json::get(&r, "value");
-                val = if json::truthy(v) { json::py_str(v) } else { String::new() };
-                if val == text {
-                    break;
-                }
-            }
+            let r = self.c.get(&p);
+            let v = json::get(&r, "value");
+            let val = if json::truthy(v) { json::py_str(v) } else { String::new() };
             if val != text {
                 return Err(Error::flow(format!(
                     "cleartype read-back mismatch (len {} vs {})",
@@ -924,82 +910,6 @@ impl<R: Reader> Flow<R> {
             }
         }
         Ok(format!("len={}", text.chars().count()))
-    }
-
-    /// The text input `cleartype:` writes to, and whether it is secure: the first
-    /// element of the first class in [`TEXT_INPUT_ORDER`] (TextField,
-    /// SecureTextField, SearchField, TextView), as one class search per class would
-    /// pick it, with fewer tree walks. One predicate query covers all four classes;
-    /// with up to [`TEXT_INPUT_TYPE_READS`] matches their types pick the class
-    /// (cheap per-element reads): 1 walk. With more (chat messages that are
-    /// TextViews themselves), one query for the first three classes, then one
-    /// TextView search: 3 walks. No match, an unreadable type or a rejected
-    /// predicate: one class search per class, in order.
-    fn find_text_input(&mut self) -> Option<(String, bool)> {
-        let order = TEXT_INPUT_ORDER;
-        match self.inputs_by_type(&order) {
-            Ok(found) => return found,
-            Err(Some(())) => {
-                // Too many matches: leave TextViews out, then take the first TextView.
-                match self.inputs_by_type(&order[..3]) {
-                    Ok(Some(found)) => return Some(found),
-                    Ok(None) => {
-                        let els = self.find_elements(order[3].0);
-                        if let Some(eid) = Self::first_element_id(&els) {
-                            return Some((eid, false));
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-            Err(None) => {}
-        }
-        for (cls, is_sec) in order {
-            let els = self.find_elements(cls);
-            if let Some(eid) = Self::first_element_id(&els) {
-                return Some((eid, is_sec));
-            }
-        }
-        None
-    }
-
-    /// One predicate query for `classes` (plain `type ==` comparisons) and, for up to
-    /// [`TEXT_INPUT_TYPE_READS`] matches, one type read each: `Ok(Some(..))` the
-    /// first element of the highest-ranked class, `Ok(None)` no match (only when
-    /// `classes` leaves TextViews out; otherwise no match is `Err(None)`, so the
-    /// caller falls back), `Err(Some(()))` too many matches, `Err(None)` anything
-    /// unverified (rejected predicate, unreadable type).
-    #[allow(clippy::result_unit_err)]
-    fn inputs_by_type(&mut self, classes: &[(&str, bool)]) -> std::result::Result<Option<(String, bool)>, Option<()>> {
-        let pred = classes.iter().map(|(c, _)| format!("type == '{c}'")).collect::<Vec<_>>().join(" OR ");
-        let p = self.c.spath("/elements");
-        let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));
-        let Some(els) = json::get(&r, "value").as_array().filter(|_| json::get(&r, "error").is_null()).cloned() else {
-            return Err(None);
-        };
-        if els.is_empty() {
-            // Nothing at all is unverified for the full set (a runner that answers
-            // [] instead of an error); without TextViews it means "none of these".
-            return if classes.len() == TEXT_INPUT_ORDER.len() { Err(None) } else { Ok(None) };
-        }
-        if els.len() > TEXT_INPUT_TYPE_READS {
-            return Err(Some(()));
-        }
-        let mut best: Option<(usize, String)> = None;
-        for el in &els {
-            let eid = Self::first_element_id(&Value::Array(vec![el.clone()])).ok_or(None)?;
-            let tp = self.c.spath(&format!("/element/{eid}/attribute/type"));
-            let t = self.c.get(&tp);
-            let rank =
-                json::get(&t, "value").as_str().and_then(|k| classes.iter().position(|(c, _)| *c == k)).ok_or(None)?;
-            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
-                best = Some((rank, eid));
-            }
-            if rank == 0 {
-                break; // nothing ranks higher
-            }
-        }
-        Ok(best.map(|(rank, eid)| (eid, classes[rank].1)))
     }
 
     fn type_digits(&mut self, arg: &str) -> Result<String> {
