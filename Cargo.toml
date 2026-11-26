@@ -1,6 +1,6 @@
 [package]
 name = "turbotap"
-version = "1.4.2"
+version = "1.4.3"
 edition = "2021"
 description = "Fast, headless CLI and multi-step flow runner for physical iPhones over Wi-Fi via patched WebDriverAgent"
 license = "MIT"
