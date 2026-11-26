@@ -387,7 +387,14 @@ impl<R: Reader> Flow<R> {
     /// Python `Flow(client, reader, timeout=8.0, deny=DENY_DEFAULT, log=None)`.
     /// `deny` None or "" disables the guard.
     pub fn new(c: WdaClient, r: R, timeout: f64, deny: Option<&str>, log: bool) -> Result<Flow<R>> {
-        let deny_also = if c.deny_also.is_empty() || deny.is_none() {
+        let deny_off = deny.map_or(true, |d| d.is_empty());
+        if deny_off && !c.deny_also.is_empty() {
+            crate::errln!(
+                "turbotap: warning: --no-deny: ignoring {} deny_also pattern(s) from --deny-also/config",
+                c.deny_also.len()
+            );
+        }
+        let deny_also = if c.deny_also.is_empty() || deny_off {
             None
         } else {
             let joined = c.deny_also.iter().map(|p| format!("(?:{p})")).collect::<Vec<_>>().join("|");
@@ -789,29 +796,35 @@ impl<R: Reader> Flow<R> {
     }
 
     /// Before `key:return`/`key:enter` or text with a newline: a newline can submit
-    /// (a keyboard whose return key reads like Send). A keyboard key label the
-    /// caller's own patterns match (`--deny-also`, config `deny_also`, an explicit
-    /// `--deny`) refuses the step with nothing sent; a match of only the built-in
-    /// default prints a warning, so no new default refusal. One `ui` read, only here.
+    /// (a keyboard whose return key reads like Send). Only the caller's own extra
+    /// patterns (`--deny-also`, config `deny_also`) refuse the step, with nothing sent;
+    /// an explicit `--deny` match only warns (existing callers did not opt into a new
+    /// refusal). Without caller patterns nothing is read: the default path costs no
+    /// extra request. A keyboard that cannot be read keeps going, with a warning.
     fn guard_submit(&mut self, what: &str) -> Result<()> {
-        if self.deny.is_none() {
+        let explicit = matches!(&self.deny, Some(DenyGuard::Custom(_)));
+        if self.deny_also.is_none() && !explicit {
             return Ok(());
         }
-        let Ok(ctl) = self.controls(false, None, None, false, true) else {
-            return Ok(());
+        let ctl = match self.controls(false, None, None, false, true) {
+            Ok(ctl) => ctl,
+            Err(e) => {
+                crate::errln!("turbotap: warning: {what}: could not read the keyboard to check your deny patterns ({e}); continuing");
+                return Ok(());
+            }
         };
         let keys: Vec<String> = ctl.iter().filter(|c| c.in_keyboard && !c.label.trim().is_empty()).map(|c| c.label.clone()).collect();
         for k in &keys {
-            let by_caller = self.deny_also.as_ref().is_some_and(|rx| rx.is_match(k).unwrap_or(true))
-                || matches!(&self.deny, Some(DenyGuard::Custom(rx)) if rx.is_match(k).unwrap_or(true));
-            if by_caller {
+            if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(k).unwrap_or(true)) {
                 return Err(Error::flow(format!(
-                    "refusing {what}: the keyboard key {} matches your deny patterns, so a newline may submit; nothing sent",
+                    "refusing {what}: the keyboard key {} matches --deny-also, so a newline may submit; nothing sent",
                     json::py_repr_str(k)
                 )));
             }
-            if matches!(self.deny, Some(DenyGuard::Default)) && DenyGuard::Default.regex().is_match(k).unwrap_or(false) {
-                crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(k));
+            if let Some(DenyGuard::Custom(rx)) = &self.deny {
+                if rx.is_match(k).unwrap_or(false) {
+                    crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(k));
+                }
             }
         }
         Ok(())
