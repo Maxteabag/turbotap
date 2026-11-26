@@ -139,3 +139,26 @@ fn assertfield_values_stay_out_of_step_logs() {
     let (verb, arg) = crate::timings::step_kind_arg("assertfield:Password=hunter2");
     assert_eq!((verb.as_str(), arg.as_deref()), ("assertfield", Some("Password")));
 }
+
+#[test]
+fn a_hidden_duplicate_does_not_make_a_name_ambiguous() {
+    let mut st = composer(BODY);
+    // Two matches for "Body": the visible one and an off-screen copy (recycled cell).
+    st.elements_map.insert(ekey(&["predicate string", &exact("Body")]), vec![json!({"ELEMENT": "b1"}), json!({"ELEMENT": "b2"})]);
+    st.element_types.insert("b2".into(), json!("XCUIElementTypeTextView"));
+    st.set_element_value("b2", Dyn::one(json!("stale copy")));
+    let mock = MockWda::start(st);
+    // WDA renders the boolean as "False" (Python-style) through py_str.
+    mock.set_custom_handler(|_st, _m, path, _d| {
+        if path.ends_with("/element/b2/attribute/visible") {
+            Some(json!({"value": false}))
+        } else if path.ends_with("/element/b1/attribute/visible") {
+            Some(json!({"value": true}))
+        } else {
+            None
+        }
+    });
+    let mut f = flow(&mock);
+    assert_eq!(f.step("readfield:Body").unwrap().unwrap(), json!(BODY));
+    f.close();
+}

@@ -172,7 +172,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
   readfield:FIELD       the exact value of the input named FIELD (label, identifier or placeholder),
                         blank lines included; read-only; a secure field gives only len=N
-  assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V, cmd:C); read-only
+  assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V, cmd:C); read-only;
+                        a secure field is checked by length only (iOS shows only bullets)
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value

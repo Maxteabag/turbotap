@@ -138,7 +138,9 @@ impl<R: Reader> Flow<R> {
         }
         if ids.len() > 1 {
             // Off-screen copies (recycled cells, hidden pages) do not count.
-            let vis: Vec<String> = ids.iter().filter(|id| self.field_attr(id, "visible") != "false").cloned().collect();
+            // WDA answers a boolean, which renders as "False"/"false".
+            let vis: Vec<String> =
+                ids.iter().filter(|id| !self.field_attr(id, "visible").trim().eq_ignore_ascii_case("false")).cloned().collect();
             if !vis.is_empty() {
                 ids = vis;
             }
