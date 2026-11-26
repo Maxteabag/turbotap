@@ -733,6 +733,9 @@ impl ReqStats {
 pub const URL_LANDING_WATCH: f64 = 0.8;
 
 pub struct WdaClient {
+    /// Caller-provided label patterns refused on top of the active --deny
+    /// (`--deny-also`, config `deny_also`); compiled by the flow.
+    pub deny_also: Vec<String>,
     /// Requests sent on this client's connection (for the per-step timing log).
     pub stats: ReqStats,
     /// The app a live `/wda/activeAppInfo` last named (for the timing log; never used
@@ -813,6 +816,7 @@ impl WdaClient {
         WdaClient {
             stats: ReqStats::default(),
             req_kinds: std::collections::BTreeMap::new(),
+            deny_also: Vec::new(),
             last_foreground: None,
             base_url,
             udid: udid.to_string(),

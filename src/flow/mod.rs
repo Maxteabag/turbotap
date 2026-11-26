@@ -321,6 +321,9 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub r: R,
     pub timeout: f64,
     pub deny: Option<DenyGuard>,
+    /// The caller's own extra deny patterns (`--deny-also`, config `deny_also`):
+    /// refused on top of `deny`, never relaxed, and used by the submit guard.
+    pub deny_also: Option<fancy_regex::Regex>,
     pub bundle: Option<String>,
     pub pending_bundle: Option<String>,
     pub pending_bundle_ts: f64,
@@ -360,6 +363,12 @@ impl<R: Reader> Flow<R> {
     /// Python `Flow(client, reader, timeout=8.0, deny=DENY_DEFAULT, log=None)`.
     /// `deny` None or "" disables the guard.
     pub fn new(c: WdaClient, r: R, timeout: f64, deny: Option<&str>, log: bool) -> Result<Flow<R>> {
+        let deny_also = if c.deny_also.is_empty() || deny.is_none() {
+            None
+        } else {
+            let joined = c.deny_also.iter().map(|p| format!("(?:{p})")).collect::<Vec<_>>().join("|");
+            Some(crate::text::compile_icase(&joined).ok_or_else(|| Error::value(format!("invalid --deny-also regex: {}", json::py_repr_str(&joined))))?)
+        };
         let deny = match deny.filter(|d| !d.is_empty()) {
             Some(d) if d == DENY_DEFAULT => Some(DenyGuard::Default),
             Some(d) => Some(DenyGuard::Custom(
@@ -373,6 +382,7 @@ impl<R: Reader> Flow<R> {
             r,
             timeout,
             deny,
+            deny_also,
             bundle: None,
             pending_bundle: None,
             pending_bundle_ts: 0.0,
@@ -464,6 +474,13 @@ impl<R: Reader> Flow<R> {
     /// says why the plain-Send exception did not apply (element check, explicit
     /// `--deny`, foreground check), so the caller can see what to fix.
     pub fn guard_relax(&mut self, text: &str, action: &str, relax: std::result::Result<(), String>) -> Result<()> {
+        if self.deny.is_none() || text.is_empty() {
+            return Ok(());
+        }
+        // The caller's own additions: refused whatever the built-in exceptions say.
+        if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(text).unwrap_or(true)) {
+            return Err(Error::flow(format!("refusing to {action} {}: matches --deny-also", json::py_repr_str(text))));
+        }
         let Some(guard) = self.deny.as_ref() else {
             return Ok(());
         };
@@ -604,6 +621,35 @@ impl<R: Reader> Flow<R> {
         let res = self.guarded_step(spec, &label);
         self.c.guard_action = prev;
         self.c.guard_result(res)
+    }
+
+    /// Before `key:return`/`key:enter` or text with a newline: a newline can submit
+    /// (a keyboard whose return key reads like Send). A keyboard key label the
+    /// caller's own patterns match (`--deny-also`, config `deny_also`, an explicit
+    /// `--deny`) refuses the step with nothing sent; a match of only the built-in
+    /// default prints a warning, so no new default refusal. One `ui` read, only here.
+    fn guard_submit(&mut self, what: &str) -> Result<()> {
+        if self.deny.is_none() {
+            return Ok(());
+        }
+        let Ok(ctl) = self.controls(false, None, None, false, true) else {
+            return Ok(());
+        };
+        let keys: Vec<String> = ctl.iter().filter(|c| c.in_keyboard && !c.label.trim().is_empty()).map(|c| c.label.clone()).collect();
+        for k in &keys {
+            let by_caller = self.deny_also.as_ref().is_some_and(|rx| rx.is_match(k).unwrap_or(true))
+                || matches!(&self.deny, Some(DenyGuard::Custom(rx)) if rx.is_match(k).unwrap_or(true));
+            if by_caller {
+                return Err(Error::flow(format!(
+                    "refusing {what}: the keyboard key {} matches your deny patterns, so a newline may submit; nothing sent",
+                    json::py_repr_str(k)
+                )));
+            }
+            if matches!(self.deny, Some(DenyGuard::Default)) && DenyGuard::Default.regex().is_match(k).unwrap_or(false) {
+                crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(k));
+            }
+        }
+        Ok(())
     }
 
     fn guarded_step(&mut self, spec: &str, label: &str) -> Result<Option<Value>> {
@@ -752,6 +798,9 @@ impl<R: Reader> Flow<R> {
                 self.wait_input_focus();
                 self.last_tap_type = None;
                 self.mark_action(false, true);
+                if text.contains('\n') {
+                    self.guard_submit("multi-line type:")?;
+                }
                 let r = self.c.fast_keys(&text, None);
                 let redact = is_secret || crate::wda::echoes_secret(&r, &text);
                 check_wda_ok(r, "type", redact)?;
@@ -764,6 +813,9 @@ impl<R: Reader> Flow<R> {
                         json::py_repr_str(arg)
                     )));
                 };
+                if kname == "return" || kname == "enter" {
+                    self.guard_submit(&format!("key:{kname}"))?;
+                }
                 self.wait_input_focus();
                 self.last_tap_type = None;
                 self.mark_action(false, true);
@@ -969,6 +1021,9 @@ impl<R: Reader> Flow<R> {
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype click", red)?;
         clock::sleep(0.15);
+        if text.contains('\n') {
+            self.guard_submit("multi-line cleartype:")?;
+        }
         let r = self.c.fast_keys(&text, None);
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype", red)?;
