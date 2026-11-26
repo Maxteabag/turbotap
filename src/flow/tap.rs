@@ -1081,13 +1081,14 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// `tapat:X,Y`: tap the point, guarded like a labelled tap. The target is the
-    /// labelled control whose centre is nearest the point (within
-    /// [`TAPAT_RADIUS`] points), else the OCR line whose box contains it. Its label
-    /// goes through `--deny` and the tap lands on the exact point, in one step: no
-    /// separate `read` to map a point to a label, and no second lookup by label that
-    /// could hit another copy of it. Nothing labelled there, or a disabled control:
-    /// refused, naming the nearest labels.
+    /// `tapat:X,Y`: a label tap with a location hint. The target is the labelled
+    /// control whose centre is nearest the point (within [`TAPAT_RADIUS`] points),
+    /// else the OCR line whose box contains it. Its label goes through `--deny` (and
+    /// the app guard, like every input), and the tap lands on that control's (or
+    /// line's) own centre, never on the given point. One step: no separate `read` to
+    /// map a point to a label, and no second lookup by label that could hit another
+    /// copy of it. Nothing labelled there, or a disabled control: refused, naming the
+    /// nearest labels.
     pub fn tap_at(&mut self, x: i64, y: i64) -> Result<String> {
         self.wait_active_app(1.5, 0.03, None);
         let ctl = self.tap_ctl(None)?;
@@ -1097,11 +1098,11 @@ impl<R: Reader> Flow<R> {
             .filter(|c| !c.label.trim().is_empty() && (c.x - x).abs() <= TAPAT_RADIUS && (c.y - y).abs() <= TAPAT_RADIUS)
             .min_by_key(|c| d2(c))
             .cloned();
-        let label = match hit {
+        let (label, tx, ty) = match hit {
             Some(c) if c.is_disabled() => {
                 return Err(Error::flow(format!("{} at {x},{y} is disabled", json::py_repr_str(&c.label))));
             }
-            Some(c) => c.label,
+            Some(c) => (c.label, c.x, c.y),
             None => {
                 let lines = match self.fresh_lines(0.15)? {
                     Some(l) => l,
@@ -1113,7 +1114,10 @@ impl<R: Reader> Flow<R> {
                     .iter()
                     .find(|l| l.x0 - pad <= fx && fx <= l.x1 + pad && l.y0 - pad <= fy && fy <= l.y1 + pad && !l.text.trim().is_empty())
                 {
-                    Some(l) => l.text.clone(),
+                    Some(l) => {
+                        let (cx, cy) = l.center();
+                        (l.text.clone(), cx, cy)
+                    }
                     None => {
                         let mut near: Vec<&Control> = ctl.iter().filter(|c| !c.label.trim().is_empty()).collect();
                         near.sort_by_key(|c| d2(c));
@@ -1127,7 +1131,7 @@ impl<R: Reader> Flow<R> {
                 }
             }
         };
-        self.tap_point(x, y, &label, None)?;
+        self.tap_point(tx, ty, &label, None)?;
         Ok(label)
     }
 

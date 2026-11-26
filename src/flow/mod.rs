@@ -127,9 +127,10 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
   tapxy:X,Y             tap points
-  tapat:X,Y             tap the point, guarded by what is there: the labelled control nearest
-                        the point (within 24 pt) or the OCR line containing it goes through
-                        --deny; nothing labelled there is refused with the nearest labels
+  tapat:X,Y             label tap with a location hint: finds the labelled control nearest
+                        X,Y (within 24 pt; else the OCR line containing it), checks its label
+                        against --deny and taps that control's own centre, never the raw
+                        point; nothing labelled there is refused with the nearest labels
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
