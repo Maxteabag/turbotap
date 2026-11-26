@@ -106,6 +106,8 @@ pub struct MockState {
     pub element_types: HashMap<String, Value>,
     pub element_enabled: HashMap<String, Value>,
     pub focused_eid: Option<String>,
+    /// Keys typed via fastKeys land nowhere (a field that moved away under the keyboard).
+    pub keys_lost: bool,
     pub screenshot_b64: Option<Seq<String>>,
     /// A full-screen image: `/wda/fastScreenshot` crops `x0..x1`/`y0..y1` (points) and
     /// scales it like wda-turbo (`scale` 1.0 = this image's pixels), as lossless PNG.
@@ -150,6 +152,7 @@ impl Default for MockState {
             element_types: HashMap::new(),
             element_enabled: HashMap::new(),
             focused_eid: None,
+            keys_lost: false,
             screenshot_b64: None,
             screen: None,
             alert_text: None,
@@ -354,7 +357,9 @@ fn route(inner: &mut Inner, method: &str, path: &str, data: &Value) -> Value {
         }
         let text = joined_text(&g("value"));
         st.typed_history.push(("fastKeys".into(), text.clone(), g("frequency").as_i64()));
-        st.append_focused(&text);
+        if !st.keys_lost {
+            st.append_focused(&text);
+        }
         fire(on_action, st, "keys", &json!(text));
         return json!({"value": {"fastKeys": true}});
     }

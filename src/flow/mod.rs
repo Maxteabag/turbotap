@@ -217,7 +217,13 @@ pub const IMAGE_STEP_VERBS: &[&str] = &[
     "swipe", "back", "read",
 ];
 pub const STALE_UI_BACKOFF: [f64; 3] = [0.05, 0.08, 0.12];
-pub const INPUT_FOCUS_SETTLE: f64 = 0.25;
+pub /// Text this long (chars) is typed with a landing probe and a read-back (see `type_long`).
+const LONG_TEXT: usize = 120;
+/// Typing rate for long text, chars/s (WDA's own default is 60).
+const LONG_TEXT_FREQ: i64 = 200;
+/// Characters typed before checking that they landed in the focused field.
+const LONG_TEXT_PROBE: usize = 24;
+const INPUT_FOCUS_SETTLE: f64 = 0.25;
 
 /// `on|1|true` -> Some(true), `off|0|false` -> Some(false).
 pub fn toggle_state(s: &str) -> Option<bool> {
@@ -641,6 +647,61 @@ impl<R: Reader> Flow<R> {
             .filter(|s| !s.is_empty())
     }
 
+    /// The value WDA reports for `eid` ("" when it has none).
+    fn element_value(&mut self, eid: &str) -> String {
+        let p = self.c.spath(&format!("/element/{eid}/attribute/value"));
+        let r = self.c.get(&p);
+        if json::has_err(&r) {
+            return String::new();
+        }
+        json::get(&r, "value").as_str().unwrap_or("").to_string()
+    }
+
+    /// Long text into the focused field (not a secret): typed at LONG_TEXT_FREQ chars/s
+    /// (TURBOTAP_TYPING_FREQ wins), first a short probe whose landing is checked on the
+    /// focused element, so a field that moved or lost focus fails after a second instead
+    /// of after the whole text; then the rest, then a read-back of the whole text.
+    /// Returns "len=N" (never the text). With no focused element named by WDA the text
+    /// is typed as before, unchecked.
+    fn type_long(&mut self, text: &str) -> Result<String> {
+        let n = text.chars().count();
+        let freq = crate::config::typing_freq().unwrap_or(LONG_TEXT_FREQ);
+        let Some(eid) = self.active_element_id() else {
+            check_wda_ok(self.c.fast_keys(text, Some(freq)), "type", false)?;
+            return Ok(format!("len={n}"));
+        };
+        let before = self.element_value(&eid);
+        let cut = text.char_indices().nth(LONG_TEXT_PROBE).map(|(i, _)| i).unwrap_or(text.len());
+        let (head, tail) = text.split_at(cut);
+        check_wda_ok(self.c.fast_keys(head, Some(freq)), "type", false)?;
+        let now = self.element_value(&eid);
+        let probe = head.trim();
+        let landed = if probe.is_empty() || (now.is_empty() && before.is_empty()) {
+            // A field whose value WDA cannot read: keep going while focus stayed there.
+            self.active_element_id().as_deref() == Some(eid.as_str())
+        } else {
+            now.contains(probe)
+        };
+        if !landed {
+            return Err(Error::flow(format!(
+                "type: the first {} characters did not land in the focused field (it moved or lost focus); stopped there, the other {} were not sent: tap the field again and retype",
+                head.chars().count(),
+                n - head.chars().count()
+            )));
+        }
+        if !tail.is_empty() {
+            check_wda_ok(self.c.fast_keys(tail, Some(freq)), "type", false)?;
+        }
+        let after = self.element_value(&eid);
+        if !(after.is_empty() && before.is_empty()) && !after.contains(text.trim()) {
+            return Err(Error::flow(format!(
+                "type: after typing {n} characters at {freq}/s the field holds {} characters and not the whole text; check it with readfield: and fix it (TURBOTAP_TYPING_FREQ sets a slower rate)",
+                after.chars().count()
+            )));
+        }
+        Ok(format!("len={n}"))
+    }
+
     /// True once `eid` has keyboard focus (live, up to `max_wait` s).
     fn wait_focus_on(&mut self, eid: &str, max_wait: f64) -> bool {
         let end = clock::now() + max_wait;
@@ -1019,6 +1080,9 @@ impl<R: Reader> Flow<R> {
                 } else {
                     None
                 };
+                if target.is_none() && text.chars().count() >= LONG_TEXT {
+                    return some(self.type_long(&text)?);
+                }
                 let r = match target.as_deref() {
                     Some(eid) => self.bound_write(eid, &text),
                     None => self.c.fast_keys(&text, None),
@@ -1263,9 +1327,14 @@ impl<R: Reader> Flow<R> {
             return Err(Error::flow("cleartype: the target field did not get keyboard focus (nothing typed)"));
         }
         // A secret is written through the target element, never sent to whatever has focus.
-        let r = if is_secret { self.bound_write(&eid, &text) } else { self.c.fast_keys(&text, None) };
-        let red = redact || crate::wda::echoes_secret(&r, &text);
-        check_wda_ok(r, "cleartype", red)?;
+        if !is_secret && text.chars().count() >= LONG_TEXT {
+            // Long text: fast, with a landing probe (the read-back below still applies).
+            self.type_long(&text)?;
+        } else {
+            let r = if is_secret { self.bound_write(&eid, &text) } else { self.c.fast_keys(&text, None) };
+            let red = redact || crate::wda::echoes_secret(&r, &text);
+            check_wda_ok(r, "cleartype", red)?;
+        }
         clock::sleep(0.20);
         if is_secret {
             self.check_focus_after_secret("cleartype", &eid, &text)?;

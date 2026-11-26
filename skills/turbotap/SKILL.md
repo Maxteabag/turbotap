@@ -15,6 +15,16 @@ Use `turbotap` to operate any app on a real iPhone over Wi-Fi without AirPlay sc
 4. **Wait on the exact control, not the clock.** For anything slow (a download, an upload, a server reply), poll `ui` once a second against the control's own position or label with a hard deadline, and act in the same moment it appears, checking the exact target again right before the press. No fixed sleeps between checks, no hand-measured coordinate boxes.
 5. **Receipt.** At the end, `turbotap --device N timings --receipt --since START --until END` splits the wall clock into the helper between steps, WDA, app wait and turbotap, with retries, failures and the longest gaps. Put it in the report: it shows where the minutes went.
 
+### Compose a draft (a post, a message, a form) in few turns
+
+Each turn costs seconds of thinking, so do each phase in ONE `flow` call and read only what the next decision needs.
+1. **Open the composer:** `open:APP`, the create/compose control, then `ui` in the same flow.
+2. **Destination first** (community, channel, recipient), then `ui` again: the destination can change the composer (rules banners, required fields, which attachment types exist). Check here whether the attachment you need is offered at all; if not, say so instead of searching for it.
+3. **Attachment next**, if offered: pick the exact item (name, duration, date) in the picker in one flow.
+4. **Text last, each field in one flow:** `tap:<field>` then `type:<text>` (or `cleartype:`). Long text (120+ characters) is typed at 200 chars/s with a 24-character probe checked on the focused field and a read-back at the end; if it says the text "did not land" (the field moved, e.g. under a banner or the keyboard), tap the field again and retype only then.
+5. **Verify in one flow:** `assertfield:<title field>=file:TITLE.txt assertfield:<body field>=file:BODY.txt read` checks the exact text (blank lines included) and shows destination and attachment.
+6. **Stop at the draft.** Never press the composer's submit control (Post, Send, a top-bar Next in a filled composer) unless the user asked to publish.
+
 ## 1. Core Speed Rules (Read Before Running Anything)
 
 1. **Bundle steps into ONE `turbotap flow` command.** Never split `open:APP` and `tap:...` across LLM turns — each extra turn costs 15–25 s while a local `flow` step takes ~200–350 ms (session settings and screen size are cached per device in `~/.cache/turbotap/`).
@@ -60,6 +70,7 @@ turbotap flow open:Messenger search:Alice wait:'re:Alice\s+Smith'
 ## 4. Forms, Auth, PIN Pads & Tricky iOS Edge Cases
 
 - **Typing & control keys (`type:`, `key:`):** `type:` automatically waits for brief keyboard focus after tapping a `TextField`/`SearchField`/`SecureTextField`/`TextView` (no manual `sleep:` needed). Use `key:return|backspace|tab|space|escape` for control keys instead of escaping `\n` in the shell (for inline newlines in `type:`, use ANSI-C quoting `$'type:line1\nline2'`, since `"type:...\n"` sends literal `\n`).
+- **Long text (`type:`/`cleartype:` with 120+ characters):** typed at 200 chars/s (set `TURBOTAP_TYPING_FREQ` for another rate) after a 24-character probe that must land in the focused field, then read back; a probe that does not land stops the step with only those characters sent.
 - **WebView & editable fields (`cleartype:TEXT` + `dismisskb`):** iOS WebViews often append instead of replacing. `cleartype:` supports `TextField`, `SecureTextField`, `SearchField`, and `TextView` (plus `env:VAR` / `cmd:CMD` for secrets), clearing, typing via `/wda/keys`, and verifying read-back on non-secure fields. Follow with `dismisskb` (one localized predicate matching `Done`/`Ferdig`/`Hide keyboard`/`Skjul tastatur`/`Dismiss`/`Lukk`) before submitting.
 - **Formatted numeric inputs (`typedigits:VALUE|env:VAR`):** Clears the field, types 1 digit every `0.08 s` via `/wda/keys`, strips formatting on read-back, and asserts an exact digit-by-digit match (retrying once on mismatch) so WebView formatters never drop digits.
 - **Installs and other long operations:** an install or download button usually turns into progress and then into the control that opens the result; wait for that control with the recipe below. Enter a password only into the focused secure field: tap that field first, use `type:env:VAR`/`type:cmd:CMD`, then check with `ui`.

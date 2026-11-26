@@ -6,6 +6,7 @@ mod test_daemon;
 mod test_fields;
 mod test_filled_controls;
 mod test_flow_runner;
+mod test_long_text;
 mod test_ocr_and_matching;
 mod test_open_failures;
 mod test_packaging_and_assets;
