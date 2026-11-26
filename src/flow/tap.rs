@@ -1119,6 +1119,18 @@ impl<R: Reader> Flow<R> {
                                 continue;
                             }
                             seen.push(t);
+                            // The name the exception accepted as an icon identifier
+                            // (`chat-send-message`, `send-button`) was already checked
+                            // against the stricter risky-word list; `\bsend\b` in the
+                            // built-in pattern would match it at a hyphen. Only for the
+                            // built-in default: an explicit --deny still applies to it.
+                            let vetted_name = own.is_ok()
+                                && el_name.value() == Some(t)
+                                && super::is_safe_icon_name(t)
+                                && matches!(self.deny, Some(super::DenyGuard::Default));
+                            if vetted_name {
+                                continue;
+                            }
                             self.guard_relax(t, "tap", own.as_ref().map(|_| ()).map_err(Clone::clone))?;
                         }
                         let may_relax = own.is_ok();
