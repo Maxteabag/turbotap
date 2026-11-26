@@ -128,7 +128,7 @@ The last five rows were measured on an iPhone 17 during the overnight lab in [PR
 
 ### Timing log
 
-Every flow step and standalone command appends one JSON line to `~/.local/state/turbotap/timings.jsonl` (`$XDG_STATE_HOME` is honoured; `TURBOTAP_TIMINGS=PATH` moves it, `TURBOTAP_TIMINGS=0` turns it off). A line has the step and its argument (only for label, app, direction and coordinate steps: typed text and credentials are never written), `ms`, `wda_ms` (time spent in WDA requests), `sleep_ms`, `wda` (round trips), `shots`, `tree` (element and source queries), `bytes_in`/`bytes_out`, `retries`, the app in front as last known (no extra request) and `ok`/`error`. The log rotates to `timings.jsonl.1` at 16 MB.
+Every flow step and standalone command appends one JSON line to `~/.local/state/turbotap/timings.jsonl` (`$XDG_STATE_HOME` is honoured; `TURBOTAP_TIMINGS=PATH` moves it, `TURBOTAP_TIMINGS=0` turns it off). A line has the step and its argument (only for label, app, direction and coordinate steps: typed text and credentials are never written), `ms`, `wda_ms` (time spent in WDA requests), `sleep_ms`, `wda` (round trips), `shots`, `tree` (element and source queries), `bytes_in`/`bytes_out`, `retries`, `req_ms` (count and total ms per request kind, ids removed, slowest first, so you can see whether a step's time went into tree searches, taps or app checks), `target` (what a `tap:`/`tapif:`/`tapat:` resolved to), the app in front as last known (no extra request) and `ok`/`error`. The log rotates to `timings.jsonl.1` at 16 MB.
 
 ```sh
 turbotap timings --since 1h                # p50/p95/max per step kind, slowest and most retried steps

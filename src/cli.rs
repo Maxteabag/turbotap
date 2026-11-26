@@ -341,6 +341,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     match cmd {
         "preflight" | "unlock" | "ocr" | "vision-ocr" | "tree" | "screenshot" => {
             let (t0, req0) = (crate::clock::real_now(), client.stats);
+            client.req_kinds.clear();
             let r = match cmd {
                 "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock")),
                 "unlock" => crate::wda::cmd_unlock(&mut client),

@@ -667,6 +667,24 @@ pub struct ReqStats {
     pub wda_us: u64,
 }
 
+/// `METHOD /path` with the session id, element ids and query removed, so requests
+/// of one kind group together (`POST /session/:s/element/:id/clear`).
+pub fn req_kind(method: &str, path: &str) -> String {
+    let p = path.split('?').next().unwrap_or(path);
+    let mut out = String::with_capacity(p.len() + 8);
+    let mut prev = "";
+    for seg in p.split('/').skip(1) {
+        out.push('/');
+        out.push_str(match prev {
+            "session" => ":s",
+            "element" if seg != "active" => ":id",
+            _ => seg,
+        });
+        prev = seg;
+    }
+    format!("{} {}", method.to_ascii_uppercase(), if out.is_empty() { "/" } else { &out })
+}
+
 impl ReqStats {
     /// `self - before`, field by field.
     pub fn since(&self, before: &ReqStats) -> ReqStats {
@@ -710,6 +728,9 @@ impl ReqStats {
 pub struct WdaClient {
     /// Requests sent on this client's connection (for the per-step timing log).
     pub stats: ReqStats,
+    /// Time per request kind (`METHOD /path` with session and element ids replaced):
+    /// count and total microseconds. The timing log takes and clears it per step.
+    pub req_kinds: std::collections::BTreeMap<String, (u32, u64)>,
     pub base_url: String,
     pub udid: String,
     pub device_key: Option<String>,
@@ -775,6 +796,7 @@ impl WdaClient {
         let turbo = if crate::config::env("WDA_TURBO").as_deref() == Some("0") { Some(false) } else { None };
         WdaClient {
             stats: ReqStats::default(),
+            req_kinds: std::collections::BTreeMap::new(),
             base_url,
             udid: udid.to_string(),
             device_key: device_key.map(String::from),
@@ -885,6 +907,12 @@ impl WdaClient {
     /// True only when the app guard is on (a non-empty allowlist, no policy error,
     /// no earlier refusal) and a live `/wda/activeAppInfo` right now names an
     /// allowlisted app. Never refuses or records anything itself.
+    fn note_req_kind(&mut self, method: &str, path: &str, us: u64) {
+        let e = self.req_kinds.entry(req_kind(method, path)).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += us;
+    }
+
     pub fn foreground_confirmed_allowed(&mut self) -> bool {
         self.foreground_status().is_ok()
     }
@@ -1238,7 +1266,11 @@ impl WdaClient {
                     .unwrap()
                     .request_borrowed(method, path, body, headers, capture_err_body, &mut parser)
             })();
-            self.stats.wda_us += t_req.elapsed().as_micros() as u64;
+            let took = t_req.elapsed().as_micros() as u64;
+            self.stats.wda_us += took;
+            if sent {
+                self.note_req_kind(method, path, took);
+            }
             match res {
                 Ok(r) => {
                     self.stats.bytes_in += self.conn.as_ref().map_or(0, |c| c.body_buf.len() as u64);
@@ -1315,7 +1347,11 @@ impl WdaClient {
                 };
                 Ok((resp, parsed))
             })();
-            self.stats.wda_us += t_req.elapsed().as_micros() as u64;
+            let took = t_req.elapsed().as_micros() as u64;
+            self.stats.wda_us += took;
+            if sent {
+                self.note_req_kind(method, path, took);
+            }
             match res {
                 Ok(r) => {
                     self.stats.bytes_in += r.0.body.len() as u64;

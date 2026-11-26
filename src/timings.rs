@@ -96,6 +96,8 @@ pub struct StepRecord<'a> {
     /// What a tap step resolved to and touched (the matched text or control label),
     /// kept only for [`TARGET_VERBS`].
     pub target: Option<&'a str>,
+    /// Time per request kind in this step ([`crate::wda::req_kind`]): count, µs.
+    pub req_kinds: Option<&'a std::collections::BTreeMap<String, (u32, u64)>>,
 }
 
 /// Steps whose result is the label they tapped: logged as `target`.
@@ -121,6 +123,16 @@ impl StepRecord<'_> {
             "app": self.bundle,
             "ok": self.ok,
         });
+        if let Some(k) = self.req_kinds.filter(|k| !k.is_empty()) {
+            // Slowest kinds first, at most 12: {"POST /session/:s/element/:id/clear": [1, 950]}.
+            let mut kinds: Vec<(&String, &(u32, u64))> = k.iter().collect();
+            kinds.sort_by_key(|(_, (_, us))| std::cmp::Reverse(*us));
+            let mut m = serde_json::Map::new();
+            for (name, (n, us)) in kinds.into_iter().take(12) {
+                m.insert(name.clone(), j!([n, (*us as f64 / 1000.0).round() as i64]));
+            }
+            v["req_ms"] = Value::Object(m);
+        }
         if let Some(t) = self.target.filter(|_| TARGET_VERBS.contains(&kind.as_str())) {
             let short: String = scrub(t).chars().take(80).collect();
             v["target"] = Value::String(short);
@@ -153,6 +165,7 @@ pub fn record_command(c: &crate::wda::WdaClient, cmd: &str, t0: f64, req0: ReqSt
         ok: err.is_none(),
         error: err_s.as_deref(),
         target: None,
+        req_kinds: Some(&c.req_kinds),
     };
     append(&rec.to_value(str::to_string));
 }

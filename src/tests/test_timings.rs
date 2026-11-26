@@ -39,6 +39,10 @@ fn test_each_flow_step_appends_one_redacted_line_with_request_counts() {
     assert_eq!(lines.len(), 3, "{raw}");
     assert_eq!(lines[0]["step"], "tapxy");
     assert_eq!(lines[0]["arg"], "5,6");
+    // Time per request kind, ids removed.
+    let kinds = lines[0]["req_ms"].as_object().unwrap();
+    assert!(kinds.keys().any(|k| k.starts_with("POST /session/:s/wda/")), "{kinds:?}");
+    assert!(kinds.values().all(|v| v[0].as_u64().unwrap() >= 1), "{kinds:?}");
     assert_eq!(lines[0]["ok"], true);
     assert!(lines[0]["wda"].as_u64().unwrap() >= 1, "{}", lines[0]);
     assert!(lines[0]["bytes_out"].as_u64().unwrap() > 0, "{}", lines[0]);
@@ -75,6 +79,16 @@ fn test_tapat_logs_the_label_it_resolved_to() {
     assert_eq!(lines[0]["step"], "tapat");
     assert_eq!(lines[0]["arg"], "372,66");
     assert_eq!(lines[0]["target"], "Settings");
+}
+
+#[test]
+fn test_req_kind_groups_requests() {
+    use crate::wda::req_kind;
+    assert_eq!(req_kind("post", "/session/abc-1/element/EL-9/clear"), "POST /session/:s/element/:id/clear");
+    assert_eq!(req_kind("GET", "/session/x/element/E1/attribute/value?y=1"), "GET /session/:s/element/:id/attribute/value");
+    assert_eq!(req_kind("GET", "/wda/activeAppInfo"), "GET /wda/activeAppInfo");
+    assert_eq!(req_kind("POST", "/session/x/elements"), "POST /session/:s/elements");
+    assert_eq!(req_kind("GET", "/session/x/element/active"), "GET /session/:s/element/active");
 }
 
 #[test]

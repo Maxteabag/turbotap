@@ -1176,6 +1176,7 @@ impl<R: Reader> Flow<R> {
                 }
             }
             let (req0, slept0) = (self.c.stats, clock::slept_total());
+            self.c.req_kinds.clear();
             self.step_retries = 0;
             let outcome = self.step(spec);
             self.record_timing(spec, s0, req0, slept0, &outcome);
@@ -1281,6 +1282,7 @@ impl<R: Reader> Flow<R> {
             ok: err.is_none(),
             error: err_s.as_deref(),
             target,
+            req_kinds: Some(&self.c.req_kinds),
         };
         crate::timings::append(&rec.to_value(|t| self.scrub(t)));
     }

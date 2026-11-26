@@ -69,7 +69,7 @@ turbotap flow open:Messenger search:Alice wait:'re:Alice\s+Smith'
 
 ## 6. Timing log (`turbotap timings`)
 
-Every flow step and standalone command appends one JSON line to `~/.local/state/turbotap/timings.jsonl` (`TURBOTAP_TIMINGS=PATH` moves it, `TURBOTAP_TIMINGS=0` turns it off): step, safe argument (never typed text or credentials), `ms`, `wda_ms` (time in WDA requests), `sleep_ms`, `wda` round trips, `shots`, `tree` queries, bytes, `retries`, app and ok/error. `turbotap timings --since 1h --by step|app|step+app` prints p50/p95/max per group plus the slowest and most retried steps. Use it after a session to find what to fix (see `turbotap-retro`).
+Every flow step and standalone command appends one JSON line to `~/.local/state/turbotap/timings.jsonl` (`TURBOTAP_TIMINGS=PATH` moves it, `TURBOTAP_TIMINGS=0` turns it off): step, safe argument (never typed text or credentials), `ms`, `wda_ms` (time in WDA requests), `sleep_ms`, `wda` round trips, `shots`, `tree` queries, bytes, `retries`, `req_ms` (time per request kind, to see where a step's time went), `target` (what a tap resolved to), app and ok/error. `turbotap timings --since 1h --by step|app|step+app` prints p50/p95/max per group plus the slowest and most retried steps. Use it after a session to find what to fix (see `turbotap-retro`).
 
 ## 7. Setup & Reference
 
