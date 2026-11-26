@@ -736,6 +736,9 @@ pub struct WdaClient {
     /// Stop files re-checked before every input request (set by the CLI for commands
     /// that touch the phone): a stop file created mid-run stops the next input.
     pub stop_paths: Vec<std::path::PathBuf>,
+    /// Caller-provided label patterns refused on top of the active --deny
+    /// (`--deny-also`, config `deny_also`); compiled by the flow.
+    pub deny_also: Vec<String>,
     /// Requests sent on this client's connection (for the per-step timing log).
     pub stats: ReqStats,
     /// The app a live `/wda/activeAppInfo` last named (for the timing log; never used
@@ -817,6 +820,7 @@ impl WdaClient {
             stats: ReqStats::default(),
             req_kinds: std::collections::BTreeMap::new(),
             stop_paths: Vec::new(),
+            deny_also: Vec::new(),
             last_foreground: None,
             base_url,
             udid: udid.to_string(),

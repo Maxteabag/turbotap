@@ -146,6 +146,20 @@ fn allow_url_scheme_arg() -> Arg {
     )
 }
 
+/// `--deny-also` values plus config `deny_also` (the device's own, else top-level; a
+/// string or a list): label patterns the caller adds, in their locale.
+fn deny_also_values(m: &ArgMatches, sm: &ArgMatches, dev_key: Option<&str>) -> Vec<String> {
+    let mut out = many_values(m, sm, "deny-also");
+    let cfg = crate::config::current();
+    let dev = dev_key.and_then(|k| cfg.raw.get("devices").and_then(|d| d.get(k))).and_then(|r| r.get("deny_also"));
+    match dev.or_else(|| cfg.raw.get("deny_also")) {
+        Some(Value::String(s)) if !s.trim().is_empty() => out.push(s.clone()),
+        Some(Value::Array(a)) => out.extend(a.iter().filter_map(|e| e.as_str()).filter(|s| !s.trim().is_empty()).map(String::from)),
+        _ => {}
+    }
+    out
+}
+
 fn many_values(m: &ArgMatches, sm: &ArgMatches, name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for mm in [m, sm] {
@@ -289,6 +303,13 @@ pub fn build_command() -> Command {
                 .arg(float_arg("timeout").default_value("8.0").help("per waiting step (s)"))
                 .arg(float_arg("scale").default_value("1.5").help("OCR px per point"))
                 .arg(Arg::new("deny").long("deny").help("regex of tap labels to refuse"))
+                .arg(
+                    Arg::new("deny-also")
+                        .long("deny-also")
+                        .value_name("REGEX")
+                        .action(ArgAction::Append)
+                        .help("extra labels to refuse on top of --deny or the default (repeatable; also config deny_also); never relaxed, and used to refuse key:return or multi-line text when the keyboard's keys match"),
+                )
                 .arg(Arg::new("no-deny").long("no-deny").action(ArgAction::SetTrue))
                 .arg(flag("quiet", "no per-step progress on stderr"))
                 .arg(allow_app_arg())
@@ -398,6 +419,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         // Resolved by the start gate just above (an error there already refused).
         client.stop_paths = crate::stop::paths_for(&keys).unwrap_or_default();
     }
+    client.deny_also = deny_also_values(&m, sm, target.dev_key.as_deref());
     match allowed {
         Ok(list) => client.set_allowed_apps(list),
         // A broken config.json or an unresolvable device never means "no guard".
