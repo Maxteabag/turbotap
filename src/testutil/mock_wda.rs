@@ -107,6 +107,9 @@ pub struct MockState {
     pub element_enabled: HashMap<String, Value>,
     pub focused_eid: Option<String>,
     pub screenshot_b64: Option<Seq<String>>,
+    /// A full-screen image: `/wda/fastScreenshot` crops `x0..x1`/`y0..y1` (points) and
+    /// scales it like wda-turbo (`scale` 1.0 = this image's pixels), as lossless PNG.
+    pub screen: Option<crate::image::GrayImage>,
     /// None -> 404 "no such alert". A Null value from the source also means 404; a
     /// dict is returned as-is.
     pub alert_text: Option<Dyn>,
@@ -148,6 +151,7 @@ impl Default for MockState {
             element_enabled: HashMap::new(),
             focused_eid: None,
             screenshot_b64: None,
+            screen: None,
             alert_text: None,
             alert_buttons: None,
             calls: Vec::new(),
@@ -534,6 +538,18 @@ fn route(inner: &mut Inner, method: &str, path: &str, data: &Value) -> Value {
         return json!({"value": null});
     }
     if clean == "/wda/fastScreenshot" || clean == "/screenshot" {
+        if let Some(img) = st.screen.as_ref() {
+            let num = |k: &str| data.get(k).and_then(Value::as_f64);
+            let (ix, iy) = (img.w as f64, img.h as f64);
+            // Points to pixels: the crop's x1 is the screen width in points.
+            let k = num("x1").map(|x1| ix / x1.max(1.0)).unwrap_or(1.0);
+            let (x0, x1) = (num("x0").map_or(0.0, |v| v * k), num("x1").map_or(ix, |v| v * k));
+            let (y0, y1) = (num("y0").map_or(0.0, |v| v * k), num("y1").map_or(iy, |v| v * k));
+            let crop = img.crop(x0 as i64, y0 as i64, x1.min(ix) as i64, y1.min(iy) as i64);
+            let sc = if clean == "/screenshot" { 1.0 } else { num("scale").unwrap_or(1.0) };
+            let out = crop.resize_bilinear(((crop.w as f64 * sc).round() as u32).max(1), ((crop.h as f64 * sc).round() as u32).max(1));
+            return json!({"value": super::b64_image(&out, "PNG", 100)});
+        }
         if let Some(s) = st.screenshot_b64.as_mut() {
             return json!({"value": s.next()});
         }

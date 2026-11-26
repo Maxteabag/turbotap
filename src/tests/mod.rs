@@ -4,6 +4,7 @@ mod test_conditional_screenshot;
 mod test_deny_submit;
 mod test_daemon;
 mod test_fields;
+mod test_filled_controls;
 mod test_flow_runner;
 mod test_ocr_and_matching;
 mod test_open_failures;

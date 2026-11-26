@@ -436,6 +436,112 @@ pub fn tesseract_tsv_binary(raw: &[u8], w: u32, h: u32, psm: i32, sauvola: bool)
 /// One OCR line as raw strip-pixel word boxes `(text, x0, y0, x1, y1)`.
 pub type RawWords = Vec<(String, i64, i64, i64, i64)>;
 
+/// The inside of a filled control in one OCR strip (strip pixels, end-exclusive), and
+/// how to binarize its label: ink is brighter (or darker) than `threshold`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilledControl {
+    pub xa: usize,
+    pub xb: usize,
+    pub ya: usize,
+    pub yb: usize,
+    pub threshold: i32,
+    pub ink_brighter: bool,
+}
+
+/// Filled controls in a strip: a block at least a quarter of the strip wide and 10 px
+/// tall whose fill differs from the background (the level at the strip's left and right
+/// edges), is even (most of it within 16 levels of its own level, so not a photo) and
+/// holds a label (pixels far from the fill, 0.3 to 40 % of it). At most four per strip;
+/// the rounded ends are left out.
+pub fn filled_controls(raw: &[u8], w: usize, h: usize) -> Vec<FilledControl> {
+    const DIFF: i32 = 40;
+    let mut out = Vec::new();
+    if w < 40 || h < 10 || raw.len() < w * h {
+        return out;
+    }
+    let mode = |vals: &mut dyn Iterator<Item = u8>| -> i32 {
+        let mut hist = [0u32; 32];
+        for v in vals {
+            hist[(v >> 3) as usize] += 1;
+        }
+        let bin = (0..32).max_by_key(|&i| hist[i]).unwrap_or(0);
+        bin as i32 * 8 + 4
+    };
+    // The page is what touches the strip's sides (a wide control can outnumber it).
+    let bg = mode(&mut (0..h).flat_map(|y| [0, 1, w - 2, w - 1].map(|x| raw[y * w + x])));
+    let far = |v: u8, from: i32| (v as i32 - from).abs() > DIFF;
+    let wide: Vec<bool> = (0..h)
+        .map(|y| {
+            let row = &raw[y * w..y * w + w];
+            let n = row.iter().step_by(2).filter(|&&v| far(v, bg)).count();
+            n * 4 >= w.div_ceil(2)
+        })
+        .collect();
+    let mut y = 0;
+    while y < h && out.len() < 4 {
+        if !wide[y] {
+            y += 1;
+            continue;
+        }
+        let ya = y;
+        while y < h && wide[y] {
+            y += 1;
+        }
+        let yb = y;
+        let rh = yb - ya;
+        if rh < 10 {
+            continue;
+        }
+        // Columns filled in at least 90 % of the run's top and bottom margin rows: a
+        // label sits in the middle and may match the page (white text, white page).
+        let m = (rh / 6).max(2);
+        let edge_rows: Vec<usize> = (ya..ya + m).chain(yb - m..yb).collect();
+        let full: Vec<bool> = (0..w)
+            .map(|x| edge_rows.iter().filter(|&&r| far(raw[r * w + x], bg)).count() * 10 >= edge_rows.len() * 9)
+            .collect();
+        let mut x = 0;
+        while x < w && out.len() < 4 {
+            if !full[x] {
+                x += 1;
+                continue;
+            }
+            let xa0 = x;
+            while x < w && full[x] {
+                x += 1;
+            }
+            let xb0 = x;
+            if (xb0 - xa0) * 4 < w {
+                continue;
+            }
+            let trim = (rh / 2).min((xb0 - xa0) / 4);
+            let (xa, xb, iya, iyb) = (xa0 + trim, xb0 - trim, ya + 1, yb - 1);
+            if xb <= xa + 8 || iyb <= iya + 6 {
+                continue;
+            }
+            let px = || (iya..iyb).flat_map(move |r| raw[r * w + xa..r * w + xb].iter().copied());
+            let fill = mode(&mut px());
+            if (fill - bg).abs() <= DIFF {
+                continue;
+            }
+            let area = (xb - xa) * (iyb - iya);
+            let even = px().filter(|&v| (v as i32 - fill).abs() <= 16).count();
+            let (mut ink_n, mut ink_sum) = (0usize, 0i64);
+            for v in px() {
+                if (v as i32 - fill).abs() > 60 {
+                    ink_n += 1;
+                    ink_sum += v as i64;
+                }
+            }
+            if even * 10 < area * 6 || ink_n * 1000 < area * 3 || ink_n * 10 > area * 4 {
+                continue;
+            }
+            let ink = (ink_sum / ink_n as i64) as i32;
+            out.push(FilledControl { xa, xb, ya: iya, yb: iyb, threshold: (fill + ink) / 2, ink_brighter: ink > fill });
+        }
+    }
+    out
+}
+
 /// Parse Tesseract TSV level-5 rows (conf > 30) grouped by (block, par, line), in
 /// first-seen order.
 pub fn parse_tsv(tsv: &str) -> Vec<RawWords> {
@@ -843,6 +949,23 @@ pub type TsvHook = Arc<dyn Fn(&[u8], u32, u32, i32, bool) -> Result<String> + Se
 /// Test replacement for `ocr_raw` (Python `mock.patch.object(reader, "_ocr_raw")`).
 pub type OcrRawHook = Arc<dyn Fn(&[u8], u32, u32, bool) -> Result<Vec<RawWords>> + Send + Sync>;
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: the `ocr_raw_hook` every [`ScreenReader`] made on this thread starts with,
+    /// so CLI-level tests (which build their own reader) can stand in for Tesseract.
+    pub static TEST_OCR_RAW_HOOK: std::cell::RefCell<Option<OcrRawHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_ocr_raw_hook() -> Option<OcrRawHook> {
+    TEST_OCR_RAW_HOOK.with(|h| h.borrow().clone())
+}
+
+#[cfg(not(test))]
+fn test_ocr_raw_hook() -> Option<OcrRawHook> {
+    None
+}
+
 /// Full-screen OCR for any app, no coordinates known in advance.
 ///
 /// - grab: wda-turbo /wda/fastScreenshot downscaled on the phone to OCR size
@@ -907,7 +1030,7 @@ impl ScreenReader {
             shot_decoded: None,
             conditional_hits: 0,
             tsv_hook: None,
-            ocr_raw_hook: None,
+            ocr_raw_hook: test_ocr_raw_hook(),
             pool: Mutex::new(None),
             warming: Mutex::new(Vec::new()),
             explicit_workers,
@@ -1064,6 +1187,46 @@ impl ScreenReader {
 
     /// OCR one strip (uniform-strip skip, dark-mode pre-inversion, direct
     /// `TessResultIterator` recognition, Sauvola variables).
+    /// OCR one strip, then read the label of any filled control (a button) the strip
+    /// OCR found no word in. One threshold for the whole strip separates the page from
+    /// the control's fill and loses a label that differs from that fill (white text on a
+    /// bright button on a dark page): the label is read again from the control's inside
+    /// on its own, binarized between the fill and the label.
+    pub fn ocr_strip(&self, raw: &[u8], w: u32, h: u32, sauvola: bool) -> Result<Vec<RawWords>> {
+        let mut lines = self.ocr_raw(raw, w, h, sauvola)?;
+        for b in filled_controls(raw, w as usize, h as usize) {
+            let inside = |(_, x0, y0, x1, y1): &(String, i64, i64, i64, i64)| {
+                let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+                b.xa as i64 <= cx && cx < b.xb as i64 && b.ya as i64 <= cy && cy < b.yb as i64
+            };
+            if lines.iter().flatten().any(inside) {
+                continue;
+            }
+            let (cw, ch) = (b.xb - b.xa, b.yb - b.ya);
+            let mut buf = Vec::with_capacity(cw * ch);
+            for y in b.ya..b.yb {
+                for &v in &raw[y * w as usize + b.xa..y * w as usize + b.xb] {
+                    let is_ink = if b.ink_brighter { v as i32 > b.threshold } else { (v as i32) < b.threshold };
+                    buf.push(if is_ink { 0 } else { 255 });
+                }
+            }
+            for line in self.ocr_raw(&buf, cw as u32, ch as u32, false)? {
+                let line: RawWords = line
+                    .into_iter()
+                    .filter(|(t, ..)| t.chars().filter(|c| c.is_alphanumeric()).count() >= 2)
+                    .map(|(t, x0, y0, x1, y1)| {
+                        let (dx, dy) = (b.xa as i64, b.ya as i64);
+                        (t, x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+                    })
+                    .collect();
+                if !line.is_empty() {
+                    lines.push(line);
+                }
+            }
+        }
+        Ok(lines)
+    }
+
     pub fn ocr_raw(&self, raw: &[u8], w: u32, h: u32, sauvola: bool) -> Result<Vec<RawWords>> {
         if let Some(hook) = self.ocr_raw_hook.as_ref() {
             return hook(raw, w, h, sauvola);
@@ -1619,7 +1782,7 @@ impl Reader for ScreenReader {
         }
         if !uniq.is_empty() {
             let results: Vec<Result<Vec<RawWords>>> = if uniq.len() == 1 {
-                vec![self.ocr_raw(uniq[0].0, w as u32, uniq[0].1 as u32, sauvola)]
+                vec![self.ocr_strip(uniq[0].0, w as u32, uniq[0].1 as u32, sauvola)]
             } else {
                 let this: &ScreenReader = self;
                 std::thread::scope(|s| {
@@ -1627,7 +1790,7 @@ impl Reader for ScreenReader {
                         .iter()
                         .map(|(raw, sh, _)| {
                             let (raw, sh) = (*raw, *sh);
-                            clock::spawn_scoped(s, move || this.ocr_raw(raw, w as u32, sh as u32, sauvola))
+                            clock::spawn_scoped(s, move || this.ocr_strip(raw, w as u32, sh as u32, sauvola))
                         })
                         .collect();
                     handles
