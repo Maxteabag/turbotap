@@ -2809,6 +2809,10 @@ fn test_flow_ending_with_open_returns_once_the_app_is_in_front() {
     assert_eq!(flow.pending_bundle, None, "flow returned before the app came to the front");
     let calls = mock.paths().iter().filter(|p| p.as_str() == "/wda/activeAppInfo").count();
     assert!(calls >= 3, "{calls}");
+    flow.close();
+}
+
+#[test]
 fn test_key_step_that_leaves_the_app_prints_a_warning() {
     let _cache = isolated_cache();
     let (_s, _g) = skip_sleep();
