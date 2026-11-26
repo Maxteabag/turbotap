@@ -457,6 +457,12 @@ fn route(inner: &mut Inner, method: &str, path: &str, data: &Value) -> Value {
         };
         return json!({"value": v});
     }
+    if clean.ends_with("/element/active") && method == "GET" {
+        return match st.focused_eid.clone() {
+            Some(eid) => json!({"value": {"ELEMENT": eid}}),
+            None => json!({"error": 404, "body": "no such element"}),
+        };
+    }
     let parts: Vec<&str> = clean.splitn(6, '/').collect();
     // ["", "session", sid, "element", eid, sub...]
     if parts.len() == 6 && parts[1] == "session" && parts[3] == "element" {

@@ -168,9 +168,14 @@ fn test_controls_and_read_full_reject_persistent_mismatched_bundle() {
 fn test_typing_500_fails_and_redacts_secrets_and_200_never_replays() {
     let _cache = isolated_cache();
     // HTTP 500 on /wda/fastKeys must fail flow type:, not return ok: True
-    let c500 = MockWda::start(MockState::default());
-    c500.set_custom_handler(|_, _m, p, _d| {
-        (p == "/wda/fastKeys").then(|| json!({"error": 500, "body": "secret-leak-token"}))
+    // A focused text field: a secret is typed only into a field that has focus.
+    let mut st500 = MockState::default();
+    st500.elements_map.insert("XCUIElementTypeTextField".into(), vec![json!({"ELEMENT": "tf1"})]);
+    st500.set_element_value("tf1", Dyn::one(json!("")));
+    let c500 = MockWda::start(st500);
+    // A secret is written through the focused element: fail that write.
+    c500.set_custom_handler(|_, m, p, _d| {
+        (m == "POST" && p.ends_with("/element/tf1/value")).then(|| json!({"error": 500, "body": "secret-leak-token"}))
     });
     let r = FakeReader::new(vec![(solid_img(200, (120, 240)), vec![])]);
     let mut flow = new_flow(&c500, r);
@@ -182,9 +187,9 @@ fn test_typing_500_fails_and_redacts_secrets_and_200_never_replays() {
     assert!(e.is_flow(), "{e:?}");
     assert!(!e.to_string().contains("SuperSecret123"));
     assert!(!e.to_string().contains("secret-leak-token"));
-    // Must NOT have fallen back to legacy /wda/keys on 500
+    // Must NOT have fallen back to any focus-typing route on 500
     let keys: Vec<String> = c500.paths().into_iter().filter(|p| p.to_lowercase().contains("keys")).collect();
-    assert_eq!(keys, vec!["/wda/fastKeys"]);
+    assert!(keys.is_empty(), "{keys:?}");
     flow.close();
 
     // 200 OK missing fastKeys marker must NOT replay through legacy /wda/keys
