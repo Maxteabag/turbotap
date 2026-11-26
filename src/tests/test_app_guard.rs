@@ -2149,7 +2149,7 @@ fn test_allow_url_scheme_opens_the_apps_own_scheme_only_with_allow_app() {
     // Refused before anything reaches /url.
     let cases: [(&str, &[&str], &[&str], &[&str], &str); 6] = [
         ("exampleapp://pair", &[OTHER], &[], &["exampleapp"], "only together with --allow-app"),
-        ("exampleapp://pair", &[], &[ALLOWED], &["exampleapp"], "was not given with --allow-app"),
+        ("exampleapp://pair", &[OTHER], &[ALLOWED], &["exampleapp"], "was not given with --allow-app"),
         ("otherapp://pair", &[], &[OTHER], &["exampleapp"], "was not given with --allow-url-scheme"),
         ("https://links.example.com/x", &[], &[OTHER], &["https"], "is a system scheme"),
         ("sms:+0000", &[], &[OTHER], &["sms"], "is a system scheme"),
