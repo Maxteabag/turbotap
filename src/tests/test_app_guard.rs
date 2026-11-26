@@ -2099,3 +2099,119 @@ fn test_allow_label_is_repeatable_exact_only_and_the_stop_file_wins() {
     assert!(mock.tapped_points().is_empty());
     assert!(input_posts(&mock).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// v1.5.2: --allow-url-scheme SCHEME (with --allow-app) for an app's own custom scheme
+// ---------------------------------------------------------------------------
+
+/// A mock with `front` in front; a POST /url records the URL and puts `lands_in` in
+/// front (what iOS would open).
+fn url_mock(front: &str, lands_in: &str) -> (MockWda, Arc<std::sync::Mutex<Vec<String>>>) {
+    let mock = MockWda::start(state_with_app(json!(front)));
+    let opened = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let o = opened.clone();
+    let lands = lands_in.to_string();
+    mock.set_custom_handler(move |st, m, p, d| {
+        if m == "POST" && p.ends_with("/url") {
+            o.lock().unwrap().push(crate::json::py_str(crate::json::get(d, "url")));
+            st.active_app = Seq::one(json!(lands.clone()));
+            return Some(json!({"value": null}));
+        }
+        None
+    });
+    (mock, opened)
+}
+
+fn url_flow(mock: &MockWda, config: &[&str], run_apps: &[&str], schemes: &[&str]) -> Flow<FakeReader> {
+    let mut c = mock.client();
+    let mut all: Vec<&str> = config.to_vec();
+    all.extend_from_slice(run_apps);
+    c.set_allowed_apps(strs(&all));
+    c.set_run_allow(strs(run_apps), vec![]);
+    c.set_allow_url_schemes(strs(schemes));
+    Flow::new(c, blank_reader(), 1.0, Some(DENY_DEFAULT), false).unwrap()
+}
+
+#[test]
+fn test_allow_url_scheme_opens_the_apps_own_scheme_only_with_allow_app() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // Opened: exact custom scheme, --allow-app app in front before and after.
+    for (scheme, url) in [("exampleapp", "exampleapp://pair?code=x"), ("ExampleApp", "EXAMPLEAPP://pair"), ("exampleapp://", "exampleapp:open")] {
+        let (mock, opened) = url_mock(OTHER, OTHER);
+        let mut flow = url_flow(&mock, &[], &[OTHER], &[scheme]);
+        flow.step(&format!("url:{url}")).unwrap_or_else(|e| panic!("{scheme} {url}: {e:?}"));
+        assert_eq!(opened.lock().unwrap().len(), 1, "{scheme} {url}");
+        // Input still works afterwards in the same app.
+        flow.step("tapxy:5,6").unwrap();
+        flow.close();
+    }
+    // Refused before anything reaches /url.
+    let cases: [(&str, &[&str], &[&str], &[&str], &str); 6] = [
+        ("exampleapp://pair", &[OTHER], &[], &["exampleapp"], "only together with --allow-app"),
+        ("exampleapp://pair", &[], &[ALLOWED], &["exampleapp"], "was not given with --allow-app"),
+        ("otherapp://pair", &[], &[OTHER], &["exampleapp"], "was not given with --allow-url-scheme"),
+        ("https://links.example.com/x", &[], &[OTHER], &["https"], "is a system scheme"),
+        ("sms:+0000", &[], &[OTHER], &["sms"], "is a system scheme"),
+        ("x-apple-reminderkit://x", &[], &[OTHER], &["x-apple-reminderkit"], "is a system scheme"),
+    ];
+    for (url, config, run_apps, schemes, want) in cases {
+        let (mock, opened) = url_mock(OTHER, OTHER);
+        let mut flow = url_flow(&mock, config, run_apps, schemes);
+        let m = expect_guard_err(flow.step(&format!("url:{url}")), want);
+        assert!(m.contains("iOS chooses which app opens a URL"), "{m}");
+        assert!(opened.lock().unwrap().is_empty(), "{url}");
+        flow.close();
+        // The request level refuses the same way (a direct POST /url).
+        let mut c = mock.client();
+        c.set_allowed_apps(strs(&[OTHER]));
+        c.set_run_allow(strs(run_apps), vec![]);
+        c.set_allow_url_schemes(strs(schemes));
+        let p = c.spath("/url");
+        let r = c.post(&p, &json!({"url": url}));
+        assert!(crate::json::has_err(&r), "{url}: {r}");
+        assert!(opened.lock().unwrap().is_empty(), "{url}");
+    }
+    // Landing in another app: the step fails and no further input is sent.
+    let (mock, opened) = url_mock(OTHER, "com.example.somewhere-else");
+    let mut flow = url_flow(&mock, &[], &[OTHER], &["exampleapp"]);
+    let cap = crate::testutil::capture::Capture::start();
+    expect_guard_err(flow.step("url:exampleapp://pair"), "'com.example.somewhere-else' came to the front");
+    assert!(cap.stderr().contains("brought 'com.example.somewhere-else' to the front"), "{}", cap.stderr());
+    assert_eq!(opened.lock().unwrap().len(), 1);
+    assert!(flow.step("tapxy:5,6").is_err());
+    assert!(mock.tapped_points().is_empty());
+    flow.close();
+    // The scheme is logged, never the URL (it can carry a pairing token).
+    let (mock, _) = url_mock(OTHER, OTHER);
+    let mut flow = url_flow(&mock, &[], &[OTHER], &["exampleapp"]);
+    let cap = crate::testutil::capture::Capture::start();
+    flow.step("url:exampleapp://pair?token=SECRET123").unwrap();
+    let err = cap.stderr();
+    assert!(err.contains("--allow-url-scheme opened a exampleapp: URL"), "{err}");
+    assert!(!err.contains("SECRET123"), "{err}");
+    flow.close();
+}
+
+#[test]
+fn test_allow_url_scheme_cli_and_the_stop_file_wins() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let (mock, opened) = url_mock(OTHER, OTHER);
+    {
+        let _e = cli_env(&mock.url, &[]);
+        let (code, out, err) =
+            run(&["--no-daemon", "flow", "--quiet", "--allow-app", OTHER, "--allow-url-scheme", "exampleapp", "url:exampleapp://pair"]);
+        assert_eq!(code, 0, "{out} {err}");
+        assert_eq!(opened.lock().unwrap().len(), 1);
+    }
+    let dir = TempDir::new("tt-url-scheme-stop-");
+    let stop = dir.path().join("phone.stop");
+    std::fs::write(&stop, "").unwrap();
+    let stop_s = stop.to_string_lossy().into_owned();
+    let _e = cli_env(&mock.url, &[("TURBOTAP_STOP_FILE", Some(stop_s.as_str()))]);
+    let (code, out, err) =
+        run(&["--no-daemon", "flow", "--quiet", "--allow-app", OTHER, "--allow-url-scheme", "exampleapp", "url:exampleapp://pair"]);
+    assert_eq!(code, 6, "{out} {err}");
+    assert_eq!(opened.lock().unwrap().len(), 1, "nothing more opened while the stop file exists");
+}

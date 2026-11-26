@@ -225,6 +225,11 @@ impl<R: Reader> Flow<R> {
         self.mark_action(false, false);
         let p = self.c.spath("/url");
         check_wda_ok(self.c.post(&p, &j!({"url": raw})), "url", false)?;
+        if self.c.app_guard_active() {
+            // Only reachable with --allow-url-scheme: check where the URL landed.
+            let label = self.c.guard_action.clone().unwrap_or_else(|| "url:".to_string());
+            self.c.confirm_url_landed(&label)?;
+        }
         // Target app may stay the same (e.g. Safari -> new URL) or switch via universal
         // link/deep-link; clear expected bundle and outgoing-app guard so subsequent
         // same-app reads are never misclassified as stale.

@@ -526,6 +526,33 @@ pub fn refuse_target(action: &str, target: Option<&str>, allowed: &[String]) -> 
     }
 }
 
+/// URL schemes `--allow-url-scheme` never opens: web, phone, messaging, mail, store,
+/// maps, settings, files and scripting schemes iOS or system apps handle.
+pub const SYSTEM_URL_SCHEMES: &[&str] = &[
+    "http", "https", "tel", "telprompt", "sms", "smsto", "mms", "imessage", "mailto", "message", "facetime",
+    "facetime-audio", "facetime-prompt", "itms", "itms-apps", "itms-appss", "itms-services", "itms-beta",
+    "itms-books", "itms-bookss", "maps", "map", "comgooglemaps", "prefs", "app-prefs", "app-settings", "settings",
+    "shortcuts", "workflow", "file", "data", "javascript", "about", "blob", "webcal", "calshow", "x-web-search",
+    "music", "musics", "audio-player-event", "videos", "photos-redirect", "wallet", "shoebox", "applepay",
+    "payment", "tweetie", "x-apple-health", "x-apple-reminderkit", "ftp", "ftps", "ssh", "sftp", "ws", "wss",
+];
+
+/// The scheme of `url` (before the first `:`), lowercased, when it is a valid scheme
+/// (a letter, then letters, digits, `+`, `.` or `-`).
+pub fn url_scheme(url: &str) -> Option<String> {
+    let (s, _) = url.trim().split_once(':')?;
+    let ok = s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c));
+    ok.then(|| s.to_ascii_lowercase())
+}
+
+/// True when `scheme` (lowercased) may be named with `--allow-url-scheme`: a custom
+/// scheme, never a system one ([`SYSTEM_URL_SCHEMES`], anything `x-apple*`/`apple*`).
+pub fn is_custom_scheme(scheme: &str) -> bool {
+    let s = scheme.trim().to_ascii_lowercase();
+    !s.is_empty() && !SYSTEM_URL_SCHEMES.contains(&s.as_str()) && !s.starts_with("x-apple") && !s.starts_with("apple")
+}
+
 pub fn refuse_url(action: &str, allowed: &[String]) -> String {
     format!(
         "app guard refused {action}: iOS chooses which app opens a URL, so url: is off while the app guard is on (allowlist [{}]); use open:<bundle_id> and navigate in the app",

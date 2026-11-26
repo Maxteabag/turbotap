@@ -114,7 +114,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         devicectl cache (~1 ms; refreshed once on an unknown name)
   launch:APP            terminate + activate (fresh start)
   url:URL               open a URL or deep-link directly via WDA /url (https://, maps://,
-                        mailto:, tel:, sms:)
+                        mailto:, tel:, sms:); refused while the app guard is on, except an
+                        app's own custom scheme given with --allow-url-scheme (with --allow-app)
   wait:TEXT             poll until TEXT is on screen (OCR-first, falls back to
                         UI controls + Sauvola OCR for colored/icon labels; 're:REGEX' for regex)
   waitany:A|B|C         poll until ANY '|'-separated target appears (OCR-first, then
@@ -591,7 +592,7 @@ impl<R: Reader> Flow<R> {
         if crate::guard::step_is_input(&verb, arg) {
             self.c.ensure_allowed_app(label, None)?;
         } else if verb == "url" {
-            self.c.ensure_url_allowed(label)?;
+            self.c.ensure_url_allowed(label, Some(arg.trim()))?;
         }
         self.step_inner(spec)
     }
