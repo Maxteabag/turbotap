@@ -678,15 +678,12 @@ impl<R: Reader> Flow<R> {
         check_wda_ok(self.c.fast_keys(head, Some(freq)), "type", false)?;
         let now = self.element_value(&eid);
         let probe = head.trim();
-        let landed = if probe.is_empty() || (now.is_empty() && before.is_empty()) {
-            // A field whose value WDA cannot read: keep going while focus stayed there.
-            self.active_element_id().as_deref() == Some(eid.as_str())
-        } else {
-            now.contains(probe)
-        };
+        // Strict: an empty value before and after is what keys lost to a moved field look
+        // like, so it counts as not landed (never typed on blind).
+        let landed = if probe.is_empty() { self.active_element_id().as_deref() == Some(eid.as_str()) } else { now.contains(probe) };
         if !landed {
             return Err(Error::flow(format!(
-                "type: the first {} characters did not land in the focused field (it moved or lost focus); stopped there, the other {} were not sent: tap the field again and retype",
+                "type: the first {} characters did not land in the focused field (it moved or lost focus, or it does not report what it holds); stopped there, the other {} were not sent: tap the field again and retype (a field that never reports its value: type it in pieces under 120 characters)",
                 head.chars().count(),
                 n - head.chars().count()
             )));
@@ -695,7 +692,7 @@ impl<R: Reader> Flow<R> {
             check_wda_ok(self.c.fast_keys(tail, Some(freq)), "type", false)?;
         }
         let after = self.element_value(&eid);
-        if !(after.is_empty() && before.is_empty()) && !after.contains(text.trim()) {
+        if !after.contains(text.trim()) {
             return Err(Error::flow(format!(
                 "type: after typing {n} characters at {freq}/s the field holds {} characters and not the whole text; check it with readfield: and fix it (TURBOTAP_TYPING_FREQ sets a slower rate)",
                 after.chars().count()
