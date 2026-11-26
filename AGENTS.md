@@ -23,9 +23,9 @@ in the middle of a bench round mixes two builds in its rows and voids the round
 (26 Nov 2026: the v1.5.0 install at 05:01 voided phone-r12's `scrollabove`).
 If neither answers within 10 minutes, install and say so.
 
-Release lines and status go to `teabag`, not to the front desk (Hazel): her queue
-is for real blockers only she or Peter can solve, and finished end results,
-preferably passed on through `teabag`.
+Release lines, PR hand-offs and status go to `teabag`. Anything meant for Hazel
+(coordination, questions, real blockers only she or Peter can solve) goes to
+`hazel-ops`, her fork, never to `hazel-74f6`: Peter chats with Hazel there.
 
 ## Rust build host
 
