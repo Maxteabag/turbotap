@@ -227,6 +227,9 @@ for i in $(seq 1 60); do
     elif curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -d '{"x0":0,"x1":320,"y0":0,"y1":40}' \
          "$WDA_URL/wda/fastScreenshot" -o /dev/null 2>/dev/null; then
       if runner_ok; then
+        # The device-IP check only refuses a positive mismatch; when it cannot compare, say so.
+        if [[ -z "$ip" ]]; then echo "warning: WDA's /status reports no device IP; device not cross-checked" >&2
+        elif ! [[ "$HOST" =~ ^[0-9.]+$ ]]; then echo "warning: $HOST is not an IPv4 address; device IP $ip not cross-checked" >&2; fi
         echo "wda-turbo up at $WDA_URL: runner pid $RPID for $UDID on $MAC, session ${sid:-new}, device IP ${ip:-not reported}, front app $bundle, derived data $DD, log $MAC:$LOG"
         exit 0
       fi
