@@ -127,6 +127,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
   tapxy:X,Y             tap points
+  tapat:X,Y             tap the point, guarded by what is there: the labelled control nearest
+                        the point (within 24 pt) or the OCR line containing it goes through
+                        --deny; nothing labelled there is refused with the nearest labels
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
@@ -616,6 +619,13 @@ impl<R: Reader> Flow<R> {
                 let x = parse_coord(parts[0])?;
                 let y = parse_coord(parts[1])?;
                 self.tap_point(x, y, "", None)?;
+            }
+            "tapat" => {
+                let parts: Vec<&str> = arg.split(',').collect();
+                if parts.len() != 2 {
+                    return Err(Error::value(format!("tapat expects X,Y, got {}", json::py_repr_str(arg))));
+                }
+                return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?)?);
             }
             "longpress" => return some(self.long_press_text(arg, 0.65)?.text),
             "longpressxy" => {

@@ -148,6 +148,10 @@ fn plain_send_target(label: &ElAttr, name: &ElAttr) -> std::result::Result<Strin
     }
 }
 
+/// `tapat:` takes the labelled control whose centre is within this many points of the
+/// tap point on both axes.
+pub const TAPAT_RADIUS: i64 = 24;
+
 impl<R: Reader> Flow<R> {
     /// `self.controls()` / `self.controls(deadline=deadline)` from the tap code.
     fn tap_ctl(&mut self, deadline: Option<f64>) -> Result<Vec<Control>> {
@@ -1075,6 +1079,56 @@ impl<R: Reader> Flow<R> {
             Ok(Value::String(s)) => ElAttr::Value(s.trim().to_string()),
             _ => ElAttr::Failed,
         }
+    }
+
+    /// `tapat:X,Y`: tap the point, guarded like a labelled tap. The target is the
+    /// labelled control whose centre is nearest the point (within
+    /// [`TAPAT_RADIUS`] points), else the OCR line whose box contains it. Its label
+    /// goes through `--deny` and the tap lands on the exact point, in one step: no
+    /// separate `read` to map a point to a label, and no second lookup by label that
+    /// could hit another copy of it. Nothing labelled there, or a disabled control:
+    /// refused, naming the nearest labels.
+    pub fn tap_at(&mut self, x: i64, y: i64) -> Result<String> {
+        self.wait_active_app(1.5, 0.03, None);
+        let ctl = self.tap_ctl(None)?;
+        let d2 = |c: &Control| (c.x - x).pow(2) + (c.y - y).pow(2);
+        let hit = ctl
+            .iter()
+            .filter(|c| !c.label.trim().is_empty() && (c.x - x).abs() <= TAPAT_RADIUS && (c.y - y).abs() <= TAPAT_RADIUS)
+            .min_by_key(|c| d2(c))
+            .cloned();
+        let label = match hit {
+            Some(c) if c.is_disabled() => {
+                return Err(Error::flow(format!("{} at {x},{y} is disabled", json::py_repr_str(&c.label))));
+            }
+            Some(c) => c.label,
+            None => {
+                let lines = match self.fresh_lines(0.15)? {
+                    Some(l) => l,
+                    None => self.lines(None, None)?,
+                };
+                let (fx, fy) = (x as f64, y as f64);
+                let pad = 6.0;
+                match lines
+                    .iter()
+                    .find(|l| l.x0 - pad <= fx && fx <= l.x1 + pad && l.y0 - pad <= fy && fy <= l.y1 + pad && !l.text.trim().is_empty())
+                {
+                    Some(l) => l.text.clone(),
+                    None => {
+                        let mut near: Vec<&Control> = ctl.iter().filter(|c| !c.label.trim().is_empty()).collect();
+                        near.sort_by_key(|c| d2(c));
+                        let names: Vec<String> =
+                            near.iter().take(3).map(|c| format!("{} ({},{})", json::py_repr_str(&c.label), c.x, c.y)).collect();
+                        return Err(Error::flow(format!(
+                            "nothing labelled at {x},{y}{}",
+                            if names.is_empty() { String::new() } else { format!("; nearest: {}", names.join(", ")) }
+                        )));
+                    }
+                }
+            }
+        };
+        self.tap_point(x, y, &label, None)?;
+        Ok(label)
     }
 
     pub fn tap_el(&mut self, label: &str, timeout: Option<f64>) -> Result<(i64, i64)> {

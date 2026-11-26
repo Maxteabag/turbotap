@@ -2755,3 +2755,40 @@ fn test_scrollto_without_direction_turns_at_the_end_of_the_list() {
     assert!(res.is_err());
     assert_eq!(d.len(), 1, "{d:?}");
 }
+
+#[test]
+fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let img = solid_img(240, (430, 932));
+    let lines = vec![ml("Inbox title", 30, 100, 200, 120)];
+    let ui = json!([
+        {"type": "Button", "label": "Settings", "x": 380, "y": 60},
+        {"type": "Button", "label": "Delete", "x": 380, "y": 800},
+        {"type": "Button", "label": "Archive", "x": 300, "y": 800, "enabled": false},
+        {"type": "Button", "label": "Info", "x": 200, "y": 300}
+    ]);
+    let mk = || {
+        let mock = MockWda::start(with_fast_ui(fui(ui.clone())));
+        let r = FakeReader::new(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)]);
+        (mock, r)
+    };
+    let pts = |m: &MockWda| m.tapped_points().iter().map(|p| (p.0, p.1)).collect::<Vec<_>>();
+    // A control within 24 pt: tapped at the exact point, its label returned.
+    let (mock, r) = mk();
+    let mut flow = mk_flow(&mock, &r, 1.0);
+    assert_eq!(step_s(&mut flow, "tapat:372,66"), "Settings");
+    assert_eq!(pts(&mock), vec![(372, 66)]);
+    // An OCR line containing the point.
+    assert_eq!(step_s(&mut flow, "tapat:120,110"), "Inbox title");
+    // The label at the point goes through --deny; a disabled control is refused.
+    flow_err(flow.step("tapat:385,795"));
+    flow_err(flow.step("tapat:300,800"));
+    // Nothing labelled there: refused, naming the nearest labels.
+    match flow.step("tapat:60,600") {
+        Err(Error::Flow(m)) => assert!(m.contains("nothing labelled at 60,600; nearest:"), "{m}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    assert_eq!(pts(&mock), vec![(372, 66), (120, 110)], "a refused tapat touched the screen");
+    flow.close();
+}

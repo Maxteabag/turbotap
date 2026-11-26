@@ -24,7 +24,7 @@ const MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// `setclip:`, `typedigits:`, `otp`, `env:`/`cmd:` forms, unknown verbs) is logged
 /// without its argument.
 pub const ARG_VERBS: &[&str] = &[
-    "tap", "tapel", "tapif", "tapbatch", "tapxy", "wait", "waitany", "gone", "assert", "assertnot", "open", "launch",
+    "tap", "tapel", "tapif", "tapbatch", "tapxy", "tapat", "wait", "waitany", "gone", "assert", "assertnot", "open", "launch",
     "swipe", "scroll", "scrollto", "read", "readel", "toggle", "slider", "longpress", "longpressxy", "doubletap",
     "doubletapxy", "zoom", "key", "sleep", "alert", "search", "dismisskb", "back", "home", "settle", "ui", "shot",
     "preflight", "unlock", "ocr", "vision-ocr", "tree", "screenshot",
