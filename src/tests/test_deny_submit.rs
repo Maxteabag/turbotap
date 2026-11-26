@@ -71,16 +71,18 @@ fn test_return_and_multiline_are_refused_when_the_keyboard_matches_the_callers_p
     assert_eq!(keys_sent(&m), 1);
     assert_eq!(m.paths().iter().filter(|p| p.ends_with("/wda/fastUI")).count(), ui_reads, "single-line typing read the keyboard");
     f.close();
-    // An explicit --deny is the caller's pattern too.
+    // An explicit --deny did not opt into a new refusal: it only warns.
     let m = MockWda::start(MockState::default().with_fast_ui(screen("Send")));
     let mut f = flow_with(&m, Some("send"), &[]);
-    assert!(f.step("key:enter").is_err());
-    assert_eq!(keys_sent(&m), 0);
+    let cap = Capture::start();
+    f.step("key:enter").unwrap();
+    assert_eq!(keys_sent(&m), 1);
+    assert!(cap.stderr().contains("matches --deny"), "{}", cap.stderr());
     f.close();
 }
 
 #[test]
-fn test_the_built_in_default_only_warns_on_return() {
+fn test_the_built_in_default_reads_and_refuses_nothing_on_return() {
     let _c = isolated_cache();
     let (_s, _g) = skip_sleep();
     let m = MockWda::start(MockState::default().with_fast_ui(screen("send")));
@@ -88,7 +90,19 @@ fn test_the_built_in_default_only_warns_on_return() {
     let cap = Capture::start();
     f.step("key:return").unwrap();
     assert_eq!(keys_sent(&m), 1, "the default must not take this power away");
-    assert!(cap.stderr().contains("a newline may submit"), "{}", cap.stderr());
+    // The default path reads nothing extra and says nothing.
+    assert_eq!(m.paths().iter().filter(|p| p.ends_with("/wda/fastUI")).count(), 0);
+    assert!(!cap.stderr().contains("a newline may submit"), "{}", cap.stderr());
+    f.close();
+}
+
+#[test]
+fn test_no_deny_warns_that_it_drops_deny_also() {
+    let _c = isolated_cache();
+    let m = MockWda::start(MockState::default().with_fast_ui(screen("Send")));
+    let cap = Capture::start();
+    let mut f = flow_with(&m, None, &["send"]);
+    assert!(cap.stderr().contains("ignoring 1 deny_also pattern"), "{}", cap.stderr());
     f.close();
 }
 
