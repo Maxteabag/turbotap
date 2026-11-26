@@ -2694,3 +2694,64 @@ fn test_url_only_flow_skips_ocr_warmup() {
     assert_eq!(code, 0);
     assert_eq!(mock.state().opened_urls, vec![json!("https://example.com")]);
 }
+
+#[test]
+fn test_same_page_tolerates_ocr_jitter_but_not_a_scroll() {
+    use crate::flow::act::same_page;
+    let page: Vec<String> = (0..10).map(|i| format!("Row {i}")).collect();
+    assert!(same_page(&page, &page));
+    // One line misread (cut by a bar or the scroll indicator): still the same place.
+    let mut jitter = page.clone();
+    jitter[9] = "Rovv 9".into();
+    assert!(same_page(&page, &jitter));
+    // One scroll stride keeps about half the lines: moved.
+    let moved: Vec<String> = (5..15).map(|i| format!("Row {i}")).collect();
+    assert!(!same_page(&page, &moved));
+    // Too few lines to tell from jitter: exact match only.
+    let short: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
+    let short2: Vec<String> = vec!["A".into(), "B".into(), "D".into()];
+    assert!(!same_page(&short, &short2));
+}
+
+#[test]
+fn test_scrollto_without_direction_turns_at_the_end_of_the_list() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let rows = |jitter: bool| -> Vec<Line> {
+        (0..7)
+            .map(|k| {
+                let t = if jitter && k == 6 { "Rovv 6".to_string() } else { format!("Row {k}") };
+                ml(&t, 40, 150 + k * 60, 200, 170 + k * 60)
+            })
+            .collect()
+    };
+    let run = |dir: &str| {
+        let (a, b, c) = (solid_img(240, (430, 932)), solid_img(120, (430, 932)), solid_img(30, (430, 932)));
+        let r = FakeReader::with(
+            vec![
+                fr(&a, &rows(false)),
+                fr(&b, &rows(true)), // the swipe did not move the list (OCR jitter on one row)
+                fr(&b, &rows(true)),
+                fr(&c, &[ml("Target row", 40, 400, 220, 420)]),
+                fr(&c, &[ml("Target row", 40, 400, 220, 420)]),
+            ],
+            (430, 932),
+            1.0,
+        );
+        let mock = MockWda::start(MockState::default());
+        let mut flow = mk_flow(&mock, &r, 1.0);
+        let res = flow.scroll_to("Target row", None, 8, dir).map(|m| m.y);
+        flow.close();
+        (res, drags(&mock))
+    };
+    // No direction: down hits the end, then it searches up.
+    let (res, d) = run("auto");
+    assert_eq!(res.unwrap(), 410);
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert!(i(&d[0]["fromY"]) > i(&d[0]["toY"]), "first swipe scrolls down: {d:?}");
+    assert!(i(&d[1]["fromY"]) < i(&d[1]["toY"]), "then up: {d:?}");
+    // An explicit down never turns: at the end it stops.
+    let (res, d) = run("down");
+    assert!(res.is_err());
+    assert_eq!(d.len(), 1, "{d:?}");
+}
