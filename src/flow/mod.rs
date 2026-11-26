@@ -216,16 +216,16 @@ flow/unlock/deploy/tap-ocr/otp-type exit 6 before contacting WDA.";
 /// [`flow_needs_ocr`]; pixel-only steps (`shot`, `settle`, `scroll`, `search`) never touch Tesseract.
 pub const IMAGE_STEP_VERBS: &[&str] = &[
     "wait", "expect", "waitany", "gone", "assert", "assertnot", "tap", "tapif", "longpress", "doubletap", "scrollto",
-    "swipe", "back", "read",
+    "swipe", "back", "read", "readfield", "assertfield",
 ];
 pub const STALE_UI_BACKOFF: [f64; 3] = [0.05, 0.08, 0.12];
-pub /// Text this long (chars) is typed with a landing probe and a read-back (see `type_long`).
+/// Text this long (chars) is typed with a landing probe and a read-back (see `type_long`).
 const LONG_TEXT: usize = 120;
 /// Typing rate for long text, chars/s (WDA's own default is 60).
 const LONG_TEXT_FREQ: i64 = 200;
 /// Characters typed before checking that they landed in the focused field.
 const LONG_TEXT_PROBE: usize = 24;
-const INPUT_FOCUS_SETTLE: f64 = 0.25;
+pub const INPUT_FOCUS_SETTLE: f64 = 0.25;
 
 /// `on|1|true` -> Some(true), `off|0|false` -> Some(false).
 pub fn toggle_state(s: &str) -> Option<bool> {
