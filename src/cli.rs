@@ -122,6 +122,24 @@ fn allow_app_arg() -> Arg {
     )
 }
 
+fn allow_label_arg() -> Arg {
+    Arg::new("allow-label").long("allow-label").value_name("EXACT_LABEL").action(ArgAction::Append).help(
+        "let a control with exactly this label through the built-in --deny for this run, only if 'send' is the only \
+         deny word in it and only while an app given with --allow-app is confirmed in front (repeatable)",
+    )
+}
+
+/// `--allow-label` values given before and after the subcommand.
+fn allow_label_values(m: &ArgMatches, sm: &ArgMatches) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for mm in [m, sm] {
+        if let Ok(Some(v)) = mm.try_get_many::<String>("allow-label") {
+            out.extend(v.cloned());
+        }
+    }
+    out
+}
+
 /// `--allow-app` values given before and after the subcommand.
 fn allow_app_values(m: &ArgMatches, sm: &ArgMatches) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -154,6 +172,7 @@ pub fn build_command() -> Command {
         .arg(Arg::new("device").long("device").value_name("DEVICE").help("device key from ~/.config/turbotap/config.json (or WDA_DEVICE)"))
         .arg(Arg::new("udid").long("udid").value_name("UDID").help("device UDID (or WDA_UDID / config.json)"))
         .arg(allow_app_arg())
+        .arg(allow_label_arg())
         .arg(flag(
             "daemon",
             "run through the warm local daemon when it is running (or TURBOTAP_DAEMON=1); falls back to this process otherwise",
@@ -239,7 +258,8 @@ pub fn build_command() -> Command {
                 .arg(Arg::new("deny").long("deny").help("regex of tap labels to refuse"))
                 .arg(Arg::new("no-deny").long("no-deny").action(ArgAction::SetTrue))
                 .arg(flag("quiet", "no per-step progress on stderr"))
-                .arg(allow_app_arg()),
+                .arg(allow_app_arg())
+                .arg(allow_label_arg()),
         )
         .subcommand(
             Command::new("otp-type")
@@ -333,6 +353,8 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     // Connect only to the addresses the identity, allowlist and stop file were
     // resolved for; the host name is not resolved again.
     client.pin_addrs(target.addrs.clone());
+    // --allow-label only ever works together with --allow-app in the same run.
+    client.set_run_allow(allow_app_values(&m, sm), allow_label_values(&m, sm));
     match allowed {
         Ok(list) => client.set_allowed_apps(list),
         // A broken config.json or an unresolvable device never means "no guard".
@@ -363,6 +385,9 @@ fn main_inner(argv: &[String]) -> Result<i32> {
             let steps: Vec<String> = sm.get_many::<String>("steps").map(|v| v.cloned().collect()).unwrap_or_default();
             // An explicit --deny is never relaxed, even when it spells the built-in
             // pattern: wrap it so it is compiled as a custom pattern.
+            if b(sm, "no-deny") && !allow_label_values(&m, sm).is_empty() {
+                crate::errln!("turbotap: warning: --allow-label has no effect with --no-deny (the whole --deny filter is off)");
+            }
             let explicit_default = format!("(?:{})", crate::flow::DENY_DEFAULT);
             let deny = if b(sm, "no-deny") {
                 None

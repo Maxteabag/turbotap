@@ -127,11 +127,17 @@ impl ElAttr {
 /// risky word ([`super::is_safe_icon_name`], e.g. `arrow.up` or `sendButton`).
 /// Unreadable or disagreeing attributes: `Err(why)`, quoting the element's label and
 /// name (never its value).
-fn plain_send_target(label: &ElAttr, name: &ElAttr) -> std::result::Result<String, String> {
-    use super::{is_plain_send, is_safe_icon_name, short_repr};
+fn plain_send_target(label: &ElAttr, name: &ElAttr, allow: &[String]) -> std::result::Result<String, String> {
+    use super::{is_plain_send, is_safe_icon_name, label_allowed_by_flag, short_repr};
     let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let l = match label {
-        ElAttr::Value(l) if is_plain_send(l) => l,
+        ElAttr::Value(l) if is_plain_send(l) || label_allowed_by_flag(l, allow) => l,
+        ElAttr::Value(l) if !allow.is_empty() => {
+            return Err(format!(
+                "element label {} is not exactly Send or Send message, nor an --allow-label label with send as its only deny word",
+                short_repr(l)
+            ))
+        }
         ElAttr::Value(l) => return Err(format!("element label {} is not exactly Send or Send message", short_repr(l))),
         ElAttr::Empty => return Err("element label is empty".into()),
         ElAttr::Failed => return Err("element label could not be read".into()),
@@ -1152,7 +1158,8 @@ impl<R: Reader> Flow<R> {
                         // The element may have been found by a substring or by its name:
                         // check what it actually is, not only the query.
                         let (el_label, el_name) = (self.element_attr(&eid, "label"), self.element_attr(&eid, "name"));
-                        let own = plain_send_target(&el_label, &el_name);
+                        let allow = self.c.allow_labels.clone();
+                        let own = plain_send_target(&el_label, &el_name, &allow);
                         let mut seen: Vec<&str> = Vec::new();
                         for t in [Some(label), el_label.value(), el_name.value()].into_iter().flatten() {
                             // The identical text twice (query == label == name) is checked

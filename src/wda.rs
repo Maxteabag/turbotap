@@ -757,6 +757,10 @@ pub struct WdaClient {
     pub cache_dir: PathBuf,
     /// Foreground app guard allowlist ([`crate::guard`]); empty = guard off.
     pub allowed_apps: Vec<String>,
+    /// Bundles given with `--allow-app` in this run (a subset of `allowed_apps`).
+    pub run_allowed_apps: Vec<String>,
+    /// Exact labels given with `--allow-label` in this run.
+    pub allow_labels: Vec<String>,
     /// First app guard refusal in this invocation (sticky: later input is refused).
     pub guard_refusal: Option<String>,
     /// Label of the action in progress, used in guard refusals (a flow step, a command).
@@ -814,6 +818,8 @@ impl WdaClient {
             last_fast_ui_kb: None,
             cache_dir: crate::config::cache_dir(),
             allowed_apps: Vec::new(),
+            run_allowed_apps: Vec::new(),
+            allow_labels: Vec::new(),
             guard_refusal: None,
             guard_action: None,
             guard_unlock_scope: false,
@@ -832,6 +838,27 @@ impl WdaClient {
     /// Turn the app guard on for this client (an empty list leaves it off).
     pub fn set_allowed_apps(&mut self, apps: Vec<String>) {
         self.allowed_apps = apps;
+    }
+
+    /// The `--allow-app` bundles and `--allow-label` labels given for this run.
+    pub fn set_run_allow(&mut self, apps: Vec<String>, labels: Vec<String>) {
+        self.run_allowed_apps = apps.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
+        self.allow_labels = labels;
+    }
+
+    /// For `--allow-label`: `Ok(bundle)` when the app guard is on and a live
+    /// `/wda/activeAppInfo` names an app given with `--allow-app` in this run (not
+    /// only one from config), else `Err(why not)`.
+    pub fn allow_label_foreground(&mut self) -> std::result::Result<String, String> {
+        if self.run_allowed_apps.is_empty() {
+            return Err("--allow-label works only together with --allow-app".into());
+        }
+        let b = self.foreground_status()?;
+        if self.run_allowed_apps.iter().any(|a| a == &b) {
+            Ok(b)
+        } else {
+            Err(format!("{} was not given with --allow-app", json::py_repr_str(&b)))
+        }
     }
 
     /// Fail every input closed with `reason` (the guard policy could not be loaded).
@@ -1033,6 +1060,8 @@ impl WdaClient {
         let mut side = WdaClient::new(&self.base_url, &self.udid, self.device_key.as_deref());
         side.cache_dir = self.cache_dir.clone();
         side.allowed_apps = self.allowed_apps.clone();
+        side.run_allowed_apps = self.run_allowed_apps.clone();
+        side.allow_labels = self.allow_labels.clone();
         side.guard_policy_error = self.guard_policy_error.clone();
         side.pinned_addrs = self.pinned_addrs.clone();
         side.copy_probes_from(self);
