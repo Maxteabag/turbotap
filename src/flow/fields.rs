@@ -253,6 +253,12 @@ impl<R: Reader> Flow<R> {
         Field { value: v, ..f.clone() }.content().chars().count()
     }
 
+    /// Total value length of every text input on screen except `f`.
+    fn other_inputs_len(&mut self, f: &Field) -> usize {
+        let ids: Vec<String> = self.field_ids(INPUT_TYPES_PRED).into_iter().filter(|id| *id != f.id).collect();
+        ids.iter().map(|id| self.field_attr(id, "value").chars().count()).sum()
+    }
+
     fn keyboard_up(&mut self) -> bool {
         !self.field_ids("type == 'XCUIElementTypeKeyboard'").is_empty()
     }
@@ -300,12 +306,15 @@ impl<R: Reader> Flow<R> {
     /// marked unverified. For a secret that still fails, with nothing typed.
     fn probe_focus(&mut self, f: &Field, secret: bool) -> Result<bool> {
         let before = self.field_value_len(f);
+        let others_before = if before == 0 { Some(self.other_inputs_len(f)) } else { None };
         self.fill_keys("x", "fill: focus probe", false)?;
         clock::sleep(0.2);
         let after = self.field_value_len(f);
+        // The target reports nothing: did the probe land in another input instead?
+        let landed_elsewhere = after == 0 && others_before.is_some_and(|b| self.other_inputs_len(f) > b);
         self.fill_keys(BACKSPACE, "fill: removing focus probe", false)?;
         clock::sleep(0.15);
-        if before == 0 && after == 0 && !secret {
+        if before == 0 && after == 0 && !secret && !landed_elsewhere {
             crate::errln!("turbotap: warning: fill: {} reports no value; the focus probe cannot be checked, typing on unverified", f.describe());
             return Ok(false);
         }
@@ -388,14 +397,12 @@ impl<R: Reader> Flow<R> {
         let got = Field { value: v, ..f.clone() };
         let got = got.content();
         let n_got = got.chars().count();
-        if n_got == 0 && want > 0 && !f.secure() {
+        if n_got == 0 && want > 0 && !f.secure() && !secret {
             // The field reports no value: nothing to read back. Never a silent ok.
-            if !secret {
-                if let Some(o) = self.ocr_in_field(&f.id) {
-                    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if norm(&o) == norm(&text) {
-                        return Ok(format!("{}: len={want} (read back by OCR: the field reports no value)", f.name));
-                    }
+            if let Some(o) = self.ocr_in_field(&f.id) {
+                let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+                if norm(&o) == norm(&text) {
+                    return Ok(format!("{}: len={want} (read back by OCR: the field reports no value)", f.name));
                 }
             }
             if checkable {

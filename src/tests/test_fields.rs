@@ -346,3 +346,30 @@ fn fill_reads_back_by_ocr_when_the_field_reports_no_value() {
     assert!(r.as_str().unwrap().contains("read back by OCR"), "{r}");
     f.close();
 }
+
+#[test]
+fn fill_refuses_plain_text_when_the_probe_lands_in_another_input() {
+    // The body reports no value and ignores the click: focus stays in the title, and
+    // the probe grows the title. That is not "unverified", it is the wrong field.
+    let mock = MockWda::start(typing_composer());
+    let mut f = flow(&mock);
+    mock.set_custom_handler(|_st, _m, path, _d| path.ends_with("/element/b1/click").then(|| json!({"value": null})));
+    let long = "Long enough plain text to need the focus probe before it is typed in.";
+    let e = f.step(&format!("fill:Body={long}")).unwrap_err().to_string();
+    assert!(e.contains("keyboard focus is not in"), "{e}");
+    assert!(keys_typed(&mock).iter().all(|(t, _)| t != long), "the text was never typed");
+    f.close();
+}
+
+#[test]
+fn fill_clears_and_fails_a_secret_whose_element_write_did_not_land_in_a_plain_field() {
+    let mock = MockWda::start(typing_composer());
+    let mut f = flow(&mock);
+    // The element write into the (plain) title is swallowed: nothing lands.
+    mock.set_custom_handler(|_st, m, path, _d| (m == "POST" && path.ends_with("/element/t1/value")).then(|| json!({"value": null})));
+    let _env = set_env(&[("TT_FILL_CODE", Some("123456"))]);
+    let e = f.step("fill:Title=env:TT_FILL_CODE").unwrap_err().to_string();
+    assert!(e.contains("read-back mismatch") && e.contains("cleared") && !e.contains("123456"), "{e}");
+    assert!(mock.calls().iter().any(|c| c.1.ends_with("/element/t1/clear")), "the field was cleared");
+    f.close();
+}
