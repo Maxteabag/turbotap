@@ -54,7 +54,20 @@ pub fn wall() -> f64 {
     HOOK.with(|h| h.borrow().as_ref().map(|c| c.wall())).unwrap_or_else(real_wall)
 }
 
+thread_local! {
+    /// Seconds slept through [`sleep`] on this thread (the timing log reads deltas).
+    static SLEPT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// Total seconds this thread has slept through [`sleep`] (requested durations).
+pub fn slept_total() -> f64 {
+    SLEPT.with(|c| c.get())
+}
+
 pub fn sleep(secs: f64) {
+    if secs > 0.0 && secs.is_finite() {
+        SLEPT.with(|c| c.set(c.get() + secs));
+    }
     let hook = HOOK.with(|h| h.borrow().clone());
     match hook {
         Some(c) => c.sleep(secs),

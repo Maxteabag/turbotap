@@ -2694,3 +2694,120 @@ fn test_url_only_flow_skips_ocr_warmup() {
     assert_eq!(code, 0);
     assert_eq!(mock.state().opened_urls, vec![json!("https://example.com")]);
 }
+
+#[test]
+fn test_same_page_tolerates_ocr_jitter_but_not_a_scroll() {
+    use crate::flow::act::same_page;
+    let page: Vec<String> = (0..10).map(|i| format!("Row {i}")).collect();
+    assert!(same_page(&page, &page));
+    // One line misread (cut by a bar or the scroll indicator): still the same place.
+    let mut jitter = page.clone();
+    jitter[9] = "Rovv 9".into();
+    assert!(same_page(&page, &jitter));
+    // One scroll stride keeps about half the lines: moved.
+    let moved: Vec<String> = (5..15).map(|i| format!("Row {i}")).collect();
+    assert!(!same_page(&page, &moved));
+    // Too few lines to tell from jitter: exact match only.
+    let short: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
+    let short2: Vec<String> = vec!["A".into(), "B".into(), "D".into()];
+    assert!(!same_page(&short, &short2));
+}
+
+#[test]
+fn test_scrollto_without_direction_turns_at_the_end_of_the_list() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let rows = |jitter: bool| -> Vec<Line> {
+        (0..7)
+            .map(|k| {
+                let t = if jitter && k == 6 { "Rovv 6".to_string() } else { format!("Row {k}") };
+                ml(&t, 40, 150 + k * 60, 200, 170 + k * 60)
+            })
+            .collect()
+    };
+    let run = |dir: &str| {
+        let (a, b, c) = (solid_img(240, (430, 932)), solid_img(120, (430, 932)), solid_img(30, (430, 932)));
+        let r = FakeReader::with(
+            vec![
+                fr(&a, &rows(false)),
+                fr(&b, &rows(true)), // the swipe did not move the list (OCR jitter on one row)
+                fr(&b, &rows(true)),
+                fr(&c, &[ml("Target row", 40, 400, 220, 420)]),
+                fr(&c, &[ml("Target row", 40, 400, 220, 420)]),
+            ],
+            (430, 932),
+            1.0,
+        );
+        let mock = MockWda::start(MockState::default());
+        let mut flow = mk_flow(&mock, &r, 1.0);
+        let res = flow.scroll_to("Target row", None, 8, dir).map(|m| m.y);
+        flow.close();
+        (res, drags(&mock))
+    };
+    // No direction: down hits the end, then it searches up.
+    let (res, d) = run("auto");
+    assert_eq!(res.unwrap(), 410);
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert!(i(&d[0]["fromY"]) > i(&d[0]["toY"]), "first swipe scrolls down: {d:?}");
+    assert!(i(&d[1]["fromY"]) < i(&d[1]["toY"]), "then up: {d:?}");
+    // An explicit down never turns: at the end it stops.
+    let (res, d) = run("down");
+    assert!(res.is_err());
+    assert_eq!(d.len(), 1, "{d:?}");
+}
+
+#[test]
+fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let img = solid_img(240, (430, 932));
+    let lines = vec![ml("Inbox title", 30, 100, 200, 120)];
+    let ui = json!([
+        {"type": "Button", "label": "Settings", "x": 380, "y": 60},
+        {"type": "Button", "label": "Delete", "x": 380, "y": 800},
+        {"type": "Button", "label": "Archive", "x": 300, "y": 800, "enabled": false},
+        {"type": "Button", "label": "Info", "x": 200, "y": 300}
+    ]);
+    let mk = || {
+        let mock = MockWda::start(with_fast_ui(fui(ui.clone())));
+        let r = FakeReader::new(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)]);
+        (mock, r)
+    };
+    let pts = |m: &MockWda| m.tapped_points().iter().map(|p| (p.0, p.1)).collect::<Vec<_>>();
+    // A control within 24 pt: tapped at its own centre (never the raw point).
+    let (mock, r) = mk();
+    let mut flow = mk_flow(&mock, &r, 1.0);
+    assert_eq!(step_s(&mut flow, "tapat:372,66"), "Settings");
+    assert_eq!(pts(&mock), vec![(380, 60)]);
+    // OCR text is never a target, even under the point.
+    match flow.step("tapat:40,105") {
+        Err(Error::Flow(m)) => assert!(m.contains("no labelled control at 40,105"), "{m}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    // The label at the point goes through --deny; a disabled control is refused.
+    flow_err(flow.step("tapat:385,795"));
+    flow_err(flow.step("tapat:300,800"));
+    // Nothing labelled there: refused, naming the nearest labels.
+    match flow.step("tapat:60,600") {
+        Err(Error::Flow(m)) => assert!(m.contains("no labelled control at 60,600; nearest:"), "{m}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    assert_eq!(pts(&mock), vec![(380, 60)], "a refused tapat touched the screen");
+    flow.close();
+}
+
+#[test]
+fn test_flow_ending_with_open_returns_once_the_app_is_in_front() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mut st = MockState::default();
+    st.active_app = Seq::of(vec![json!("com.example.prev"), json!("com.example.prev"), json!("com.example.target")]);
+    let mock = MockWda::start(st);
+    let mut flow = mk_flow(&mock, &FakeReader::new(vec![]), 1.0);
+    let (ok, _) = flow.run_outcome(&["open:com.example.target".to_string()]).unwrap();
+    assert!(ok);
+    assert_eq!(flow.pending_bundle, None, "flow returned before the app came to the front");
+    let calls = mock.paths().iter().filter(|p| p.as_str() == "/wda/activeAppInfo").count();
+    assert!(calls >= 3, "{calls}");
+    flow.close();
+}

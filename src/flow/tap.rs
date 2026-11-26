@@ -148,6 +148,10 @@ fn plain_send_target(label: &ElAttr, name: &ElAttr) -> std::result::Result<Strin
     }
 }
 
+/// `tapat:` takes the labelled control whose centre is within this many points of the
+/// tap point on both axes.
+pub const TAPAT_RADIUS: i64 = 24;
+
 impl<R: Reader> Flow<R> {
     /// `self.controls()` / `self.controls(deadline=deadline)` from the tap code.
     fn tap_ctl(&mut self, deadline: Option<f64>) -> Result<Vec<Control>> {
@@ -1077,6 +1081,40 @@ impl<R: Reader> Flow<R> {
         }
     }
 
+    /// `tapat:X,Y`: a label tap with a location hint. The target is the labelled
+    /// accessibility control whose centre is nearest the point (within
+    /// [`TAPAT_RADIUS`] points on both axes); OCR text is never a target. Its label
+    /// goes through `--deny` (and the app guard, like every input), and the tap lands
+    /// on that control's own centre, never on the given point. The resolved label is
+    /// the step result (flow output) and the `target` of its timing-log line. One
+    /// step: no separate `read` to map a point to a label, and no second lookup by
+    /// label that could hit another copy of it. No labelled control there, or a
+    /// disabled one: refused, naming the nearest labels.
+    pub fn tap_at(&mut self, x: i64, y: i64) -> Result<String> {
+        self.wait_active_app(1.5, 0.03, None);
+        let ctl = self.tap_ctl(None)?;
+        let d2 = |c: &Control| (c.x - x).pow(2) + (c.y - y).pow(2);
+        let hit = ctl
+            .iter()
+            .filter(|c| !c.label.trim().is_empty() && (c.x - x).abs() <= TAPAT_RADIUS && (c.y - y).abs() <= TAPAT_RADIUS)
+            .min_by_key(|c| d2(c))
+            .cloned();
+        let Some(c) = hit else {
+            let mut near: Vec<&Control> = ctl.iter().filter(|c| !c.label.trim().is_empty()).collect();
+            near.sort_by_key(|c| d2(c));
+            let names: Vec<String> = near.iter().take(3).map(|c| format!("{} ({},{})", json::py_repr_str(&c.label), c.x, c.y)).collect();
+            return Err(Error::flow(format!(
+                "no labelled control at {x},{y}{}",
+                if names.is_empty() { String::new() } else { format!("; nearest: {}", names.join(", ")) }
+            )));
+        };
+        if c.is_disabled() {
+            return Err(Error::flow(format!("{} at {x},{y} is disabled", json::py_repr_str(&c.label))));
+        }
+        self.tap_point(c.x, c.y, &c.label, None)?;
+        Ok(c.label)
+    }
+
     pub fn tap_el(&mut self, label: &str, timeout: Option<f64>) -> Result<(i64, i64)> {
         self.wait_active_app(1.5, 0.03, None);
         let q = json::dumps(&Value::String(label.to_string()));
@@ -1087,7 +1125,12 @@ impl<R: Reader> Flow<R> {
             format!("label CONTAINS[c] {q} OR name CONTAINS[c] {q}"),
         ];
         let end = clock::wall() + timeout.filter(|t| *t != 0.0).unwrap_or(self.timeout);
+        let mut pass = 0u64;
         while clock::wall() < end {
+            if pass > 0 {
+                self.step_retries += 1;
+            }
+            pass += 1;
             for pred in &preds {
                 let p = self.c.spath("/element");
                 let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));

@@ -1036,6 +1036,7 @@ impl<R: Reader> Flow<R> {
             // Keep controls and provenance together: never overwrite (app_name, bundle_id)
             // when a retry fails and returns None, or the final stale check would be bypassed.
             self.last_ui_retried_stale = true;
+            self.step_retries += 1;
             let screen_pt = self.screen_pt_for(deadline)?;
             let wb = if exp_set { exp } else { None };
             for delay in STALE_UI_BACKOFF {

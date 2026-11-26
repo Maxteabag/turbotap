@@ -102,6 +102,8 @@ pub struct MockState {
     pub element_values: HashMap<String, Dyn>,
     pub element_labels: HashMap<String, Value>,
     pub element_names: HashMap<String, Value>,
+    /// `attribute/type` answers (XCUIElementType...), by element id.
+    pub element_types: HashMap<String, Value>,
     pub element_enabled: HashMap<String, Value>,
     pub focused_eid: Option<String>,
     pub screenshot_b64: Option<Seq<String>>,
@@ -142,6 +144,7 @@ impl Default for MockState {
             element_values: HashMap::new(),
             element_labels: HashMap::new(),
             element_names: HashMap::new(),
+            element_types: HashMap::new(),
             element_enabled: HashMap::new(),
             focused_eid: None,
             screenshot_b64: None,
@@ -488,6 +491,7 @@ fn route(inner: &mut Inner, method: &str, path: &str, data: &Value) -> Value {
             }
             "attribute/label" => return json!({"value": st.element_labels.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/name" => return json!({"value": st.element_names.get(&eid).cloned().unwrap_or(Value::Null)}),
+            "attribute/type" => return json!({"value": st.element_types.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/value" => {
                 let v = match st.element_values.get_mut(&eid) {
                     Some(d) => d.next(&Value::Null),

@@ -178,6 +178,19 @@ pub fn build_command() -> Command {
         )
         .subcommand(Command::new("unlock"))
         .subcommand(
+            Command::new("timings")
+                .about("summarize the per-step timing log: p50/p95/max per step or app, slowest and most retried steps")
+                .long_about(
+                    "Every flow step appends one JSON line to $XDG_STATE_HOME/turbotap/timings.jsonl \
+                     (default ~/.local/state; TURBOTAP_TIMINGS=PATH moves it, TURBOTAP_TIMINGS=0 turns it off). \
+                     Typed text and credentials are never logged.",
+                )
+                .arg(Arg::new("since").long("since").value_name("WHEN").help("30m, 2h, 1d, epoch seconds or YYYY-MM-DD[THH:MM] (UTC)"))
+                .arg(Arg::new("by").long("by").value_name("KEY").default_value("step").value_parser(["step", "app", "step+app"]))
+                .arg(Arg::new("file").long("file").value_name("PATH").help("read this log instead"))
+                .arg(Arg::new("top").long("top").value_name("N").value_parser(clap::value_parser!(usize)).default_value("10")),
+        )
+        .subcommand(
             Command::new("install-skill")
                 .about("install the turbotap agent skills (Claude Code, Codex, ...)")
                 .long_about(
@@ -285,6 +298,10 @@ fn main_inner(argv: &[String]) -> Result<i32> {
             crate::skills::cmd_install_skill(b(sm, "agents"), b(sm, "claude"), b(sm, "codex"), &dirs, b(sm, "force"))?;
             return Ok(0);
         }
+        "timings" => {
+            let top = sm.get_one::<usize>("top").copied().unwrap_or(10);
+            return crate::timings::cmd_timings(s(sm, "since"), s(sm, "by").unwrap_or("step"), s(sm, "file"), top);
+        }
         "daemon" => {
             return crate::daemon::cmd_daemon(s(sm, "action").unwrap_or("status"), f(sm, "idle"), b(sm, "foreground"));
         }
@@ -322,18 +339,26 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         Err(reason) => client.set_guard_policy_error(reason),
     }
     match cmd {
-        "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock"))?,
-        "unlock" => crate::wda::cmd_unlock(&mut client)?,
+        "preflight" | "unlock" | "ocr" | "vision-ocr" | "tree" | "screenshot" => {
+            let (t0, req0) = (crate::clock::real_now(), client.stats);
+            client.req_kinds.clear();
+            let r = match cmd {
+                "preflight" => crate::wda::cmd_preflight(&mut client, b(sm, "stock")),
+                "unlock" => crate::wda::cmd_unlock(&mut client),
+                "ocr" => crate::ocr::cmd_ocr(&mut client, f(sm, "scale").unwrap_or(1.5), i(sm, "y0").unwrap_or(0), i(sm, "y1")),
+                "vision-ocr" => crate::vision::cmd_vision_ocr(
+                    &mut client,
+                    s(sm, "mode").unwrap_or("accurate"),
+                    f(sm, "scale").unwrap_or(crate::vision::VISION_DEFAULT_SCALE),
+                ),
+                "tree" => cmd_tree(&mut client),
+                _ => cmd_screenshot(&mut client, s(sm, "out").unwrap_or("")),
+            };
+            crate::timings::record_command(&client, cmd, t0, req0, r.as_ref().err());
+            r?
+        }
         "deploy" => crate::deploy::cmd_deploy(&mut client, b(sm, "no-build"))?,
-        "ocr" => crate::ocr::cmd_ocr(&mut client, f(sm, "scale").unwrap_or(1.5), i(sm, "y0").unwrap_or(0), i(sm, "y1"))?,
-        "vision-ocr" => crate::vision::cmd_vision_ocr(
-            &mut client,
-            s(sm, "mode").unwrap_or("accurate"),
-            f(sm, "scale").unwrap_or(crate::vision::VISION_DEFAULT_SCALE),
-        )?,
         "tap-ocr" => crate::flow::cmd_tap_ocr(client, s(sm, "text").unwrap_or(""))?,
-        "tree" => cmd_tree(&mut client)?,
-        "screenshot" => cmd_screenshot(&mut client, s(sm, "out").unwrap_or(""))?,
         "flow" => {
             let steps: Vec<String> = sm.get_many::<String>("steps").map(|v| v.cloned().collect()).unwrap_or_default();
             // An explicit --deny is never relaxed, even when it spells the built-in

@@ -127,6 +127,11 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
   tapxy:X,Y             tap points
+  tapat:X,Y             label tap with a location hint: finds the labelled control nearest
+                        X,Y (within 24 pt; controls only, never OCR text), checks its label
+                        against --deny and taps that control's own centre, never the raw
+                        point; returns the label; no control there is refused with the
+                        nearest labels
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
@@ -140,7 +145,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
   alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
-  scrollto:TEXT         scroll down (max 8x) until TEXT is visible (scrollto:up:TEXT scrolls up)
+  scrollto:TEXT         scroll down (max 8x) until TEXT is visible; at the end of the list
+                        it turns and searches back up (scrollto:up:TEXT / scrollto:down:TEXT
+                        scroll one way only)
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
   swipe:left|right:TEXT horizontal row swipe on TEXT's row (damped 80%->30% / 20%->70% to reveal
                         row actions without triggering full-width destructive delete)
@@ -293,6 +300,9 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub reads: Vec<Value>,
     /// Print one JSON line per finished step to stderr.
     pub log: bool,
+    /// Step-level retries in the current step (re-queries, stale-tree backoffs), for
+    /// the timing log; reset before each step.
+    pub step_retries: u64,
     pub ui_worker: Option<UiWorker>,
     pub last_action_ts: f64,
     pub last_action_is_typing: bool,
@@ -340,6 +350,7 @@ impl<R: Reader> Flow<R> {
             last_tap_ts: 0.0,
             reads: Vec::new(),
             log,
+            step_retries: 0,
             ui_worker: None,
             last_action_ts: 0.0,
             last_action_is_typing: false,
@@ -608,6 +619,13 @@ impl<R: Reader> Flow<R> {
                 let y = parse_coord(parts[1])?;
                 self.tap_point(x, y, "", None)?;
             }
+            "tapat" => {
+                let parts: Vec<&str> = arg.split(',').collect();
+                if parts.len() != 2 {
+                    return Err(Error::value(format!("tapat expects X,Y, got {}", json::py_repr_str(arg))));
+                }
+                return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?)?);
+            }
             "longpress" => return some(self.long_press_text(arg, 0.65)?.text),
             "longpressxy" => {
                 let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
@@ -715,7 +733,7 @@ impl<R: Reader> Flow<R> {
                 self.scroll(dir)?;
             }
             "scrollto" => {
-                let mut direction = "down".to_string();
+                let mut direction = "auto".to_string();
                 let mut target = arg;
                 if let Some((pfx, rest)) = arg.split_once(':') {
                     let p = pfx.trim().to_lowercase();
@@ -1067,7 +1085,12 @@ impl<R: Reader> Flow<R> {
                     self.note_secret(arg);
                 }
             }
-            match self.step(spec) {
+            let (req0, slept0) = (self.c.stats, clock::slept_total());
+            self.c.req_kinds.clear();
+            self.step_retries = 0;
+            let outcome = self.step(spec);
+            self.record_timing(spec, s0, req0, slept0, &outcome);
+            match outcome {
                 Ok(res) => {
                     let mut item = serde_json::Map::new();
                     item.insert("step".into(), j!(safe_step(spec)));
@@ -1129,6 +1152,12 @@ impl<R: Reader> Flow<R> {
                 Err(e) => return Err(self.scrub_error(e)),
             }
         }
+        // A flow that ends right after open:/launch: (no read or tap to wait lazily)
+        // returns once the app is in front, so the caller's next command does not see
+        // the previous app.
+        if self.pending_bundle.is_some() {
+            self.wait_active_app(1.5, 0.03, None);
+        }
         let reads = if take_reads { std::mem::take(&mut self.reads) } else { self.reads.clone() };
         let mut res = j!({
             "ok": true,
@@ -1138,6 +1167,34 @@ impl<R: Reader> Flow<R> {
         });
         self.scrub_value(&mut res);
         Ok((true, res))
+    }
+}
+
+impl<R: Reader> Flow<R> {
+    /// Append the finished step to the timing log ([`crate::timings`]). Uses only
+    /// counters and state already held: no request.
+    fn record_timing(&self, spec: &str, s0: f64, req0: crate::wda::ReqStats, slept0: f64, outcome: &Result<Option<Value>>) {
+        if crate::timings::log_path().is_none() {
+            return;
+        }
+        let err = outcome.as_ref().err();
+        let err_s = err.map(|e| e.to_string());
+        let target = outcome.as_ref().ok().and_then(|v| v.as_ref()).and_then(Value::as_str);
+        let dev = self.c.device_key.clone().filter(|d| !d.is_empty()).or_else(|| Some(self.c.udid.clone()).filter(|u| !u.is_empty()));
+        let rec = crate::timings::StepRecord {
+            device: dev.as_deref(),
+            spec,
+            ms: (clock::real_now() - s0) * 1000.0,
+            sleep_ms: (clock::slept_total() - slept0) * 1000.0,
+            retries: self.step_retries,
+            req: self.c.stats.since(&req0),
+            bundle: self.bundle.as_deref(),
+            ok: err.is_none(),
+            error: err_s.as_deref(),
+            target,
+            req_kinds: Some(&self.c.req_kinds),
+        };
+        crate::timings::append(&rec.to_value(|t| self.scrub(t)));
     }
 }
 
