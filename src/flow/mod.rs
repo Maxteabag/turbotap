@@ -164,9 +164,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         nearest labels
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys;
-                        these are hardware-keyboard key events to whatever has focus system-wide:
-                        key:escape can leave the app (seen going to the Home screen with a
-                        context menu open). A key step that leaves the app prints a warning
+                        these are hardware-keyboard key events to whatever has focus
+                        system-wide; a key step after which another app is in front prints
+                        a warning (marks only, nothing is refused)
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
@@ -568,8 +568,8 @@ impl<R: Reader> Flow<R> {
 
     /// After a `key:` step: one live `/wda/activeAppInfo`, and a warning on stderr when
     /// the app in front is no longer the one the flow opened (key events go to the
-    /// system's focus, and Escape can leave the app). Marks only, never refuses: the
-    /// app guard still checks the next input as always.
+    /// system's focus, so an app change right after one is worth seeing). Marks only,
+    /// never refuses: the app guard still checks the next input as always.
     fn mark_key_left_app(&mut self, kname: &str) {
         let Some(expected) = self.bundle.clone() else { return };
         if let Ok(now) = self.c.live_foreground_app(None) {
