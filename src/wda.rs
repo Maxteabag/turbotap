@@ -731,6 +731,9 @@ pub const URL_LANDING_WATCH: f64 = 0.8;
 pub struct WdaClient {
     /// Requests sent on this client's connection (for the per-step timing log).
     pub stats: ReqStats,
+    /// The app a live `/wda/activeAppInfo` last named (for the timing log; never used
+    /// to authorize anything).
+    pub last_foreground: Option<String>,
     /// Time per request kind (`METHOD /path` with session and element ids replaced):
     /// count and total microseconds. The timing log takes and clears it per step.
     pub req_kinds: std::collections::BTreeMap<String, (u32, u64)>,
@@ -806,6 +809,7 @@ impl WdaClient {
         WdaClient {
             stats: ReqStats::default(),
             req_kinds: std::collections::BTreeMap::new(),
+            last_foreground: None,
             base_url,
             udid: udid.to_string(),
             device_key: device_key.map(String::from),
@@ -982,7 +986,13 @@ impl WdaClient {
         match self.exchange_borrowed("GET", "/wda/activeAppInfo", None, &[], 5.0, deadline, false, |b| {
             serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
         }) {
-            Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => crate::guard::foreground_from_envelope(&v),
+            Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => {
+                let r = crate::guard::foreground_from_envelope(&v);
+                if let Ok(b) = &r {
+                    self.last_foreground = Some(b.clone());
+                }
+                r
+            }
             Ok(Some((status, _, _))) => Err(format!("activeAppInfo failed: HTTP {status}")),
             Ok(None) => Err("activeAppInfo failed: deadline exceeded".into()),
             Err(_) => Err("activeAppInfo failed".into()),

@@ -120,3 +120,45 @@ fn test_timings_command_summarizes_a_file() {
     assert_eq!(v["groups"][0]["max_ms"], 300);
     assert_eq!(v["slowest"][0]["ms"], 300);
 }
+
+#[test]
+fn test_timing_line_names_the_app_the_guard_saw_without_open() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let dir = TempDir::new("tt-timings-app-");
+    let path = dir.path().join("t.jsonl");
+    let _l = log_to(&path);
+    let mock = MockWda::start(MockState { active_app: Seq::one(json!("com.example.app")), ..Default::default() });
+    let mut c = mock.client();
+    c.set_allowed_apps(vec!["com.example.app".to_string()]);
+    let mut flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let (ok, _) = flow.run_outcome(&["tapxy:5,6".to_string()]).unwrap();
+    assert!(ok);
+    flow.close();
+    let lines = log_lines(&path);
+    assert_eq!(lines[0]["app"], "com.example.app", "{}", lines[0]);
+}
+
+#[test]
+fn test_cleartype_with_no_text_accepts_a_placeholder_only_field() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let run = |placeholder: &'static str| {
+        let mut st = MockState::default();
+        st.elements_map.insert("XCUIElementTypeTextView".into(), vec![json!({"ELEMENT": "tv1"})]);
+        // After clearing, the empty composer reports its placeholder as its value.
+        st.set_element_value("tv1", Dyn::one(json!("Message")));
+        let mock = MockWda::start(st);
+        mock.set_custom_handler(move |_, _, p, _| p.ends_with("/attribute/placeholderValue").then(|| json!({"value": placeholder})));
+        let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 0.5, Some(DENY_DEFAULT), false).unwrap();
+        let r = flow.step("cleartype:");
+        flow.close();
+        r
+    };
+    assert_eq!(run("Message").unwrap(), Some(json!("len=0")));
+    // A value that is not the placeholder is still a mismatch.
+    match run("Type here") {
+        Err(crate::error::Error::Flow(m)) => assert!(m.contains("read-back mismatch"), "{m}"),
+        other => panic!("expected mismatch, got {other:?}"),
+    }
+}

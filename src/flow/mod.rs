@@ -978,7 +978,14 @@ impl<R: Reader> Flow<R> {
             let r = self.c.get(&p);
             let v = json::get(&r, "value");
             let val = if json::truthy(v) { json::py_str(v) } else { String::new() };
-            if val != text {
+            // Clearing (`cleartype:` with no text): an empty field may report its
+            // placeholder as its value; that counts as empty.
+            let placeholder_only = text.is_empty() && !val.is_empty() && {
+                let pp = self.c.spath(&format!("/element/{eid}/attribute/placeholderValue"));
+                let ph = self.c.get(&pp);
+                json::get(&ph, "value").as_str().is_some_and(|p| p.trim() == val.trim())
+            };
+            if val != text && !placeholder_only {
                 return Err(Error::flow(format!(
                     "cleartype read-back mismatch (len {} vs {})",
                     val.chars().count(),
@@ -1265,7 +1272,8 @@ impl<R: Reader> Flow<R> {
             sleep_ms: (clock::slept_total() - slept0) * 1000.0,
             retries: self.step_retries,
             req: self.c.stats.since(&req0),
-            bundle: self.bundle.as_deref(),
+            // The app the flow opened, else the one the app guard's live check saw.
+            bundle: self.bundle.as_deref().or(self.c.last_foreground.as_deref()),
             ok: err.is_none(),
             error: err_s.as_deref(),
             target,
