@@ -3228,6 +3228,40 @@ pub fn check_wda_ok(res: Value, action: &str, redact: bool) -> Result<Value> {
     Ok(res)
 }
 
+/// The readable reason in an error answer from WDA: its JSON body's `value.message`
+/// on one line, else the body text, else the error itself (at most 400 characters).
+pub fn wda_error_reason(res: &Value) -> String {
+    let body = json::get(res, "body");
+    let txt = if json::truthy(body) { json::py_str(body) } else { json::py_str(json::get(res, "error")) };
+    let msg = serde_json::from_str::<Value>(&txt)
+        .ok()
+        .and_then(|v| v.get("value").and_then(|x| x.get("message")).and_then(Value::as_str).map(str::to_string))
+        .unwrap_or(txt);
+    let one = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() > 400 {
+        one.chars().take(400).collect::<String>() + "…"
+    } else {
+        one
+    }
+}
+
+/// True when WDA itself answered with an error status (not a lost connection or a
+/// deadline, where nobody knows what happened on the phone).
+pub fn wda_answered_error(res: &Value) -> bool {
+    json::err_code(res).is_some_and(|c| c >= 400)
+}
+
+/// The error for an `open:`/`launch:` that iOS refused, with WDA's reason on one line.
+pub fn app_open_error(action: &str, bundle_id: &str, res: &Value) -> Error {
+    let reason = wda_error_reason(res);
+    let hint = if reason.contains("FBSOpenApplication") || reason.to_lowercase().contains("not installed") {
+        format!(" (iOS did not open {bundle_id}: check that it is installed and allowed on this device and that the phone is unlocked)")
+    } else {
+        String::new()
+    };
+    Error::flow(format!("{action} failed: {reason}{hint}"))
+}
+
 /// True when a WDA answer quotes `secret` back (raw or base64), so error messages
 /// built from it must be redacted.
 pub fn echoes_secret(res: &Value, secret: &str) -> bool {

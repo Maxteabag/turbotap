@@ -649,12 +649,20 @@ impl<R: Reader> Flow<R> {
                 self.c.ensure_allowed_target(&label, Some(&bid))?;
                 self.mark_action(false, false);
                 let bundle_changed = self.bundle.as_deref() != Some(bid.as_str());
-                if verb.as_ref() == "launch" {
-                    let r = self.c.fast_launch(&bid, true);
-                    check_wda_ok(r, &format!("launch:{bid}"), false)?;
+                // WDA's own error answer means iOS did not open the app: stop here with its
+                // reason instead of reading or typing into whatever is in front. No answer
+                // at all (a lost connection) keeps going; the next step's app check waits.
+                let r = if verb.as_ref() == "launch" {
+                    self.c.fast_launch(&bid, true)
                 } else {
                     let p = self.c.spath("/wda/apps/activate");
-                    self.c.post(&p, &j!({"bundleId": bid}));
+                    self.c.post(&p, &j!({"bundleId": bid}))
+                };
+                if crate::wda::wda_answered_error(&r) {
+                    return Err(crate::wda::app_open_error(&format!("{verb}:{bid}"), &bid, &r));
+                }
+                if verb.as_ref() == "launch" {
+                    check_wda_ok(r, &format!("launch:{bid}"), false)?;
                 }
                 self.bundle = Some(bid.clone());
                 let now = clock::now();
