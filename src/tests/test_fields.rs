@@ -318,3 +318,31 @@ fn fill_values_stay_out_of_step_logs() {
     let (verb, arg) = crate::timings::step_kind_arg("fill:Password=hunter2");
     assert_eq!((verb.as_str(), arg.as_deref()), ("fill", Some("Password")));
 }
+
+#[test]
+fn fill_into_a_field_that_reports_no_value_goes_on_and_says_unverified() {
+    // Some editors never report their value: the probe cannot be checked and nothing
+    // reads back. fill: types on (no new refusal) and says so (never a silent ok).
+    let mut st = typing_composer();
+    st.keys_lost = true;
+    let mock = MockWda::start(st);
+    let mut f = flow(&mock);
+    let long = "A synthetic title long enough to need the focus probe, about sixty characters.";
+    let r = f.step(&format!("fill:Title={long}")).unwrap().unwrap();
+    assert!(r.as_str().unwrap().contains("unverified"), "{r}");
+    assert!(keys_typed(&mock).iter().any(|(t, _)| t == long));
+    f.close();
+}
+
+#[test]
+fn fill_reads_back_by_ocr_when_the_field_reports_no_value() {
+    let mut st = typing_composer();
+    st.keys_lost = true;
+    st.element_rects.insert("t1".into(), json!({"x": 16, "y": 150, "width": 398, "height": 90}));
+    let mock = MockWda::start(st);
+    let lines = vec![make_line("My title", 20.0, 160.0, 200.0, 180.0)];
+    let mut f = Flow::new(mock.client(), FakeReader::new(vec![(solid_img(255, (120, 240)), lines)]), 0.5, Some(DENY_DEFAULT), false).unwrap();
+    let r = f.step("fill:Title=My title").unwrap().unwrap();
+    assert!(r.as_str().unwrap().contains("read back by OCR"), "{r}");
+    f.close();
+}

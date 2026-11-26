@@ -295,13 +295,20 @@ impl<R: Reader> Flow<R> {
     /// Prove keyboard focus is in `f`: one probe character must grow `f` by exactly
     /// one (key events go to the one first responder, so then it went nowhere
     /// else); it is deleted again either way. Fails with nothing typed.
-    fn probe_focus(&mut self, f: &Field) -> Result<()> {
+    /// Ok(false): plain text into a field that reports no value at all, so the probe
+    /// cannot be checked (some web views and custom editors); the caller goes on,
+    /// marked unverified. For a secret that still fails, with nothing typed.
+    fn probe_focus(&mut self, f: &Field, secret: bool) -> Result<bool> {
         let before = self.field_value_len(f);
         self.fill_keys("x", "fill: focus probe", false)?;
         clock::sleep(0.2);
         let after = self.field_value_len(f);
         self.fill_keys(BACKSPACE, "fill: removing focus probe", false)?;
         clock::sleep(0.15);
+        if before == 0 && after == 0 && !secret {
+            crate::errln!("turbotap: warning: fill: {} reports no value; the focus probe cannot be checked, typing on unverified", f.describe());
+            return Ok(false);
+        }
         if after != before + 1 {
             return Err(Error::flow(format!(
                 "fill: keyboard focus is not in {} (a probe character did not land there and was deleted again); nothing was typed",
@@ -311,7 +318,7 @@ impl<R: Reader> Flow<R> {
         if self.field_value_len(f) != before {
             return Err(Error::flow(format!("fill: could not remove the focus probe from {}; nothing was typed", f.describe())));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// `fill:FIELD=VALUE`: type into the input named FIELD only, and verify. VALUE
@@ -362,8 +369,9 @@ impl<R: Reader> Flow<R> {
             self.focus_field(&f)?;
         }
         let want = text.chars().count();
+        let mut checkable = true;
         if secret || want >= PROBE_MIN_LEN {
-            self.probe_focus(&f)?;
+            checkable = self.probe_focus(&f, secret)?;
         }
         if secret {
             // Through the element itself (as type:/cleartype: since #26): a focus
@@ -380,6 +388,21 @@ impl<R: Reader> Flow<R> {
         let got = Field { value: v, ..f.clone() };
         let got = got.content();
         let n_got = got.chars().count();
+        if n_got == 0 && want > 0 && !f.secure() {
+            // The field reports no value: nothing to read back. Never a silent ok.
+            if !secret {
+                if let Some(o) = self.ocr_in_field(&f.id) {
+                    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if norm(&o) == norm(&text) {
+                        return Ok(format!("{}: len={want} (read back by OCR: the field reports no value)", f.name));
+                    }
+                }
+            }
+            if checkable {
+                crate::errln!("turbotap: warning: fill: {} reports no value after typing; not read back", f.describe());
+            }
+            return Ok(format!("{}: len={want} (unverified: the field reports no value)", f.name));
+        }
         let secret_wrong = if f.secure() { n_got != want } else { secret && got != text };
         if secret_wrong {
             // Never leave a wrong or partial secret in the field.
