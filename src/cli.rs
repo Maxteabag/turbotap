@@ -226,7 +226,12 @@ pub fn build_command() -> Command {
                 .arg(Arg::new("since").long("since").value_name("WHEN").help("30m, 2h, 1d, epoch seconds or YYYY-MM-DD[THH:MM] (UTC)"))
                 .arg(Arg::new("by").long("by").value_name("KEY").default_value("step").value_parser(["step", "app", "step+app"]))
                 .arg(Arg::new("file").long("file").value_name("PATH").help("read this log instead"))
-                .arg(Arg::new("top").long("top").value_name("N").value_parser(clap::value_parser!(usize)).default_value("10")),
+                .arg(Arg::new("top").long("top").value_name("N").value_parser(clap::value_parser!(usize)).default_value("10"))
+                .arg(flag(
+                    "receipt",
+                    "one run's wall clock split: helper/agent between steps, WDA, app wait, turbotap; retries, failures, longest gaps (with --since/--until and --device)",
+                ))
+                .arg(Arg::new("until").long("until").value_name("WHEN").help("with --receipt: end of the run (same forms as --since)")),
         )
         .subcommand(
             Command::new("install-skill")
@@ -340,6 +345,9 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         }
         "timings" => {
             let top = sm.get_one::<usize>("top").copied().unwrap_or(10);
+            if b(sm, "receipt") {
+                return crate::timings::cmd_timings_receipt(s(sm, "since"), s(sm, "until"), s(&m, "device"), s(sm, "file"), top);
+            }
             return crate::timings::cmd_timings(s(sm, "since"), s(sm, "by").unwrap_or("step"), s(sm, "file"), top);
         }
         "daemon" => {

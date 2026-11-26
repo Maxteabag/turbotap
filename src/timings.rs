@@ -329,6 +329,94 @@ pub fn summarize(lines: &[Value], since: Option<f64>, by: &str, top: usize) -> V
 }
 
 /// `turbotap timings [--since S] [--by step|app|step+app] [--file PATH] [--top N]`.
+/// Steps whose job is to wait for the app or the screen.
+const WAIT_STEPS: [&str; 5] = ["sleep", "wait", "waitany", "gone", "expect"];
+
+/// One run's wall clock split by who spent it, from the log lines between `since` and
+/// `until` (and one device): the helper or agent between steps, WDA, waiting for the app
+/// (wait steps, and settle sleeps inside other steps), and turbotap's own work; plus
+/// retries, failures and the longest gaps between steps.
+pub fn receipt(lines: &[Value], since: Option<f64>, until: Option<f64>, device: Option<&str>, top: usize) -> Value {
+    let f = |l: &Value, k: &str| l.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    let mut pick: Vec<(f64, f64, &Value)> = lines
+        .iter()
+        .filter_map(|l| {
+            let end = l.get("ts")?.as_f64()?;
+            let start = end - f(l, "ms") / 1000.0;
+            let in_window = since.is_none_or(|s| end >= s) && until.is_none_or(|u| start <= u);
+            let on_device = device.is_none_or(|d| l.get("device").and_then(Value::as_str) == Some(d));
+            (in_window && on_device).then_some((start, end, l))
+        })
+        .collect();
+    pick.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let brief = |l: &Value| j!({"ts": l.get("ts"), "step": l.get("step"), "arg": l.get("arg"), "ms": l.get("ms"), "ok": l.get("ok")});
+    let Some(&(t0, _, _)) = pick.first() else {
+        return j!({"steps": 0, "device": device});
+    };
+    let t1 = pick.iter().map(|p| p.1).fold(t0, f64::max);
+    let (mut step_ms, mut wda_ms, mut wait_ms, mut retries) = (0.0, 0.0, 0.0, 0u64);
+    let mut gaps: Vec<(f64, &Value, &Value)> = Vec::new();
+    let mut fails = Vec::new();
+    let (mut busy_until, mut prev): (f64, Option<&Value>) = (t0, None);
+    for &(s, e, l) in &pick {
+        let ms = (e - s) * 1000.0;
+        let w = f(l, "wda_ms").min(ms);
+        step_ms += ms;
+        wda_ms += w;
+        wait_ms += if WAIT_STEPS.contains(&l.get("step").and_then(Value::as_str).unwrap_or("")) {
+            ms - w
+        } else {
+            f(l, "sleep_ms").min(ms - w)
+        };
+        retries += l.get("retries").and_then(Value::as_u64).unwrap_or(0);
+        if l.get("ok").and_then(Value::as_bool) == Some(false) {
+            fails.push(brief(l));
+        }
+        if let Some(p) = prev.filter(|_| s > busy_until) {
+            gaps.push(((s - busy_until) * 1000.0, p, l));
+        }
+        busy_until = busy_until.max(e);
+        prev = Some(l);
+    }
+    let gap_ms: f64 = gaps.iter().map(|g| g.0).sum();
+    gaps.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let r = |x: f64| x.round() as i64;
+    j!({
+        "device": device,
+        "from": t0, "to": t1,
+        "steps": pick.len(), "failed": fails.len(), "retries": retries,
+        "wall_ms": r((t1 - t0) * 1000.0),
+        "split_ms": {
+            "helper_between_steps": r(gap_ms),
+            "wda": r(wda_ms),
+            "app_wait": r(wait_ms),
+            "turbotap_own": r((step_ms - wda_ms - wait_ms).max(0.0)),
+        },
+        "longest_gaps": gaps.iter().take(top).map(|(ms, a, b)| j!({"ms": r(*ms), "after": brief(a), "before": brief(b)})).collect::<Vec<_>>(),
+        "failures": fails,
+    })
+}
+
+pub fn cmd_timings_receipt(since: Option<&str>, until: Option<&str>, device: Option<&str>, file: Option<&str>, top: usize) -> Result<i32> {
+    let path = match file {
+        Some(f) => crate::config::expanduser(f),
+        None => log_path().ok_or_else(|| Error::value("timing log is off (TURBOTAP_TIMINGS=0); pass --file PATH"))?,
+    };
+    let now = crate::clock::wall();
+    let since = since.map(|s| parse_since(s, now)).transpose()?;
+    let until = until.map(|s| parse_since(s, now)).transpose()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(Error::Os(format!("{}: {e}", path.display()))),
+    };
+    let lines: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let mut out = receipt(&lines, since, until, device, top);
+    out["file"] = Value::String(path.display().to_string());
+    crate::outln!("{}", json::dumps_utf8(&out));
+    Ok(0)
+}
+
 pub fn cmd_timings(since: Option<&str>, by: &str, file: Option<&str>, top: usize) -> Result<i32> {
     let path = match file {
         Some(f) => crate::config::expanduser(f),
