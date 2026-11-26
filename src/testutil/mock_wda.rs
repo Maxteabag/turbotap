@@ -492,6 +492,8 @@ fn route(inner: &mut Inner, method: &str, path: &str, data: &Value) -> Value {
             "attribute/label" => return json!({"value": st.element_labels.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/name" => return json!({"value": st.element_names.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/type" => return json!({"value": st.element_types.get(&eid).cloned().unwrap_or(Value::Null)}),
+            // GET /element/<id>/name: the element's type (W3C tag name).
+            "name" => return json!({"value": st.element_types.get(&eid).cloned().unwrap_or(Value::Null)}),
             "attribute/value" => {
                 let v = match st.element_values.get_mut(&eid) {
                     Some(d) => d.next(&Value::Null),

@@ -18,6 +18,7 @@ use crate::wda::{check_wda_ok, WdaClient};
 use serde_json::{json as j, Value};
 
 pub mod act;
+pub mod fields;
 pub mod sense;
 pub mod tap;
 pub mod worker;
@@ -169,6 +170,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         system-wide; a key step after which another app is in front prints
                         a warning (marks only, nothing is refused)
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
+  readfield:FIELD       the exact value of the input named FIELD (label, identifier or placeholder),
+                        blank lines included; read-only; a secure field gives only len=N
+  assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V, cmd:C); read-only
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
@@ -252,6 +256,10 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
 pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
     let verb = verb.trim();
+    if verb.eq_ignore_ascii_case("assertfield") {
+        let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+        return value.starts_with("env:") || value.starts_with("cmd:");
+    }
     CREDENTIAL_VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb))
         || ((verb.eq_ignore_ascii_case("type") || verb.eq_ignore_ascii_case("setclip"))
             && (arg.starts_with("env:") || arg.starts_with("cmd:")))
@@ -264,6 +272,14 @@ pub fn safe_step(spec: &str) -> String {
         return spec.to_string();
     };
     let trimmed = verb.trim();
+    if trimmed.eq_ignore_ascii_case("assertfield") {
+        // FIELD=VALUE: the field name is shown; the value only as env:NAME or file:PATH.
+        return match arg.split_once('=') {
+            Some((_, value)) if value.starts_with("env:") || value.starts_with("file:") => spec.to_string(),
+            Some((field, _)) => format!("{verb}:{field}=<redacted>"),
+            None => spec.to_string(),
+        };
+    }
     if !SECRET_ARG_VERBS.iter().any(|v| v.eq_ignore_ascii_case(trimmed)) || arg.starts_with("env:") {
         return spec.to_string();
     }
@@ -773,6 +789,8 @@ impl<R: Reader> Flow<R> {
                 return some(kname);
             }
             "cleartype" => return some(self.clear_type(&verb, arg)?),
+            "readfield" => return some(self.read_field(arg)?),
+            "assertfield" => return some(self.assert_field(arg)?),
             "dismisskb" => return some(self.dismiss_kb()?),
             "typedigits" => return some(self.type_digits(arg)?),
             "pintap" => return some(self.pin_tap(arg)?),
