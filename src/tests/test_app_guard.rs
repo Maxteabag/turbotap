@@ -2245,3 +2245,19 @@ fn test_a_passing_banner_is_rechecked_not_refused_and_a_takeover_still_is() {
         flow.close();
     }
 }
+
+#[test]
+fn test_refusal_with_springboard_in_front_says_when_the_phone_is_locked() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    for (locked, says) in [(true, true), (false, false)] {
+        let mut st = state_with_app(json!("com.apple.springboard"));
+        st.locked = Seq::one(json!(locked));
+        let mock = MockWda::start(st);
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+        let m = expect_guard_err(flow.step("tapxy:5,6"), "foreground app 'com.apple.springboard'");
+        assert_eq!(m.contains("the phone is locked"), says, "{locked}: {m}");
+        assert!(mock.tapped_points().is_empty());
+        flow.close();
+    }
+}

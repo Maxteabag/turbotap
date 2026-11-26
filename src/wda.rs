@@ -1084,7 +1084,15 @@ impl WdaClient {
         match first {
             Ok(b) if self.allowed_apps.iter().any(|a| a == &b) => Ok(true),
             Ok(b) if self.guard_unlock_scope && b == SPRINGBOARD => Ok(true),
-            Ok(b) => Err(self.guard_refuse(crate::guard::refuse_foreground(action, &b, &self.allowed_apps))),
+            Ok(b) => {
+                let mut msg = crate::guard::refuse_foreground(action, &b, &self.allowed_apps);
+                // SpringBoard in front is often a locked phone: say so (one read, only
+                // on refusal) instead of leaving it at "wrong app".
+                if b == SPRINGBOARD && matches!(self.confirm_locked_state(0), Ok(true)) {
+                    msg.push_str("; the phone is locked (run 'turbotap unlock' or unlock it, then open the app again)");
+                }
+                Err(self.guard_refuse(msg))
+            }
             Err(_) if expired(deadline) => Ok(false),
             Err(why) => Err(self.guard_refuse(crate::guard::refuse_unknown(action, &why, &self.allowed_apps))),
         }
