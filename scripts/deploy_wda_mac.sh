@@ -156,10 +156,14 @@ for pid in $(ps -axo pid=,command= | awk -v u="$UDID" '/xcodebuild/ && /WebDrive
 done
 sleep 2
 cd "$SRC"
+# One log per device, kept across restarts (the previous run moves to .1), so a
+# restart never wipes the evidence of why the last runner stopped working.
+LOG="/var/tmp/wda-runner-$UDID.log"
+[ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
 nohup "$XB" test-without-building -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
   -destination "id=$UDID" -derivedDataPath "$DD" "${SIGN[@]}" USE_PORT=8100 \
-  >/var/tmp/wda-direct.log 2>&1 </dev/null &
-echo "runner started pid $!"
+  >"$LOG" 2>&1 </dev/null &
+echo "runner started pid $! (log $LOG)"
 REMOTE
 for _ in $(seq 1 60); do
   if curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -d '{"x0":0,"x1":320,"y0":0,"y1":40}' \
@@ -168,5 +172,5 @@ for _ in $(seq 1 60); do
   fi
   sleep 1
 done
-echo "WDA did not come up; see $MAC:/var/tmp/wda-direct.log" >&2
+echo "WDA did not come up; see $MAC:/var/tmp/wda-runner-$UDID.log (a locked iPhone: Xcode waits until it is unlocked)" >&2
 exit 1

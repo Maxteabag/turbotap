@@ -2854,6 +2854,7 @@ impl WdaClient {
     /// and a runner without UI-testing access cannot type the passcode, so a locked
     /// phone (devicectl's `passcodeRequired`) is reported instead of restarting.
     pub fn recover_ui_testing(&mut self) -> Result<()> {
+        crate::devicectl::record_ui_testing_lost(&self.udid, self.idle_secs(), "flow");
         if let Ok(Some(true)) = crate::devicectl::passcode_required(&self.udid) {
             return Err(Error::runtime(LOST_LOCKED_MSG));
         }
@@ -3570,6 +3571,7 @@ pub fn cmd_keepawake(client: &mut WdaClient, secs: f64, idle: f64, unlock: bool,
             }
             let r = client.keep_awake(idle);
             if r == "lost" {
+                crate::devicectl::record_ui_testing_lost(&client.udid, client.idle_secs(), "keepawake");
                 let locked = crate::devicectl::passcode_required(&client.udid).ok().flatten();
                 crate::errln!(
                     "turbotap: keepawake: WDA lost UI-testing authorization{}",

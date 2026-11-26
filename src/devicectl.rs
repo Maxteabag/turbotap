@@ -77,3 +77,30 @@ pub fn cmd_uninstall(udid: &str, base_url: &str, cache_dir: &std::path::Path, bu
     );
     Ok(())
 }
+
+/// CoreDevice connection facts for diagnostics: (transportType, tunnelState).
+pub fn connection_state(udid: &str) -> Result<(String, String)> {
+    let r = devicectl_json(udid, "device info details", 25.0)?;
+    let cp = json::get(&r, "connectionProperties");
+    let s = |k: &str| json::get(cp, k).as_str().unwrap_or("").to_string();
+    Ok((s("transportType"), s("tunnelState")))
+}
+
+/// Append one line to `~/.local/state/turbotap/ui-testing-lost.jsonl` when the
+/// runner has lost UI-testing access: when, how long the phone had been idle, and
+/// what devicectl says about the lock and the connection, to find what causes it.
+pub fn record_ui_testing_lost(udid: &str, idle_secs: f64, context: &str) {
+    let lock = passcode_required(udid).ok().flatten();
+    let (transport, tunnel) = connection_state(udid).unwrap_or_default();
+    let line = serde_json::json!({
+        "ts": crate::clock::real_wall(), "udid": udid, "context": context,
+        "idle_s": (idle_secs * 10.0).round() / 10.0, "passcode_required": lock,
+        "transport": transport, "tunnel": tunnel,
+    });
+    let dir = crate::config::expanduser("~/.local/state/turbotap");
+    let _ = std::fs::create_dir_all(&dir);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("ui-testing-lost.jsonl")) {
+        let _ = writeln!(f, "{line}");
+    }
+}
