@@ -1782,3 +1782,160 @@ fn test_tapel_attribute_reads_need_a_strict_success_envelope() {
         assert_eq!(mock.tapped_points().len(), 1, "{resp:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// v1.4.2: icon-style names on a plain Send button, and refusals that say why
+// ---------------------------------------------------------------------------
+
+/// A mock with one element found by `tapel:QUERY`'s exact predicate, with the given
+/// label and name attributes, and `app` in front.
+fn mock_with_named_element(app: &str, query: &str, label: Option<&str>, name: Option<&str>) -> MockWda {
+    let mut st = state_with_app(json!(app));
+    let q = serde_json::to_string(query).unwrap();
+    st.element_map.insert(format!("(label == {q} OR name == {q}) AND enabled == 1"), Dyn::one(json!({"ELEMENT": "nm-1"})));
+    st.element_rects.insert("nm-1".into(), json!({"x": 340, "y": 780, "width": 32, "height": 32}));
+    if let Some(l) = label {
+        st.element_labels.insert("nm-1".into(), json!(l));
+    }
+    if let Some(n) = name {
+        st.element_names.insert("nm-1".into(), json!(n));
+    }
+    MockWda::start(st)
+}
+
+#[test]
+fn test_safe_icon_name_rule() {
+    use crate::flow::is_safe_icon_name;
+    for n in ["arrow.up", "arrow.up.circle.fill", "paperplane.fill", "sendButton", "send-button", "composer_send", "ic_send_24", "SendMessageButton"] {
+        assert!(is_safe_icon_name(n), "{n}");
+    }
+    for n in [
+        "",
+        "Send to all",
+        "send all",
+        "sendAll",
+        "sendtoall",
+        "sendMoney",
+        "sendPaymentButton",
+        "pay-button",
+        "tipJar",
+        "deleteButton",
+        "startCall",
+        "voice.record",
+        "attachFile",
+        "send.everyone",
+        "broadcastSend",
+        "fund_transfer",
+        "send/button",
+        "send✓",
+        &"a".repeat(65),
+    ] {
+        assert!(!is_safe_icon_name(n), "{n}");
+    }
+}
+
+#[test]
+fn test_plain_send_label_with_icon_identifier_is_allowed_in_allowlisted_app() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    for (query, label, name) in [
+        ("Send", "Send", "arrow.up"),
+        ("Send", "Send", "sendButton"),
+        ("Send message", "Send message", "paperplane.fill"),
+        ("Send message", "Send", "Send message"),
+    ] {
+        let mock = mock_with_named_element(ALLOWED, query, Some(label), Some(name));
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+        flow.step(&format!("tapel:{query}")).unwrap_or_else(|e| panic!("{label}/{name}: {e:?}"));
+        let pts: Vec<(i64, i64)> = mock.tapped_points().iter().map(|p| (p.0, p.1)).collect();
+        assert_eq!(pts, vec![(356, 796)], "{label}/{name}");
+        flow.close();
+    }
+    // Still refused: risky names, names that are sentences, other labels, no
+    // allowlist, an explicit --deny. Nothing is tapped.
+    let refused: [(&str, Option<&str>, Option<&str>, &[&str], &str); 7] = [
+        ("Send", Some("Send"), Some("sendMoneyButton"), &[ALLOWED], "name 'sendMoneyButton'"),
+        ("Send", Some("Send"), Some("send-to-all"), &[ALLOWED], "name 'send-to-all'"),
+        ("Send", Some("Send"), Some("Send to everyone"), &[ALLOWED], "name 'Send to everyone'"),
+        ("Send", Some("Send payment"), Some("arrow.up"), &[ALLOWED], "label 'Send payment' is not exactly"),
+        ("Send", None, Some("arrow.up"), &[ALLOWED], "element label is empty"),
+        ("Pay", Some("Pay"), Some("arrow.up"), &[ALLOWED], "matches --deny"),
+        ("Send", Some("Send"), Some("arrow.up"), &[], "app guard off"),
+    ];
+    for (query, label, name, allow, want) in refused {
+        let mock = mock_with_named_element(ALLOWED, query, label, name);
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), allow);
+        match flow.step(&format!("tapel:{query}")) {
+            Err(Error::Flow(m)) => {
+                assert!(m.contains("matches --deny"), "{label:?}/{name:?}: {m}");
+                assert!(m.contains(want), "{label:?}/{name:?}: want {want:?} in {m}");
+            }
+            other => panic!("{label:?}/{name:?}: expected --deny refusal, got {other:?}"),
+        }
+        assert!(input_posts(&mock).is_empty(), "{label:?}/{name:?}");
+        assert!(mock.tapped_points().is_empty(), "{label:?}/{name:?}");
+        flow.close();
+    }
+}
+
+#[test]
+fn test_send_refusal_explains_element_and_foreground() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // Element check fails: the message names the label, the name and the foreground
+    // result (here confirmed), so the caller sees it is the element, not the app.
+    let mock = mock_with_named_element(ALLOWED, "Send message", Some("Send"), Some("send all"));
+    let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+    match flow.step("tapel:Send message") {
+        Err(Error::Flow(m)) => {
+            assert!(m.contains("plain-Send exception not applied"), "{m}");
+            assert!(m.contains("label 'Send' but name 'send all'"), "{m}");
+            assert!(m.contains(&format!("foreground: {ALLOWED} confirmed allowlisted")), "{m}");
+        }
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    flow.close();
+    // Element fine, foreground unconfirmed: the foreground reason.
+    let mock = MockWda::start(state_with_app(json!({"error": 500, "body": "boom"})));
+    let mut c = mock.client();
+    c.set_allowed_apps(strs(&[ALLOWED]));
+    let mut flow = Flow::new(c, blank_reader(), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    match flow.guard("Send", "tap") {
+        Err(Error::Flow(m)) => assert!(m.contains("foreground: unconfirmed"), "{m}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    flow.close();
+    // An explicit --deny says so.
+    let mock = mock_with_named_element(ALLOWED, "Send", Some("Send"), None);
+    let mut flow = guarded_flow(&mock, &blank_reader(), Some(r"\bsend\b"), &[ALLOWED]);
+    match flow.step("tapel:Send") {
+        Err(Error::Flow(m)) => assert!(m.contains("an explicit --deny is never relaxed"), "{m}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    flow.close();
+}
+
+#[test]
+fn test_allow_app_flag_alone_gives_plain_send_for_that_bundle() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // OTHER is not in config's allowed_apps; --allow-app adds it for this run only.
+    let mock = mock_with_named_element(OTHER, "Send", Some("Send"), Some("arrow.up.circle.fill"));
+    {
+        let _e = cli_env(&mock.url, &[]);
+        let (code, out, err) = run(&["--no-daemon", "flow", "--quiet", "--allow-app", OTHER, "tapel:Send"]);
+        assert_eq!(code, 0, "{out} {err}");
+        assert_eq!(mock.tapped_points().len(), 1);
+        // Without it the app guard refuses first.
+        let (code, _, _) = run(&["--no-daemon", "flow", "--quiet", "tapel:Send"]);
+        assert_ne!(code, 0);
+    }
+    // Pay stays denied with it.
+    let mock2 = mock_with_named_element(OTHER, "Pay", Some("Pay"), Some("arrow.up"));
+    let _e2 = cli_env(&mock2.url, &[]);
+    let (code, out, _) = run(&["--no-daemon", "flow", "--quiet", "--allow-app", OTHER, "tapel:Pay"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("matches --deny"), "{out}");
+    assert!(mock2.tapped_points().is_empty());
+    assert_eq!(mock.tapped_points().len(), 1);
+}

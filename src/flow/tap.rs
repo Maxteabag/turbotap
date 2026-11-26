@@ -121,6 +121,33 @@ impl ElAttr {
     }
 }
 
+/// The plain-Send exception's element check for a `tapel:` target: `Ok(label)` when
+/// the label was read and is exactly a plain Send, and the name was read and is
+/// empty, the same text, another plain Send, or an icon-style identifier with no
+/// risky word ([`super::is_safe_icon_name`], e.g. `arrow.up` or `sendButton`).
+/// Unreadable or disagreeing attributes: `Err(why)`, quoting the element's label and
+/// name (never its value).
+fn plain_send_target(label: &ElAttr, name: &ElAttr) -> std::result::Result<String, String> {
+    use super::{is_plain_send, is_safe_icon_name, short_repr};
+    let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let l = match label {
+        ElAttr::Value(l) if is_plain_send(l) => l,
+        ElAttr::Value(l) => return Err(format!("element label {} is not exactly Send or Send message", short_repr(l))),
+        ElAttr::Empty => return Err("element label is empty".into()),
+        ElAttr::Failed => return Err("element label could not be read".into()),
+    };
+    match name {
+        ElAttr::Empty => Ok(l.clone()),
+        ElAttr::Value(n) if fold(n) == fold(l) || is_plain_send(n) || is_safe_icon_name(n) => Ok(l.clone()),
+        ElAttr::Value(n) => Err(format!(
+            "element label {} but name {} is not empty, a plain Send or a safe icon identifier",
+            short_repr(l),
+            short_repr(n)
+        )),
+        ElAttr::Failed => Err(format!("element label {} but its name could not be read", short_repr(l))),
+    }
+}
+
 impl<R: Reader> Flow<R> {
     /// `self.controls()` / `self.controls(deadline=deadline)` from the tap code.
     fn tap_ctl(&mut self, deadline: Option<f64>) -> Result<Vec<Control>> {
@@ -1082,19 +1109,20 @@ impl<R: Reader> Flow<R> {
                         // The element may have been found by a substring or by its name:
                         // check what it actually is, not only the query.
                         let (el_label, el_name) = (self.element_attr(&eid, "label"), self.element_attr(&eid, "name"));
-                        let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-                        // The exception needs a successfully read label that is exactly a
-                        // plain Send, and a name that was read too and is empty or the
-                        // same. Unreadable or disagreeing attributes: no exception.
-                        let own: Option<String> = match (&el_label, &el_name) {
-                            (ElAttr::Value(l), ElAttr::Empty) => Some(l.clone()),
-                            (ElAttr::Value(l), ElAttr::Value(n)) if fold(l) == fold(n) => Some(l.clone()),
-                            _ => None,
-                        };
-                        let may_relax = own.as_deref().is_some_and(super::is_plain_send);
+                        let own = plain_send_target(&el_label, &el_name);
+                        let mut seen: Vec<&str> = Vec::new();
                         for t in [Some(label), el_label.value(), el_name.value()].into_iter().flatten() {
-                            self.guard_with(t, "tap", may_relax)?;
+                            // The identical text twice (query == label == name) is checked
+                            // once: each plain-Send check costs a live foreground request.
+                            // Exact comparison only; a custom --deny may be case-sensitive.
+                            if seen.contains(&t) {
+                                continue;
+                            }
+                            seen.push(t);
+                            self.guard_relax(t, "tap", own.as_ref().map(|_| ()).map_err(Clone::clone))?;
                         }
+                        let may_relax = own.is_ok();
+                        let own = own.ok();
                         self.tap_point_with(x, y, own.as_deref().unwrap_or(label), None, may_relax)?;
                         return Ok((x, y));
                     }

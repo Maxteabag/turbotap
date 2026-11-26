@@ -40,6 +40,42 @@ pub fn is_plain_send(label: &str) -> bool {
     PLAIN_SEND_LABELS.contains(&norm.as_str())
 }
 
+/// Substrings that disqualify an element name from [`is_safe_icon_name`]: money,
+/// destructive, call/recording, mass-recipient, attachment and confirmation words.
+/// Matched anywhere in the lowercased name, so `sendtoall` and `small` both fail:
+/// a false refusal only costs the exception, a false pass could send money.
+const ICON_NAME_RISKY: &[&str] = &[
+    "pay", "buy", "purchase", "order", "checkout", "subscri", "fund", "money", "cash", "coin", "crypto", "wallet",
+    "transfer", "wire", "tip", "donat", "gift", "bill", "invoice", "price", "delet", "remov", "erase", "reset",
+    "unsend", "trash", "destroy", "wipe", "call", "phone", "dial", "facetime", "voice", "audio", "video", "record",
+    "mic", "all", "every", "broadcast", "group", "invite", "share", "forward", "attach", "file", "photo", "image",
+    "location", "contact", "accept", "decline", "confirm", "approve", "sign", "post", "publish",
+];
+
+/// True when `name` (an element's accessibility identifier, which WDA reports as
+/// `name` when set) looks like a developer identifier or SF Symbol for an icon-only
+/// button (`arrow.up.circle.fill`, `sendButton`, `composer-send`): 1-64 ASCII
+/// letters, digits, `.`, `_` or `-`, and none of [`ICON_NAME_RISKY`]. Sentences and
+/// anything with spaces never qualify.
+pub fn is_safe_icon_name(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() || n.len() > 64 || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+        return false;
+    }
+    let low = n.to_ascii_lowercase();
+    !ICON_NAME_RISKY.iter().any(|w| low.contains(w))
+}
+
+/// `s` quoted for a refusal message, cut to 48 characters (element labels and names
+/// only; never typed text or values).
+pub(crate) fn short_repr(s: &str) -> String {
+    let mut t: String = s.chars().take(48).collect();
+    if t.len() < s.len() {
+        t.push_str("...");
+    }
+    json::py_repr_str(&t)
+}
+
 pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
@@ -375,30 +411,62 @@ impl<R: Reader> Flow<R> {
     /// `--deny`, no allowlist, an unconfirmed foreground app or any other label stays
     /// refused.
     pub fn guard_with(&mut self, text: &str, action: &str, may_relax: bool) -> Result<()> {
-        if let Some(guard) = self.deny.as_ref() {
-            if text.is_empty() {
-                return Ok(());
-            }
-            match guard.regex().is_match(text) {
-                Ok(false) => {}
-                Ok(true) => {
-                    let eligible = may_relax && matches!(guard, DenyGuard::Default) && is_plain_send(text);
-                    if eligible && self.c.foreground_confirmed_allowed() {
-                        return Ok(());
-                    }
-                    return Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text))));
-                }
-                // An evaluation error (e.g. backtrack limit) is an unverified result, not a
-                // non-match: fail closed before any action is dispatched.
-                Err(e) => {
-                    return Err(Error::flow(format!(
-                        "refusing to {action} {}: --deny could not be evaluated ({e})",
-                        json::py_repr_str(text)
-                    )));
-                }
-            }
+        self.guard_relax(text, action, if may_relax { Ok(()) } else { Err(String::new()) })
+    }
+
+    /// [`Flow::guard_with`] where `relax` is `Ok` when the caller verified `text` is
+    /// the target's own label, else `Err(why not)`. A refusal of a Send-like target
+    /// says why the plain-Send exception did not apply (element check, explicit
+    /// `--deny`, foreground check), so the caller can see what to fix.
+    pub fn guard_relax(&mut self, text: &str, action: &str, relax: std::result::Result<(), String>) -> Result<()> {
+        let Some(guard) = self.deny.as_ref() else {
+            return Ok(());
+        };
+        if text.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let is_default = matches!(guard, DenyGuard::Default);
+        match guard.regex().is_match(text) {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                let plain = is_plain_send(text);
+                let mut why: Vec<String> = Vec::new();
+                if !is_default {
+                    if plain {
+                        why.push("an explicit --deny is never relaxed".into());
+                    }
+                } else {
+                    match &relax {
+                        Err(note) if !note.is_empty() => why.push(note.clone()),
+                        Err(_) => {}
+                        Ok(()) if !plain => {}
+                        Ok(()) => match self.c.foreground_status() {
+                            Ok(_) => return Ok(()),
+                            Err(fg) => why.push(format!("foreground: {fg}")),
+                        },
+                    }
+                    // Element check failed: still report the foreground result.
+                    if matches!(&relax, Err(n) if !n.is_empty()) {
+                        match self.c.foreground_status() {
+                            Ok(b) => why.push(format!("foreground: {b} confirmed allowlisted")),
+                            Err(fg) => why.push(format!("foreground: {fg}")),
+                        }
+                    }
+                }
+                let mut msg = format!("refusing to {action} {}: matches --deny", json::py_repr_str(text));
+                if !why.is_empty() {
+                    msg.push_str("; plain-Send exception not applied: ");
+                    msg.push_str(&why.join("; "));
+                }
+                Err(Error::flow(msg))
+            }
+            // An evaluation error (e.g. backtrack limit) is an unverified result, not a
+            // non-match: fail closed before any action is dispatched.
+            Err(e) => Err(Error::flow(format!(
+                "refusing to {action} {}: --deny could not be evaluated ({e})",
+                json::py_repr_str(text)
+            ))),
+        }
     }
 
     fn wait_input_focus(&mut self) {
