@@ -139,7 +139,27 @@ fn test_cleartype_finds_a_lone_text_view_with_one_tree_query() {
     assert_eq!(flow.step("cleartype:pw1").unwrap(), Some(json!("len=3")));
     assert!(!mock.paths().iter().any(|p| p.ends_with("/attribute/value")), "{:?}", mock.paths());
     flow.close();
-    // Several inputs: the class order still decides (TextField before TextView).
+    // Several inputs: their types pick the same element the class order would
+    // (TextField before SearchField before TextView), still with one tree query.
+    for (els, types, want) in [
+        (vec!["tv1", "tf1"], vec!["XCUIElementTypeTextView", "XCUIElementTypeTextField"], "tf1"),
+        (vec!["tv1", "sf1"], vec!["XCUIElementTypeTextView", "XCUIElementTypeSearchField"], "sf1"),
+        (vec!["tv1", "tv2"], vec!["XCUIElementTypeTextView", "XCUIElementTypeTextView"], "tv1"),
+    ] {
+        let mut st = MockState::default();
+        st.elements_map.insert(ekey(&["predicate string", INPUT_PRED]), els.iter().map(|e| json!({"ELEMENT": e})).collect());
+        for (e, t) in els.iter().zip(&types) {
+            st.element_types.insert(e.to_string(), json!(t));
+        }
+        st.set_element_value(want, Dyn::one(json!("")));
+        let mock = MockWda::start(st);
+        let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 0.5, Some(DENY_DEFAULT), false).unwrap();
+        assert_eq!(flow.step("cleartype:abc").unwrap(), Some(json!("len=3")), "{els:?}");
+        assert!(mock.paths().iter().any(|p| p.ends_with(&format!("/element/{want}/click"))), "{els:?}: {:?}", mock.paths());
+        assert_eq!(tree_queries(&mock), 1, "{els:?}: {:?}", mock.paths());
+        flow.close();
+    }
+    // A type that cannot be read: the class order decides, one search per class.
     let mut st = MockState::default();
     st.elements_map.insert(ekey(&["predicate string", INPUT_PRED]), vec![json!({"ELEMENT": "tv1"}), json!({"ELEMENT": "tf1"})]);
     st.elements_map.insert("XCUIElementTypeTextField".into(), vec![json!({"ELEMENT": "tf1"})]);

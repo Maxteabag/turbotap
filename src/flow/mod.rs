@@ -197,6 +197,10 @@ pub fn is_url_scheme(s: &str) -> bool {
 /// Verbs whose argument is text typed or tapped into the device (PINs, passwords,
 /// clipboard contents). Their inline values and `cmd:` command lines never appear in
 /// flow output; `env:VAR` names are shown.
+/// `cleartype:` reads at most this many matched inputs' types before falling back to
+/// one class search per type.
+const TEXT_INPUT_TYPE_READS: usize = 6;
+
 /// `cleartype:` read-back: wait before each read of the field's value.
 const CLEARTYPE_READBACK: [f64; 4] = [0.0, 0.08, 0.12, 0.2];
 
@@ -917,8 +921,10 @@ impl<R: Reader> Flow<R> {
     /// The text input `cleartype:` writes to, and whether it is secure. One predicate
     /// query for all four input types (one tree walk instead of up to four class
     /// searches; a chat composer is a TextView, which the class order checked last).
-    /// One match: its type decides `secure`. None, several, or a runner that rejects
-    /// the predicate: the class order TextField, SecureTextField, SearchField, TextView.
+    /// Up to [`TEXT_INPUT_TYPE_READS`] matches: their types pick the first of the
+    /// highest-priority class (TextField, SecureTextField, SearchField, TextView), the
+    /// same element the class order would pick. None, more, an unreadable type, or a
+    /// runner that rejects the predicate: one class search per type, in that order.
     fn find_text_input(&mut self) -> Option<(String, bool)> {
         const ORDER: [(&str, bool); 4] = [
             ("XCUIElementTypeTextField", false),
@@ -932,14 +938,33 @@ impl<R: Reader> Flow<R> {
         // An empty answer falls back too: a runner that does not map `type` in an IN
         // predicate would answer [] rather than an error.
         if let Some(els) = json::get(&r, "value").as_array().filter(|_| json::get(&r, "error").is_null()) {
-            if els.len() == 1 {
-                if let Some(eid) = Self::first_element_id(&Value::Array(els.clone())) {
+            // Several inputs (a search field and a composer, say): read each one's
+            // type (a per-element read, far cheaper than another tree walk) and take
+            // the first of the highest-priority type, as the class order would.
+            if (1..=TEXT_INPUT_TYPE_READS).contains(&els.len()) {
+                let mut best: Option<(usize, String, bool)> = None;
+                let mut complete = true;
+                for el in els {
+                    let Some(eid) = Self::first_element_id(&Value::Array(vec![el.clone()])) else {
+                        complete = false;
+                        break;
+                    };
                     let tp = self.c.spath(&format!("/element/{eid}/attribute/type"));
                     let t = self.c.get(&tp);
-                    if let Some(kind) = json::get(&t, "value").as_str() {
-                        if let Some((_, sec)) = ORDER.iter().find(|(c, _)| *c == kind) {
-                            return Some((eid, *sec));
-                        }
+                    let Some(rank) = json::get(&t, "value").as_str().and_then(|k| ORDER.iter().position(|(c, _)| *c == k)) else {
+                        complete = false;
+                        break;
+                    };
+                    if best.as_ref().is_none_or(|(r, _, _)| rank < *r) {
+                        best = Some((rank, eid, ORDER[rank].1));
+                    }
+                    if rank == 0 {
+                        break; // a TextField: nothing ranks higher
+                    }
+                }
+                if complete {
+                    if let Some((_, eid, sec)) = best {
+                        return Some((eid, sec));
                     }
                 }
             }
