@@ -1842,6 +1842,10 @@ fn test_plain_send_label_with_icon_identifier_is_allowed_in_allowlisted_app() {
         ("Send", "Send", "arrow.up"),
         ("Send", "Send", "sendButton"),
         ("Send message", "Send message", "paperplane.fill"),
+        // Hyphenated identifiers: `\bsend\b` matches at the hyphen, but the name
+        // passed the stricter icon-name rule.
+        ("Send message", "Send message", "chat-send-message"),
+        ("Send", "Send", "send-button"),
         ("Send message", "Send", "Send message"),
     ] {
         let mock = mock_with_named_element(ALLOWED, query, Some(label), Some(name));
@@ -1904,6 +1908,16 @@ fn test_send_refusal_explains_element_and_foreground() {
         Err(Error::Flow(m)) => assert!(m.contains("foreground: unconfirmed"), "{m}"),
         other => panic!("expected refusal, got {other:?}"),
     }
+    flow.close();
+    // An explicit --deny still applies to a hyphenated icon name.
+    // (a pattern that matches only the name, on an otherwise plain Send button).
+    let mock = mock_with_named_element(ALLOWED, "Send", Some("Send"), Some("chat-send-message"));
+    let mut flow = guarded_flow(&mock, &blank_reader(), Some("chat-send"), &[ALLOWED]);
+    match flow.step("tapel:Send") {
+        Err(Error::Flow(m)) => assert!(m.contains("'chat-send-message': matches --deny"), "{m}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    assert!(mock.tapped_points().is_empty());
     flow.close();
     // An explicit --deny says so.
     let mock = mock_with_named_element(ALLOWED, "Send", Some("Send"), None);
