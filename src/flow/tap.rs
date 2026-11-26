@@ -635,6 +635,11 @@ impl<R: Reader> Flow<R> {
         is_form_label: bool,
     ) -> Result<Option<Control>> {
         let mut c = if m.rank != 0 || is_form_label { exact_control(ctl, base, TAP_FORM_TYPES, false).cloned() } else { None };
+        // A list row labelled "Title, subtitle, status": the one row whose label has a
+        // part exactly equal to TEXT beats an OCR line that only contains TEXT.
+        if c.is_none() && m.rank != 0 && !base.starts_with("re:") {
+            c = unique_part_control(ctl, base).cloned();
+        }
         if c.is_none() && is_form_label {
             c = self.input_near(base, m, Some(ctl))?;
         }
