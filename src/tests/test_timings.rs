@@ -149,7 +149,15 @@ fn test_cleartype_with_no_text_accepts_a_placeholder_only_field() {
         // After clearing, the empty composer reports its placeholder as its value.
         st.set_element_value("tv1", Dyn::one(json!("Message")));
         let mock = MockWda::start(st);
-        mock.set_custom_handler(move |_, _, p, _| p.ends_with("/attribute/placeholderValue").then(|| json!({"value": placeholder})));
+        mock.set_custom_handler(move |_, _, p, _| {
+            if p.ends_with("/attribute/placeholderValue") {
+                Some(json!({"value": placeholder}))
+            } else if p.ends_with("/attribute/value") {
+                Some(json!({"value": "Message"}))
+            } else {
+                None
+            }
+        });
         let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 0.5, Some(DENY_DEFAULT), false).unwrap();
         let r = flow.step("cleartype:");
         flow.close();
