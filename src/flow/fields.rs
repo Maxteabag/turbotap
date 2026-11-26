@@ -134,7 +134,7 @@ impl<R: Reader> Flow<R> {
     /// The text OCR sees inside the field's own frame, line by line (for an input whose
     /// value WDA reports empty although text is shown). Only visible lines: blank lines
     /// and text scrolled out of the field are not seen.
-    fn ocr_in_field(&mut self, id: &str) -> Option<String> {
+    pub(crate) fn ocr_in_field(&mut self, id: &str) -> Option<String> {
         let (x, y, w, h) = self.field_rect(id)?;
         if w <= 0.0 || h <= 0.0 {
             return None;

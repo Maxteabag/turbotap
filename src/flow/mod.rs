@@ -219,6 +219,14 @@ pub const IMAGE_STEP_VERBS: &[&str] = &[
     "swipe", "back", "read", "readfield", "assertfield",
 ];
 pub const STALE_UI_BACKOFF: [f64; 3] = [0.05, 0.08, 0.12];
+/// OCR shows the probe: its first letters and digits (up to 12) appear, ignoring case,
+/// spaces and punctuation (OCR misreads quotes and dashes).
+fn probe_seen(seen: &str, probe: &str) -> bool {
+    let norm = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>();
+    let want: String = norm(probe).chars().take(12).collect();
+    !want.is_empty() && norm(seen).contains(&want)
+}
+
 /// Text this long (chars) is typed with a landing probe and a read-back (see `type_long`).
 const LONG_TEXT: usize = 120;
 /// Typing rate for long text, chars/s (WDA's own default is 60).
@@ -669,28 +677,56 @@ impl<R: Reader> Flow<R> {
         let n = text.chars().count();
         let freq = crate::config::typing_freq().unwrap_or(LONG_TEXT_FREQ);
         let Some(eid) = self.active_element_id() else {
+            crate::errln!("turbotap: warning: type: WDA names no focused element; typing on unverified");
             check_wda_ok(self.c.fast_keys(text, Some(freq)), "type", false)?;
-            return Ok(format!("len={n}"));
+            return Ok(format!("len={n} (unverified: no focused element to check)"));
         };
         let cut = text.char_indices().nth(LONG_TEXT_PROBE).map(|(i, _)| i).unwrap_or(text.len());
         let (head, tail) = text.split_at(cut);
         check_wda_ok(self.c.fast_keys(head, Some(freq)), "type", false)?;
         let now = self.element_value(&eid);
         let probe = head.trim();
-        // Strict: an empty value before and after is what keys lost to a moved field look
-        // like, so it counts as not landed (never typed on blind).
-        let landed = if probe.is_empty() { self.active_element_id().as_deref() == Some(eid.as_str()) } else { now.contains(probe) };
-        if !landed {
-            return Err(Error::flow(format!(
-                "type: the first {} characters did not land in the focused field (it moved or lost focus, or it does not report what it holds); stopped there, the other {} were not sent: tap the field again and retype (a field that never reports its value: type it in pieces under 120 characters)",
+        let stop = |what: &str| {
+            Error::flow(format!(
+                "type: the first {} characters did not land in the focused field ({what}); stopped there, the other {} were not sent: tap the field again and retype",
                 head.chars().count(),
                 n - head.chars().count()
-            )));
+            ))
+        };
+        // How the probe was checked: by the field's value, by OCR of its frame (a field
+        // that reports no value), or not at all (nothing readable either way).
+        let mut how = "value";
+        if probe.is_empty() {
+            how = "focus";
+        } else if !now.is_empty() {
+            if !now.contains(probe) {
+                return Err(stop("its value does not show them: it moved or lost focus"));
+            }
+        } else {
+            match self.ocr_in_field(&eid) {
+                Some(seen) if probe_seen(&seen, probe) => how = "ocr",
+                Some(_) => return Err(stop("they are not shown in it: it moved or lost focus")),
+                None => {
+                    how = "none";
+                    crate::errln!(
+                        "turbotap: warning: type: the focused field reports no value and OCR read nothing in it; typing on unverified"
+                    );
+                }
+            }
         }
         if !tail.is_empty() {
             check_wda_ok(self.c.fast_keys(tail, Some(freq)), "type", false)?;
         }
         let after = self.element_value(&eid);
+        if after.is_empty() && how != "value" {
+            // The field never reports its value: the whole text cannot be read back.
+            let note = if how == "ocr" { "start seen by OCR" } else { "unverified" };
+            if how != "ocr" {
+                return Ok(format!("len={n} (unverified: the field reports no value and OCR read nothing)"));
+            }
+            crate::errln!("turbotap: warning: type: the field reports no value; the start was seen by OCR, the rest is not read back");
+            return Ok(format!("len={n} ({note}; the field reports no value, the rest is not read back)"));
+        }
         if !after.contains(text.trim()) {
             return Err(Error::flow(format!(
                 "type: after typing {n} characters at {freq}/s the field holds {} characters and not the whole text; check it with readfield: and fix it (TURBOTAP_TYPING_FREQ sets a slower rate)",
