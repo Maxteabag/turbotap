@@ -197,8 +197,16 @@ pub fn is_url_scheme(s: &str) -> bool {
 /// Verbs whose argument is text typed or tapped into the device (PINs, passwords,
 /// clipboard contents). Their inline values and `cmd:` command lines never appear in
 /// flow output; `env:VAR` names are shown.
-/// `cleartype:` reads at most this many matched inputs' types before falling back to
-/// one class search per type.
+/// `cleartype:`'s input classes, in the order it prefers them (secure: no read-back).
+const TEXT_INPUT_ORDER: [(&str, bool); 4] = [
+    ("XCUIElementTypeTextField", false),
+    ("XCUIElementTypeSecureTextField", true),
+    ("XCUIElementTypeSearchField", false),
+    ("XCUIElementTypeTextView", false),
+];
+
+/// `cleartype:` reads at most this many matched inputs' types before narrowing the
+/// query or falling back to one class search per class.
 const TEXT_INPUT_TYPE_READS: usize = 6;
 
 /// `cleartype:` read-back: wait before each read of the field's value.
@@ -918,64 +926,80 @@ impl<R: Reader> Flow<R> {
         Ok(format!("len={}", text.chars().count()))
     }
 
-    /// The text input `cleartype:` writes to, and whether it is secure. One predicate
-    /// query for all four input types (one tree walk instead of up to four class
-    /// searches; a chat composer is a TextView, which the class order checked last).
-    /// Up to [`TEXT_INPUT_TYPE_READS`] matches: their types pick the first of the
-    /// highest-priority class (TextField, SecureTextField, SearchField, TextView), the
-    /// same element the class order would pick. None, more, an unreadable type, or a
-    /// runner that rejects the predicate: one class search per type, in that order.
+    /// The text input `cleartype:` writes to, and whether it is secure: the first
+    /// element of the first class in [`TEXT_INPUT_ORDER`] (TextField,
+    /// SecureTextField, SearchField, TextView), as one class search per class would
+    /// pick it, with fewer tree walks. One predicate query covers all four classes;
+    /// with up to [`TEXT_INPUT_TYPE_READS`] matches their types pick the class
+    /// (cheap per-element reads): 1 walk. With more (chat messages that are
+    /// TextViews themselves), one query for the first three classes, then one
+    /// TextView search: 3 walks. No match, an unreadable type or a rejected
+    /// predicate: one class search per class, in order.
     fn find_text_input(&mut self) -> Option<(String, bool)> {
-        const ORDER: [(&str, bool); 4] = [
-            ("XCUIElementTypeTextField", false),
-            ("XCUIElementTypeSecureTextField", true),
-            ("XCUIElementTypeSearchField", false),
-            ("XCUIElementTypeTextView", false),
-        ];
-        let pred = format!("type IN {{{}}}", ORDER.iter().map(|(c, _)| format!("'{c}'")).collect::<Vec<_>>().join(", "));
-        let p = self.c.spath("/elements");
-        let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));
-        // An empty answer falls back too: a runner that does not map `type` in an IN
-        // predicate would answer [] rather than an error.
-        if let Some(els) = json::get(&r, "value").as_array().filter(|_| json::get(&r, "error").is_null()) {
-            // Several inputs (a search field and a composer, say): read each one's
-            // type (a per-element read, far cheaper than another tree walk) and take
-            // the first of the highest-priority type, as the class order would.
-            if (1..=TEXT_INPUT_TYPE_READS).contains(&els.len()) {
-                let mut best: Option<(usize, String, bool)> = None;
-                let mut complete = true;
-                for el in els {
-                    let Some(eid) = Self::first_element_id(&Value::Array(vec![el.clone()])) else {
-                        complete = false;
-                        break;
-                    };
-                    let tp = self.c.spath(&format!("/element/{eid}/attribute/type"));
-                    let t = self.c.get(&tp);
-                    let Some(rank) = json::get(&t, "value").as_str().and_then(|k| ORDER.iter().position(|(c, _)| *c == k)) else {
-                        complete = false;
-                        break;
-                    };
-                    if best.as_ref().is_none_or(|(r, _, _)| rank < *r) {
-                        best = Some((rank, eid, ORDER[rank].1));
+        let order = TEXT_INPUT_ORDER;
+        match self.inputs_by_type(&order) {
+            Ok(found) => return found,
+            Err(Some(())) => {
+                // Too many matches: leave TextViews out, then take the first TextView.
+                match self.inputs_by_type(&order[..3]) {
+                    Ok(Some(found)) => return Some(found),
+                    Ok(None) => {
+                        let els = self.find_elements(order[3].0);
+                        if let Some(eid) = Self::first_element_id(&els) {
+                            return Some((eid, false));
+                        }
                     }
-                    if rank == 0 {
-                        break; // a TextField: nothing ranks higher
-                    }
-                }
-                if complete {
-                    if let Some((_, eid, sec)) = best {
-                        return Some((eid, sec));
-                    }
+                    Err(_) => {}
                 }
             }
+            Err(None) => {}
         }
-        for (cls, is_sec) in ORDER {
+        for (cls, is_sec) in order {
             let els = self.find_elements(cls);
             if let Some(eid) = Self::first_element_id(&els) {
                 return Some((eid, is_sec));
             }
         }
         None
+    }
+
+    /// One predicate query for `classes` (plain `type ==` comparisons) and, for up to
+    /// [`TEXT_INPUT_TYPE_READS`] matches, one type read each: `Ok(Some(..))` the
+    /// first element of the highest-ranked class, `Ok(None)` no match (only when
+    /// `classes` leaves TextViews out; otherwise no match is `Err(None)`, so the
+    /// caller falls back), `Err(Some(()))` too many matches, `Err(None)` anything
+    /// unverified (rejected predicate, unreadable type).
+    #[allow(clippy::result_unit_err)]
+    fn inputs_by_type(&mut self, classes: &[(&str, bool)]) -> std::result::Result<Option<(String, bool)>, Option<()>> {
+        let pred = classes.iter().map(|(c, _)| format!("type == '{c}'")).collect::<Vec<_>>().join(" OR ");
+        let p = self.c.spath("/elements");
+        let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));
+        let Some(els) = json::get(&r, "value").as_array().filter(|_| json::get(&r, "error").is_null()).cloned() else {
+            return Err(None);
+        };
+        if els.is_empty() {
+            // Nothing at all is unverified for the full set (a runner that answers
+            // [] instead of an error); without TextViews it means "none of these".
+            return if classes.len() == TEXT_INPUT_ORDER.len() { Err(None) } else { Ok(None) };
+        }
+        if els.len() > TEXT_INPUT_TYPE_READS {
+            return Err(Some(()));
+        }
+        let mut best: Option<(usize, String)> = None;
+        for el in &els {
+            let eid = Self::first_element_id(&Value::Array(vec![el.clone()])).ok_or(None)?;
+            let tp = self.c.spath(&format!("/element/{eid}/attribute/type"));
+            let t = self.c.get(&tp);
+            let rank =
+                json::get(&t, "value").as_str().and_then(|k| classes.iter().position(|(c, _)| *c == k)).ok_or(None)?;
+            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                best = Some((rank, eid));
+            }
+            if rank == 0 {
+                break; // nothing ranks higher
+            }
+        }
+        Ok(best.map(|(rank, eid)| (eid, classes[rank].1)))
     }
 
     fn type_digits(&mut self, arg: &str) -> Result<String> {
