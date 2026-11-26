@@ -1,5 +1,6 @@
-//! Exact field read-back: `readfield:FIELD` returns an input's value exactly as
-//! the app holds it (blank lines included), `assertfield:FIELD=VALUE` checks it.
+//! Exact field input and read-back: `fill:FIELD=VALUE` types into one named input
+//! and verifies it, `readfield:FIELD` returns an input's value exactly as the app
+//! holds it (blank lines included), `assertfield:FIELD=VALUE` checks it.
 //!
 //! `ui` carries values only for switches, sliders, text/search fields and picker
 //! wheels, the tree cleans whitespace, and OCR sees only the visible lines, so none
@@ -10,7 +11,21 @@ use super::Flow;
 use crate::error::{Error, Result};
 use crate::json;
 use crate::ocr::Reader;
+use crate::clock;
+use crate::wda::check_wda_ok;
 use serde_json::{json as j, Value};
+
+/// Characters per second for `fill:` (`TURBOTAP_TYPING_FREQ` overrides). 200 read
+/// back exactly on a real iPhone: 1393 characters of six-paragraph text in 7.2 s,
+/// against 23 s at XCTest's default 60.
+pub const FILL_TYPING_FREQ: i64 = 200;
+
+/// From this length on, `fill:` proves focus before typing: typing long text into
+/// nothing wastes seconds.
+const PROBE_MIN_LEN: usize = 40;
+
+/// XCTest's delete key.
+const BACKSPACE: &str = "\u{8}";
 
 /// Every kind of text input.
 pub(crate) const INPUT_TYPES_PRED: &str = "type IN {'XCUIElementTypeTextField','XCUIElementTypeSecureTextField',\
@@ -231,6 +246,162 @@ impl<R: Reader> Flow<R> {
                 )))
             }
         }
+    }
+
+    fn field_value_len(&mut self, f: &Field) -> usize {
+        let v = self.field_attr(&f.id, "value");
+        Field { value: v, ..f.clone() }.content().chars().count()
+    }
+
+    fn keyboard_up(&mut self) -> bool {
+        !self.field_ids("type == 'XCUIElementTypeKeyboard'").is_empty()
+    }
+
+    /// Focus `f` and confirm a keyboard is up. Some custom text views ignore WDA's
+    /// element click: then tap inside the element's own frame (near its top, where
+    /// a tall text view's first line is) and check again.
+    fn focus_field(&mut self, f: &Field) -> Result<()> {
+        let p = self.c.spath(&format!("/element/{}/click", f.id));
+        let r = self.c.post(&p, &j!({}));
+        check_wda_ok(r, &format!("fill: focusing {}", f.describe()), true)?;
+        clock::sleep(0.3);
+        if self.keyboard_up() {
+            return Ok(());
+        }
+        let p = self.c.spath(&format!("/element/{}/rect", f.id));
+        let rect = json::get(&self.c.get(&p), "value").clone();
+        let n = |k: &str| json::get(&rect, k).as_f64().unwrap_or(0.0);
+        let (x, y, w, h) = (n("x"), n("y"), n("width"), n("height"));
+        if w > 0.0 && h > 0.0 {
+            self.tap_point((x + w / 2.0) as i64, (y + (h / 2.0).min(20.0)) as i64, "", None)?;
+            clock::sleep(0.35);
+        }
+        if !self.keyboard_up() {
+            return Err(Error::flow(format!("fill: no keyboard after focusing {}; nothing was typed", f.describe())));
+        }
+        Ok(())
+    }
+
+    fn fill_keys(&mut self, text: &str, what: &str, redact: bool) -> Result<()> {
+        let n = text.chars().count() as f64;
+        let freq = crate::config::typing_freq().unwrap_or(FILL_TYPING_FREQ);
+        let timeout = (10.0 + 2.0 * n / (freq as f64).max(1.0)).max(crate::wda::DEFAULT_TIMEOUT);
+        let r = self.c.fast_keys_timeout(text, Some(freq), timeout);
+        let red = redact || crate::wda::echoes_secret(&r, text);
+        check_wda_ok(r, what, red)?;
+        Ok(())
+    }
+
+    /// Prove keyboard focus is in `f`: one probe character must grow `f` by exactly
+    /// one (key events go to the one first responder, so then it went nowhere
+    /// else); it is deleted again either way. Fails with nothing typed.
+    fn probe_focus(&mut self, f: &Field) -> Result<()> {
+        let before = self.field_value_len(f);
+        self.fill_keys("x", "fill: focus probe", false)?;
+        clock::sleep(0.2);
+        let after = self.field_value_len(f);
+        self.fill_keys(BACKSPACE, "fill: removing focus probe", false)?;
+        clock::sleep(0.15);
+        if after != before + 1 {
+            return Err(Error::flow(format!(
+                "fill: keyboard focus is not in {} (a probe character did not land there and was deleted again); nothing was typed",
+                f.describe()
+            )));
+        }
+        if self.field_value_len(f) != before {
+            return Err(Error::flow(format!("fill: could not remove the focus probe from {}; nothing was typed", f.describe())));
+        }
+        Ok(())
+    }
+
+    /// `fill:FIELD=VALUE`: type into the input named FIELD only, and verify. VALUE
+    /// is text, `file:PATH` (exact multi-line text; one trailing newline dropped) or
+    /// `env:VAR` / `cmd:CMD` (secret). The field is cleared, focused (element click,
+    /// then a tap in its own frame if no keyboard came up) and, for secrets, secure
+    /// fields and text of 40+ characters, proven focused with one probe character.
+    /// Text is typed at 200 characters per second; a secret is written through the
+    /// element and followed by the focus check of `type:`/`cleartype:`. Secrets and
+    /// secure fields are checked by length (a mismatch clears the field), everything
+    /// else is read back exactly. A field missing while the keyboard is up is looked
+    /// for again after a short downward drag closes it.
+    pub fn fill(&mut self, arg: &str) -> Result<String> {
+        let Some((field, spec)) = arg.split_once('=') else {
+            return Err(Error::flow("fill expects FIELD=VALUE (VALUE: text, file:PATH, env:VAR or cmd:CMD)"));
+        };
+        let (text, secret_src) = expected_value("fill", spec)?;
+        let f = match self.find_field("fill", field) {
+            Ok(f) => f,
+            Err(e) if e.to_string().contains("no text input named") && self.keyboard_up() => {
+                // Lists keep only visible cells: a field under the keyboard can drop
+                // out of the tree. Close the keyboard with a short downward drag (80
+                // pt, mid-screen; interactive keyboard dismissal), look again.
+                let (w, h) = self.r.pt_size(&mut self.c, false, None)?;
+                let y0 = h * 2 / 5;
+                self.drag(w / 2, y0, w / 2, y0 + 80, 0.15, 0.0)?;
+                clock::sleep(0.3);
+                self.find_field("fill", field)?
+            }
+            Err(e) => return Err(e),
+        };
+        let secret = secret_src || f.secure();
+        if secret {
+            self.note_secret(&text);
+        }
+        self.mark_action(false, true);
+        if !f.content().is_empty() {
+            let p = self.c.spath(&format!("/element/{}/clear", f.id));
+            let r = self.c.post(&p, &j!({}));
+            check_wda_ok(r, &format!("fill: clearing {}", f.describe()), true)?;
+        }
+        self.focus_field(&f)?;
+        if self.field_value_len(&f) > 0 {
+            // Some fields only clear once focused.
+            let p = self.c.spath(&format!("/element/{}/clear", f.id));
+            let r = self.c.post(&p, &j!({}));
+            check_wda_ok(r, &format!("fill: clearing {}", f.describe()), true)?;
+            self.focus_field(&f)?;
+        }
+        let want = text.chars().count();
+        if secret || want >= PROBE_MIN_LEN {
+            self.probe_focus(&f)?;
+        }
+        if secret {
+            // Through the element itself (as type:/cleartype: since #26): a focus
+            // change after the probe (an autofill or password sheet) cannot redirect
+            // it; then make sure no other field got any of it.
+            let r = self.bound_write(&f.id, &text);
+            check_wda_ok(r, &format!("fill {}", f.describe()), true)?;
+            self.check_focus_after_secret("fill", &f.id, &text)?;
+        } else {
+            self.fill_keys(&text, &format!("fill {}", f.describe()), false)?;
+        }
+        clock::sleep(0.25);
+        let v = self.field_attr(&f.id, "value");
+        let got = Field { value: v, ..f.clone() };
+        let got = got.content();
+        let n_got = got.chars().count();
+        let secret_wrong = if f.secure() { n_got != want } else { secret && got != text };
+        if secret_wrong {
+            // Never leave a wrong or partial secret in the field.
+            let p = self.c.spath(&format!("/element/{}/clear", f.id));
+            self.c.post(&p, &j!({}));
+            return Err(Error::flow(format!(
+                "fill: {} read-back mismatch (len {n_got} vs {want}); the field was cleared",
+                f.describe()
+            )));
+        }
+        if !secret && got != text {
+            let i = first_diff(got, &text);
+            let ctx = |s: &str| -> String { s.chars().skip(i.saturating_sub(10)).take(30).collect() };
+            return Err(Error::flow(format!(
+                "fill: {} read-back differs: len {} vs {want}, first difference at char {i}: got {} want {}",
+                f.describe(),
+                got.chars().count(),
+                json::py_repr_str(&ctx(got)),
+                json::py_repr_str(&ctx(&text)),
+            )));
+        }
+        Ok(format!("{}: len={want}", f.name))
     }
 
     /// `readfield:FIELD`: the named input's exact value (an echoed placeholder reads

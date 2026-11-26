@@ -172,6 +172,10 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         system-wide; a key step after which another app is in front prints
                         a warning (marks only, nothing is refused)
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
+  fill:FIELD=VALUE      type into the input named FIELD (label, identifier or placeholder) only: clear,
+                        focus (tap fallback), probe focus for secrets/long text, type at 200 chars/s,
+                        verify (exact; secrets and secure fields by length). VALUE: text, file:PATH,
+                        env:V or cmd:C; never printed unless env:/file:
   readfield:FIELD       the exact value of the input named FIELD (label, identifier or placeholder),
                         blank lines included; read-only; a secure field gives only len=N
   assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V, cmd:C); read-only;
@@ -267,7 +271,7 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
 pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
     let verb = verb.trim();
-    if verb.eq_ignore_ascii_case("assertfield") {
+    if verb.eq_ignore_ascii_case("assertfield") || verb.eq_ignore_ascii_case("fill") {
         let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
         return value.starts_with("env:") || value.starts_with("cmd:");
     }
@@ -283,7 +287,7 @@ pub fn safe_step(spec: &str) -> String {
         return spec.to_string();
     };
     let trimmed = verb.trim();
-    if trimmed.eq_ignore_ascii_case("assertfield") {
+    if trimmed.eq_ignore_ascii_case("assertfield") || trimmed.eq_ignore_ascii_case("fill") {
         // FIELD=VALUE: the field name is shown; the value only as env:NAME or file:PATH.
         return match arg.split_once('=') {
             Some((_, value)) if value.starts_with("env:") || value.starts_with("file:") => spec.to_string(),
@@ -1126,6 +1130,7 @@ impl<R: Reader> Flow<R> {
             "cleartype" => return some(self.clear_type(&verb, arg)?),
             "readfield" => return some(self.read_field(arg)?),
             "assertfield" => return some(self.assert_field(arg)?),
+            "fill" => return some(self.fill(arg)?),
             "dismisskb" => return some(self.dismiss_kb()?),
             "banner" if arg.trim() == "dismiss" => return some(self.dismiss_banner()?),
             "banner" => return Err(Error::flow("banner: use banner:dismiss")),

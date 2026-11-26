@@ -2905,6 +2905,12 @@ impl WdaClient {
     /// L676-701. `/wda/fastKeys` (wda-turbo v3+), stock `/wda/keys` only on a
     /// definitive 404 (never replays an accepted request).
     pub fn fast_keys(&mut self, text: &str, frequency: Option<i64>) -> Value {
+        self.fast_keys_timeout(text, frequency, DEFAULT_TIMEOUT)
+    }
+
+    /// [`WdaClient::fast_keys`] with a request timeout sized for long text (XCTest
+    /// types every character inside one request, at `frequency` per second).
+    pub fn fast_keys_timeout(&mut self, text: &str, frequency: Option<i64>, timeout: f64) -> Value {
         let freq = match frequency {
             Some(f) if f != 0 => Some(f),
             _ => crate::config::typing_freq(),
@@ -2914,7 +2920,7 @@ impl WdaClient {
             if let Some(f) = freq {
                 body["frequency"] = j!(f);
             }
-            let r = self.post("/wda/fastKeys", &body);
+            let r = self.req("POST", "/wda/fastKeys", Some(&body), timeout, None);
             if !r.is_object() {
                 return json::error_value("invalid response from /wda/fastKeys");
             }
@@ -2933,7 +2939,7 @@ impl WdaClient {
             legacy["frequency"] = j!(f);
         }
         let path = self.spath("/wda/keys");
-        self.post(&path, &legacy)
+        self.req("POST", &path, Some(&legacy), timeout, None)
     }
 
     /// L703-741. `/wda/fastLaunch` (wda-turbo v5); on 404 optional terminate +

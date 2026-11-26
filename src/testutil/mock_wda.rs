@@ -189,7 +189,16 @@ impl MockState {
                 Some(Dyn::Seq(s)) => s.peek().as_str().unwrap_or("").to_string(),
                 _ => String::new(),
             };
-            self.element_values.insert(eid, Dyn::one(json!(format!("{cur}{text}"))));
+            // XCTest's delete key removes the last character.
+            let mut out = cur;
+            for ch in text.chars() {
+                if ch == '\u{8}' {
+                    out.pop();
+                } else {
+                    out.push(ch);
+                }
+            }
+            self.element_values.insert(eid, Dyn::one(json!(out)));
         }
     }
 }

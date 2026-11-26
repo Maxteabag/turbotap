@@ -222,7 +222,7 @@ App PINs work the same way. `pintap:cmd:"security find-generic-password -w -s ba
 
 Both. `read` grabs a cropped, downscaled screenshot from the phone and OCRs it locally with `libtesseract` (`OEM_LSTM_ONLY`), split into strips that run in parallel in one process with dark-mode pre-inversion and strip caching (100-180ms cold, ~50ms cached). OCR sees everything that's drawn, including web views and apps with poor accessibility labels. It also pulls the accessibility tree via `/wda/fastUI` (158-198ms with `wda-turbo.patch`, or trimmed `/source` fallback in ~297ms) to catch what OCR misses: icon-only buttons, app keypad keys, unlabeled controls, switch states and exact field values. The agent gets the merged result as JSON text and tap targets, not images.
 
-`readfield:Body` returns one text input's exact value (blank lines included) and `assertfield:Body=file:post.txt` checks it, for proving what a form holds; a secure field is only reported by its length.
+`fill:Body=file:post.txt` types into that one named input at 200 characters per second, after making sure it has keyboard focus, and reads it back exactly (`fill:Password=env:PW` for secrets, checked by length). `readfield:Body` returns one text input's exact value (blank lines included) and `assertfield:Body=file:post.txt` checks it, for proving what a form holds; a secure field is only reported by its length.
 
 `read:ocr` skips the tree when you only need text, `read:Y0-Y1` OCRs a single vertical band 3-4x faster, and `ui` or `readel:TEXT` give you just the tree.
 
