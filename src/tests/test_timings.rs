@@ -41,7 +41,7 @@ fn test_each_flow_step_appends_one_redacted_line_with_request_counts() {
     assert_eq!(lines[0]["arg"], "5,6");
     // Time per request kind, ids removed.
     let kinds = lines[0]["req_ms"].as_object().unwrap();
-    assert!(kinds.keys().any(|k| k.starts_with("POST /session/:s/wda/")), "{kinds:?}");
+    assert!(kinds.contains_key("POST /wda/fastTap"), "{kinds:?}");
     assert!(kinds.values().all(|v| v[0].as_u64().unwrap() >= 1), "{kinds:?}");
     assert_eq!(lines[0]["ok"], true);
     assert!(lines[0]["wda"].as_u64().unwrap() >= 1, "{}", lines[0]);
