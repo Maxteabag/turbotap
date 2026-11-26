@@ -392,7 +392,7 @@ pub fn receipt(lines: &[Value], since: Option<f64>, until: Option<f64>, device: 
             "app_wait": r(wait_ms),
             "turbotap_own": r((step_ms - wda_ms - wait_ms).max(0.0)),
         },
-        "longest_gaps": gaps.iter().take(top).map(|(ms, a, b)| j!({"ms": r(*ms), "after": brief(a), "before": brief(b)})).collect::<Vec<_>>(),
+        "longest_gaps": gaps.iter().take(top).map(|&(ms, a, b)| j!({"ms": r(ms), "after": brief(a), "before": brief(b)})).collect::<Vec<_>>(),
         "failures": fails,
     })
 }
