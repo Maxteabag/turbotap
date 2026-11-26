@@ -1208,6 +1208,11 @@ fn test_picker_key_cleartype_typedigits_and_clipboard() {
         vec![json!({"ELEMENT": "tf1"})],
     );
     st.element_types.insert("tf1".into(), json!("XCUIElementTypeTextField"));
+    // fill:/secret cleartype confirm a keyboard is up after focusing.
+    st.elements_map.insert(
+        crate::testutil::mock_wda::ekey(&["predicate string", "type == 'XCUIElementTypeKeyboard'"]),
+        vec![json!({"ELEMENT": "kb1"})],
+    );
     st.set_element_value("tf1", Dyn::one(json!("")));
     let c = MockWda::start(st);
     let r = FakeReader::new(vec![]);
