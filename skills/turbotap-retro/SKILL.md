@@ -38,13 +38,23 @@ turbotap preflight                               # when a phone is reachable
 
 ## 4. Privacy check, then commit and open a pull request
 
-The skills and docs ship in a public binary, so a private detail in one commit stays public in the history even after a later fix. Run the pattern check, then read the whole diff yourself:
+The skills and docs ship in a public binary, so a private detail in one commit stays public in the history even after a later fix. Run the pattern check, then read the whole diff yourself. The check prints only line numbers of the diff, never the matched text, so a real value it finds is not copied into your terminal log or chat; open those lines in your editor. A failed `git diff` or `grep` is reported as a failure, not as a clean result:
 
 ```bash
-git diff origin/main | grep -nE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-F]{8}-[0-9A-F]{16}|@[a-z0-9-]+\.[a-z]{2,}|(rbw|bw|op|pass|security) (get|find|item)|--folder|passcode|password|pin\b|\b(my|his|her|their) (phone|iphone)' || echo "pattern check clean"
+git fetch -q origin
+PAT='([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-F]{8}-[0-9A-F]{16}|@[a-z0-9-]+\.[a-z]{2,}|(rbw|bw|op|pass|security) (get|find|item)|--folder|passcode|password|pin\b|\b(my|his|her|their) (phone|iphone)'
+if ! d=$(git diff origin/main); then echo "pattern check FAILED: git diff failed"
+else
+  hits=$(printf '%s\n' "$d" | grep -nE "$PAT"); rc=$?
+  case $rc in
+    0) echo "review diff lines: $(printf '%s\n' "$hits" | cut -d: -f1 | tr '\n' ' ')(open with: git diff origin/main | sed -n 'Np')" ;;
+    1) echo "pattern check: no matches" ;;
+    *) echo "pattern check FAILED: grep exit $rc" ;;
+  esac
+fi
 ```
 
-Review every hit. Placeholder values such as `192.168.1.50`, `example.com`, `000081XX-...` or `your-secret-manager get iphone-passcode` are fine, and real ones are not. The pattern check cannot see the rest, so read the diff for: people's names, which device belongs to whom or which device number to use, real vault entry or folder names, host and agent names, team rules or approvals ("X said it is always OK"), and app-specific labels presented as a generic step. Those belong in the user's private config or private skills, not here.
+Review every reported line. Placeholder values such as `192.168.1.50`, `example.com`, `000081XX-...` or `your-secret-manager get iphone-passcode` are fine, and real ones are not. The pattern check cannot see the rest, so read the diff for: people's names, which device belongs to whom or which device number to use, real vault entry or folder names, host and agent names, team rules or approvals ("X said it is always OK"), and app-specific labels presented as a generic step. Those belong in the user's private config or private skills, not here.
 
 Verify commit author identity (`git config user.name` / `user.email`), commit only the files you changed with a conventional message (`perf(tap): ...`, `fix(flow): ...`) on a branch, push the branch and open a pull request so the diff is reviewed before it reaches `main`. After it merges, if you installed `turbotap` from Git, reinstall it so the fix is live (installed skills refresh themselves on the next run):
 
