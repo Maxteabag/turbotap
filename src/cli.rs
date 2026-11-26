@@ -205,7 +205,6 @@ pub fn build_command() -> Command {
     Command::new("turbotap")
         .about("Fast generic WebDriverAgent (WDA) controller for physical iOS devices")
         .version(crate::VERSION)
-        .disable_version_flag(true)
         .infer_long_args(true)
         .subcommand_required(true)
         .arg_required_else_help(false)
@@ -679,5 +678,20 @@ mod unit {
         assert_eq!(sm.get_one::<f64>("scale").copied(), Some(2.0));
         let m3 = parse_cli(&s(&["ocr", "--y0", "100", "--y1", "400"])).unwrap();
         assert_eq!(m3.subcommand_name(), Some("ocr"));
+    }
+}
+
+#[cfg(test)]
+mod version_flag {
+    use crate::testutil::capture::Capture;
+
+    #[test]
+    fn version_flag_prints_the_crate_version_and_exits_0() {
+        for flag in ["--version", "-V"] {
+            let cap = Capture::start();
+            let code = super::run_cli(&[flag.to_string()]);
+            assert_eq!(code, 0, "{flag}");
+            assert!(cap.stdout().contains(crate::VERSION), "{flag}: {}", cap.stdout());
+        }
     }
 }

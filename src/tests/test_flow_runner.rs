@@ -2827,12 +2827,24 @@ fn test_tapat_with_a_label_presses_only_that_exact_enabled_control() {
         other => panic!("expected refusal, got {other:?}"),
     }
     assert!(pts.is_empty());
-    // Two Ready controls at the point: ambiguous, nothing pressed.
+    // Two Ready controls near the point (repeated rows): the nearest is pressed.
     let (res, pts) = run(
         json!([{"type": "Button", "label": "Ready", "x": 352, "y": 590}, {"type": "Button", "label": "Ready", "x": 360, "y": 600}]),
         "tapat:352,590=Ready",
     );
-    assert!(matches!(res, Err(Error::Flow(ref m)) if m.contains("several controls labelled 'Ready'")), "{res:?}");
+    assert_eq!(res.unwrap(), Some(json!("Ready")));
+    assert_eq!(pts, vec![(352, 590)]);
+    // One control listed twice at the same place: pressed once.
+    let dup = json!({"type": "Button", "label": "Ready", "x": 352, "y": 590});
+    let (res, pts) = run(json!([dup, dup]), "tapat:350,588=Ready");
+    assert_eq!(res.unwrap(), Some(json!("Ready")));
+    assert_eq!(pts, vec![(352, 590)]);
+    // Two equally near at different places: ambiguous, nothing pressed.
+    let (res, pts) = run(
+        json!([{"type": "Button", "label": "Ready", "x": 340, "y": 590}, {"type": "Button", "label": "Ready", "x": 364, "y": 590}]),
+        "tapat:352,590=Ready",
+    );
+    assert!(matches!(res, Err(Error::Flow(ref m)) if m.contains("equally near")), "{res:?}");
     assert!(pts.is_empty());
     // Disabled, or only a different case: nothing pressed.
     let (res, pts) = run(json!([{"type": "Button", "label": "Ready", "x": 352, "y": 590, "enabled": false}]), "tapat:352,590=Ready");
