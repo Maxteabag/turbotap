@@ -18,9 +18,9 @@ fn refused_body(bundle: &str) -> String {
     format!("{{\n  \"value\" : {{\n    \"error\" : \"unknown error\",\n    \"message\" : \"{msg}\",\n    \"traceback\" : \"\"\n  }},\n  \"sessionId\" : \"s\"\n}}")
 }
 
-fn mock_refusing(bundle: &'static str) -> MockWda {
+fn mock_refusing(bundle: &'static str, front: &str) -> MockWda {
     let mut st = MockState::default();
-    st.active_app = Seq::one(json!("com.example.home"));
+    st.active_app = Seq::one(json!(front));
     let mock = MockWda::start(st);
     mock.set_custom_handler(move |_, m, p, d| {
         let target = d.get("bundleId").and_then(Value::as_str) == Some(bundle);
@@ -64,7 +64,7 @@ fn sent_after(mock: &MockWda, path_end: &str) -> Vec<String> {
 #[test]
 fn test_open_of_an_app_ios_refuses_fails_at_once_with_the_reason() {
     let _c = isolated_cache();
-    let mock = mock_refusing(MISSING);
+    let mock = mock_refusing(MISSING, "com.example.home");
     let (code, out) = cli(&mock, &[&format!("open:{MISSING}"), "read:ocr"]);
     assert_ne!(code, 0, "{out}");
     assert!(out.contains(&format!("open:{MISSING} failed: Error Domain=FBSOpenApplicationServiceErrorDomain")), "{out}");
@@ -78,7 +78,7 @@ fn test_open_of_an_app_ios_refuses_fails_at_once_with_the_reason() {
 #[test]
 fn test_launch_refusal_reads_as_one_line_not_raw_json() {
     let _c = isolated_cache();
-    let mock = mock_refusing(MISSING);
+    let mock = mock_refusing(MISSING, "com.example.home");
     let (code, out) = cli(&mock, &[&format!("launch:{MISSING}")]);
     assert_ne!(code, 0, "{out}");
     let line = out.lines().find(|l| l.contains(&format!("launch:{MISSING} failed"))).unwrap_or_else(|| panic!("{out}"));
@@ -89,14 +89,15 @@ fn test_launch_refusal_reads_as_one_line_not_raw_json() {
 #[test]
 fn test_working_open_costs_one_request_as_before() {
     let _c = isolated_cache();
-    let mock = mock_refusing(MISSING);
+    let mock = mock_refusing(MISSING, PRESENT);
     let (code, out) = cli(&mock, &[&format!("open:{PRESENT}"), "home"]);
     assert_eq!(code, 0, "{out}");
     let activates = mock.calls().iter().filter(|(_, p, _)| p.ends_with("/wda/apps/activate")).count();
     assert_eq!(activates, 1);
-    // open: itself sent nothing but the activate: the next request is the home step's.
+    // open: sends the activate and one live foreground read (its receipt), nothing else.
     let after = sent_after(&mock, "/wda/apps/activate");
-    assert!(after.first().is_some_and(|c| c.ends_with("/wda/pressButton")), "{after:?}");
+    assert_eq!(after.get(0).map(String::as_str), Some("GET /wda/activeAppInfo"), "{after:?}");
+    assert!(after.get(1).is_some_and(|c| c.ends_with("/wda/pressButton")), "{after:?}");
 }
 
 #[test]
@@ -110,4 +111,54 @@ fn test_reason_helper_keeps_wda_messages_short_and_plain() {
     assert!(!crate::wda::wda_answered_error(&json!({"error": "connection refused"})));
     let long = json!({"error": 500, "body": "x ".repeat(500)});
     assert!(crate::wda::wda_error_reason(&long).chars().count() <= 401);
+}
+
+fn flow_on(mock: &MockWda) -> crate::flow::Flow<FakeReader> {
+    crate::flow::Flow::new(mock.client(), FakeReader::new(vec![]), 1.0, None, false).unwrap()
+}
+
+fn front_reads(mock: &MockWda) -> usize {
+    mock.calls().iter().filter(|(_, p, _)| p == "/wda/activeAppInfo").count()
+}
+
+#[test]
+fn test_open_receipt_fails_when_another_app_stays_in_front() {
+    let _c = isolated_cache();
+    let mock = MockWda::start(MockState { active_app: Seq::one(json!("com.example.other")), ..Default::default() });
+    let mut flow = flow_on(&mock);
+    let err = flow.step(&format!("open:{PRESENT}")).unwrap_err().to_string();
+    assert!(err.contains(&format!("open:{PRESENT}: WDA reported the app opened, but 'com.example.other' is in front")), "{err}");
+    flow.close();
+}
+
+#[test]
+fn test_open_receipt_with_springboard_in_front_keeps_the_old_behaviour() {
+    // An alert, a banner or a lock puts SpringBoard in front: no failure, the app stays
+    // pending for the next steps exactly as before.
+    let _c = isolated_cache();
+    let mock = MockWda::start(MockState { active_app: Seq::one(json!("com.apple.springboard")), ..Default::default() });
+    let mut flow = flow_on(&mock);
+    flow.step(&format!("open:{PRESENT}")).unwrap();
+    assert_eq!(flow.pending_bundle.as_deref(), Some(PRESENT));
+    assert_eq!(front_reads(&mock), 1);
+    flow.close();
+}
+
+#[test]
+fn test_confirmed_open_spares_the_next_steps_own_foreground_read() {
+    let _c = isolated_cache();
+    let mock = MockWda::start(MockState { active_app: Seq::one(json!(PRESENT)), ..Default::default() });
+    let mut flow = flow_on(&mock);
+    flow.step(&format!("open:{PRESENT}")).unwrap();
+    assert_eq!(front_reads(&mock), 1, "the receipt");
+    // The next step's wait for the app takes the receipt as its answer: no second read.
+    assert!(flow.wait_active_app(1.5, 0.03, None));
+    assert_eq!(front_reads(&mock), 1);
+    assert_eq!(flow.pending_bundle, None);
+    // Only once: a later wait asks WDA as before.
+    flow.pending_bundle = Some(PRESENT.into());
+    flow.pending_bundle_ts = crate::clock::now();
+    assert!(flow.wait_active_app(1.5, 0.03, None));
+    assert_eq!(front_reads(&mock), 2);
+    flow.close();
 }

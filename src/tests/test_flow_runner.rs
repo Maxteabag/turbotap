@@ -1280,7 +1280,7 @@ fn test_deny_guard_blocks_default_dangerous_actions_unless_disabled() {
 fn test_launch_uses_fast_launch_preserves_state_invalidates_cache_and_propagates_errors() {
     let _cache = isolated_cache();
     let img = solid_img(220, (430, 932));
-    let c = MockWda::start(MockState::default());
+    let c = MockWda::start(MockState { active_app: Seq::one(json!("com.example.new")), ..Default::default() });
     let r = FakeReader::new(vec![fr(&img, &[])]);
     let mut flow = mk_flow(&c, &r, 8.0);
     // Seed cached controls and outgoing app state before launch:.
@@ -1292,10 +1292,13 @@ fn test_launch_uses_fast_launch_preserves_state_invalidates_cache_and_propagates
 
     let res = step_s(&mut flow, "launch:com.example.new");
     assert_eq!(res, "com.example.new");
+    // The launch, then the receipt's one live foreground read.
+    let calls = c.calls();
     assert_eq!(
-        *c.calls().last().unwrap(),
+        calls[calls.len() - 2],
         ("POST".to_string(), "/wda/fastLaunch".to_string(), json!({"bundleId": "com.example.new", "terminate": true}))
     );
+    assert_eq!(calls.last().unwrap().1, "/wda/activeAppInfo");
     assert!(flow.ctl_cache.is_none());
     assert_eq!(flow.bundle.as_deref(), Some("com.example.new"));
     assert_eq!(flow.pending_bundle.as_deref(), Some("com.example.new"));
@@ -1317,12 +1320,13 @@ fn test_launch_uses_fast_launch_preserves_state_invalidates_cache_and_propagates
     // Fallback on stock WDA (404 on /wda/fastLaunch -> terminate + launchUnattached).
     let mut st = MockState::default();
     st.fast_launch_404 = true;
+    st.active_app = Seq::one(json!("com.example.stock"));
     let c_stock = MockWda::start(st);
     let mut flow_stock = mk_flow(&c_stock, &FakeReader::new(vec![fr(&img, &[])]), 8.0);
     assert_eq!(step_s(&mut flow_stock, "launch:com.example.stock"), "com.example.stock");
     assert_eq!(
         c_stock.paths(),
-        vec!["/wda/fastLaunch", "/session/test-session-1/wda/apps/terminate", "/wda/apps/launchUnattached"]
+        vec!["/wda/fastLaunch", "/session/test-session-1/wda/apps/terminate", "/wda/apps/launchUnattached", "/wda/activeAppInfo"]
     );
     assert_eq!(flow_stock.bundle.as_deref(), Some("com.example.stock"));
     assert_eq!(flow_stock.pending_bundle.as_deref(), Some("com.example.stock"));
