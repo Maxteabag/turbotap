@@ -71,9 +71,12 @@ fn test_open_of_an_app_ios_refuses_fails_at_once_with_the_reason() {
     assert!(out.contains(&format!("open:{MISSING} failed: Error Domain=FBSOpenApplicationServiceErrorDomain")), "{out}");
     assert!(out.contains("The request was denied by service delegate"), "{out}");
     assert!(out.contains(&format!("iOS did not open {MISSING}")), "{out}");
-    // Nothing after the refused activate: no read of whatever app is in front.
+    // It fails at once: no waiting for the app to come to the front and no input after the refused
+    // activate. The only requests after it are the one read every failed step reports.
     let after = sent_after(&mock, "/wda/apps/activate");
-    assert!(!after.iter().any(|c| c.contains("Screenshot") || c.contains("activeAppInfo")), "{after:?}");
+    assert!(!after.iter().any(|c| c.contains("activeAppInfo") || c.contains("/wda/apps/")), "{after:?}");
+    assert!(!after.iter().any(|c| c.contains("Tap") || c.contains("Keys") || c.contains("/value") || c.contains("/click")), "{after:?}");
+    assert!(after.len() <= 6, "{after:?}");
 }
 
 #[test]
