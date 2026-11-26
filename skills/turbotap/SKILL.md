@@ -53,36 +53,41 @@ turbotap flow open:Messenger search:Alice wait:'re:Alice\s+Smith'
 - **Typing & control keys (`type:`, `key:`):** `type:` automatically waits for brief keyboard focus after tapping a `TextField`/`SearchField`/`SecureTextField`/`TextView` (no manual `sleep:` needed). Use `key:return|backspace|tab|space|escape` for control keys instead of escaping `\n` in the shell (for inline newlines in `type:`, use ANSI-C quoting `$'type:line1\nline2'`, since `"type:...\n"` sends literal `\n`).
 - **WebView & editable fields (`cleartype:TEXT` + `dismisskb`):** iOS WebViews often append instead of replacing. `cleartype:` supports `TextField`, `SecureTextField`, `SearchField`, and `TextView` (plus `env:VAR` / `cmd:CMD` for secrets), clearing, typing via `/wda/keys`, and verifying read-back on non-secure fields. Follow with `dismisskb` (one localized predicate matching `Done`/`Ferdig`/`Hide keyboard`/`Skjul tastatur`/`Dismiss`/`Lukk`) before submitting.
 - **Formatted numeric inputs (`typedigits:VALUE|env:VAR`):** Clears the field, types 1 digit every `0.08 s` via `/wda/keys`, strips formatting on read-back, and asserts an exact digit-by-digit match (retrying once on mismatch) so WebView formatters never drop digits.
-- **App Store installs:** After `Get`/`Hent`, handle the account sheet (`tapel:Installer`) and Apple ID password (`cleartype:cmd:YOUR_SECRET_CMD` + `tapel:Bekreft`/`Sign In`). The row button shows download progress in `ui` until `Open`/`Åpne`; wait for it as below.
-- **Waiting for a control that takes long to appear (a download's `Open`, a slow `Done`):** poll the accessibility tree once a second against the control's own position, with a hard deadline, and press the moment it is there. Avoid fixed 5-10 s sleeps between checks and hand-measured coordinate boxes: they add the sleep to every wait and miss a control a few points off. `ui` takes about 0.2 s and no screenshot, so a 1 s cadence is cheap; `wait:` grabs frames continuously and suits waits of seconds, not minutes. The App Store turns the same button from `Get` into progress into `Open`, so its own position is the anchor:
+- **Installs and other long operations:** an install or download button usually turns into progress and then into the control that opens the result; wait for that control with the recipe below. Enter a password only into the focused secure field: tap that field first, use `type:env:VAR`/`type:cmd:CMD`, then check with `ui`.
+- **Waiting for a control that takes long to appear:** poll the accessibility tree once a second with a hard deadline and press the moment the exact control is there, instead of fixed sleeps between checks or hand-measured coordinate boxes. `ui` takes about 0.2 s and no screenshot, so a 1 s cadence is cheap; `wait:` grabs frames continuously and suits waits of seconds, not minutes. The caller supplies the device, the app the control belongs to, the deadline and the target's exact label as the live tree shows it (any language), plus, when the label can appear more than once, the position where this control will appear:
 
   ```sh
-  DEV=NAME; APP=com.apple.AppStore        # device, and the one app this wait may drive (both calls)
-  X=...; Y=...                            # centre of the row's own Get/Redownload control, read with `ui`
-  LIMIT=300; end=$((SECONDS + LIMIT)); last="nothing"
-  tt() { timeout "$1" turbotap --device "$DEV" flow --quiet --allow-app "$APP" "${@:2}"; }
-  near='[.reads[-1].ui[]? | select(((.x - $x) | fabs) <= 24 and ((.y - $y) | fabs) <= 24)]'
+  DEV=...; APP=...; LIMIT=...   # turbotap device, bundle id of the app the control belongs to, deadline in seconds
+  LABEL=...                     # the target's exact label as the screen shows it, in its language (or an identifier the app exposes as its label)
+  X=; Y=                        # optional: where the control will appear (its position in `ui`); empty = anywhere, but then only one may match
+  end=$((SECONDS + LIMIT)); last="nothing"
+  tt() { TURBOTAP_ALLOWED_APPS="$APP" timeout "$1" turbotap --device "$DEV" "${@:2}"; }
+  sel='.reads[-1].ui[]? | select($x == "" or (((.x - ($x | tonumber)) | fabs) <= 24 and ((.y - ($y | tonumber)) | fabs) <= 24))'
   while :; do
-    left=$((end - SECONDS)); [ "$left" -gt 0 ] || { echo "no Open at $X,$Y within ${LIMIT}s; it last showed: $last" >&2; exit 1; }
-    out=$(tt "$left" ui); rc=$?
+    left=$((end - SECONDS)); [ "$left" -gt 0 ] || { echo "'$LABEL' did not appear within ${LIMIT}s; last seen: $last" >&2; exit 1; }
+    out=$(tt "$left" flow --quiet --allow-app "$APP" ui); rc=$?
     if [ "$rc" -ne 0 ] || [ "$(jq -r '.ok' <<<"$out" 2>/dev/null)" != true ]; then
       echo "ui failed (rc $rc), stopping" >&2; exit $((rc ? rc : 1))   # 6 = stop file, 1 = app guard or other refusal
     fi
-    last=$(jq -r --argjson x "$X" --argjson y "$Y" "$near | map(.label) | join(\", \") | if . == \"\" then \"nothing\" else . end" <<<"$out")
-    hits=$(jq -c --argjson x "$X" --argjson y "$Y" "$near | map(select((.label == \"Open\" or .label == \"Åpne\") and .enabled != false))" <<<"$out")
+    a=(--arg l "$LABEL" --arg x "$X" --arg y "$Y")
+    last=$(jq -r "${a[@]}" "[$sel | .label] | .[0:5] | if length == 0 then \"nothing\" else join(\", \") end" <<<"$out")
+    hits=$(jq -c "${a[@]}" "[$sel | select(.label == \$l and .enabled != false)]" <<<"$out")
     case $(jq length <<<"$hits") in
       0) ;;
-      1) label=$(jq -r '.[0].label' <<<"$hits"); left=$((end - SECONDS)); [ "$left" -gt 0 ] || left=1
-         res=$(tt "$left" "tapat:$X,$Y=$label"); rc=$?
-         if [ "$rc" -eq 0 ] && [ "$(jq -r '.ok' <<<"$res" 2>/dev/null)" = true ]; then echo "pressed $label at $X,$Y"; exit 0; fi
-         echo "press refused or failed (rc $rc); nothing pressed if it changed: $(jq -r '.error // empty' <<<"$res" 2>/dev/null)" >&2; exit $((rc ? rc : 1)) ;;
-      *) echo "several Open controls at $X,$Y ($last); not pressing" >&2; exit 3 ;;
+      1) left=$((end - SECONDS)); [ "$left" -gt 0 ] || left=1
+         front=$(tt "$left" preflight | jq -r '.active_app // empty' 2>/dev/null)
+         [ "$front" = "$APP" ] || { echo "'$front' is in front, not $APP; not pressing" >&2; exit 4; }
+         px=$(jq -r '.[0].x' <<<"$hits"); py=$(jq -r '.[0].y' <<<"$hits")
+         res=$(tt "$left" flow --quiet --allow-app "$APP" "tapat:$px,$py=$LABEL"); rc=$?
+         if [ "$rc" -eq 0 ] && [ "$(jq -r '.ok' <<<"$res" 2>/dev/null)" = true ]; then echo "pressed '$LABEL' at $px,$py"; exit 0; fi
+         echo "press refused or failed (rc $rc); nothing pressed if the control changed" >&2; exit $((rc ? rc : 1)) ;;
+      *) echo "several enabled '$LABEL' controls match; not pressing (give X,Y)" >&2; exit 3 ;;
     esac
     sleep 1
   done
   ```
 
-  Every call carries the run's `--allow-app` and is bounded by the remaining budget. A failed `ui` stops at once with its exit code (6 = stop file, 1 = app guard or another refusal); several matching controls stop without pressing; the press is `tapat:X,Y=LABEL`, which re-reads the screen and presses only the one enabled control labelled exactly LABEL there, so a control that changed since the read is refused with nothing pressed; only an exit code 0 with `"ok": true` counts as pressed. On the deadline it reports what the control last showed.
+  Every call carries the app guard for that app and is bounded by the remaining budget. A failed `ui` stops at once with its exit code (6 = stop file, 1 = app guard or another refusal). Several enabled matches stop without pressing. Right before the press it checks that the app in front is exactly that app; the press is `tapat:X,Y=LABEL`, which re-reads the screen and presses only the one enabled control with exactly that label there, so a control that changed since the read is refused with nothing pressed. Only exit code 0 with `"ok": true` counts as pressed; on the deadline it reports what it last saw.
 - **`FLAG_SECURE` PIN pads (`pintap:DIGITS|env:VAR|cmd:CMD`):** Dismiss any Face ID sheet first (`alert:accept` or `tap:Cancel`), then run `pintap:env:APP_PIN` — reads `XCUIElementTypeKey` rects from `/source` and taps via `/wda/fastTapBatch` (conservative 150 ms inter-key spacing in one XPC call, with automatic fallback to sequential `/wda/fastTap` on older/stock WDA).
 - **Clipboard (`clipboard`, `setclip:TEXT|env:V|cmd:C`):** `clipboard` (alias `copy`) reads the iOS pasteboard via `/wda/getPasteboard`; `setclip:` writes UTF-8 text via `/wda/setPasteboard` (use `env:`/`cmd:` for secrets). *iOS 16+ caveat:* `setclip:` writes from the WDA runner, so pasting into another app may trigger an iOS `"Allow Paste"` banner unless previously allowed for that app.
 - **Unlocking an authorized device:** Use `turbotap --device NAME unlock` with a configured `passcode_cmd` or a securely supplied `WDA_PASSCODE`. Keep the passcode out of output and logs. If an attempt fails, stop rather than retrying.

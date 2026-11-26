@@ -2810,31 +2810,31 @@ fn test_tapat_with_a_label_presses_only_that_exact_enabled_control() {
         let pts: Vec<(i64, i64)> = mock.tapped_points().iter().map(|p| (p.0, p.1)).collect();
         (res, pts)
     };
-    let other_row = json!({"type": "Button", "label": "Open", "x": 352, "y": 720});
-    // The row's own button reads Open: pressed at its centre; another row's Open is ignored.
-    let (res, pts) = run(json!([{"type": "Button", "label": "Open", "x": 352, "y": 590}, other_row]), "tapat:350,588=Open");
-    assert_eq!(res.unwrap(), Some(json!("Open")));
+    let other_row = json!({"type": "Button", "label": "Ready", "x": 352, "y": 720});
+    // The control at the point reads Ready: pressed at its centre; another Ready elsewhere is ignored.
+    let (res, pts) = run(json!([{"type": "Button", "label": "Ready", "x": 352, "y": 590}, other_row]), "tapat:350,588=Ready");
+    assert_eq!(res.unwrap(), Some(json!("Ready")));
     assert_eq!(pts, vec![(352, 590)]);
-    // It changed since it was read (now a progress control): nothing pressed, though
-    // another Open is on screen and a bare tapat would press the progress control.
-    let (res, pts) = run(json!([{"type": "Button", "label": "Stop downloading", "x": 352, "y": 590}, other_row]), "tapat:350,588=Open");
+    // It changed since it was read (now Busy): nothing pressed, though another Ready is
+    // on screen and a bare tapat would press the Busy control.
+    let (res, pts) = run(json!([{"type": "Button", "label": "Busy", "x": 352, "y": 590}, other_row]), "tapat:350,588=Ready");
     match res {
-        Err(Error::Flow(m)) => assert!(m.contains("no control labelled exactly 'Open' at 350,588 (now: 'Stop downloading'"), "{m}"),
+        Err(Error::Flow(m)) => assert!(m.contains("no control labelled exactly 'Ready' at 350,588 (now: 'Busy'"), "{m}"),
         other => panic!("expected refusal, got {other:?}"),
     }
     assert!(pts.is_empty());
-    // Two Open controls at the point: ambiguous, nothing pressed.
+    // Two Ready controls at the point: ambiguous, nothing pressed.
     let (res, pts) = run(
-        json!([{"type": "Button", "label": "Open", "x": 352, "y": 590}, {"type": "Button", "label": "Open", "x": 360, "y": 600}]),
-        "tapat:352,590=Open",
+        json!([{"type": "Button", "label": "Ready", "x": 352, "y": 590}, {"type": "Button", "label": "Ready", "x": 360, "y": 600}]),
+        "tapat:352,590=Ready",
     );
-    assert!(matches!(res, Err(Error::Flow(ref m)) if m.contains("several controls labelled 'Open'")), "{res:?}");
+    assert!(matches!(res, Err(Error::Flow(ref m)) if m.contains("several controls labelled 'Ready'")), "{res:?}");
     assert!(pts.is_empty());
     // Disabled, or only a different case: nothing pressed.
-    let (res, pts) = run(json!([{"type": "Button", "label": "Open", "x": 352, "y": 590, "enabled": false}]), "tapat:352,590=Open");
+    let (res, pts) = run(json!([{"type": "Button", "label": "Ready", "x": 352, "y": 590, "enabled": false}]), "tapat:352,590=Ready");
     assert!(matches!(res, Err(Error::Flow(ref m)) if m.contains("is disabled")), "{res:?}");
     assert!(pts.is_empty());
-    let (res, pts) = run(json!([{"type": "Button", "label": "open", "x": 352, "y": 590}]), "tapat:352,590=Open");
+    let (res, pts) = run(json!([{"type": "Button", "label": "ready", "x": 352, "y": 590}]), "tapat:352,590=Ready");
     assert!(res.is_err() && pts.is_empty());
     // An empty label is a usage error.
     let (res, _) = run(json!([]), "tapat:352,590=");
