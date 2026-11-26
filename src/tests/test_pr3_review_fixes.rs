@@ -168,7 +168,11 @@ fn test_controls_and_read_full_reject_persistent_mismatched_bundle() {
 fn test_typing_500_fails_and_redacts_secrets_and_200_never_replays() {
     let _cache = isolated_cache();
     // HTTP 500 on /wda/fastKeys must fail flow type:, not return ok: True
-    let c500 = MockWda::start(MockState::default());
+    // A focused text field: a secret is typed only into a field that has focus.
+    let mut st500 = MockState::default();
+    st500.elements_map.insert("XCUIElementTypeTextField".into(), vec![json!({"ELEMENT": "tf1"})]);
+    st500.set_element_value("tf1", Dyn::one(json!("")));
+    let c500 = MockWda::start(st500);
     c500.set_custom_handler(|_, _m, p, _d| {
         (p == "/wda/fastKeys").then(|| json!({"error": 500, "body": "secret-leak-token"}))
     });

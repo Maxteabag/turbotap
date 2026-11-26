@@ -567,6 +567,110 @@ impl<R: Reader> Flow<R> {
         }
     }
 
+    /// Element ids of one class on screen.
+    fn element_ids(&mut self, cls: &str) -> Vec<String> {
+        let els = self.find_elements(cls);
+        els.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.as_object()?.values().next().map(json::py_str))
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// The element with keyboard focus (`GET /element/active`), if WDA names one.
+    fn active_element_id(&mut self) -> Option<String> {
+        let p = self.c.spath("/element/active");
+        let r = self.c.get(&p);
+        if json::has_err(&r) {
+            return None;
+        }
+        let m = json::get(&r, "value").as_object()?.clone();
+        m.get("ELEMENT")
+            .or_else(|| m.get("element-6066-11e4-a52e-4f735466cecf"))
+            .map(json::py_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// True once `eid` has keyboard focus (live, up to `max_wait` s).
+    fn wait_focus_on(&mut self, eid: &str, max_wait: f64) -> bool {
+        let end = clock::now() + max_wait;
+        loop {
+            if self.active_element_id().as_deref() == Some(eid) {
+                return true;
+            }
+            if clock::now() >= end {
+                return false;
+            }
+            clock::sleep(0.1);
+        }
+    }
+
+    /// Where a secret (`cleartype:env:`/`cmd:`) may go: the secure field (of several,
+    /// only the one with focus); with no secure field on screen, the focused text field
+    /// or the only one (a one-time code). Anything else is refused before typing.
+    fn secret_target(&mut self) -> Result<(String, bool)> {
+        let secure = self.element_ids("XCUIElementTypeSecureTextField");
+        let active = self.active_element_id();
+        if !secure.is_empty() {
+            if let Some(a) = active.as_ref().filter(|a| secure.contains(a)) {
+                return Ok((a.clone(), true));
+            }
+            if secure.len() == 1 {
+                return Ok((secure[0].clone(), true));
+            }
+            return Err(Error::flow(
+                "cleartype: several secure fields on screen and none has focus; tap the intended one first (nothing typed)",
+            ));
+        }
+        let mut inputs = Vec::new();
+        for cls in ["XCUIElementTypeTextField", "XCUIElementTypeSearchField", "XCUIElementTypeTextView"] {
+            inputs.extend(self.element_ids(cls));
+        }
+        if let Some(a) = active.as_ref().filter(|a| inputs.contains(a)) {
+            return Ok((a.clone(), false));
+        }
+        if inputs.len() == 1 {
+            return Ok((inputs[0].clone(), false));
+        }
+        Err(Error::flow(if inputs.is_empty() {
+            "cleartype: no field on screen for the secret (nothing typed)"
+        } else {
+            "cleartype: no secure field and several text fields, none focused; tap the intended one first (nothing typed)"
+        }))
+    }
+
+    /// Clear `eid` when its value holds the secret or a piece of it (3+ characters),
+    /// so a secret that landed in a visible field never stays on screen.
+    fn clear_if_holds_secret(&mut self, eid: &str, secret: &str) -> bool {
+        let p = self.c.spath(&format!("/element/{eid}/attribute/value"));
+        let r = self.c.get(&p);
+        let val = json::get(&r, "value").as_str().unwrap_or("").to_string();
+        let chars: Vec<char> = secret.chars().collect();
+        let k = chars.len().min(3);
+        let holds = k > 0 && (val.contains(secret) || chars.windows(k).any(|w| val.contains(&w.iter().collect::<String>())));
+        if holds {
+            let p = self.c.spath(&format!("/element/{eid}/clear"));
+            self.c.post(&p, &j!({}));
+        }
+        holds
+    }
+
+    /// After a secret was typed: focus must still be on `eid`. If a popup or autofill
+    /// moved it, the field that got the keys is cleared and the step fails.
+    fn check_focus_after_secret(&mut self, verb: &str, eid: &str, secret: &str) -> Result<()> {
+        match self.active_element_id() {
+            Some(a) if a != eid => {
+                let cleared = self.clear_if_holds_secret(&a, secret);
+                Err(Error::flow(format!(
+                    "{verb}: focus moved to another field while typing the secret{}; check the screen before any retry, no screenshot first",
+                    if cleared { " (that field was cleared)" } else { "" }
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// After a `key:` step: one live `/wda/activeAppInfo`, and a warning on stderr when
     /// the app in front is no longer the one the flow opened (key events go to the
     /// system's focus, so an app change right after one is worth seeing). Marks only,
@@ -752,9 +856,30 @@ impl<R: Reader> Flow<R> {
                 self.wait_input_focus();
                 self.last_tap_type = None;
                 self.mark_action(false, true);
+                // A secret only into a field that has focus, and into the secure field
+                // when there is one: never into a username field next to it.
+                let focus = if is_secret {
+                    let active = self.active_element_id();
+                    let Some(a) = active else {
+                        return Err(Error::flow("type: no field has keyboard focus for the secret (nothing typed)"));
+                    };
+                    let secure = self.element_ids("XCUIElementTypeSecureTextField");
+                    if !secure.is_empty() && !secure.contains(&a) {
+                        return Err(Error::flow(
+                            "type: the secret goes into a secure field, but focus is on another field; tap the password field first (nothing typed)",
+                        ));
+                    }
+                    Some(a)
+                } else {
+                    None
+                };
                 let r = self.c.fast_keys(&text, None);
                 let redact = is_secret || crate::wda::echoes_secret(&r, &text);
                 check_wda_ok(r, "type", redact)?;
+                if let Some(a) = focus {
+                    clock::sleep(0.2);
+                    self.check_focus_after_secret("type", &a, &text)?;
+                }
             }
             "key" => {
                 let kname = arg.trim().to_lowercase();
@@ -941,22 +1066,29 @@ impl<R: Reader> Flow<R> {
         let text = secret_arg(verb, arg)?;
         self.note_secret(&text);
         self.mark_action(false, true);
-        let mut els = Value::Array(vec![]);
-        let mut secure = false;
-        for (cls, is_sec) in [
-            ("XCUIElementTypeTextField", false),
-            ("XCUIElementTypeSecureTextField", true),
-            ("XCUIElementTypeSearchField", false),
-            ("XCUIElementTypeTextView", false),
-        ] {
-            els = self.find_elements(cls);
-            if json::truthy(&els) {
-                secure = is_sec;
-                break;
+        // A secret goes to the secure field (or the focused one), never just to the
+        // first text field: that put passwords into username fields.
+        let (eid, secure) = if is_secret {
+            self.secret_target()?
+        } else {
+            let mut els = Value::Array(vec![]);
+            let mut secure = false;
+            for (cls, is_sec) in [
+                ("XCUIElementTypeTextField", false),
+                ("XCUIElementTypeSecureTextField", true),
+                ("XCUIElementTypeSearchField", false),
+                ("XCUIElementTypeTextView", false),
+            ] {
+                els = self.find_elements(cls);
+                if json::truthy(&els) {
+                    secure = is_sec;
+                    break;
+                }
             }
-        }
-        let Some(eid) = Self::first_element_id(&els) else {
-            return Err(Error::flow("no TextField, SecureTextField, SearchField, or TextView on screen"));
+            let Some(eid) = Self::first_element_id(&els) else {
+                return Err(Error::flow("no TextField, SecureTextField, SearchField, or TextView on screen"));
+            };
+            (eid, secure)
         };
         let redact = is_secret || secure;
         let p = self.c.spath(&format!("/element/{eid}/clear"));
@@ -969,10 +1101,17 @@ impl<R: Reader> Flow<R> {
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype click", red)?;
         clock::sleep(0.15);
+        // Right before the secret: the target itself must hold keyboard focus.
+        if is_secret && !self.wait_focus_on(&eid, 1.0) {
+            return Err(Error::flow("cleartype: the target field did not get keyboard focus (nothing typed)"));
+        }
         let r = self.c.fast_keys(&text, None);
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype", red)?;
         clock::sleep(0.20);
+        if is_secret {
+            self.check_focus_after_secret("cleartype", &eid, &text)?;
+        }
         if !secure {
             let p = self.c.spath(&format!("/element/{eid}/attribute/value"));
             let r = self.c.get(&p);
@@ -986,6 +1125,11 @@ impl<R: Reader> Flow<R> {
                 json::get(&ph, "value").as_str().is_some_and(|p| p.trim() == val.trim())
             };
             if val != text && !placeholder_only {
+                // Never leave a wrong or partial secret visible for a retry or a screenshot.
+                if is_secret {
+                    let p = self.c.spath(&format!("/element/{eid}/clear"));
+                    self.c.post(&p, &j!({}));
+                }
                 return Err(Error::flow(format!(
                     "cleartype read-back mismatch (len {} vs {})",
                     val.chars().count(),

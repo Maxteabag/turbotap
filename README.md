@@ -210,7 +210,7 @@ Other options:
 
 The command runs without a shell, so wrap it in `sh -c '...'` if you need a pipe.
 
-App PINs work the same way. `pintap:cmd:"security find-generic-password -w -s bank-pin"` or `pintap:env:APP_PIN` fetches the PIN locally and the step reports only `tapped 4 digits`. `type:`, `cleartype:` and `typedigits:` take `env:` (and `type:`/`cleartype:` also `cmd:`) for the same reason. Avoid writing the digits straight into a step like `pintap:1234`, since the agent then has them.
+App PINs work the same way. `pintap:cmd:"security find-generic-password -w -s bank-pin"` or `pintap:env:APP_PIN` fetches the PIN locally and the step reports only `tapped 4 digits`. `type:`, `cleartype:` and `typedigits:` take `env:` (and `type:`/`cleartype:` also `cmd:`) for the same reason. Avoid writing the digits straight into a step like `pintap:1234`, since the agent then has them. A secret from `env:`/`cmd:` goes only into the field meant for it: `cleartype:` picks the secure (password) field, or the focused one of several, and with no secure field the focused or only text field; it checks live that the target has keyboard focus right before the keys and refuses with nothing typed otherwise. `type:` refuses a secret when a password field is on screen but focus is elsewhere. If focus moves while typing (autofill, a popup), the field that got the keys is cleared and the step fails; a failed read-back clears the field too, so a secret never stays visible for a later screenshot or read.
 
 ### How does it read the screen, accessibility tree or screenshots?
 
