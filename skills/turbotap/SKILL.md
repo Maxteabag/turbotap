@@ -53,7 +53,23 @@ turbotap flow open:Messenger search:Alice wait:'re:Alice\s+Smith'
 - **Typing & control keys (`type:`, `key:`):** `type:` automatically waits for brief keyboard focus after tapping a `TextField`/`SearchField`/`SecureTextField`/`TextView` (no manual `sleep:` needed). Use `key:return|backspace|tab|space|escape` for control keys instead of escaping `\n` in the shell (for inline newlines in `type:`, use ANSI-C quoting `$'type:line1\nline2'`, since `"type:...\n"` sends literal `\n`).
 - **WebView & editable fields (`cleartype:TEXT` + `dismisskb`):** iOS WebViews often append instead of replacing. `cleartype:` supports `TextField`, `SecureTextField`, `SearchField`, and `TextView` (plus `env:VAR` / `cmd:CMD` for secrets), clearing, typing via `/wda/keys`, and verifying read-back on non-secure fields. Follow with `dismisskb` (one localized predicate matching `Done`/`Ferdig`/`Hide keyboard`/`Skjul tastatur`/`Dismiss`/`Lukk`) before submitting.
 - **Formatted numeric inputs (`typedigits:VALUE|env:VAR`):** Clears the field, types 1 digit every `0.08 s` via `/wda/keys`, strips formatting on read-back, and asserts an exact digit-by-digit match (retrying once on mismatch) so WebView formatters never drop digits.
-- **App Store installs:** After `Get`/`Hent`, handle the account sheet (`tapel:Installer`) and Apple ID password (`cleartype:cmd:YOUR_SECRET_CMD` + `tapel:Bekreft`/`Sign In`). The row button shows download progress in `ui` until `Open`/`Åpne`.
+- **App Store installs:** After `Get`/`Hent`, handle the account sheet (`tapel:Installer`) and Apple ID password (`cleartype:cmd:YOUR_SECRET_CMD` + `tapel:Bekreft`/`Sign In`). The row button shows download progress in `ui` until `Open`/`Åpne`; wait for it as below.
+- **Waiting for a control that takes long to appear (a download's `Open`, a slow `Done`):** anchor on the control itself, poll the accessibility tree once a second with a hard deadline, and tap in the same moment it appears. Do not sleep a fixed 5-10 s between checks (an 8 s cadence wasted ~30 s after `Open` was already there) and do not accept only a hand-measured coordinate box (a few points off and it never matches). `ui` costs ~0.2 s and takes no screenshot, so a 1 s cadence is cheap; `wait:` grabs frames continuously and suits waits of seconds, not minutes. The App Store morphs the same button (`Get` → progress → `Open`), so its own position is the anchor:
+
+  ```sh
+  D=15; X=...; Y=...                      # centre of the row's Get/Redownload control from `ui` (tap it with tapat:$X,$Y)
+  deadline=$((SECONDS + 300))
+  while :; do
+    pt=$(turbotap --device $D flow ui | jq -r --argjson x $X --argjson y $Y '
+      [.reads[-1].ui[] | select((.label == "Open" or .label == "Åpne") and ((.x - $x) | fabs) <= 24 and ((.y - $y) | fabs) <= 24)]
+      | if length == 1 then "\(.[0].x),\(.[0].y)" else empty end')
+    if [ -n "$pt" ]; then turbotap --device $D flow "tapat:$pt"; break; fi
+    [ $SECONDS -lt $deadline ] || { echo "no Open at $X,$Y after 300 s"; break; }
+    sleep 1
+  done
+  ```
+
+  `tapat:` re-checks the label against `--deny` and the app guard and taps the control's own centre. On timeout, report what the control showed last (e.g. a progress label), not just "not found".
 - **`FLAG_SECURE` PIN pads (`pintap:DIGITS|env:VAR|cmd:CMD`):** Dismiss any Face ID sheet first (`alert:accept` or `tap:Cancel`), then run `pintap:env:APP_PIN` — reads `XCUIElementTypeKey` rects from `/source` and taps via `/wda/fastTapBatch` (conservative 150 ms inter-key spacing in one XPC call, with automatic fallback to sequential `/wda/fastTap` on older/stock WDA).
 - **Clipboard (`clipboard`, `setclip:TEXT|env:V|cmd:C`):** `clipboard` (alias `copy`) reads the iOS pasteboard via `/wda/getPasteboard`; `setclip:` writes UTF-8 text via `/wda/setPasteboard` (use `env:`/`cmd:` for secrets). *iOS 16+ caveat:* `setclip:` writes from the WDA runner, so pasting into another app may trigger an iOS `"Allow Paste"` banner unless previously allowed for that app.
 - **Unlocking an authorized device:** Use `turbotap --device NAME unlock` with a configured `passcode_cmd` or a securely supplied `WDA_PASSCODE`. Keep the passcode out of output and logs. If an attempt fails, stop rather than retrying.
