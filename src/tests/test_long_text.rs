@@ -1,9 +1,9 @@
 //! Long text (a post body) was typed blind at WDA's default 60 chars/s: 1393 characters
 //! took ~24 s, and when the field moved under the keyboard the whole pass went nowhere.
 //! Long text now goes at 200 chars/s with a short probe checked on the focused field
-//! first (its value, or OCR of its frame when it reports none) and a read-back of the
-//! whole text at the end. Short text is unchanged. Never a silent ok: an unreadable
-//! field gives an "unverified" result.
+//! first and a read-back of the whole text at the end. Short text is unchanged. A
+//! field that reports no value cannot be checked: typed on, never a silent ok (the
+//! result says "unverified").
 
 use crate::flow::Flow;
 use crate::testutil::*;
@@ -55,8 +55,9 @@ fn a_probe_that_does_not_land_stops_before_the_rest() {
     let _c = isolated_cache();
     let (_s, _g) = skip_sleep();
     let m = MockWda::start(form(true));
-    // The field still shows its placeholder: OCR can read it, the probe is not there.
-    let mut f = flow_seeing(&m, &[("body text (optional)", 310.0)]);
+    // The field reports its value (earlier text) and the probe is not in it: lost keys.
+    m.state().set_element_value("b1", Dyn::one(json!("Earlier text")));
+    let mut f = flow_on(&m);
     let text = body();
     let e = f.step(&format!("type:{text}")).unwrap_err().to_string();
     assert!(e.contains("did not land") && e.contains("were not sent"), "{e}");
@@ -80,26 +81,11 @@ fn short_text_is_typed_as_before() {
 }
 
 #[test]
-fn a_field_without_a_value_is_checked_by_ocr_and_typing_goes_on() {
+fn a_field_without_a_value_types_on_and_says_unverified() {
     let _c = isolated_cache();
     let (_s, _g) = skip_sleep();
     let m = MockWda::start(form(true));
-    // The field never reports its value, but OCR shows the probe text in it.
-    let mut f = flow_seeing(&m, &[("Paragraph 1: a line of s", 310.0)]);
-    let text = body();
-    let r = f.step(&format!("type:{text}")).unwrap().unwrap();
-    assert!(r.as_str().unwrap().contains("start seen by OCR"), "{r}");
-    let sent: usize = m.state().typed_history.iter().filter(|h| h.0 == "fastKeys").map(|h| h.1.chars().count()).sum();
-    assert_eq!(sent, text.chars().count());
-    f.close();
-}
-
-#[test]
-fn nothing_readable_goes_on_but_says_unverified() {
-    let _c = isolated_cache();
-    let (_s, _g) = skip_sleep();
-    let m = MockWda::start(form(true));
-    // No value and nothing OCR can read in the field: no new refusal, but never a silent ok.
+    // The field reports no value before or after the probe: no new refusal, never a silent ok.
     let mut f = flow_on(&m);
     let text = body();
     let r = f.step(&format!("type:{text}")).unwrap().unwrap();
