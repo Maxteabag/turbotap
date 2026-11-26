@@ -2811,3 +2811,29 @@ fn test_flow_ending_with_open_returns_once_the_app_is_in_front() {
     assert!(calls >= 3, "{calls}");
     flow.close();
 }
+
+#[test]
+fn test_key_step_that_leaves_the_app_prints_a_warning() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // The flow opened com.example.target; after key:escape SpringBoard is in front.
+    let mut st = MockState::default();
+    st.active_app = Seq::of(vec![json!("com.example.target"), json!("com.apple.springboard")]);
+    let mock = MockWda::start(st);
+    let mut flow = mk_flow(&mock, &FakeReader::new(vec![]), 1.0);
+    flow.bundle = Some("com.example.target".into());
+    let cap = crate::testutil::capture::Capture::start();
+    mock.state().active_app = Seq::one(json!("com.apple.springboard"));
+    assert_eq!(step_s(&mut flow, "key:escape"), "escape");
+    let err = cap.stderr();
+    assert!(err.contains("key:escape left 'com.example.target'; 'com.apple.springboard' is in front now"), "{err}");
+    flow.close();
+    // Still in the same app: no warning.
+    let mock = MockWda::start(MockState { active_app: Seq::one(json!("com.example.target")), ..Default::default() });
+    let mut flow = mk_flow(&mock, &FakeReader::new(vec![]), 1.0);
+    flow.bundle = Some("com.example.target".into());
+    let cap = crate::testutil::capture::Capture::start();
+    assert_eq!(step_s(&mut flow, "key:return"), "return");
+    assert!(!cap.stderr().contains("warning"), "{}", cap.stderr());
+    flow.close();
+}
