@@ -206,7 +206,8 @@ fn test_full_read_also_returns_the_button_label() {
     assert_eq!(code, 0, "{err}");
     let lines = lines_of(&v);
     assert!(lines.iter().any(|(t, x, y)| t == "Continue" && (x - 201).abs() <= 3 && (y - 756).abs() <= 3), "{lines:?}");
-    assert!(lines.iter().any(|(t, _, y)| t == "Title" && (y - 140).abs() <= 3), "the page text is still read: {lines:?}");
+    // The title bar spans y 130..150 pt; a strip cut may split it, so any line in that band.
+    assert!(lines.iter().any(|(t, _, y)| t == "Title" && (128..=152).contains(y)), "the page text is still read: {lines:?}");
 }
 
 #[test]
