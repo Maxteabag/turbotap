@@ -672,7 +672,6 @@ impl<R: Reader> Flow<R> {
             check_wda_ok(self.c.fast_keys(text, Some(freq)), "type", false)?;
             return Ok(format!("len={n}"));
         };
-        let before = self.element_value(&eid);
         let cut = text.char_indices().nth(LONG_TEXT_PROBE).map(|(i, _)| i).unwrap_or(text.len());
         let (head, tail) = text.split_at(cut);
         check_wda_ok(self.c.fast_keys(head, Some(freq)), "type", false)?;
