@@ -2837,3 +2837,34 @@ fn test_key_step_that_leaves_the_app_prints_a_warning() {
     assert!(!cap.stderr().contains("warning"), "{}", cap.stderr());
     flow.close();
 }
+
+#[test]
+fn test_tap_prefers_the_one_row_whose_label_part_is_exactly_the_text() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // OCR: another row's subtitle starts with the text; the real title was misread.
+    let lines = vec![ml("tt-ema-1: E2E-LONG-30 jobb", 60, 200, 300, 220), ml("tt-ema-l", 60, 390, 140, 410)];
+    let run = |cells: Value| {
+        let img1 = solid_img(240, (430, 932));
+        let img2 = solid_img(200, (430, 932));
+        let mock = MockWda::start(with_fast_ui(fui(cells)));
+        let r = FakeReader::with(vec![fr(&img1, &lines), fr(&img2, &lines), fr(&copy_img(&img2), &lines)], (430, 932), 1.0);
+        let mut flow = mk_flow(&mock, &r, 1.0);
+        let _ = flow.step("tap:tt-ema-1");
+        flow.close();
+        mock.tapped_points().iter().map(|p| (p.0, p.1)).collect::<Vec<_>>()
+    };
+    // One row whose accessibility label has the exact part: that row.
+    let pts = run(json!([
+        {"type": "Cell", "label": "Claude backend, tt-ema-1-h02, Idle", "x": 200, "y": 210},
+        {"type": "Cell", "label": "Claude backend, tt-ema-1, Working…", "x": 200, "y": 400}
+    ]));
+    assert_eq!(pts.first(), Some(&(200, 400)), "{pts:?}");
+    // Two rows with that part: ambiguous, the OCR match stands.
+    let pts = run(json!([
+        {"type": "Cell", "label": "Claude backend, tt-ema-1, Idle", "x": 200, "y": 210},
+        {"type": "Cell", "label": "Codex backend, tt-ema-1, Working…", "x": 200, "y": 400}
+    ]));
+    assert_ne!(pts.first(), Some(&(200, 400)), "{pts:?}");
+    assert!(!pts.is_empty());
+}

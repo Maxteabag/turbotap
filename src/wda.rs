@@ -24,6 +24,10 @@ use std::time::Duration;
 pub const DEFAULT_TIMEOUT: f64 = 25.0;
 pub const SPRINGBOARD: &str = "com.apple.springboard";
 
+/// How long the app guard re-checks (live, sending nothing) when SpringBoard is in
+/// front before an input, since a notification banner makes it active for a moment.
+pub const BANNER_RECHECK: f64 = 1.0;
+
 // ---------------------------------------------------------------------------
 // Raw HTTP/1.1 connection
 // ---------------------------------------------------------------------------
@@ -731,6 +735,9 @@ pub const URL_LANDING_WATCH: f64 = 0.8;
 pub struct WdaClient {
     /// Requests sent on this client's connection (for the per-step timing log).
     pub stats: ReqStats,
+    /// The app a live `/wda/activeAppInfo` last named (for the timing log; never used
+    /// to authorize anything).
+    pub last_foreground: Option<String>,
     /// Time per request kind (`METHOD /path` with session and element ids replaced):
     /// count and total microseconds. The timing log takes and clears it per step.
     pub req_kinds: std::collections::BTreeMap<String, (u32, u64)>,
@@ -806,6 +813,7 @@ impl WdaClient {
         WdaClient {
             stats: ReqStats::default(),
             req_kinds: std::collections::BTreeMap::new(),
+            last_foreground: None,
             base_url,
             udid: udid.to_string(),
             device_key: device_key.map(String::from),
@@ -982,7 +990,13 @@ impl WdaClient {
         match self.exchange_borrowed("GET", "/wda/activeAppInfo", None, &[], 5.0, deadline, false, |b| {
             serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
         }) {
-            Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => crate::guard::foreground_from_envelope(&v),
+            Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => {
+                let r = crate::guard::foreground_from_envelope(&v);
+                if let Ok(b) = &r {
+                    self.last_foreground = Some(b.clone());
+                }
+                r
+            }
             Ok(Some((status, _, _))) => Err(format!("activeAppInfo failed: HTTP {status}")),
             Ok(None) => Err("activeAppInfo failed: deadline exceeded".into()),
             Err(_) => Err("activeAppInfo failed".into()),
@@ -1044,10 +1058,41 @@ impl WdaClient {
         if expired(deadline) {
             return Ok(false);
         }
-        match self.live_foreground_app(deadline) {
+        let mut first = self.live_foreground_app(deadline);
+        // A notification banner makes SpringBoard active for a moment. Re-check (live,
+        // nothing is sent meanwhile) for up to BANNER_RECHECK before refusing; every
+        // wait is printed with what was in front, so a real takeover still shows.
+        if matches!(&first, Ok(b) if b == SPRINGBOARD) && !self.guard_unlock_scope && !self.allowed_apps.iter().any(|a| a == SPRINGBOARD) {
+            let t0 = clock::now();
+            let end = deadline.map_or(t0 + BANNER_RECHECK, |d| d.min(t0 + BANNER_RECHECK));
+            while clock::now() < end {
+                clock::sleep(0.2f64.min((end - clock::now()).max(0.0)));
+                first = self.live_foreground_app(deadline);
+                if !matches!(&first, Ok(b) if b == SPRINGBOARD) {
+                    break;
+                }
+            }
+            let after = match &first {
+                Ok(b) => json::py_repr_str(b),
+                Err(e) => e.clone(),
+            };
+            crate::errln!(
+                "turbotap: {SPRINGBOARD} was in front before {action} (a banner?); re-checked for {} ms: {after} in front",
+                ((clock::now() - t0) * 1000.0).round() as i64
+            );
+        }
+        match first {
             Ok(b) if self.allowed_apps.iter().any(|a| a == &b) => Ok(true),
             Ok(b) if self.guard_unlock_scope && b == SPRINGBOARD => Ok(true),
-            Ok(b) => Err(self.guard_refuse(crate::guard::refuse_foreground(action, &b, &self.allowed_apps))),
+            Ok(b) => {
+                let mut msg = crate::guard::refuse_foreground(action, &b, &self.allowed_apps);
+                // SpringBoard in front is often a locked phone: say so (one read, only
+                // on refusal) instead of leaving it at "wrong app".
+                if b == SPRINGBOARD && matches!(self.confirm_locked_state(0), Ok(true)) {
+                    msg.push_str("; the phone is locked (run 'turbotap unlock' or unlock it, then open the app again)");
+                }
+                Err(self.guard_refuse(msg))
+            }
             Err(_) if expired(deadline) => Ok(false),
             Err(why) => Err(self.guard_refuse(crate::guard::refuse_unknown(action, &why, &self.allowed_apps))),
         }

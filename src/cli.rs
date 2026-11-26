@@ -133,7 +133,7 @@ fn allow_url_scheme_arg() -> Arg {
     Arg::new("allow-url-scheme").long("allow-url-scheme").value_name("SCHEME").action(ArgAction::Append).help(
         "let url: open this exact custom scheme (e.g. myapp) for this run while the app guard is on, only together \
          with --allow-app and while that app is confirmed in front before and after (repeatable; never http, https, \
-         tel, sms, mailto or other system schemes)",
+         tel, sms, mailto or other system schemes). On a shared test phone, get the phone owner's go before each use",
     )
 }
 

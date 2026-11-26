@@ -2215,3 +2215,49 @@ fn test_allow_url_scheme_cli_and_the_stop_file_wins() {
     assert_eq!(code, 6, "{out} {err}");
     assert_eq!(opened.lock().unwrap().len(), 1, "nothing more opened while the stop file exists");
 }
+
+#[test]
+fn test_a_passing_banner_is_rechecked_not_refused_and_a_takeover_still_is() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    // SpringBoard (a banner) for two checks, then the allowlisted app again: the tap
+    // goes to the app, after a logged re-check. Nothing is sent while SpringBoard is in front.
+    let mut st = state_with_app(json!(ALLOWED));
+    st.active_app = Seq::of(vec![json!("com.apple.springboard"), json!("com.apple.springboard"), json!(ALLOWED)]);
+    let mock = MockWda::start(st);
+    let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+    let cap = crate::testutil::capture::Capture::start();
+    flow.step("tapxy:5,6").unwrap();
+    assert!(cap.stderr().contains("re-checked for"), "{}", cap.stderr());
+    assert_eq!(mock.tapped_points().len(), 1);
+    flow.close();
+    // SpringBoard stays in front (or another app takes over): refused after the wait,
+    // and the wait is logged with what was in front.
+    for front in ["com.apple.springboard", "com.example.takeover"] {
+        let mut st = state_with_app(json!(ALLOWED));
+        st.active_app = Seq::of(vec![json!("com.apple.springboard"), json!(front)]);
+        let mock = MockWda::start(st);
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+        let cap = crate::testutil::capture::Capture::start();
+        expect_guard_err(flow.step("tapxy:5,6"), &format!("foreground app '{front}'"));
+        assert!(cap.stderr().contains(&format!("'{front}' in front")), "{}", cap.stderr());
+        assert!(mock.tapped_points().is_empty(), "{front}");
+        flow.close();
+    }
+}
+
+#[test]
+fn test_refusal_with_springboard_in_front_says_when_the_phone_is_locked() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    for (locked, says) in [(true, true), (false, false)] {
+        let mut st = state_with_app(json!("com.apple.springboard"));
+        st.locked = Seq::one(json!(locked));
+        let mock = MockWda::start(st);
+        let mut flow = guarded_flow(&mock, &blank_reader(), Some(DENY_DEFAULT), &[ALLOWED]);
+        let m = expect_guard_err(flow.step("tapxy:5,6"), "foreground app 'com.apple.springboard'");
+        assert_eq!(m.contains("the phone is locked"), says, "{locked}: {m}");
+        assert!(mock.tapped_points().is_empty());
+        flow.close();
+    }
+}

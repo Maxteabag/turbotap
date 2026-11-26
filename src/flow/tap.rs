@@ -158,6 +158,30 @@ fn plain_send_target(label: &ElAttr, name: &ElAttr, allow: &[String]) -> std::re
 /// tap point on both axes.
 pub const TAPAT_RADIUS: i64 = 24;
 
+/// The one enabled control in [`TAP_FORM_TYPES`] whose label, split at commas, has a
+/// part equal to `text` (case-insensitive, whitespace cleaned). None when there is
+/// none or more than one (ambiguous: the caller keeps its OCR match).
+fn unique_part_control<'a>(controls: &'a [Control], text: &str) -> Option<&'a Control> {
+    let want = crate::text::casefold(&crate::text::clean_text(text));
+    if want.is_empty() {
+        return None;
+    }
+    let mut found: Option<&'a Control> = None;
+    for c in controls {
+        if c.is_disabled() || !TAP_FORM_TYPES.contains(&c.kind.as_str()) || !c.label.contains(',') {
+            continue;
+        }
+        let hit = c.label.split(',').any(|p| crate::text::casefold(&crate::text::clean_text(p)) == want);
+        if hit {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(c);
+        }
+    }
+    found
+}
+
 impl<R: Reader> Flow<R> {
     /// `self.controls()` / `self.controls(deadline=deadline)` from the tap code.
     fn tap_ctl(&mut self, deadline: Option<f64>) -> Result<Vec<Control>> {
@@ -611,6 +635,11 @@ impl<R: Reader> Flow<R> {
         is_form_label: bool,
     ) -> Result<Option<Control>> {
         let mut c = if m.rank != 0 || is_form_label { exact_control(ctl, base, TAP_FORM_TYPES, false).cloned() } else { None };
+        // A list row labelled "Title, subtitle, status": the one row whose label has a
+        // part exactly equal to TEXT beats an OCR line that only contains TEXT.
+        if c.is_none() && m.rank != 0 && !base.starts_with("re:") {
+            c = unique_part_control(ctl, base).cloned();
+        }
         if c.is_none() && is_form_label {
             c = self.input_near(base, m, Some(ctl))?;
         }
@@ -1265,6 +1294,12 @@ impl<R: Reader> Flow<R> {
             let rc = self.tap_ctl(None)?;
             let ctl = scope(&rc, &cur_lines, wh);
             if let Some(c) = exact_control(&ctl, &base, TAP_FORM_TYPES, false) {
+                return Ok(Match::new(c.x, c.y, c.label.clone(), None, 0));
+            }
+            // A list row's accessibility label often reads "Title, subtitle, status": a
+            // single control with a comma-separated part exactly equal to TEXT beats an
+            // OCR line that only starts with or contains TEXT (another row's subtitle).
+            if let Some(c) = unique_part_control(&ctl, &base) {
                 return Ok(Match::new(c.x, c.y, c.label.clone(), None, 0));
             }
         }
