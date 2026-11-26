@@ -162,3 +162,135 @@ fn a_hidden_duplicate_does_not_make_a_name_ambiguous() {
     assert_eq!(f.step("readfield:Body").unwrap().unwrap(), json!(BODY));
     f.close();
 }
+
+// ---------------------------------------------------------------------------
+// fill:
+// ---------------------------------------------------------------------------
+
+const KEYBOARD: &str = "type == 'XCUIElementTypeKeyboard'";
+
+/// The composer with a keyboard up, empty title/body and an empty password field.
+fn typing_composer() -> MockState {
+    let mut st = composer("");
+    st.set_element_value("t1", Dyn::one(json!("")));
+    st.set_element_value("p1", Dyn::one(json!("")));
+    st.elements_map.insert(ekey(&["predicate string", KEYBOARD]), vec![json!({"ELEMENT": "kb"})]);
+    st.element_rects.insert("b1".into(), json!({"x": 16, "y": 560, "width": 398, "height": 300}));
+    st
+}
+
+fn keys_typed(mock: &MockWda) -> Vec<(String, Option<i64>)> {
+    mock.state().typed_history.iter().map(|(_, t, f)| (t.clone(), *f)).collect()
+}
+
+#[test]
+fn fill_types_long_text_at_200_after_a_focus_probe_and_reads_it_back() {
+    let mock = MockWda::start(typing_composer());
+    let mut f = flow(&mock);
+    let dir = std::env::temp_dir().join(format!("tt-fill-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("body.txt");
+    std::fs::write(&file, format!("{BODY}\n")).unwrap();
+    let r = f.step(&format!("fill:Body=file:{}", file.display())).unwrap().unwrap();
+    assert_eq!(r, json!(format!("Body: len={}", BODY.chars().count())));
+    assert_eq!(mock.state().element_values.get_mut("b1").unwrap().next(&serde_json::Value::Null), json!(BODY));
+    // Probe, delete, then the text, all at 200 characters per second.
+    let typed = keys_typed(&mock);
+    assert_eq!(typed, vec![("x".into(), Some(200)), ("\u{8}".into(), Some(200)), (BODY.into(), Some(200))]);
+    // A short value needs no probe.
+    f.step("fill:Title=My title").unwrap();
+    assert_eq!(keys_typed(&mock).last().unwrap().0, "My title");
+    assert_eq!(keys_typed(&mock).len(), 4);
+    f.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fill_taps_inside_the_field_when_the_element_click_brings_no_keyboard() {
+    let mut st = typing_composer();
+    st.elements_map.remove(&ekey(&["predicate string", KEYBOARD]));
+    let mock = MockWda::start(st);
+    let tapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let t2 = tapped.clone();
+    mock.set_custom_handler(move |_st, _m, path, _d| {
+        if path.ends_with("/wda/fastTap") {
+            t2.store(true, std::sync::atomic::Ordering::SeqCst);
+            return None;
+        }
+        if path.ends_with("/elements") && _d["value"] == json!(KEYBOARD) {
+            let up = t2.load(std::sync::atomic::Ordering::SeqCst);
+            return Some(json!({"value": if up { vec![json!({"ELEMENT": "kb"})] } else { vec![] }}));
+        }
+        None
+    });
+    let mut f = flow(&mock);
+    f.step("fill:Body=Short body").unwrap();
+    assert!(tapped.load(std::sync::atomic::Ordering::SeqCst));
+    // The tap went inside the body's frame, near its top.
+    let tap = mock.calls_to("/wda/fastTap").last().cloned().unwrap();
+    assert_eq!((tap.2["x"].as_i64(), tap.2["y"].as_i64()), (Some(215), Some(580)));
+    f.close();
+}
+
+#[test]
+fn fill_refuses_a_secret_when_the_probe_lands_elsewhere() {
+    let mock = MockWda::start(typing_composer());
+    let mut f = flow(&mock);
+    f.step("fill:Title=My title").unwrap();
+    // The password field ignores the click: focus stays in the title.
+    mock.set_custom_handler(|_st, _m, path, _d| path.ends_with("/element/p1/click").then(|| json!({"value": null})));
+    let _env = set_env(&[("TT_FILL_SECRET", Some("hunter22"))]);
+    let e = f.step("fill:Password=env:TT_FILL_SECRET").unwrap_err().to_string();
+    assert!(e.contains("keyboard focus is not in") && !e.contains("hunter22"), "{e}");
+    // The probe was deleted again and the secret never typed.
+    assert_eq!(mock.state().element_values.get_mut("t1").unwrap().next(&serde_json::Value::Null), json!("My title"));
+    assert!(keys_typed(&mock).iter().all(|(t, _)| t != "hunter22"));
+    f.close();
+}
+
+#[test]
+fn fill_checks_a_secure_field_by_length() {
+    let mut st = typing_composer();
+    st.elements_map.insert(ekey(&["predicate string", &exact("Password")]), vec![json!({"ELEMENT": "p1"})]);
+    let mock = MockWda::start(st);
+    let mut f = flow(&mock);
+    let _env = set_env(&[("TT_FILL_SECRET", Some("hunter22"))]);
+    let r = f.step("fill:Password=env:TT_FILL_SECRET").unwrap().unwrap();
+    assert_eq!(r, json!("Password: len=8"));
+    f.close();
+}
+
+#[test]
+fn fill_looks_again_after_closing_the_keyboard() {
+    let mut st = typing_composer();
+    st.elements_map.remove(&ekey(&["predicate string", &exact("Body")]));
+    let mock = MockWda::start(st);
+    let dragged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = dragged.clone();
+    let body_pred = exact("Body");
+    mock.set_custom_handler(move |_st, _m, path, data| {
+        if path.contains("ragfromto") || path.ends_with("/wda/fastDrag") {
+            d2.store(true, std::sync::atomic::Ordering::SeqCst);
+            return None;
+        }
+        if path.ends_with("/elements") && data["value"] == json!(body_pred) {
+            let seen = d2.load(std::sync::atomic::Ordering::SeqCst);
+            return Some(json!({"value": if seen { vec![json!({"ELEMENT": "b1"})] } else { vec![] }}));
+        }
+        None
+    });
+    let mut f = flow(&mock);
+    f.step("fill:Body=Short body").unwrap();
+    assert!(dragged.load(std::sync::atomic::Ordering::SeqCst));
+    f.close();
+}
+
+#[test]
+fn fill_values_stay_out_of_step_logs() {
+    assert_eq!(safe_step("fill:Password=hunter2"), "fill:Password=<redacted>");
+    assert_eq!(safe_step("fill:Body=file:/tmp/b.txt"), "fill:Body=file:/tmp/b.txt");
+    assert!(crate::flow::is_secret_step("fill:Password=cmd:pass show x"));
+    assert!(!crate::flow::is_secret_step("fill:Title=Hello"));
+    let (verb, arg) = crate::timings::step_kind_arg("fill:Password=hunter2");
+    assert_eq!((verb.as_str(), arg.as_deref()), ("fill", Some("Password")));
+}

@@ -67,8 +67,8 @@ pub fn step_kind_arg(spec: &str) -> (String, Option<String>) {
         Some((v, a)) => (v.trim().to_ascii_lowercase(), Some(a)),
         None => (spec.trim().to_ascii_lowercase(), None),
     };
-    // `assertfield:FIELD=VALUE`: the field name only.
-    if verb == "assertfield" {
+    // `assertfield:FIELD=VALUE` / `fill:FIELD=VALUE`: the field name only.
+    if verb == "assertfield" || verb == "fill" {
         let field = arg.and_then(|a| a.split_once('=').map(|(f, _)| f.chars().take(60).collect::<String>()));
         return (verb, field);
     }
