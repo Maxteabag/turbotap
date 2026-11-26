@@ -128,9 +128,10 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
   tapxy:X,Y             tap points
   tapat:X,Y             label tap with a location hint: finds the labelled control nearest
-                        X,Y (within 24 pt; else the OCR line containing it), checks its label
+                        X,Y (within 24 pt; controls only, never OCR text), checks its label
                         against --deny and taps that control's own centre, never the raw
-                        point; nothing labelled there is refused with the nearest labels
+                        point; returns the label; no control there is refused with the
+                        nearest labels
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
@@ -1128,7 +1129,7 @@ impl<R: Reader> Flow<R> {
             let (req0, slept0) = (self.c.stats, clock::slept_total());
             self.step_retries = 0;
             let outcome = self.step(spec);
-            self.record_timing(spec, s0, req0, slept0, outcome.as_ref().err());
+            self.record_timing(spec, s0, req0, slept0, &outcome);
             match outcome {
                 Ok(res) => {
                     let mut item = serde_json::Map::new();
@@ -1212,11 +1213,13 @@ impl<R: Reader> Flow<R> {
 impl<R: Reader> Flow<R> {
     /// Append the finished step to the timing log ([`crate::timings`]). Uses only
     /// counters and state already held: no request.
-    fn record_timing(&self, spec: &str, s0: f64, req0: crate::wda::ReqStats, slept0: f64, err: Option<&Error>) {
+    fn record_timing(&self, spec: &str, s0: f64, req0: crate::wda::ReqStats, slept0: f64, outcome: &Result<Option<Value>>) {
         if crate::timings::log_path().is_none() {
             return;
         }
+        let err = outcome.as_ref().err();
         let err_s = err.map(|e| e.to_string());
+        let target = outcome.as_ref().ok().and_then(|v| v.as_ref()).and_then(Value::as_str);
         let dev = self.c.device_key.clone().filter(|d| !d.is_empty()).or_else(|| Some(self.c.udid.clone()).filter(|u| !u.is_empty()));
         let rec = crate::timings::StepRecord {
             device: dev.as_deref(),
@@ -1228,6 +1231,7 @@ impl<R: Reader> Flow<R> {
             bundle: self.bundle.as_deref(),
             ok: err.is_none(),
             error: err_s.as_deref(),
+            target,
         };
         crate::timings::append(&rec.to_value(|t| self.scrub(t)));
     }

@@ -58,6 +58,26 @@ fn test_each_flow_step_appends_one_redacted_line_with_request_counts() {
 }
 
 #[test]
+fn test_tapat_logs_the_label_it_resolved_to() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let dir = TempDir::new("tt-timings-tapat-");
+    let path = dir.path().join("t.jsonl");
+    let _l = log_to(&path);
+    let ui = json!([{"type": "Button", "label": "Settings", "x": 380, "y": 60}]);
+    let mock = MockWda::start(MockState::default().with_fast_ui(fast_ui(ui, "Example", "com.example.app")));
+    let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let (ok, _) = flow.run_outcome(&["tapat:372,66".to_string()]).unwrap();
+    assert!(ok);
+    flow.close();
+    let lines = log_lines(&path);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["step"], "tapat");
+    assert_eq!(lines[0]["arg"], "372,66");
+    assert_eq!(lines[0]["target"], "Settings");
+}
+
+#[test]
 fn test_no_log_when_off() {
     let _c = isolated_cache();
     let (_s, _g) = skip_sleep();

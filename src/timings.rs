@@ -93,7 +93,13 @@ pub struct StepRecord<'a> {
     pub bundle: Option<&'a str>,
     pub ok: bool,
     pub error: Option<&'a str>,
+    /// What a tap step resolved to and touched (the matched text or control label),
+    /// kept only for [`TARGET_VERBS`].
+    pub target: Option<&'a str>,
 }
+
+/// Steps whose result is the label they tapped: logged as `target`.
+pub const TARGET_VERBS: &[&str] = &["tap", "tapif", "tapat"];
 
 impl StepRecord<'_> {
     pub fn to_value(&self, scrub: impl Fn(&str) -> String) -> Value {
@@ -115,6 +121,10 @@ impl StepRecord<'_> {
             "app": self.bundle,
             "ok": self.ok,
         });
+        if let Some(t) = self.target.filter(|_| TARGET_VERBS.contains(&kind.as_str())) {
+            let short: String = scrub(t).chars().take(80).collect();
+            v["target"] = Value::String(short);
+        }
         if let Some(e) = self.error {
             // Only for verbs whose argument may be logged (a typing step's error could
             // quote what was typed), and only the first words: enough to group failures.
@@ -142,6 +152,7 @@ pub fn record_command(c: &crate::wda::WdaClient, cmd: &str, t0: f64, req0: ReqSt
         bundle: None,
         ok: err.is_none(),
         error: err_s.as_deref(),
+        target: None,
     };
     append(&rec.to_value(str::to_string));
 }

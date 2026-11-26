@@ -2779,17 +2779,20 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
     let mut flow = mk_flow(&mock, &r, 1.0);
     assert_eq!(step_s(&mut flow, "tapat:372,66"), "Settings");
     assert_eq!(pts(&mock), vec![(380, 60)]);
-    // An OCR line containing the point: tapped at the line's centre.
-    assert_eq!(step_s(&mut flow, "tapat:40,105"), "Inbox title");
+    // OCR text is never a target, even under the point.
+    match flow.step("tapat:40,105") {
+        Err(Error::Flow(m)) => assert!(m.contains("no labelled control at 40,105"), "{m}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
     // The label at the point goes through --deny; a disabled control is refused.
     flow_err(flow.step("tapat:385,795"));
     flow_err(flow.step("tapat:300,800"));
     // Nothing labelled there: refused, naming the nearest labels.
     match flow.step("tapat:60,600") {
-        Err(Error::Flow(m)) => assert!(m.contains("nothing labelled at 60,600; nearest:"), "{m}"),
+        Err(Error::Flow(m)) => assert!(m.contains("no labelled control at 60,600; nearest:"), "{m}"),
         other => panic!("expected refusal, got {other:?}"),
     }
-    assert_eq!(pts(&mock), vec![(380, 60), (115, 110)], "a refused tapat touched the screen");
+    assert_eq!(pts(&mock), vec![(380, 60)], "a refused tapat touched the screen");
     flow.close();
 }
 
