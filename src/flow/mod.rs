@@ -1248,7 +1248,22 @@ impl<R: Reader> Flow<R> {
                 out = out.replace(sec.as_str(), "<redacted>");
             }
         }
+        // A secret that ended up somewhere visible comes back in pieces too (a cut-off
+        // field value, an OCR misread): such a string is withheld whole.
+        if self.holds_secret_piece(&out) {
+            return "<redacted: may hold part of a secret>".to_string();
+        }
         out
+    }
+
+    /// True when `s` holds 5 characters in a row (the whole secret when shorter) of a
+    /// remembered secret of 4+ characters, ignoring case.
+    pub fn holds_secret_piece(&self, s: &str) -> bool {
+        let low = s.to_lowercase();
+        self.secrets.iter().any(|sec| {
+            let c: Vec<char> = sec.to_lowercase().chars().collect();
+            c.len() >= 4 && c.windows(c.len().min(5)).any(|w| low.contains(&w.iter().collect::<String>()))
+        })
     }
 
     /// Scrub every string value in an output value. Object keys are never touched:
@@ -1262,7 +1277,7 @@ impl<R: Reader> Flow<R> {
         }
         match v {
             Value::String(s) => {
-                if self.secrets.iter().any(|sec| s.contains(sec.as_str())) {
+                if self.secrets.iter().any(|sec| s.contains(sec.as_str())) || self.holds_secret_piece(s) {
                     *s = self.scrub(s);
                 }
             }

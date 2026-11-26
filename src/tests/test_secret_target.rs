@@ -196,3 +196,55 @@ fn test_no_secret_in_cli_output_or_timing_log_when_it_fails() {
     let logged = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(!logged.is_empty() && !logged.contains(FAKE), "{logged}");
 }
+
+#[test]
+fn test_focus_taken_by_a_popup_at_the_click_means_zero_secret_input() {
+    let _c = isolated_cache();
+    // The password field was focused, but tapping it opens an autofill popup that puts
+    // focus on the username field: the secret is never sent.
+    let mut st = login(false);
+    st.focused_eid = Some("p1".into());
+    let m = MockWda::start(st);
+    m.set_custom_handler(|st, method, p, _| {
+        if method == "POST" && p.ends_with("/element/p1/click") {
+            st.focused_eid = Some("u1".into());
+            return Some(json!({"value": null}));
+        }
+        None
+    });
+    let mut flow = flow_on(&m);
+    let e = with_secret(|| flow.step(&format!("cleartype:env:{VAR}"))).unwrap_err().to_string();
+    assert!(e.contains("nothing typed"), "{e}");
+    assert!(typed(&m).is_empty(), "keys were sent: {:?}", typed(&m));
+    assert_eq!(val(&m, "u1"), "");
+    assert_eq!(val(&m, "p1"), "");
+    flow.close();
+}
+
+#[test]
+fn test_a_later_read_withholds_a_partial_secret() {
+    let _c = isolated_cache();
+    // After the secret was handled in this flow, a field shows a cut-off copy of it
+    // ("fake-Pas", "FAKE-PASS"): the read output withholds those strings, not others.
+    let mut st = login(false);
+    st.focused_eid = Some("p1".into());
+    st.fast_ui = Some(Dyn::one(json!({
+        "bundleId": "com.example.app", "appName": "Example", "screen": [430, 932],
+        "ui": [
+            {"type": "TextField", "label": "Username", "value": "fake-Pas", "x": 200, "y": 300},
+            {"type": "StaticText", "label": "FAKE-PASS shown", "x": 200, "y": 350},
+            {"type": "Button", "label": "Log in", "x": 200, "y": 500}
+        ]
+    })));
+    let m = MockWda::start(st);
+    let mut flow = flow_on(&m);
+    let steps: Vec<String> = [format!("cleartype:env:{VAR}"), "ui".to_string()].to_vec();
+    let res = with_secret(|| flow.run(&steps)).unwrap();
+    flow.close();
+    let dump = res.to_string();
+    for piece in ["fake-Pas", "FAKE-PASS", "Pass-123"] {
+        assert!(!dump.contains(piece), "{piece} in {dump}");
+    }
+    assert!(dump.contains("Log in"), "{dump}");
+    assert!(dump.contains("may hold part of a secret"), "{dump}");
+}
