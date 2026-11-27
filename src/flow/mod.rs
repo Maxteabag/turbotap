@@ -29,8 +29,8 @@ pub use worker::{ProbeSnapshot, UiWorker};
 pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
-  open:APP              activate an app by display name or bundle ID (open:Spotify,
-                        open:com.apple.Preferences); names come from a per-device
+  open:APP              activate the caller's app by display name or bundle ID;
+                        names come from a per-device
                         devicectl cache (~1 ms; refreshed once on an unknown name)
   launch:APP            terminate + activate (fresh start)
   url:URL               open a URL or deep-link directly via WDA /url (https://, maps://,
@@ -48,14 +48,10 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         controls fallback; supports @region and 're:REGEX')
   assertnot:TEXT        single-frame non-mutating check that TEXT is NOT on screen (checks
                         both OCR and UI controls; supports @region and 're:REGEX')
-  tap:TEXT              wait until TEXT is on screen at the same spot twice, tap its
-                        centre, and re-tap once if the screen did not react; text
-                        OCR cannot see falls back to the control with that label.
-                        A Button labelled exactly TEXT beats a longer OCR line that
-                        only contains it; a switch row's label taps the toggle;
-                        If several targets match, use an exact label and location.
-                        With an active iOS alert, waitany: can match an exact button
-                        label and tap: presses it by name. The app guard still applies.
+  tap:TEXT              resolve caller-supplied text or accessibility label and tap once;
+                        reports an unconfirmed result if no visible reaction can be verified.
+                        Use an exact label and location when targets are ambiguous.
+                        A live iOS alert button can be selected by its exact label.
   tapif:TEXT            optional tap (~1 s max): tap TEXT (OCR + exact UI control
                         fallback, respects --deny and @region) or return 'skipped'
                         cleanly without failing the flow
@@ -63,12 +59,12 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         @region, checks --deny upfront); generic tapbatch:A,B,C re-resolves live
                         UI controls and --deny between every tap so layout changes never tap
                         stale coordinates; tapbatch:fixed:A,B,C opts into single-snapshot
-                        /wda/fastTapBatch dispatch for known stationary keypads (e.g. Calculator)
+                        /wda/fastTapBatch dispatch for stationary controls explicitly selected by the caller
   toggle:LABEL[=on|off] idempotently set or flip an iOS Switch control (supports @region;
                         =on|off|1|0|true|false skips tap when already in desired state and
                         verifies state after tapping; respects --deny)
   TEXT@below:HEADER     (tap/tapif/tapbatch/toggle/longpress/doubletap/swipe:left|right/wait/waitany/assert/assertnot/scrollto) only match under HEADER,
-  TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
+  TEXT@above:HEADER TEXT@y>N match only in the caller-specified screen region
   longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
                         @region, OCR + UI fallback, respects --deny)
   longpressxy:X,Y[,MS]  long-press points (default 650 ms; optional MS or Ns, e.g. 800 or 0.8s)

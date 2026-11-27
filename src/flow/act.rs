@@ -381,11 +381,11 @@ impl<R: Reader> Flow<R> {
     }
 
     /// L4116. Set an XCUIElementTypeSlider to a normalized fraction [0.0, 1.0]:
-    /// slider:50%, slider:0.5, slider:Brightness=70%, slider:Lysstyrke=0.4.
+    /// slider:50%, slider:0.5, slider:LABEL=70%.
     pub fn set_slider(&mut self, spec: &str) -> Result<String> {
         let raw = spec.trim();
         if raw.is_empty() {
-            return Err(Error::flow("slider requires PCT or LABEL=PCT (e.g. slider:50% or slider:Brightness=70%)"));
+            return Err(Error::flow("slider requires PCT or LABEL=PCT"));
         }
         let (target_label, val_str) = match raw.rsplit_once('=') {
             Some((label_part, val_part)) => {
