@@ -122,6 +122,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   waitany:A|B|C         poll until ANY '|'-separated target appears (OCR-first, then
                         UI controls + Sauvola fallback; per-target @region supported);
                         returns the matched text
+  waitcontrol:LABEL     wait for an exact live accessibility label using --timeout;
+                        returns the control and sends no input or screenshot request
   gone:TEXT             poll until TEXT is no longer on screen
   assert:TEXT           single-frame non-mutating check that TEXT is on screen (OCR + UI
                         controls fallback; supports @region and 're:REGEX')

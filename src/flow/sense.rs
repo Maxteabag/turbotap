@@ -744,6 +744,7 @@ impl<R: Reader> Flow<R> {
         }
 
         let deadline = clock::now() + timeout;
+        let poll_interval = (timeout / 4.0).clamp(0.1, 1.0);
         loop {
             self.c.stop_check().map_err(Error::flow)?;
             let now = clock::now();
@@ -762,7 +763,7 @@ impl<R: Reader> Flow<R> {
             if let Some(control) = controls.into_iter().find(|control| control.label == label) {
                 return Ok(control);
             }
-            clock::sleep(remaining.min(0.1));
+            clock::sleep(remaining.min(poll_interval));
         }
         Err(Error::flow(format!(
             "waitcontrol timed out after {timeout} s waiting for {}",
