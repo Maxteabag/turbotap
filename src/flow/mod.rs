@@ -165,7 +165,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         point; returns the label; no control there is refused with the
                         nearest labels. tapat:X,Y=LABEL presses only the one enabled control
                         labelled exactly LABEL there, read fresh; anything else is refused
-                        with nothing pressed
+                        with nothing pressed; reports if the accepted tap had no visible reaction
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys;
                         these are hardware-keyboard key events to whatever has focus
@@ -187,7 +187,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         matched by label/name; rejects disabled sliders; respects --deny)
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
-  dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
+  dismisskb             use the keyboard's own dismiss control or try a short downward drag;
+                        kb-visible means the keyboard is still up
   banner:dismiss        swipe away a notification banner over the app (only when SpringBoard
                         is in front and the phone is unlocked; otherwise nothing is sent)
   alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert

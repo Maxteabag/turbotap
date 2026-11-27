@@ -1162,7 +1162,7 @@ impl<R: Reader> Flow<R> {
             if c.is_disabled() {
                 return Err(Error::flow(format!("{} at {x},{y} is disabled; nothing pressed", json::py_repr_str(&c.label))));
             }
-            self.tap_point(c.x, c.y, &c.label, None)?;
+            self.tap_at_check_reaction(&c)?;
             return Ok(c.label);
         }
         let hit = ctl
@@ -1182,8 +1182,24 @@ impl<R: Reader> Flow<R> {
         if c.is_disabled() {
             return Err(Error::flow(format!("{} at {x},{y} is disabled", json::py_repr_str(&c.label))));
         }
-        self.tap_point(c.x, c.y, &c.label, None)?;
+        self.tap_at_check_reaction(&c)?;
         Ok(c.label)
+    }
+
+    fn tap_at_check_reaction(&mut self, control: &Control) -> Result<()> {
+        let baseline = self.tap_grab().ok();
+        self.tap_point(control.x, control.y, &control.label, None)?;
+        // An acknowledged tap may have a nonvisual effect. Do not replay it based on pixels.
+        let reaction = match baseline {
+            Some(frame) => self.changed_since(Some(frame), 0.45, Some(control.x), Some(control.y)).ok(),
+            None => None,
+        };
+        match reaction {
+            Some(true) => {}
+            Some(false) => crate::errln!("turbotap: tapat: tap sent, no visible reaction"),
+            None => crate::errln!("turbotap: tapat: tap sent, reaction could not be checked"),
+        }
+        Ok(())
     }
 
     pub fn tap_el(&mut self, label: &str, timeout: Option<f64>) -> Result<(i64, i64)> {

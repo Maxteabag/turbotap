@@ -1393,7 +1393,7 @@ fn test_dismisskb_fast_ui_and_stock_wda_fallback() {
 
     // Visible floating keyboard at x=15..195, y=500..700 with ONLY unrelated app
     // buttons ('Done' at (335, 730) OR unmarked 'Hide keyboard' at (75, 455) in-band
-    // without keyboard/accessory provenance) -> returns 'no-kb' with ZERO taps!
+    // without keyboard/accessory provenance) -> returns 'kb-visible' with ZERO taps!
     c.state().tapped_points.clear();
     let floating_rect = json!({"x": 15, "y": 500, "width": 180, "height": 200});
     set_fast_ui(
@@ -1407,13 +1407,13 @@ fn test_dismisskb_fast_ui_and_stock_wda_fallback() {
             Some(floating_rect),
         ),
     );
-    assert_eq!(step_s(&mut flow, "dismisskb"), "no-kb");
+    assert_eq!(step_s(&mut flow, "dismisskb"), "kb-visible");
     assert_eq!(c.tapped_points(), vec![]);
 
-    // Visible keyboard with ONLY an ordinary app top-bar 'Done' (y=80) returns 'no-kb'.
+    // Visible keyboard with ONLY an ordinary app top-bar 'Done' (y=80) returns 'kb-visible'.
     c.state().tapped_points.clear();
     set_fast_ui(&c, kb_ui(json!([{"type": "Button", "label": "Done", "x": 380, "y": 80}]), true, Some(kb_rect.clone())));
-    assert_eq!(step_s(&mut flow, "dismisskb"), "no-kb");
+    assert_eq!(step_s(&mut flow, "dismisskb"), "kb-visible");
     assert_eq!(c.tapped_points(), vec![]);
 
     // FastUI prefers inKeyboard 'Hide keyboard' over keyboard-accessory 'Done'.
@@ -1432,13 +1432,21 @@ fn test_dismisskb_fast_ui_and_stock_wda_fallback() {
     assert_eq!(step_s(&mut flow, "dismisskb"), "dismissed");
     assert_eq!(last_tap_xy(&c), (390, 540));
 
-    // FastUI succeeds with no dismiss button -> returns 'no-kb' cleanly without predicate fallback.
+    // FastUI succeeds with no dismiss button -> returns 'kb-visible' cleanly without predicate fallback.
     c.clear_calls();
     c.state().tapped_points.clear();
     set_fast_ui(&c, kb_ui(json!([{"type": "Button", "label": "Submit", "x": 200, "y": 400}]), true, Some(kb_rect.clone())));
-    assert_eq!(step_s(&mut flow, "dismisskb"), "no-kb");
+    assert_eq!(step_s(&mut flow, "dismisskb"), "kb-visible");
     assert_eq!(c.tapped_points(), vec![]);
     assert_eq!(paths_suffix(&c, "/element"), Vec::<String>::new());
+
+    c.set_on_action(|st, action, _| {
+        if action == "drag" {
+            st.fast_ui = Some(Dyn::one(kb_ui(json!([]), false, None)));
+        }
+    });
+    assert_eq!(step_s(&mut flow, "dismisskb"), "dismissed");
+    assert_eq!(c.tapped_points(), vec![]);
 
     // Custom --deny blocks dismisskb tap cleanly.
     let c_deny = MockWda::start(with_fast_ui(kb_ui(
@@ -1489,7 +1497,7 @@ fn test_dismisskb_fast_ui_and_stock_wda_fallback() {
     assert!(!c_stock.paths().iter().any(|p| p.contains(SOURCE_LITE)));
 
     // Stock WDA floating keyboard at x=15..195, y=500..700 with only an unrelated app
-    // toolbar/button at (335, 730) outside keyboard bounds -> returns 'no-kb', ZERO clicks!
+    // toolbar/button at (335, 730) outside keyboard bounds -> returns 'kb-visible', ZERO clicks!
     let mut st = MockState::default();
     st.fast_ui_404 = true;
     st.element_map.insert(ekey(&["class name", "XCUIElementTypeKeyboard"]), Dyn::one(json!({"ELEMENT": "kb-float"})));
@@ -1504,7 +1512,7 @@ fn test_dismisskb_fast_ui_and_stock_wda_fallback() {
     let mut flow_float = mk_flow(&c_float, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
     {
         let (_sk, _g) = skip_sleep();
-        assert_eq!(step_s(&mut flow_float, "dismisskb"), "no-kb");
+        assert_eq!(step_s(&mut flow_float, "dismisskb"), "kb-visible");
     }
     assert!(!c_float.paths().iter().any(|p| p.ends_with("/click")));
     flow_float.close();
@@ -2781,7 +2789,9 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
     // A control within 24 pt: tapped at its own centre (never the raw point).
     let (mock, r) = mk();
     let mut flow = mk_flow(&mock, &r, 1.0);
+    let cap = crate::testutil::capture::Capture::start();
     assert_eq!(step_s(&mut flow, "tapat:372,66"), "Settings");
+    assert!(cap.stderr().contains("tap sent, no visible reaction"));
     assert_eq!(pts(&mock), vec![(380, 60)]);
     // OCR text is never a target, even under the point.
     match flow.step("tapat:40,105") {

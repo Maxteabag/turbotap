@@ -765,6 +765,27 @@ impl<R: Reader> Flow<R> {
         Ok(())
     }
 
+    /// Try interactive dismissal only for a keyboard docked at the bottom.
+    fn dismiss_docked_keyboard(&mut self, rect: Option<&Value>) -> Result<String> {
+        let Some(rect) = rect else { return Ok("kb-visible".into()) };
+        let (w, h) = self.act_pt_size()?;
+        let (x, y, width, height) = (num(rect, "x"), num(rect, "y"), num(rect, "width"), num(rect, "height"));
+        if x.abs() > 8.0 || width < w as f64 - 16.0 || y + height < h as f64 - 50.0 || y < 140.0 || y > (h - 40) as f64 {
+            return Ok("kb-visible".into());
+        }
+        self.drag(w / 2, y as i64 - 48, w / 2, y as i64 + 60, 0.2, 0.0)?;
+        clock::sleep(0.3);
+        self.c.last_fast_ui_kb = None;
+        if self.controls_opt(false, None, None, true, false)?.is_some() {
+            if let Some((Some(visible), _)) = self.c.last_fast_ui_kb.as_ref() {
+                return Ok(if *visible { "kb-visible" } else { "dismissed" }.into());
+            }
+        }
+        // On stock WDA a missing keyboard element can also mean an observation
+        // failed. Keep the result unverified when the fast route cannot confirm.
+        Ok(if self.visible_keyboard_rect()?.is_some() { "kb-visible" } else { "dismissal-unverified" }.into())
+    }
+
     /// L5061. Return the visible XCUIElementTypeKeyboard rect dict or None via stock WDA.
     fn visible_keyboard_rect(&mut self) -> Result<Option<Value>> {
         let p = self.c.spath("/element");
@@ -898,7 +919,7 @@ impl<R: Reader> Flow<R> {
             }
         };
         if let Some(ctl) = ctl {
-            let (has_kb, _kb_rect) = self.c.last_fast_ui_kb.clone().unwrap_or((None, None));
+            let (has_kb, kb_rect) = self.c.last_fast_ui_kb.clone().unwrap_or((None, None));
             if has_kb == Some(false) {
                 return Ok("no-kb".to_string());
             }
@@ -917,7 +938,7 @@ impl<R: Reader> Flow<R> {
                     (!item.in_keyboard, low != "hide keyboard" && low != "skjul tastatur", -item.y, item.x)
                 });
                 let Some(c) = best.cloned() else {
-                    return Ok("no-kb".to_string());
+                    return self.dismiss_docked_keyboard(kb_rect.as_ref());
                 };
                 self.tap_point(c.x, c.y, &c.label, None)?;
                 self.invalidate_ctl_cache();
@@ -932,7 +953,7 @@ impl<R: Reader> Flow<R> {
         };
         let cands = self.stock_keyboard_dismiss_candidates(&kb_rect);
         let Some((_, cy, cx, eid)) = cands.into_iter().min_by_key(|(p, cy, cx, _)| (*p, -*cy, *cx)) else {
-            return Ok("no-kb".to_string());
+            return self.dismiss_docked_keyboard(Some(&kb_rect));
         };
         let lp = self.c.spath(&format!("/element/{eid}/attribute/label"));
         let lbl_r = self.c.get(&lp);
