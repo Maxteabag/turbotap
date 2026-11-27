@@ -110,8 +110,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   dismisskb:tapat:X,Y=LABEL  tap the exact labelled control at the caller's location hint
                         reports dismissed, kb-visible, no-kb or dismissal-unverified
   alert:text            read the active iOS alert
-  alert:accept:LABEL    press this exact live alert button under the caller's guards
-  alert:dismiss:LABEL   dismiss using this exact live alert button under the caller's guards
+  alert:accept[:LABEL]  request the native action or press the exact live button
+  alert:dismiss[:LABEL] request the native dismissal or press the exact live button
+                        supply LABEL when a caller deny filter is active
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
   scrollto:TEXT         scroll down (max 8x) until TEXT is visible; at the end of the list
                         it turns and searches back up (scrollto:up:TEXT / scrollto:down:TEXT
