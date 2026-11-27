@@ -542,17 +542,104 @@ fn ordinal_and_named_fill_treat_a_visible_title_pair_as_one_input() {
     assert!(keys_typed(&mock).iter().all(|(text, _)| text == "x" || text == "\u{8}"));
 }
 
+fn visible_search_inputs(_: &mut MockState, _: &str, path: &str, _: &Value) -> Option<Value> {
+    path.ends_with("/attribute/visible").then(|| json!({"value": true}))
+}
+
 #[test]
-fn search_writes_only_the_input_named_by_the_caller() {
-    let mock = MockWda::start(typing_composer());
+fn search_after_open_prefers_the_native_role_over_a_focused_plain_input() {
+    let _cache = isolated_cache();
+    let mock = MockWda::start(MockState::default());
+    mock.set_custom_handler(visible_search_inputs);
+    mock.set_on_action(|st, action, _| {
+        if action == "app" {
+            st.active_app = Seq::one(json!("com.example.catalog"));
+            st.elements_map.insert(
+                ekey(&["predicate string", INPUT_TYPES_PRED]),
+                vec![json!({"ELEMENT": "plain"}), json!({"ELEMENT": "role"}), json!({"ELEMENT": "role"})],
+            );
+            st.element_types.insert("role".into(), json!("XCUIElementTypeSearchField"));
+            st.element_types.insert("plain".into(), json!("XCUIElementTypeTextField"));
+            st.element_labels.insert("role".into(), json!("目録"));
+            st.set_element_value("plain", Dyn::one(json!("keep this")));
+            st.set_element_value("role", Dyn::one(json!("old query")));
+        }
+    });
+    let mut f = flow(&mock);
+    f.step("open:com.example.catalog").unwrap();
+    for _ in 0..2 {
+        assert_eq!(f.step("search:=a=env:B").unwrap(), Some(json!("len=7")));
+    }
+    assert_eq!(f.step("readfield:#1").unwrap(), Some(json!("keep this")));
+    let calls = mock.paths();
+    assert_eq!(calls.iter().filter(|p| p.ends_with("/element/role/clear")).count(), 1);
+    assert_eq!(calls.iter().filter(|p| p.ends_with("/element/role/value")).count(), 1);
+    assert!(keys_typed(&mock).is_empty());
+}
+
+#[test]
+fn search_requires_unique_focus_for_plain_inputs_and_honors_an_explicit_override() {
+    let mut st = typing_composer();
+    st.focused_eid = None;
+    let mock = MockWda::start(st);
+    mock.set_custom_handler(visible_search_inputs);
     let mut f = flow(&mock);
     let error = f.step("search:cedar").unwrap_err().to_string();
-    assert!(error.contains("choose the input first"), "{error}");
+    assert!(error.contains("2 visible plain text inputs") && error.contains("verified focus"), "{error}");
+
+    mock.state().focused_eid = Some("b1".into());
+    let error = f.step("search:Unknown=cedar").unwrap_err().to_string();
+    assert!(error.contains("no text input named"), "{error}");
+    assert!(mock.calls().iter().all(|(m, p, _)| m == "GET" || p.ends_with("/elements")));
+
+    assert_eq!(f.step("search:cedar").unwrap(), Some(json!("len=5")));
+    assert_eq!(f.step("search:Title=oak=leaf").unwrap(), Some(json!("Title: len=8")));
+    assert_eq!(f.step("search:Title=oak=leaf").unwrap(), Some(json!("Title: len=8")));
+    assert_eq!(f.step("readfield:Title").unwrap(), Some(json!("oak=leaf")));
+    assert_eq!(f.step("readfield:Body").unwrap(), Some(json!("cedar")));
+    assert_eq!(keys_typed(&mock).len(), 1);
+}
+
+#[test]
+fn search_refuses_ambiguous_roles_and_a_denied_target_before_input() {
+    let mut st = typing_composer();
+    for id in ["t1", "b1"] {
+        st.element_types.insert(id.into(), json!("XCUIElementTypeSearchField"));
+    }
+    st.element_names.insert("t1".into(), json!("blocked.input"));
+    let mock = MockWda::start(st);
+    mock.set_custom_handler(visible_search_inputs);
+    let mut client = mock.client();
+    client.deny_also = vec!["^blocked[.]input$".into()];
+    let mut f = Flow::new(client, FakeReader::new(vec![]), 0.5, None, false).unwrap();
+    let error = f.step("search:cedar").unwrap_err().to_string();
+    assert!(error.contains("2 visible native SearchFields are ambiguous"), "{error}");
+    mock.state().element_types.insert("b1".into(), json!("XCUIElementTypeTextView"));
+    let error = f.step("search:cedar").unwrap_err().to_string();
+    assert!(error.contains("matches --deny-also"), "{error}");
+    assert!(mock.calls().iter().all(|(m, p, _)| m == "GET" || p.ends_with("/elements")));
+}
+
+#[test]
+fn search_reports_direct_readback_failure_without_replaying_the_write() {
+    let mut st = typing_composer();
+    st.elements_map.insert(
+        ekey(&["predicate string", INPUT_TYPES_PRED]),
+        vec![json!({"ELEMENT": "p1"}), json!({"element-6066-11e4-a52e-4f735466cecf": "t1"})],
+    );
+    st.focused_eid = None;
+    let mock = MockWda::start(st);
+    mock.set_custom_handler(visible_search_inputs);
+    mock.set_on_action(|st, action, _| {
+        if action == "value" {
+            st.set_element_value("t1", Dyn::one(json!("different")));
+        }
+    });
+    let mut f = flow(&mock);
+    let error = f.step("search:cedar").unwrap_err().to_string();
+    assert!(error.contains("direct value read-back"), "{error}");
+    assert_eq!(mock.paths().iter().filter(|p| p.ends_with("/element/t1/value")).count(), 1);
     assert!(keys_typed(&mock).is_empty());
-    assert_eq!(f.step("search:Title=cedar").unwrap(), Some(json!("Title: len=5")));
-    assert_eq!(f.step("search:Title=cedar").unwrap(), Some(json!("Title: len=5")));
-    assert_eq!(f.step("readfield:Title").unwrap(), Some(json!("cedar")));
-    assert!(!mock.paths().iter().any(|p| p.ends_with("/element/b1/clear")));
 }
 
 #[test]

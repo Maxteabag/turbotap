@@ -75,7 +75,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   doubletapxy:X,Y       double-tap points via /wda/fastDoubleTap
   zoom:in|out|SCALE[@X,Y] two-finger pinch/zoom via /wda/fastPinch (in=2.0, out=0.5, or
                         positive scale; defaults to screen center)
-  search:FIELD=VALUE    fill the exact input selected by the caller (same as fill:)
+  search:QUERY          fill the visible native SearchField, or the focused/only plain input
+  search:FIELD=VALUE    select an input explicitly (same value syntax as fill:)
+  search:=QUERY         literal query, including any '=' (the first '=' normally selects FIELD)
   readel:TEXT           labels of controls containing TEXT (accessibility tree)
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
@@ -188,6 +190,16 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
     }
 }
 
+pub(crate) fn field_assignment<'a>(verb: &str, arg: &'a str) -> Option<(&'a str, &'a str)> {
+    arg.split_once('=').filter(|(field, _)| !verb.eq_ignore_ascii_case("search") || !field.is_empty())
+}
+
+fn wda_element_ref(value: &Value) -> Option<&str> {
+    value.get("ELEMENT").or_else(|| value.get("element-6066-11e4-a52e-4f735466cecf"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
 /// True when the step enters a credential: `pintap`/`typedigits`/`cleartype` in any
 /// form, or `type`/`setclip` with an `env:`/`cmd:` value (the documented way to pass
 /// secrets). Its value is scrubbed from all flow output, and if it fails no screen
@@ -197,7 +209,7 @@ pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
     let verb = verb.trim();
     if verb.eq_ignore_ascii_case("assertfield") || verb.eq_ignore_ascii_case("fill") || verb.eq_ignore_ascii_case("search") {
-        let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+        let value = field_assignment(verb, arg).map(|(_, v)| v).unwrap_or("");
         return value.starts_with("env:") || value.starts_with("cmd:");
     }
     CREDENTIAL_VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb))
@@ -217,7 +229,7 @@ pub fn safe_step(spec: &str) -> String {
             return format!("{}:<redacted>", trimmed.to_ascii_lowercase());
         }
         // For non-secret FIELD=VALUE, retain the field name and any file path.
-        return match arg.split_once('=') {
+        return match field_assignment(trimmed, arg) {
             Some((_, value)) if value.starts_with("file:") => spec.to_string(),
             Some((field, _)) => format!("{verb}:{field}=<redacted>"),
             None => spec.to_string(),
@@ -463,15 +475,7 @@ impl<R: Reader> Flow<R> {
     /// The element with keyboard focus (`GET /element/active`), if WDA names one.
     fn active_element_id(&mut self) -> Option<String> {
         let p = self.c.spath("/element/active");
-        let r = self.c.get(&p);
-        if json::has_err(&r) {
-            return None;
-        }
-        let m = json::get(&r, "value").as_object()?.clone();
-        m.get("ELEMENT")
-            .or_else(|| m.get("element-6066-11e4-a52e-4f735466cecf"))
-            .map(json::py_str)
-            .filter(|s| !s.is_empty())
+        wda_element_ref(&self.c.strict_get_value(&p).ok()?).map(str::to_owned)
     }
 
     /// The value WDA reports for `eid` ("" when it has none).
@@ -591,7 +595,7 @@ impl<R: Reader> Flow<R> {
     fn bound_write(&mut self, eid: &str, text: &str) -> Value {
         let chars: Vec<Value> = text.chars().map(|c| Value::String(c.to_string())).collect();
         let p = self.c.spath(&format!("/element/{eid}/value"));
-        self.c.post(&p, &j!({"text": text, "value": chars}))
+        self.c.req_2xx("POST", &p, Some(&j!({"text": text, "value": chars})), crate::wda::DEFAULT_TIMEOUT, None)
     }
 
     /// Clear `eid` when its value holds the secret or a piece of it (3+ characters),
@@ -1140,12 +1144,7 @@ impl<R: Reader> Flow<R> {
                 self.reads.push(j!({"el": ui::controls_to_value(&hits)}));
                 return some(hits[0].label.clone());
             }
-            "search" => {
-                if !arg.contains('=') {
-                    return Err(Error::flow("search expects FIELD=VALUE; read the UI and choose the input first"));
-                }
-                return some(self.fill(arg)?);
-            }
+            "search" => return some(self.search(arg)?),
             "settle" => {
                 self.settle(2.0, None, 0.6)?;
             }

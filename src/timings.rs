@@ -76,7 +76,8 @@ fn step_kind_arg_with(spec: &str, scrub: impl Fn(&str) -> String) -> (String, Op
         if crate::flow::is_secret_step(spec) {
             return (verb, None);
         }
-        let field = arg.and_then(|a| a.split_once('=').map(|(f, _)| scrub(f).chars().take(60).collect::<String>()));
+        let field = arg.and_then(|a| crate::flow::field_assignment(&verb, a))
+            .map(|(f, _)| scrub(f).chars().take(60).collect::<String>());
         return (verb, field);
     }
     // `read:ocr`, `read:vision`, `read:0-400`: keep the mode, it is what makes the time.

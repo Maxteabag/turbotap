@@ -31,6 +31,7 @@ const BACKSPACE: &str = "\u{8}";
 pub(crate) const INPUT_TYPES_PRED: &str = "type IN {'XCUIElementTypeTextField','XCUIElementTypeSecureTextField',\
 'XCUIElementTypeSearchField','XCUIElementTypeTextView'}";
 const SECURE: &str = "XCUIElementTypeSecureTextField";
+const SEARCH: &str = "XCUIElementTypeSearchField";
 
 /// NSPredicate string literal.
 pub(crate) fn pred_lit(s: &str) -> String {
@@ -678,6 +679,144 @@ impl<R: Reader> Flow<R> {
         })
     }
 
+    fn check_search_target(&mut self, id: &str) -> Result<()> {
+        if self.has_deny_patterns() {
+            for attr in ["label", "name", "placeholderValue"] {
+                let text = self.search_attribute(id, attr)?;
+                self.guard(text.trim(), "search in")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn search_attribute(&mut self, id: &str, attr: &str) -> Result<String> {
+        let path = self.c.spath(&format!("/element/{id}/attribute/{attr}"));
+        match self.c.strict_get_value(&path) {
+            Ok(Value::Null) => Ok(String::new()),
+            Ok(Value::String(text)) => Ok(text),
+            _ => Err(Error::flow(format!("search: could not read the selected input's {attr}"))),
+        }
+    }
+
+    fn search_flag(&mut self, id: &str, attr: &str) -> Result<bool> {
+        let path = self.c.spath(&format!("/element/{id}/attribute/{attr}"));
+        self.c.strict_get_value(&path).ok().as_ref().and_then(crate::ui::parse_wda_bool)
+            .ok_or_else(|| Error::flow(format!("search: could not verify input {attr}; use search:FIELD=VALUE")))
+    }
+
+    fn discover_search_input(&mut self) -> Result<Option<String>> {
+        let path = self.c.spath("/elements");
+        let request = j!({"using": "predicate string", "value": INPUT_TYPES_PRED});
+        let response = self.c.req_2xx("POST", &path, Some(&request), crate::wda::DEFAULT_TIMEOUT, None);
+        let rows = crate::guard::success_value(&response).ok().and_then(Value::as_array)
+            .ok_or_else(|| Error::flow("search: could not enumerate native text inputs"))?;
+        let mut ids = rows.iter().map(super::wda_element_ref).collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::flow("search: WDA returned an invalid native text input reference"))?;
+        ids.sort_unstable();
+        ids.dedup();
+        let mut search = Vec::new();
+        let mut plain = Vec::new();
+        for id in ids {
+            let path = self.c.spath(&format!("/element/{id}/name"));
+            let candidates = match self.c.strict_get_value(&path).ok().as_ref().and_then(Value::as_str) {
+                Some(SECURE) => continue,
+                Some(SEARCH) => &mut search,
+                Some("XCUIElementTypeTextField" | "XCUIElementTypeTextView") => &mut plain,
+                _ => return Err(Error::flow("search: could not verify a native text input role")),
+            };
+            if self.search_flag(id, "visible")? {
+                candidates.push(id);
+            }
+        }
+        match search.as_slice() {
+            [id] => return Ok(Some((*id).to_owned())),
+            [] => {}
+            many => return Err(Error::flow(format!(
+                "search: {} visible native SearchFields are ambiguous; use search:FIELD=VALUE", many.len()
+            ))),
+        }
+        match plain.as_slice() {
+            [] => Ok(None),
+            [id] => Ok(Some((*id).to_owned())),
+            many => self.active_element_id().filter(|id| many.contains(&id.as_str())).map(Some).ok_or_else(|| Error::flow(format!(
+                "search: {} visible plain text inputs and none has verified focus; focus the intended input or use search:FIELD=VALUE", many.len()
+            ))),
+        }
+    }
+
+    pub(super) fn search(&mut self, arg: &str) -> Result<String> {
+        self.c.stop_check().map_err(Error::flow)?;
+        if let Some((field, spec)) = super::field_assignment("search", arg) {
+            return self.fill_named(field, spec, true);
+        }
+        let query = arg.strip_prefix('=').unwrap_or(arg);
+        if query.trim().is_empty() || query.chars().any(char::is_control) {
+            return Err(Error::flow("search: expected a nonempty query without control characters"));
+        }
+        let opened = self.pending_bundle.clone();
+        if opened.is_some() {
+            self.wait_active_app(1.5, 0.03, None);
+        }
+        let app = self.c.live_foreground_app(None)
+            .map_err(|_| Error::flow("search: could not verify the foreground app"))?;
+        if opened.as_ref().is_some_and(|expected| expected != &app) {
+            return Err(Error::flow("search: the app opened by this flow is no longer in front"));
+        }
+        let deadline = clock::now() + self.timeout;
+        let id = loop {
+            self.c.stop_check().map_err(Error::flow)?;
+            if let Some(id) = self.discover_search_input()? {
+                break id;
+            }
+            let remaining = deadline - clock::now();
+            if opened.is_none() || remaining <= 0.0 {
+                return Err(Error::flow("search: no visible native SearchField or plain text input; reveal the input first"));
+            }
+            clock::sleep(remaining.min(0.05));
+        };
+        if !self.search_flag(&id, "enabled")? {
+            return Err(Error::flow("search: the selected input is disabled"));
+        }
+        self.check_search_target(&id)?;
+        let before = self.search_attribute(&id, "value")?;
+        let placeholder = self.search_attribute(&id, "placeholderValue")?;
+        if query == placeholder {
+            return Err(Error::flow("search: the query equals the input's placeholder and cannot be verified"));
+        }
+        let check_app = |flow: &mut Self| {
+            if flow.c.live_foreground_app(None).as_deref() == Ok(app.as_str()) {
+                Ok(())
+            } else {
+                Err(Error::flow("search: the foreground app changed during search"))
+            }
+        };
+        check_app(self)?;
+        let receipt = format!("len={}", query.chars().count());
+        if before == query {
+            return Ok(receipt);
+        }
+        self.mark_action(false, true);
+        if !before.is_empty() && before != placeholder {
+            let path = self.c.spath(&format!("/element/{id}/clear"));
+            let response = self.c.req_2xx("POST", &path, Some(&j!({})), crate::wda::DEFAULT_TIMEOUT, None);
+            crate::guard::success_value(&response)
+                .map_err(|_| Error::flow("search: could not confirm the clear; query was not sent"))?;
+            let after_clear = self.search_attribute(&id, "value")?;
+            if !after_clear.is_empty() && after_clear != placeholder {
+                return Err(Error::flow("search: the selected input did not clear; query was not sent"));
+            }
+            check_app(self)?;
+        }
+        let response = self.bound_write(&id, query);
+        crate::guard::success_value(&response)
+            .map_err(|_| Error::flow("search: could not confirm the element write; check the input before retrying"))?;
+        check_app(self)?;
+        if self.search_attribute(&id, "value")? != query {
+            return Err(Error::flow("search: direct value read-back could not verify the query; check the input before retrying"));
+        }
+        Ok(receipt)
+    }
+
     /// `fill:FIELD=VALUE`: type into the input named FIELD only, and verify. VALUE
     /// is text, `file:PATH` (exact multi-line text; one trailing newline dropped) or
     /// `env:VAR` / `cmd:CMD` (secret). The field is cleared, focused (element click,
@@ -691,10 +830,22 @@ impl<R: Reader> Flow<R> {
         let Some((field, spec)) = arg.split_once('=') else {
             return Err(Error::flow("fill expects FIELD=VALUE (VALUE: text, file:PATH, env:VAR or cmd:CMD)"));
         };
-        let (text, secret_src) = expected_value("fill", spec)?;
-        if secret_src {
-            self.note_secret(&text);
-        }
+        self.fill_named(field, spec, false)
+    }
+
+    fn fill_named(&mut self, field: &str, spec: &str, search: bool) -> Result<String> {
+        let secret_src = spec.starts_with("env:") || spec.starts_with("cmd:");
+        // Named search must resolve its selector before interpreting the value,
+        // since an unescaped '=' may have been intended as query text.
+        let resolved = if search {
+            None
+        } else {
+            let (text, _) = expected_value("fill", spec)?;
+            if secret_src {
+                self.note_secret(&text);
+            }
+            Some(text)
+        };
         let lookup_error = |e| {
             if secret_src {
                 Error::SecretField("fill: could not identify one field; check its label and close the keyboard if it is hidden")
@@ -705,9 +856,26 @@ impl<R: Reader> Flow<R> {
         let app = self.c.live_foreground_app(None).ok();
         let FieldTarget { field: mut f, mut twin } =
             self.find_field("fill", field, app.as_deref()).map_err(lookup_error)?;
+        let text = match resolved {
+            Some(text) => text,
+            None => {
+                self.check_search_target(&f.id)?;
+                let (text, _) = expected_value("fill", spec)?;
+                if secret_src {
+                    self.note_secret(&text);
+                }
+                text
+            }
+        };
         let secret = secret_src || f.secure();
         if f.secure() && !secret_src {
             self.note_secret(&text);
+        }
+        if search && !secret && twin.is_none() && !text.chars().any(char::is_control)
+            && self.search_attribute(&f.id, "value").is_ok_and(|value| value == text)
+            && self.search_attribute(&f.id, "placeholderValue").is_ok_and(|placeholder| placeholder != text)
+        {
+            return Ok(format!("{}: len={}", f.name, text.chars().count()));
         }
         self.mark_action(false, true);
         let want = text.chars().count();
@@ -733,6 +901,9 @@ impl<R: Reader> Flow<R> {
             }
             if next.field.kind != f.kind {
                 return Err(changed);
+            }
+            if search {
+                self.check_search_target(&next.field.id)?;
             }
             f = next.field;
             twin = next.twin;
