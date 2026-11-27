@@ -18,6 +18,9 @@ use crate::wda::{check_wda_ok, WdaClient};
 use serde_json::{json as j, Value};
 
 pub mod act;
+mod appinstall;
+#[cfg(test)]
+mod appinstall_tests;
 pub mod fields;
 pub mod sense;
 pub mod tap;
@@ -110,6 +113,8 @@ pub(crate) fn short_repr(s: &str) -> String {
 pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
+  appinstall:NAME|BUNDLE[|open]
+                        install a free App Store product and wait for its Open control
   open:APP              activate an app by display name or bundle ID (open:Spotify,
                         open:com.apple.Preferences); names come from a per-device
                         devicectl cache (~1 ms; refreshed once on an unknown name)
@@ -991,6 +996,7 @@ impl<R: Reader> Flow<R> {
                 }
                 return some(bid);
             }
+            "appinstall" => return some(self.appinstall(arg)?),
             "url" => return some(self.open_url(arg)?),
             "wait" | "expect" => return some(self.wait(arg, None, false, None, true)?.text),
             "waitany" => return some(self.wait_any(arg, None)?.text),
