@@ -7,16 +7,16 @@
 //! `skip_sleep()`.
 use crate::clock;
 use crate::error::Error;
-use crate::flow::{Flow, DENY_DEFAULT, FLOW_HELP, IMAGE_STEP_VERBS, STALE_UI_BACKOFF};
+use crate::flow::{Flow, FLOW_HELP, IMAGE_STEP_VERBS, STALE_UI_BACKOFF};
 use crate::image::{content_pixel_still, Frame};
 use crate::json;
 use crate::ocr::{ReadOpts, Reader};
 use crate::testutil::*;
 use crate::text::{find_text, Line, DEFAULT_FUZZY};
-use crate::ui::{Control, CTL_CACHE_TTL, DISMISS_KB_LABELS, SOURCE_LITE};
+use crate::ui::{Control, CTL_CACHE_TTL};
 use crate::wda::WdaClient;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -35,9 +35,9 @@ fn fr(img: &Frame, lines: &[Line]) -> (Frame, Vec<Line>) {
     (img.clone(), lines.to_vec())
 }
 
-/// `cli.Flow(c, reader=r, timeout=T)` (default --deny).
+/// Flow with no caller deny patterns.
 fn mk_flow(mock: &MockWda, r: &FakeReader, timeout: f64) -> Flow<FakeReader> {
-    Flow::new(mock.client(), r.clone(), timeout, Some(DENY_DEFAULT), false).unwrap()
+    Flow::new(mock.client(), r.clone(), timeout, None, false).unwrap()
 }
 
 fn mk_flow_deny(mock: &MockWda, r: &FakeReader, timeout: f64, deny: Option<&str>) -> Flow<FakeReader> {
@@ -453,7 +453,7 @@ fn test_springboard_system_alert_awareness_in_controls_and_read_full() {
     flow_src_alert.close();
 
     // 2. CRITICAL SAFETY INVARIANT: Ordinary outgoing SpringBoard Home Screen
-    // (bundleId="com.apple.springboard" + alert_text=None/empty/404) right after
+    // (bundleId="com.apple.springboard" and an explicit absent alert) right after
     // home -> open:App STILL retries _STALE_UI_BACKOFF and raises _StaleAppError in
     // controls() / returns ui_res=None in read_full(), never caching or exposing Home Screen icons.
     let sb_home_ui = fast_ui(
@@ -461,11 +461,11 @@ fn test_springboard_system_alert_awareness_in_controls_and_read_full() {
         "SpringBoard",
         "com.apple.springboard",
     );
-    for no_alert_val in [None, Some("   ")] {
+    for no_alert in [None, Some(json!({"value": null}))] {
         let mut st = MockState::default();
         st.active_app = Seq::one(json!("com.example.target"));
         st.fast_ui = Some(Dyn::one(sb_home_ui.clone()));
-        st.alert_text = no_alert_val.map(|v| Dyn::one(json!(v)));
+        st.alert_text = no_alert.map(Dyn::one);
         let c_home = MockWda::start(st);
         let r_home = FakeReader::with(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)], (430, 932), 1.0);
         let mut flow_home = mk_flow(&c_home, &r_home, 1.0);
@@ -698,6 +698,50 @@ fn test_gone_skips_ocr_while_pixel_still_and_detects_change_immediately() {
 }
 
 #[test]
+fn test_gone_polls_live_text_after_ocr_miss_and_reuses_identical_frames() {
+    let _cache = isolated_cache();
+    let present = fui(json!([{"type": "Text", "label": "Waiting for network", "x": 200, "y": 450}]));
+    let absent = fui(json!([]));
+    let mock = MockWda::start(MockState {
+        fast_ui: Some(Dyn::of(vec![present.clone(), present, absent])),
+        ..MockState::default()
+    });
+    let frame = solid_img(220, (430, 932));
+    let reader = FakeReader::with(vec![fr(&frame, &[])], (430, 932), 1.0);
+    let mut flow = mk_flow(&mock, &reader, 1.0);
+    let (_clock, _hook) = virtual_clock();
+    let (ok, output) = flow.run_outcome(&["gone:Waiting for network@y>300".into()]).unwrap();
+    assert!(ok, "{output}");
+    assert_eq!(mock.paths().iter().filter(|p| *p == "/wda/fastUI?text=1").count(), 3);
+    assert_eq!(reader.read_calls(), 1);
+    flow.close();
+}
+
+#[test]
+fn test_gone_honors_stop_during_accessibility_observation() {
+    let _cache = isolated_cache();
+    let dir = TempDir::new("tt-gone-stop-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(with_fast_ui(fui(json!([]))));
+    let path = stop.clone();
+    mock.set_custom_handler(move |_, _, p, _| {
+        if p == "/wda/fastUI?text=1" {
+            std::fs::write(&path, "").unwrap();
+        }
+        None
+    });
+    let reader = FakeReader::new(vec![]);
+    let mut flow = mk_flow(&mock, &reader, 1.0);
+    flow.c.stop_paths = vec![stop];
+    let (ok, output) = flow.run_outcome(&["gone:Loading".into(), "tapxy:10,10".into()]).unwrap();
+    assert!(!ok, "{output}");
+    assert!(crate::stop::take_stopped());
+    assert!(mock.tapped_points().is_empty());
+    assert_eq!(reader.read_calls(), 1);
+    flow.close();
+}
+
+#[test]
 fn test_tap_text_drains_transition_before_ocr() {
     let _cache = isolated_cache();
     // Simulate an active iOS slide transition right after a prior tap with large reaction diff.
@@ -718,7 +762,7 @@ fn test_tap_text_drains_transition_before_ocr() {
     let mut flow = mk_flow(&c, &r, 1.0);
     flow.last_action_ts = clock::now();
     flow.last_reaction_diff = 12.0;
-    let m = flow.tap_text("About").unwrap();
+    let m = flow.tap_text("About").unwrap().target;
     assert_eq!(m.text, "About");
     // Mid-transition frame f_mid was drained with grab(), never OCR'd.
     assert_eq!(r.read_calls(), 1);
@@ -761,13 +805,14 @@ fn test_keypad_control_cache_hit_and_invalidation_safety_net() {
     let ui_calls_before = count_prefix(&c, "/wda/fastUI");
 
     // Cached tap on "7" hits directly with 0 OCR and 0 extra /wda/fastUI calls.
-    let m7 = flow.tap_text("7").unwrap();
-    assert_eq!((m7.x, m7.y), (60, 380));
+    let tap7 = flow.tap_text("7").unwrap();
+    assert!(tap7.reaction_observed);
+    assert_eq!((tap7.target.x, tap7.target.y), (60, 380));
     assert_eq!(r.read_calls(), 0);
     assert_eq!(count_prefix(&c, "/wda/fastUI"), ui_calls_before);
 
     // Second cached tap on "8" also succeeds from cache.
-    let m8 = flow.tap_text("8").unwrap();
+    let m8 = flow.tap_text("8").unwrap().target;
     assert_eq!((m8.x, m8.y), (140, 380));
     assert_eq!(r.read_calls(), 0);
 
@@ -790,7 +835,7 @@ fn test_keypad_control_cache_hit_and_invalidation_safety_net() {
     assert!(flow.ctl_cache.is_none());
 
     // Safety net: non-reaction after an acknowledged cached tap invalidates
-    // cache for future steps, returns the Match, and NEVER replays the tap.
+    // cache for future steps and reports the acknowledged tap as unconfirmed.
     let still = solid_img(30, (240, 480));
     r.set_frames(vec![fr(&still, &[])]);
     set_last(&r, &still);
@@ -801,47 +846,59 @@ fn test_keypad_control_cache_hit_and_invalidation_safety_net() {
     let m_still = flow.try_cached_tap("7").unwrap();
     flow.changed_since_hook = None;
     let m_still = m_still.expect("cached tap match");
-    assert_eq!(m_still.text, "[Key:7]");
+    assert_eq!(m_still.target.text, "[Key:7]");
+    assert!(!m_still.reaction_observed);
     assert_eq!(count_eq(&c, "/wda/fastTap") - taps_before, 1);
     assert!(flow.ctl_cache.is_none());
     flow.close();
 }
 
 #[test]
-fn test_form_label_input_near_and_switch_near() {
+fn test_tap_unchanged_frame_reports_one_tap_on_the_selected_label() {
     let _cache = isolated_cache();
     let img = solid_img(240, (430, 932));
-    let img_changed = solid_img(100, (430, 932));
-    let lines = vec![ml("Subject:", 20, 200, 90, 220), ml("Wi-Fi", 20, 300, 80, 320)];
-    let ui = json!([
-        {"type": "TextField", "label": "Subject", "x": 230, "y": 210},
-        {"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 310, "value": "0"},
-    ]);
-    let c = MockWda::start(with_fast_ui(fui(ui)));
-    let r = FakeReader::with(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)], (430, 932), 1.0);
-    let mut flow = mk_flow(&c, &r, 1.0);
-    // Tapping form label "Subject:" redirects to row-aligned TextField center (230, 210).
-    let m_sub = flow.tap_text("Subject:").unwrap();
-    assert_eq!((m_sub.x, m_sub.y), (230, 210));
+    let cases = [
+        (
+            "Subject:",
+            ml("Subject:", 20, 200, 90, 220),
+            (55, 210),
+            json!({"type": "TextField", "label": "Subject", "x": 230, "y": 210}),
+        ),
+        (
+            "Wi-Fi",
+            ml("Wi-Fi", 20, 300, 80, 320),
+            (50, 310),
+            json!({"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 310, "value": "0"}),
+        ),
+        (
+            "Recipient",
+            ml("Recipient", 20, 400, 100, 420),
+            (60, 410),
+            json!({"type": "TextField", "label": "Address", "x": 230, "y": 410}),
+        ),
+        (
+            "Stopwatch",
+            ml("Stopwatch", 200, 888, 280, 904),
+            (240, 896),
+            json!({"type": "Tab", "label": "Stopwatch", "x": 240, "y": 882}),
+        ),
+    ];
 
-    // Tapping switch label "Wi-Fi" with no frame reaction falls back to Switch toggle (380, 310).
-    c.state().tapped_points.clear();
-    r.set_frames(vec![fr(&img, &lines), fr(&copy_img(&img), &lines), fr(&copy_img(&img), &lines)]);
-    flow.changed_since_hook = Some(false);
-    let m_sw = flow.tap_text("Wi-Fi").unwrap();
-    flow.changed_since_hook = None;
-    assert_eq!((m_sw.x, m_sw.y), (380, 310));
-    assert_eq!(last_tap_xy(&c), (380, 310));
+    for (label, line, point, control) in cases {
+        let c = MockWda::start(with_fast_ui(fui(json!([control]))));
+        let r = FakeReader::with(vec![fr(&img, &[line.clone()]), fr(&copy_img(&img), &[line.clone()])], (430, 932), 1.0);
+        let mut flow = mk_flow(&c, &r, 1.0);
+        let result = step_s(&mut flow, &format!("tap:{label}"));
+        assert_eq!(result, format!("{label} (tap acknowledged, reaction unconfirmed)"));
+        assert_eq!(tapped_xy(&c), vec![point], "{label}");
+        assert!(drags(&c).is_empty(), "{label}");
 
-    // If toggle pixels already changed (_box_diff >= 4), do NOT double-toggle.
-    c.state().tapped_points.clear();
-    r.set_frames(vec![fr(&img, &lines), fr(&copy_img(&img), &lines), fr(&img_changed, &lines)]);
-    flow.changed_since_hook = Some(false);
-    flow.tap_text("Wi-Fi").unwrap();
-    flow.changed_since_hook = None;
-    // Only the initial label tap occurred; no second toggle tap.
-    assert_eq!(c.tapped_points().len(), 1);
-    flow.close();
+        c.state().tapped_points.clear();
+        r.set_frames(vec![fr(&img, &[line])]);
+        assert_eq!(step_s(&mut flow, &format!("tapif:{label}")), label);
+        assert_eq!(tapped_xy(&c), vec![point], "{label}");
+        flow.close();
+    }
 }
 
 #[test]
@@ -879,13 +936,13 @@ fn test_tap_text_region_icon_control_shortcut_and_disabled_rejection() {
     let r = FakeReader::with(vec![fr(&img, &[])], (430, 932), 1.0);
     let mut flow = mk_flow(&c, &r, 0.4);
     // 1. Instant exact_control shortcut respects @y<150 and @y>700 (1 OCR read, 0 wait polls).
-    let m_top = flow.tap_text("Close@y<150").unwrap();
+    let m_top = flow.tap_text("Close@y<150").unwrap().target;
     assert_eq!((m_top.x, m_top.y), (380, 90));
     assert_eq!(r.read_calls(), 1);
 
     r.lock().read_calls = 0;
     flow.last_action_ts = 0.0;
-    let m_bot = flow.tap_text("Close@y>700").unwrap();
+    let m_bot = flow.tap_text("Close@y>700").unwrap().target;
     assert_eq!((m_bot.x, m_bot.y), (380, 780));
     assert_eq!(r.read_calls(), 1);
 
@@ -919,7 +976,7 @@ fn test_tap_text_region_icon_control_shortcut_and_disabled_rejection() {
     c.state().tapped_points.clear();
     flow.last_action_ts = 0.0;
     flow.timeout = 0.05;
-    let m_part = flow.tap_text("Add Item@y>700").unwrap();
+    let m_part = flow.tap_text("Add Item@y>700").unwrap().target;
     assert_eq!((m_part.x, m_part.y), (360, 820));
 
     c.state().tapped_points.clear();
@@ -971,7 +1028,7 @@ fn test_settle_transition_already_still_reuses_frame_and_skips_confirm_pass() {
     let mut flow = mk_flow(&c, &r, 1.0);
     flow.last_action_ts = clock::now();
     flow.last_reaction_diff = 12.0;
-    let m = flow.tap_text("About").unwrap();
+    let m = flow.tap_text("About").unwrap().target;
     assert_eq!(m.text, "About");
     assert_eq!(r.read_calls(), 1);
     // 1 grab inside _settle_transition (reused for OCR) + 1 grab inside changed_since().
@@ -990,74 +1047,11 @@ fn test_settle_transition_already_still_reuses_frame_and_skips_confirm_pass() {
     let mut flow2 = mk_flow(&c2, &r2, 1.0);
     flow2.last_action_ts = clock::now();
     flow2.last_reaction_diff = 12.0;
-    let m2 = flow2.tap_text("About").unwrap();
+    let m2 = flow2.tap_text("About").unwrap().target;
     assert_eq!(m2.text, "About");
     assert_eq!(r2.read_calls(), 1);
     assert_eq!(r2.grab_calls(), 2);
     flow2.close();
-}
-
-#[test]
-fn test_search_focus_settle_only_sleeps_remaining_time_since_last_tap() {
-    let _cache = isolated_cache();
-    let img = solid_img(240, (430, 932));
-    let img_open = solid_img(180, (430, 932));
-
-    // 1. Direct SearchField tap sleeps ~0.18s right after tap_point before fast_keys.
-    let c_direct = MockWda::start(with_fast_ui(fui(json!([
-        {"type": "SearchField", "label": "Search", "x": 200, "y": 110},
-    ]))));
-    let r_direct = FakeReader::with(vec![fr(&img, &[]), fr(&copy_img(&img), &[])], (430, 932), 1.0);
-    let mut flow_direct = mk_flow(&c_direct, &r_direct, 0.5);
-    {
-        let (sk, _g) = skip_sleep();
-        flow_direct.search("hello").unwrap();
-        let sleeps = sleeps_of(&sk);
-        assert_eq!(sleeps.len(), 1, "{sleeps:?}");
-        assert!(sleeps[0] > 0.1);
-    }
-    assert_eq!(c_direct.state().typed_history.last().unwrap().1, "hello");
-    flow_direct.close();
-
-    // 2. Search Button opening an already-focused SearchField after >= 0.18s elapsed
-    // during transition + controls() skips the redundant 0.18s sleep.
-    let mut st = MockState::default();
-    st.fast_ui = Some(Dyn::of(vec![
-        fui(json!([{"type": "Button", "label": "Search", "x": 200, "y": 110}])),
-        fui(json!([
-            {"type": "SearchField", "label": "Search", "x": 202, "y": 112},
-            {"type": "Button", "label": "Cancel", "x": 380, "y": 112},
-        ])),
-    ]));
-    let c_btn = MockWda::start(st);
-    let r_btn = FakeReader::with(
-        vec![fr(&img_open, &[]), fr(&copy_img(&img_open), &[]), fr(&copy_img(&img_open), &[])],
-        (430, 932),
-        1.0,
-    );
-    set_last(&r_btn, &img);
-    let mut flow_btn = mk_flow(&c_btn, &r_btn, 0.5);
-    {
-        // Python wrapped controls() to set `_last_tap_ts = now - 0.25` after its 2nd call;
-        // here the 2nd /wda/fastUI answer advances the virtual clock by 0.25 s instead.
-        let (vc, _g) = virtual_clock();
-        let ctl_calls = Arc::new(AtomicUsize::new(0));
-        {
-            let (vc, ctl_calls) = (vc.clone(), ctl_calls.clone());
-            c_btn.set_custom_handler(move |_, _, p, _| {
-                if p.starts_with("/wda/fastUI") && ctl_calls.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
-                    // Simulate >= 0.25s having already elapsed since tap_point(c).
-                    vc.advance(0.25);
-                }
-                None
-            });
-        }
-        flow_btn.search("world").unwrap();
-        assert_eq!(vc.sleeps.lock().unwrap().clone(), Vec::<f64>::new());
-    }
-    assert_eq!(c_btn.tapped_points().len(), 1);
-    assert_eq!(c_btn.state().typed_history.last().unwrap().1, "world");
-    flow_btn.close();
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,12 +1065,162 @@ fn test_tapif_hits_ocr_ui_respects_deny_and_skips_cleanly() {
     let lines = vec![ml("Not Now", 100, 400, 180, 420), ml("Delete", 100, 500, 180, 520)];
     let c = MockWda::start(with_fast_ui(fui(json!([{"type": "Button", "label": "Dismiss", "x": 380, "y": 90}]))));
     let r = FakeReader::new(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)]);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     assert_eq!(step_s(&mut flow, "tapif:Not Now"), "Not Now");
     assert_eq!(step_s(&mut flow, "tapif:Dismiss"), "[Button:Dismiss]");
     assert_eq!(step_s(&mut flow, "tapif:MissingBanner"), "skipped");
     flow_err(flow.step("tapif:Delete"));
     flow.close();
+}
+
+#[test]
+fn test_waitany_and_tap_use_live_named_alert_instead_of_foreground_controls() {
+    let _cache = isolated_cache();
+    const LABEL: &str = "Be appen om ikke å spore";
+    let img = solid_img(240, (430, 932));
+    let lines = [ml("Settings", 40, 200, 120, 220), ml(LABEL, 40, 300, 230, 325)];
+    let r = FakeReader::new(vec![fr(&img, &lines)]);
+    let mut st = MockState::default();
+    st.active_app = Seq::one(json!("com.apple.springboard"));
+    st.fast_ui = Some(Dyn::one(fast_ui(
+        json!([{"type": "Button", "label": "Settings", "x": 90, "y": 220}]),
+        "SpringBoard",
+        "com.apple.springboard",
+    )));
+    st.alert_text = Some(Dyn::one(json!("Vil du tillate sporing?")));
+    st.alert_buttons = Some(Dyn::one(json!([LABEL, "Tillat", "Delete Account"])));
+    let mock = MockWda::start(st);
+    let mut flow = mk_flow_deny(&mock, &r, 1.0, Some("^Delete Account$"));
+    flow.c.set_allowed_apps(vec!["com.example.target".into(), "com.apple.springboard".into()]);
+    step_v(&mut flow, "open:com.example.target");
+
+    // The unrelated exact OCR hit comes first. The live alert owns the match.
+    assert_eq!(step_s(&mut flow, &format!("waitany:Settings|{LABEL}")), LABEL);
+    assert!(mock.tapped_points().is_empty());
+
+    for step in ["tap:Settings", "tap:spore"] {
+        assert!(flow_err(flow.step(step)).contains("no unique exact match"));
+    }
+    assert!(flow_err(flow.step("tap:Delete Account")).contains("matches --deny"));
+    mock.state().alert_buttons = Some(Dyn::one(json!([LABEL, 17])));
+    assert!(flow_err(flow.step(&format!("tap:{LABEL}"))).contains("no usable button metadata"));
+    mock.state().alert_buttons = None;
+    assert!(flow_err(flow.step(&format!("tap:{LABEL}"))).contains("no usable button metadata"));
+    let path = flow.c.spath("/alert/accept");
+    assert!(mock.calls_to(&path).is_empty());
+    assert!(mock.tapped_points().is_empty());
+
+    mock.state().alert_buttons = Some(Dyn::one(json!([LABEL, "Tillat", "Delete Account"])));
+    assert_eq!(step_s(&mut flow, &format!("tap:{LABEL}")), LABEL);
+    assert_eq!(mock.calls_to(&path), vec![("POST".into(), path.clone(), json!({"name": LABEL}))]);
+    assert!(mock.tapped_points().is_empty());
+
+    // If the alert closes after waitany, a foreground control with the same label
+    // is not a substitute. A new wait can still match ordinary foreground text.
+    assert_eq!(step_s(&mut flow, &format!("waitany:{LABEL}")), LABEL);
+    mock.state().alert_text = None;
+    mock.state().active_app = Seq::one(json!("com.example.target"));
+    assert!(flow_err(flow.step(&format!("tap:{LABEL}"))).contains("no longer active"));
+    assert_eq!(step_s(&mut flow, &format!("waitany:Settings|{LABEL}")), "Settings");
+    assert_eq!(mock.calls_to(&path).len(), 1);
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
+fn test_alert_action_requires_an_exact_live_allowed_button() {
+    let _cache = isolated_cache();
+    let mut st = MockState::default();
+    st.alert_text = Some(Dyn::one(json!("Choose what to do")));
+    st.alert_buttons = Some(Dyn::one(json!(["Allow: Once", "Keep Draft", "Delete"])));
+    let mock = MockWda::start(st);
+    let reader = FakeReader::new(vec![]);
+    let mut flow = mk_flow_deny(&mock, &reader, 1.0, Some("^Delete$"));
+    let accept = flow.c.spath("/alert/accept");
+    let dismiss = flow.c.spath("/alert/dismiss");
+
+    for step in ["alert", "alert:", "alert:accept: ", "alert:dismiss:", "alert:invalid:Delete"] {
+        assert!(flow_err(flow.step(step)).contains("LABEL"), "{step}");
+    }
+    assert!(flow_err(flow.step("alert:accept")).contains("native alert choice against caller deny rules"));
+    assert!(flow_err(flow.step("alert:accept:Allow")).contains("no unique exact match"));
+    assert!(flow_err(flow.step("alert:dismiss:Delete")).contains("matches --deny"));
+    assert!(mock.calls_to(&accept).is_empty());
+    assert!(mock.calls_to(&dismiss).is_empty());
+
+    assert_eq!(step_s(&mut flow, "alert:accept:Allow: Once"), "Allow: Once");
+    assert_eq!(step_s(&mut flow, "alert:dismiss:Keep Draft"), "Keep Draft");
+    assert_eq!(mock.calls_to(&accept), vec![("POST".into(), accept.clone(), json!({"name": "Allow: Once"}))]);
+    assert_eq!(mock.calls_to(&dismiss), vec![("POST".into(), dismiss.clone(), json!({"name": "Keep Draft"}))]);
+
+    mock.state().alert_text = None;
+    assert_eq!(step_s(&mut flow, "alert:accept:Allow: Once"), "no-alert");
+    mock.state().alert_text = Some(Dyn::one(json!({"error": 404, "body": "unknown command"})));
+    assert!(flow_err(flow.step("alert:accept:Allow: Once")).contains("could not verify active iOS alert"));
+    assert_eq!(mock.calls_to(&accept).len(), 1);
+
+    mock.state().alert_text = Some(Dyn::one(json!("Choose what to do")));
+    mock.set_custom_handler(fail_on_suffix("/alert/accept", 500, "alert action failed"));
+    assert!(flow_err(flow.step("alert:accept:Allow: Once")).contains("alert active iOS alert failed"));
+    assert_eq!(mock.calls_to(&accept).len(), 2);
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
+fn test_native_alert_actions_use_wda_choice_and_report_absence_or_failure() {
+    let _cache = isolated_cache();
+    let mut st = MockState::default();
+    // WDA can observe an alert that has no text and offers no button metadata.
+    st.alert_text = Some(Dyn::one(json!("")));
+    st.alert_buttons = Some(Dyn::one(json!({"error": 404, "body": "unknown command"})));
+    let mock = MockWda::start(st);
+    let reader = FakeReader::new(vec![]);
+    let mut flow = mk_flow(&mock, &reader, 1.0);
+    let accept = flow.c.spath("/alert/accept");
+    let dismiss = flow.c.spath("/alert/dismiss");
+
+    assert_eq!(step_s(&mut flow, "alert:accept"), "accept-sent");
+    assert_eq!(step_s(&mut flow, "alert:dismiss"), "dismiss-sent");
+    assert_eq!(mock.calls_to(&accept), vec![("POST".into(), accept.clone(), json!({}))]);
+    assert_eq!(mock.calls_to(&dismiss), vec![("POST".into(), dismiss.clone(), json!({}))]);
+
+    let mut client = mock.client();
+    client.deny_also = vec!["^Something Else$".into()];
+    let mut guarded = Flow::new(client, reader, 1.0, None, false).unwrap();
+    assert!(flow_err(guarded.step("alert:dismiss")).contains("use alert:accept:LABEL or alert:dismiss:LABEL"));
+
+    mock.state().alert_text = None;
+    assert_eq!(step_s(&mut flow, "alert:accept"), "no-alert");
+    assert_eq!(step_s(&mut guarded, "alert:dismiss"), "no-alert");
+    mock.state().alert_text = Some(Dyn::one(json!({"error": 404, "body": "unknown command"})));
+    assert!(flow_err(flow.step("alert:dismiss")).contains("could not verify active iOS alert"));
+    assert_eq!(mock.calls_to(&accept).len(), 1);
+    assert_eq!(mock.calls_to(&dismiss).len(), 1);
+
+    mock.state().alert_text = Some(Dyn::one(json!("Choose what to do")));
+    mock.set_custom_handler(fail_on_suffix("/alert/dismiss", 500, "alert action failed"));
+    assert!(flow_err(flow.step("alert:dismiss")).contains("alert active iOS alert failed"));
+    assert_eq!(mock.calls_to(&dismiss).len(), 2);
+    assert!(mock.calls_to(&flow.c.spath("/wda/alert/buttons")).is_empty());
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
+fn test_alert_actions_recheck_foreground_before_input() {
+    let _cache = isolated_cache();
+    let r = FakeReader::new(vec![fr(&solid_img(240, (430, 932)), &[])]);
+    for (step, suffix) in [("tap:Don't Allow", "/alert/accept"), ("alert:dismiss", "/alert/dismiss")] {
+        let mut st = MockState::default();
+        st.active_app = Seq::of(vec![json!("com.apple.springboard"), json!("com.example.other")]);
+        st.alert_text = Some(Dyn::one(json!("Allow tracking?")));
+        st.alert_buttons = Some(Dyn::one(json!(["Don't Allow"])));
+        let mock = MockWda::start(st);
+        let mut flow = mk_flow(&mock, &r, 1.0);
+        flow.c.set_allowed_apps(vec!["com.apple.springboard".into()]);
+
+        assert!(matches!(flow.step(step), Err(Error::AppGuard(message)) if message.contains("com.example.other")));
+        assert!(!mock.paths().iter().any(|path| path.ends_with(suffix)));
+        assert!(mock.tapped_points().is_empty());
+    }
 }
 
 #[test]
@@ -1101,7 +1245,7 @@ fn test_longpress_and_longpressxy_with_deny_guard() {
     let lines = vec![ml("Draft Note", 50, 240, 170, 260), ml("Delete", 50, 340, 130, 360)];
     let c = MockWda::start(MockState::default());
     let r = FakeReader::new(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)]);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     assert_eq!(step_s(&mut flow, "longpress:Draft Note"), "Draft Note");
     assert_eq!(*c.tapped_points().last().unwrap(), (110, 250, Some(0.65)));
 
@@ -1162,37 +1306,18 @@ fn test_swipe_directional_and_row_swipes() {
 }
 
 #[test]
-fn test_bottom_tab_cold_cache_disabled_guard_and_center_refinement() {
+fn test_tapif_cold_cache_does_not_press_a_disabled_tab() {
     let _cache = isolated_cache();
-    let img1 = solid_img(240, (402, 874));
-    let img2 = solid_img(180, (402, 874));
-    let tab_lines = vec![ml("Stopwatch", 200, 828, 280, 844)]; // y = 836 (> 874 - 55 = 819)
-
-    // 1. Cold cache + disabled accessibility tab at (240, 822) under exact OCR at (240, 836):
-    // MUST fetch controls, report disabled, and dispatch ZERO tap POSTs.
-    let c_dis = MockWda::start(with_fast_ui(fui(json!([
+    let img = solid_img(240, (402, 874));
+    let lines = vec![ml("Stopwatch", 200, 828, 280, 844)];
+    let c = MockWda::start(with_fast_ui(fui(json!([
         {"type": "Tab", "label": "Stopwatch", "x": 240, "y": 822, "enabled": false}
     ]))));
-    let r_dis = FakeReader::with(vec![fr(&img1, &tab_lines), fr(&copy_img(&img1), &tab_lines)], (402, 874), 1.0);
-    let mut flow_dis = mk_flow(&c_dis, &r_dis, 0.5);
-    let msg = flow_err(flow_dis.tap_text("Stopwatch"));
-    assert!(msg.to_lowercase().contains("disabled"), "{msg}");
-    assert_eq!(c_dis.tapped_points(), vec![]);
-    flow_dis.close();
-
-    // 2. Enabled accessibility tab in the bottom band refines to the Tab centre (240, 822).
-    let c_en = MockWda::start(with_fast_ui(fui(json!([
-        {"type": "Tab", "label": "Stopwatch", "x": 240, "y": 822, "enabled": true}
-    ]))));
-    let r_en = FakeReader::with(
-        vec![fr(&img1, &tab_lines), fr(&copy_img(&img1), &tab_lines), fr(&img2, &tab_lines)],
-        (402, 874),
-        1.0,
-    );
-    let mut flow_en = mk_flow(&c_en, &r_en, 0.5);
-    flow_en.tap_text("Stopwatch").unwrap();
-    assert_eq!(tapped_xy(&c_en), vec![(240, 822)]);
-    flow_en.close();
+    let r = FakeReader::with(vec![fr(&img, &lines)], (402, 874), 1.0);
+    let mut flow = mk_flow(&c, &r, 0.5);
+    assert_eq!(step_s(&mut flow, "tapif:Stopwatch"), "skipped");
+    assert!(c.tapped_points().is_empty());
+    flow.close();
 }
 
 #[test]
@@ -1257,23 +1382,10 @@ fn test_picker_key_cleartype_typedigits_and_clipboard() {
     assert_eq!(res, "len=11");
     assert_eq!(step_s(&mut flow, "clipboard"), "copied text");
     assert_eq!(*flow.reads.last().unwrap(), json!({"clipboard": "copied text"}));
+    flow.step("setclip:").unwrap();
+    assert_eq!(step_s(&mut flow, "clipboard"), "");
+    assert_eq!(*flow.reads.last().unwrap(), json!({"clipboard": "", "empty": true}));
     flow.close();
-}
-
-#[test]
-fn test_deny_guard_blocks_default_dangerous_actions_unless_disabled() {
-    let _cache = isolated_cache();
-    let c = MockWda::start(MockState::default());
-    let mut flow_guarded = Flow::new(c.client(), FakeReader::new(vec![]), 8.0, Some(DENY_DEFAULT), false).unwrap();
-    let mut flow_open = Flow::new(c.client(), FakeReader::new(vec![]), 8.0, None, false).unwrap();
-    for dangerous in ["Send", "Delete", "Buy", "Pay", "Cancel booking", "Accept"] {
-        flow_err(flow_guarded.tap_point(100, 100, dangerous, None));
-    }
-    // With deny=None (--no-deny), tap proceeds.
-    flow_open.tap_point(100, 100, "Send", None).unwrap();
-    assert_eq!(last_tap_xy(&c), (100, 100));
-    flow_guarded.close();
-    flow_open.close();
 }
 
 #[test]
@@ -1344,194 +1456,204 @@ fn test_launch_uses_fast_launch_preserves_state_invalidates_cache_and_propagates
     flow_err_.close();
 }
 
-fn kb_ui(items: Value, has_kb: bool, rect: Option<Value>) -> Value {
-    let mut d = fui(items);
-    d["hasKeyboard"] = json!(has_kb);
-    if has_kb {
-        if let Some(rc) = rect {
-            d["keyboardRect"] = rc;
-        }
-    }
-    d
+fn kb_ui(items: Value, has_kb: bool) -> Value {
+    let mut data = fui(items);
+    data["hasKeyboard"] = json!(has_kb);
+    data
 }
 
 #[test]
-fn test_dismisskb_fast_ui_and_stock_wda_fallback() {
+fn test_swipe_points_sends_one_gesture_to_the_requested_coordinates() {
     let _cache = isolated_cache();
-    let img = solid_img(240, (120, 240));
-    let kb_rect = json!({"x": 0, "y": 600, "width": 430, "height": 332});
+    let img = solid_img(240, (430, 932));
+    let mock = MockWda::start(MockState::default());
+    let mut flow = mk_flow(&mock, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
 
-    // 1. FastUI with NO visible keyboard MUST NOT tap an ordinary app 'Done' button!
-    let app_done_only = json!([
-        {"type": "Button", "label": "Done", "x": 380, "y": 80},
-        {"type": "Button", "label": "Ferdig", "x": 380, "y": 560},
-    ]);
-    let c_nokb = MockWda::start(with_fast_ui(kb_ui(app_done_only, false, Some(kb_rect.clone()))));
-    let mut flow_nokb = mk_flow(&c_nokb, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
-    assert_eq!(step_s(&mut flow_nokb, "dismisskb"), "no-kb");
-    assert_eq!(c_nokb.tapped_points(), vec![]);
-    assert_eq!(paths_suffix(&c_nokb, "/element"), Vec::<String>::new());
-    flow_nokb.close();
-
-    // 2. FastUI with visible keyboard: ignores disabled Button, non-Button Text, and ordinary
-    // app 'Done' (no inKeyboard/inKeyboardAccessory provenance); taps verified keyboard accessory 'Ferdig'.
-    let ui_with_kb = json!([
-        {"type": "Text", "label": "Done", "x": 100, "y": 600, "inKeyboardAccessory": true},
-        {"type": "Button", "label": "Done", "x": 380, "y": 580, "enabled": false, "inKeyboardAccessory": true},
-        {"type": "Button", "label": "Done", "x": 380, "y": 80},
-        {"type": "Button", "label": "Ferdig", "x": 380, "y": 560, "inKeyboardAccessory": true},
-    ]);
-    let c = MockWda::start(with_fast_ui(kb_ui(ui_with_kb.clone(), true, Some(kb_rect.clone()))));
-    let r = FakeReader::new(vec![fr(&img, &[]), fr(&copy_img(&img), &[])]);
-    let mut flow = mk_flow(&c, &r, 0.5);
-    flow.store_ctl_cache(&ctls(&ui_with_kb), Some(img.clone()));
-    assert_eq!(step_s(&mut flow, "dismisskb"), "dismissed");
-    assert_eq!(last_tap_xy(&c), (380, 560));
-    assert!(flow.ctl_cache.is_none());
-    // Zero slow /element predicate calls when fastUI succeeded.
-    assert_eq!(paths_suffix(&c, "/element"), Vec::<String>::new());
-
-    // Visible floating keyboard at x=15..195, y=500..700 with ONLY unrelated app
-    // buttons ('Done' at (335, 730) OR unmarked 'Hide keyboard' at (75, 455) in-band
-    // without keyboard/accessory provenance) -> returns 'no-kb' with ZERO taps!
-    c.state().tapped_points.clear();
-    let floating_rect = json!({"x": 15, "y": 500, "width": 180, "height": 200});
-    set_fast_ui(
-        &c,
-        kb_ui(
-            json!([
-                {"type": "Button", "label": "Done", "x": 335, "y": 730},
-                {"type": "Button", "label": "Hide keyboard", "x": 75, "y": 455},
-            ]),
-            true,
-            Some(floating_rect),
-        ),
-    );
-    assert_eq!(step_s(&mut flow, "dismisskb"), "no-kb");
-    assert_eq!(c.tapped_points(), vec![]);
-
-    // Visible keyboard with ONLY an ordinary app top-bar 'Done' (y=80) returns 'no-kb'.
-    c.state().tapped_points.clear();
-    set_fast_ui(&c, kb_ui(json!([{"type": "Button", "label": "Done", "x": 380, "y": 80}]), true, Some(kb_rect.clone())));
-    assert_eq!(step_s(&mut flow, "dismisskb"), "no-kb");
-    assert_eq!(c.tapped_points(), vec![]);
-
-    // FastUI prefers inKeyboard 'Hide keyboard' over keyboard-accessory 'Done'.
-    c.state().tapped_points.clear();
-    set_fast_ui(
-        &c,
-        kb_ui(
-            json!([
-                {"type": "Button", "label": "Done", "x": 380, "y": 560, "inKeyboardAccessory": true},
-                {"type": "Button", "label": "Hide keyboard", "x": 390, "y": 540, "inKeyboard": true},
-            ]),
-            true,
-            Some(kb_rect.clone()),
-        ),
-    );
-    assert_eq!(step_s(&mut flow, "dismisskb"), "dismissed");
-    assert_eq!(last_tap_xy(&c), (390, 540));
-
-    // FastUI succeeds with no dismiss button -> returns 'no-kb' cleanly without predicate fallback.
-    c.clear_calls();
-    c.state().tapped_points.clear();
-    set_fast_ui(&c, kb_ui(json!([{"type": "Button", "label": "Submit", "x": 200, "y": 400}]), true, Some(kb_rect.clone())));
-    assert_eq!(step_s(&mut flow, "dismisskb"), "no-kb");
-    assert_eq!(c.tapped_points(), vec![]);
-    assert_eq!(paths_suffix(&c, "/element"), Vec::<String>::new());
-
-    // Custom --deny blocks dismisskb tap cleanly.
-    let c_deny = MockWda::start(with_fast_ui(kb_ui(
-        json!([{"type": "Button", "label": "Done", "x": 380, "y": 560, "inKeyboardAccessory": true}]),
-        true,
-        Some(kb_rect.clone()),
-    )));
-    let mut flow_deny = mk_flow_deny(&c_deny, &FakeReader::new(vec![fr(&img, &[])]), 8.0, Some(r"done"));
-    flow_err(flow_deny.step("dismisskb"));
-    assert_eq!(c_deny.tapped_points(), vec![]);
-    flow_deny.close();
+    assert_eq!(step_s(&mut flow, "swipe:points:215,80:215,12"), "gesture-sent");
+    assert!(flow.step("swipe:points:215,80:215,-12").is_err());
+    let sent = drags(&mock);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["fromY"], 80);
+    assert_eq!(sent[0]["toY"], 12);
+    assert!(mock.tapped_points().is_empty());
     flow.close();
+}
 
-    // 3. Stock WDA (fastUI 404): requires visible XCUIElementTypeKeyboard AND actual
-    // keyboard or flush accessory-toolbar ancestry; never clicks app buttons outside bounds.
-    let labels_pred = DISMISS_KB_LABELS.iter().map(|l| format!("'{l}'")).collect::<Vec<_>>().join(", ");
-    let kb_chain = format!(
-        "**/XCUIElementTypeKeyboard/**/XCUIElementTypeButton[`label IN {{{labels_pred}}} OR name IN {{{labels_pred}}}`]"
-    );
-    let btn_pred = format!("type == 'XCUIElementTypeButton' AND (label IN {{{labels_pred}}} OR name IN {{{labels_pred}}})");
-    let mut st = MockState::default();
-    st.fast_ui_404 = true;
-    st.element_map.insert(ekey(&["class name", "XCUIElementTypeKeyboard"]), Dyn::one(json!({"ELEMENT": "kb-1"})));
-    st.elements_map.insert(ekey(&["class chain", &kb_chain]), vec![]);
-    st.elements_map
-        .insert(ekey(&["class name", "XCUIElementTypeToolbar"]), vec![json!({"ELEMENT": "tb-top"}), json!({"ELEMENT": "tb-acc"})]);
-    st.elements_map.insert(ekey(&["tb-top", "predicate string", &btn_pred]), vec![json!({"ELEMENT": "app-done"})]);
-    st.elements_map.insert(ekey(&["tb-acc", "predicate string", &btn_pred]), vec![json!({"ELEMENT": "kb-done-1"})]);
-    for (k, v) in [
-        ("kb-1", json!({"x": 0, "y": 600, "width": 430, "height": 332})),
-        ("tb-top", json!({"x": 0, "y": 50, "width": 430, "height": 44})),
-        ("tb-acc", json!({"x": 0, "y": 556, "width": 430, "height": 44})),
-        ("app-done", json!({"x": 340, "y": 52, "width": 70, "height": 40})),
-        ("kb-done-1", json!({"x": 340, "y": 558, "width": 70, "height": 40})),
+#[test]
+fn test_swipe_points_requires_ack_and_only_falls_back_for_a_missing_route() {
+    let _cache = isolated_cache();
+    let img = solid_img(240, (430, 932));
+    for (fast, stock, expected_ok, expected_stock) in [
+        (json!({}), json!({"value": null}), false, false),
+        (json!({"value": {"error": "injection failed"}}), json!({"value": null}), false, false),
+        (json!({"value": false}), json!({"value": null}), false, false),
+        (json!({"error": 404, "body": "unknown route"}), json!({"value": "unexpected"}), false, true),
+        (json!({"error": 404, "body": "element missing"}), json!({"value": null}), false, false),
+        (json!({"error": 404, "body": "unknown route"}), json!({"status": 13, "value": null}), false, true),
+        (json!({"error": 404, "body": "unknown route"}), json!({"value": null}), true, true),
     ] {
-        st.element_rects.insert(k.into(), v);
+        let mock = MockWda::start(MockState::default());
+        mock.set_custom_handler(move |_, _, path, _| {
+            if path == "/wda/fastDrag" {
+                Some(fast.clone())
+            } else if path.ends_with("/wda/dragfromtoforduration") {
+                Some(stock.clone())
+            } else {
+                None
+            }
+        });
+        let mut flow = mk_flow(&mock, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
+        assert_eq!(flow.step("swipe:points:215,80:215,12").is_ok(), expected_ok);
+        assert_eq!(mock.paths().iter().any(|p| p.ends_with("/wda/dragfromtoforduration")), expected_stock);
+        flow.close();
     }
-    st.element_labels.insert("app-done".into(), json!("Done"));
-    st.element_labels.insert("kb-done-1".into(), json!("Done"));
-    let c_stock = MockWda::start(st);
-    let mut flow_stock = mk_flow(&c_stock, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
-    {
-        let (_sk, _g) = skip_sleep();
-        assert_eq!(step_s(&mut flow_stock, "dismisskb"), "dismissed");
-    }
-    assert!(c_stock.paths().iter().any(|p| p.ends_with("/element/kb-done-1/click")));
-    assert!(!c_stock.paths().iter().any(|p| p.ends_with("/element/app-done/click")));
-    assert!(!c_stock.paths().iter().any(|p| p.contains(SOURCE_LITE)));
+}
 
-    // Stock WDA floating keyboard at x=15..195, y=500..700 with only an unrelated app
-    // toolbar/button at (335, 730) outside keyboard bounds -> returns 'no-kb', ZERO clicks!
-    let mut st = MockState::default();
-    st.fast_ui_404 = true;
-    st.element_map.insert(ekey(&["class name", "XCUIElementTypeKeyboard"]), Dyn::one(json!({"ELEMENT": "kb-float"})));
-    st.elements_map.insert(ekey(&["class chain", &kb_chain]), vec![]);
-    st.elements_map.insert(ekey(&["class name", "XCUIElementTypeToolbar"]), vec![json!({"ELEMENT": "tb-app"})]);
-    st.elements_map.insert(ekey(&["tb-app", "predicate string", &btn_pred]), vec![json!({"ELEMENT": "app-done-float"})]);
-    st.element_rects.insert("kb-float".into(), json!({"x": 15, "y": 500, "width": 180, "height": 200}));
-    st.element_rects.insert("tb-app".into(), json!({"x": 280, "y": 710, "width": 120, "height": 44}));
-    st.element_rects.insert("app-done-float".into(), json!({"x": 300, "y": 710, "width": 70, "height": 40}));
-    st.element_labels.insert("app-done-float".into(), json!("Done"));
-    let c_float = MockWda::start(st);
-    let mut flow_float = mk_flow(&c_float, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
-    {
-        let (_sk, _g) = skip_sleep();
-        assert_eq!(step_s(&mut flow_float, "dismisskb"), "no-kb");
-    }
-    assert!(!c_float.paths().iter().any(|p| p.ends_with("/click")));
-    flow_float.close();
+#[test]
+fn test_back_only_sends_the_requested_gesture_or_exact_tap() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let img = solid_img(240, (430, 932));
+    let lines = [ml("Current page", 100, 150, 220, 175), ml("<", 20, 70, 35, 90)];
+    let controls = json!([
+        {"type": "Button", "label": "Tilbake", "x": 22, "y": 75},
+        {"type": "Button", "label": "Previous screen", "x": 72, "y": 180},
+        {"type": "Button", "label": "Previous screen", "x": 72, "y": 400},
+    ]);
+    let mock = MockWda::start(with_fast_ui(fui(controls)));
+    let reader = FakeReader::new(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)]);
+    let mut flow = mk_flow(&mock, &reader, 0.5);
 
-    // Stock WDA with no visible keyboard returns 'no-kb' and NEVER clicks app 'Done'.
-    c_stock.clear_calls();
-    c_stock.state().element_map.clear();
-    {
-        let (_sk, _g) = skip_sleep();
-        assert_eq!(step_s(&mut flow_stock, "dismisskb"), "no-kb");
-    }
-    assert!(!c_stock.paths().iter().any(|p| p.ends_with("/click")));
+    // An unchanging screen cannot authorize a second action after the edge swipe.
+    assert_eq!(step_s(&mut flow, "back"), "edge-swipe-sent");
+    assert_eq!(drags(&mock).len(), 1);
+    assert!(mock.tapped_points().is_empty());
 
-    // Stock WDA click HTTP 500 propagates FlowError.
-    let mut st = MockState::default();
-    st.fast_ui_404 = true;
-    st.element_map.insert(ekey(&["class name", "XCUIElementTypeKeyboard"]), Dyn::one(json!({"ELEMENT": "kb-1"})));
-    st.elements_map.insert(ekey(&["class chain", &kb_chain]), vec![json!({"ELEMENT": "kb-err"})]);
-    st.element_rects.insert("kb-1".into(), json!({"x": 0, "y": 600, "width": 430, "height": 332}));
-    st.element_rects.insert("kb-err".into(), json!({"x": 340, "y": 780, "width": 70, "height": 40}));
-    st.element_labels.insert("kb-err".into(), json!("Hide keyboard"));
-    let c_err = MockWda::start(st);
-    c_err.set_custom_handler(fail_on_suffix("/click", 500, "click failed"));
-    let mut flow_e = mk_flow(&c_err, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
-    flow_err(flow_e.step("dismisskb"));
-    flow_e.close();
-    flow_stock.close();
+    assert!(flow_err(flow.step("back:")).contains("use back:LABEL"));
+    assert!(flow_err(flow.step("back:Back")).contains("no control labelled exactly"));
+    assert!(flow_err(flow.step("back:Previous screen")).contains("several controls"));
+    assert!(flow_err(flow.step("back:tapat:70,178")).contains("use back:LABEL"));
+    assert!(mock.tapped_points().is_empty());
+    assert_eq!(drags(&mock).len(), 1);
+
+    flow.changed_since_hook = Some(true);
+    assert_eq!(step_s(&mut flow, "back:tapat:70,178=Previous screen"), "tap-sent");
+    assert_eq!(last_tap_xy(&mock), (72, 180));
+    assert_eq!(mock.tapped_points().len(), 1);
+    assert_eq!(drags(&mock).len(), 1);
+    flow.close();
+}
+
+#[test]
+fn test_tap_and_tapif_do_not_treat_a_back_label_as_an_alias() {
+    let _cache = isolated_cache();
+    let (_s, _g) = virtual_clock();
+    let img = solid_img(240, (430, 932));
+    let lines = [ml("<", 20, 70, 35, 90)];
+    let mock = MockWda::start(with_fast_ui(fui(json!([
+        {"type": "Button", "label": "Tilbake", "x": 300, "y": 250}
+    ]))));
+    let reader = FakeReader::new(vec![fr(&img, &lines)]);
+    let mut flow = mk_flow(&mock, &reader, 0.5);
+
+    assert_eq!(step_s(&mut flow, "tapif:Back"), "skipped");
+    assert!(flow.step("tap:Back").is_err());
+    assert!(mock.tapped_points().is_empty());
+    flow.close();
+}
+
+#[test]
+fn test_dismisskb_checks_exact_targets_and_observes_keyboard_after_tapping() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let img = solid_img(240, (430, 932));
+    let reader = FakeReader::new(vec![fr(&img, &[])]);
+    let controls = json!([
+        {"type": "Button", "label": "Done", "x": 390, "y": 560, "inKeyboardAccessory": true},
+        {"type": "Button", "label": "Fold input", "x": 330, "y": 550},
+        {"type": "Button", "label": "Compact input", "x": 245, "y": 550, "enabled": false},
+    ]);
+    let mock = MockWda::start(with_fast_ui(kb_ui(controls.clone(), true)));
+    let mut flow = mk_flow_deny(&mock, &reader, 0.5, Some("^Done$"));
+
+    assert_eq!(step_s(&mut flow, "dismisskb"), "kb-visible");
+    assert!(flow_err(flow.step("dismisskb:Fold")).contains("no control labelled exactly"));
+    assert!(flow_err(flow.step("dismisskb:Compact input")).contains("is disabled"));
+    assert!(flow_err(flow.step("dismisskb:Done")).contains("refus"));
+    assert!(mock.tapped_points().is_empty());
+    assert!(drags(&mock).is_empty());
+
+    assert_eq!(step_s(&mut flow, "dismisskb:Fold input"), "kb-visible");
+    assert_eq!(last_tap_xy(&mock), (330, 550));
+
+    mock.set_on_action(|st, action, _| {
+        if action == "tap" {
+            st.fast_ui = Some(Dyn::one(kb_ui(json!([]), false)));
+        }
+    });
+    flow.changed_since_hook = Some(true);
+    assert_eq!(step_s(&mut flow, "dismisskb:tapat:325,552=Fold input"), "dismissed");
+    assert_eq!(last_tap_xy(&mock), (330, 550));
+    set_fast_ui(&mock, kb_ui(controls, false));
+    assert_eq!(step_s(&mut flow, "dismisskb:Fold input"), "no-kb");
+    assert_eq!(mock.tapped_points().len(), 2);
+    assert!(drags(&mock).is_empty());
+    flow.close();
+}
+
+#[test]
+fn test_bare_dismisskb_gestures_only_for_a_docked_keyboard() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let img = solid_img(240, (430, 932));
+    let reader = FakeReader::new(vec![fr(&img, &[])]);
+    let mut keyboard = kb_ui(json!([]), true);
+    keyboard["keyboardRect"] = json!({"x": 100, "y": 600, "width": 230, "height": 250});
+    let mock = MockWda::start(with_fast_ui(keyboard.clone()));
+    let mut flow = mk_flow(&mock, &reader, 0.5);
+
+    assert_eq!(step_s(&mut flow, "dismisskb"), "kb-visible");
+    assert!(drags(&mock).is_empty());
+    keyboard["keyboardRect"] = json!({"x": 0, "y": 600, "width": 430, "height": 332});
+    set_fast_ui(&mock, keyboard);
+    mock.set_on_action(|st, action, _| {
+        if action == "drag" {
+            st.fast_ui = Some(Dyn::one(kb_ui(json!([]), false)));
+        }
+    });
+    assert_eq!(step_s(&mut flow, "dismisskb"), "dismissed");
+    assert_eq!(drags(&mock).len(), 1);
+    assert_eq!(step_s(&mut flow, "dismisskb"), "no-kb");
+    assert_eq!(drags(&mock).len(), 1);
+    assert!(mock.tapped_points().is_empty());
+    flow.close();
+}
+
+#[test]
+fn test_dismisskb_reports_an_unreadable_stock_keyboard_as_unverified() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let img = solid_img(240, (430, 932));
+    let reader = FakeReader::new(vec![fr(&img, &[])]);
+    let mock = MockWda::start(with_fast_ui(fui(json!([
+        {"type": "Button", "label": "Fold input", "x": 330, "y": 550}
+    ]))));
+    mock.set_custom_handler(|st, method, path, data| {
+        if method == "POST" && path.ends_with("/elements") && data["value"] == "XCUIElementTypeKeyboard" {
+            return Some(if st.tapped_points.is_empty() {
+                json!({"value": [{"ELEMENT": "keyboard"}]})
+            } else {
+                json!({"error": 500, "body": "keyboard tree unavailable"})
+            });
+        }
+        None
+    });
+    mock.state().element_rects.insert("keyboard".into(), json!({"x": 0, "y": 600, "width": 430, "height": 332}));
+    let mut flow = mk_flow(&mock, &reader, 0.5);
+    assert_eq!(step_s(&mut flow, "dismisskb:Fold input"), "dismissal-unverified");
+    assert_eq!(last_tap_xy(&mock), (330, 550));
+    assert_eq!(mock.tapped_points().len(), 1);
+    flow.close();
 }
 
 #[test]
@@ -1616,7 +1738,7 @@ fn test_tapbatch_regions_errors_fallback_and_upfront_deny_zero_taps() {
     ]);
     let c = MockWda::start(with_fast_ui(fui(key_ui.clone())));
     let r = FakeReader::with(vec![fr(&img, &lines), fr(&solid_img(100, (430, 932)), &lines)], (430, 932), 1.0);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     // @y> filter needs zero OCR calls on fixed-layout batch.
     assert_eq!(step_s(&mut flow, "tapbatch:fixed:1@y>200,2@y<600"), "2 taps");
     assert_eq!(r.read_calls(), 0);
@@ -1756,42 +1878,6 @@ fn test_tapbatch_regions_errors_fallback_and_upfront_deny_zero_taps() {
 }
 
 #[test]
-fn test_search_polls_through_cold_launch_splash_until_search_control_renders() {
-    let _cache = isolated_cache();
-    let img = solid_img(220, (430, 932));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut st = MockState::default();
-    st.active_app = Seq::one(json!("com.example.store"));
-    {
-        let calls = calls.clone();
-        st.fast_ui = Some(Dyn::func(move |_| {
-            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
-            if n <= 2 {
-                return json!({"bundleId": "com.example.store", "appName": "Store", "screen": [430, 932], "ui": []});
-            }
-            json!({
-                "bundleId": "com.example.store",
-                "appName": "Store",
-                "screen": [430, 932],
-                "ui": [{"type": "SearchField", "label": "Search", "x": 200, "y": 100}],
-            })
-        }));
-    }
-    let c = MockWda::start(st);
-    let r = FakeReader::new(vec![fr(&img, &[]), fr(&img, &[])]);
-    let mut flow = mk_flow(&c, &r, 2.0);
-    let res = {
-        let (_sk, _g) = skip_sleep();
-        step_v(&mut flow, "launch:com.example.store");
-        step_s(&mut flow, "search:Wikipedia")
-    };
-    assert_eq!(res, "Search");
-    assert!(calls.load(Ordering::SeqCst) >= 3);
-    assert!(c.state().typed_history.iter().any(|(_, txt, _)| txt == "Wikipedia"));
-    flow.close();
-}
-
-#[test]
 fn test_url_opens_valid_schemes_updates_switch_state_and_rejects_invalid_or_error() {
     let _cache = isolated_cache();
     let img = solid_img(220, (430, 932));
@@ -1913,7 +1999,7 @@ fn test_toggle_idempotent_states_region_verification_and_guards() {
     };
     let c = MockWda::start(with_fast_ui(fui(base_ui.clone())));
     let r = FakeReader::with(vec![fr(&img_before, &lines), fr(&img_after, &lines)], (430, 932), 1.0);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     let before_after = || vec![fr(&img_before, &lines), fr(&img_after, &lines)];
 
     // 1. Idempotent zero-tap skip when already in desired state (all accepted spellings).
@@ -2027,10 +2113,12 @@ fn test_toggle_idempotent_states_region_verification_and_guards() {
     // (b) Explicit requested state with unreadable initial value refuses with ZERO taps;
     // disappearing switch or unreadable post-tap state raises FlowError (never reports 'toggled'/'on').
     c.state().tapped_points.clear();
-    set_fast_ui(&c, sw("Sync", 210, None));
-    let msg = flow_err(flow.step("toggle:Sync=on"));
-    assert!(msg.contains("unreadable initial state"), "{msg}");
-    assert_eq!(c.tapped_points(), vec![]);
+    for value in [None, Some("on"), Some("yes"), Some("off"), Some("no")] {
+        set_fast_ui(&c, sw("Sync", 210, value));
+        let msg = flow_err(flow.step("toggle:Sync=on"));
+        assert!(msg.contains("unreadable initial state"), "{msg}");
+        assert_eq!(c.tapped_points(), vec![]);
+    }
 
     c.state().tapped_points.clear();
     set_fast_ui_seq(&c, vec![sw("Sync", 210, Some("0")), fui(json!([]))]);
@@ -2080,7 +2168,7 @@ fn test_slider_parsing_matching_guards_disabled_and_errors() {
     }
     let c = MockWda::start(st);
     let r = FakeReader::new(vec![fr(&img, &[])]);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     // 1. Unlabelled slider selects first slider and normalizes %, 0-1, and >1-100.
     flow.store_ctl_cache(&ctls(&json!([{"type": "Button", "label": "Ok", "x": 50, "y": 50}])), Some(img.clone()));
     assert_eq!(step_s(&mut flow, "slider:50%"), "50%");
@@ -2187,7 +2275,7 @@ fn test_slider_parsing_matching_guards_disabled_and_errors() {
     st.element_enabled.insert("sa1".into(), json!(true));
     st.element_enabled.insert("sa2".into(), json!(true));
     let c_alias = MockWda::start(st);
-    let mut flow_alias = mk_flow(&c_alias, &FakeReader::new(vec![fr(&img, &[])]), 8.0);
+    let mut flow_alias = mk_flow_deny(&c_alias, &FakeReader::new(vec![fr(&img, &[])]), 8.0, Some("^Delete Threshold$"));
     // Named match via name='SafeID' must still block on label='Delete Threshold'.
     let msg = flow_err(flow_alias.step("slider:SafeID=50%"));
     assert!(msg.contains("--deny"), "{msg}");
@@ -2197,14 +2285,31 @@ fn test_slider_parsing_matching_guards_disabled_and_errors() {
     assert_eq!(paths_suffix(&c_alias, "/value"), Vec::<String>::new());
     flow_alias.close();
 
-    // Label/name lookup error while --deny is active refuses with ZERO value POSTs.
-    let c_aerr = MockWda::start(slider_state(&["s1"]));
-    c_aerr.set_custom_handler(|_, _, p, _| p.contains("/attribute/name").then(|| json!({"error": 500, "body": "attr err"})));
-    let mut flow_aerr = mk_flow(&c_aerr, &FakeReader::new(vec![fr(&img, &[])]), 8.0);
-    let msg = flow_err(flow_aerr.step("slider:50%"));
-    assert!(msg.contains("--deny"), "{msg}");
-    assert_eq!(paths_suffix(&c_aerr, "/value"), Vec::<String>::new());
-    flow_aerr.close();
+    // An absent alias is valid only when WDA actually returned null or empty text.
+    for (response, valid) in [
+        (json!({"error": 500, "body": "attr err"}), false),
+        (json!({"__raw__": {"status": 302, "body": "{\"value\":null}"}}), false),
+        (json!({"status": 7, "value": null}), false),
+        (json!({}), false),
+        (json!({"error": null, "value": null}), false),
+        (json!({"value": 0}), false),
+        (json!({"value": null}), true),
+        (json!({"value": ""}), true),
+    ] {
+        let mock = MockWda::start(slider_state(&["s1"]));
+        mock.set_custom_handler(move |_, _, p, _| p.ends_with("/attribute/name").then(|| response.clone()));
+        let mut client = mock.client();
+        client.deny_also = vec!["^Delete Threshold$".into()];
+        let mut flow = Flow::new(client, FakeReader::new(vec![]), 8.0, None, false).unwrap();
+        if valid {
+            assert_eq!(step_s(&mut flow, "slider:50%"), "50%");
+        } else {
+            let msg = flow_err(flow.step("slider:50%"));
+            assert!(msg.contains("cannot verify slider label/name"), "{msg}");
+        }
+        assert_eq!(paths_suffix(&mock, "/value").len(), usize::from(valid));
+        flow.close();
+    }
 
     // Failed /enabled and /attribute/enabled on the selected element MUST refuse with
     // ZERO value POSTs even when fastUI has a matching older tree (no enabled field)
@@ -2318,7 +2423,7 @@ fn test_scrollto_then_tap_reuses_settled_lines_without_redundant_ocr() {
         1.0,
     );
     let r = AgingReadReader(inner.clone());
-    let mut flow = Flow::new(c.client(), r, 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(c.client(), r, 1.0, None, false).unwrap();
     let res_scroll = step_s(&mut flow, "scrollto:Generelt");
     assert_eq!(res_scroll, "Generelt");
     let d = drags(&c);
@@ -2587,7 +2692,7 @@ fn test_assert_assertnot_and_alert_text_verbs() {
     assert_eq!(flow.last_action_ts, 0.0);
 
     // 5. alert:text reads active alert text and appends {"alert": txt} to reads;
-    // returns "no-alert" when no alert is active; preserves alert:accept and alert:dismiss.
+    // returns "no-alert" when no alert is active.
     assert_eq!(step_s(&mut flow, "alert:text"), "Allow Notifications?");
     assert_eq!(*flow.reads.last().unwrap(), json!({"alert": "Allow Notifications?"}));
 
@@ -2602,18 +2707,11 @@ fn test_assert_assertnot_and_alert_text_verbs() {
     c.state().alert_text = Some(Dyn::one(json!({"error": 404, "body": "unknown command"})));
     flow_err(flow.step("alert:text"));
 
-    {
-        let (_sk, _g) = skip_sleep();
-        assert_eq!(step_s(&mut flow, "alert:accept"), "accept");
-        assert_eq!(step_s(&mut flow, "alert:dismiss"), "dismiss");
-    }
-    flow_err(flow.step("alert:invalid"));
     flow_err(flow.step("assert:re:"));
     flow_err(flow.step("assertnot:re:"));
 
     assert!(FLOW_HELP.contains("assert:TEXT"));
     assert!(FLOW_HELP.contains("assertnot:TEXT"));
-    assert!(FLOW_HELP.contains("alert:accept|dismiss|text"));
     assert!(IMAGE_STEP_VERBS.contains(&"assert"));
     assert!(IMAGE_STEP_VERBS.contains(&"assertnot"));
     assert!(!IMAGE_STEP_VERBS.contains(&"alert"));
@@ -2683,7 +2781,7 @@ fn test_ui_only_flow_skips_ocr_warmup() {
     let mock = MockWda::start(with_fast_ui(fui(json!([{"type": "Button", "label": "Settings", "x": 100, "y": 200}]))));
     let steps: Vec<String> = vec!["ui".into(), "tapxy:100,200".into()];
     assert!(!crate::flow::flow_needs_ocr(&steps));
-    let code = crate::flow::cmd_flow(mock.client(), &steps, 2.0, 1.5, Some(DENY_DEFAULT), true).unwrap();
+    let code = crate::flow::cmd_flow(mock.client(), &steps, 2.0, 1.5, None, true).unwrap();
     assert_eq!(code, 0);
 }
 
@@ -2694,7 +2792,7 @@ fn test_url_only_flow_skips_ocr_warmup() {
     let mock = MockWda::start(MockState::default());
     let steps: Vec<String> = vec!["url:https://example.com".into()];
     assert!(!crate::flow::flow_needs_ocr(&steps));
-    let code = crate::flow::cmd_flow(mock.client(), &steps, 2.0, 1.5, Some(DENY_DEFAULT), true).unwrap();
+    let code = crate::flow::cmd_flow(mock.client(), &steps, 2.0, 1.5, None, true).unwrap();
     assert_eq!(code, 0);
     assert_eq!(mock.state().opened_urls, vec![json!("https://example.com")]);
 }
@@ -2780,8 +2878,10 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
     let pts = |m: &MockWda| m.tapped_points().iter().map(|p| (p.0, p.1)).collect::<Vec<_>>();
     // A control within 24 pt: tapped at its own centre (never the raw point).
     let (mock, r) = mk();
-    let mut flow = mk_flow(&mock, &r, 1.0);
-    assert_eq!(step_s(&mut flow, "tapat:372,66"), "Settings");
+    let mut flow = mk_flow_deny(&mock, &r, 1.0, Some("^Delete"));
+    let (ok, result) = flow.run_outcome(&["tapat:372,66".into()]).unwrap();
+    assert!(!ok);
+    assert!(result["error"].as_str().unwrap().contains("observed no visible reaction"));
     assert_eq!(pts(&mock), vec![(380, 60)]);
     // OCR text is never a target, even under the point.
     match flow.step("tapat:40,105") {
@@ -2789,7 +2889,7 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
         other => panic!("expected refusal, got {other:?}"),
     }
     // The label at the point goes through --deny; a disabled control is refused.
-    flow_err(flow.step("tapat:385,795"));
+    assert!(flow_err(flow.step("tapat:385,795")).contains("--deny"));
     flow_err(flow.step("tapat:300,800"));
     // Nothing labelled there: refused, naming the nearest labels.
     match flow.step("tapat:60,600") {
@@ -2809,6 +2909,7 @@ fn test_tapat_with_a_label_presses_only_that_exact_enabled_control() {
         let mock = MockWda::start(with_fast_ui(fui(ui)));
         let r = FakeReader::new(vec![fr(&img, &[]), fr(&copy_img(&img), &[])]);
         let mut flow = mk_flow(&mock, &r, 1.0);
+        flow.changed_since_hook = Some(true);
         let res = flow.step(step);
         flow.close();
         let pts: Vec<(i64, i64)> = mock.tapped_points().iter().map(|p| (p.0, p.1)).collect();

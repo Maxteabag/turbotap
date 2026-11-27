@@ -524,6 +524,7 @@ pub fn check_output(cmd: &str) -> Result<String> {
     // Never name the helper in errors: its path or arguments may embed the secret.
     let out = std::process::Command::new(prog)
         .args(args)
+        .env_remove(crate::redaction::KEY_ENV)
         .stderr(std::process::Stdio::null())
         .output()
         .map_err(|e| Error::runtime(format!("credential helper could not be started ({:?})", e.kind())))?;

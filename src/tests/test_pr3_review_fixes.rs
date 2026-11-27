@@ -2,7 +2,7 @@
 //! and Generation 5 WDA v4 / speed fixes.
 use crate::clock;
 use crate::error::Error;
-use crate::flow::{Flow, DENY_DEFAULT};
+use crate::flow::Flow;
 use crate::image::{content_pixel_still, thumb_diff, Frame, GrayImage};
 use crate::ocr::{ReadOpts, Reader, ScreenReader};
 use crate::testutil::{isolated_cache, make_line, set_env, skip_sleep, solid_img, Dyn, FakeReader, MockState, MockWda, Seq};
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn new_flow<R: Reader>(m: &MockWda, r: R) -> Flow<R> {
-    Flow::new(m.client(), r, 8.0, Some(DENY_DEFAULT), false).unwrap()
+    Flow::new(m.client(), r, 8.0, None, false).unwrap()
 }
 
 fn post_calls(m: &MockWda) -> Vec<(String, String)> {

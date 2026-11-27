@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::image::Frame;
 use crate::json;
 use crate::ocr::{ReadOpts, Reader, ScreenReader};
-use crate::text::{split_where, Line, Match};
+use crate::text::{split_where, Line};
 use crate::ui::{self, Control};
 use crate::wda::{check_wda_ok, WdaClient};
 use serde_json::{json as j, Value};
@@ -26,92 +26,11 @@ pub mod worker;
 pub use sense::{AlertStatus, UiExpectation};
 pub use worker::{ProbeSnapshot, UiWorker};
 
-pub const DENY_DEFAULT: &str = r"cancel booking|cancel appointment|delete account|erase all|reset all|confirm purchase|\bbuy\b|\bpay\b|\bsubscribe\b|start (audio|video) call|\bsend\b|record voice|delete|unsend|remove|^(accept|decline|maybe)$";
-
-/// The only labels the built-in [`DENY_DEFAULT`] lets through, and only while the app
-/// guard confirms (live) that an allowlisted app is in front: exactly `Send` or
-/// `Send message` (case, surrounding and repeated whitespace ignored). Anything else
-/// containing "send" (`Send payment`, `Send all funds`, `Send attachment`, ...) stays
-/// refused like every other default entry.
-pub const PLAIN_SEND_LABELS: &[&str] = &["send", "send message"];
-
-/// True when `label`, normalized, is exactly one of [`PLAIN_SEND_LABELS`].
-pub fn is_plain_send(label: &str) -> bool {
-    let norm = label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    PLAIN_SEND_LABELS.contains(&norm.as_str())
-}
-
-/// [`DENY_DEFAULT`] without its `\bsend\b` entry: a label `--allow-label` names may
-/// pass only if it does not match this (send is the only deny word in it).
-fn deny_without_send() -> &'static fancy_regex::Regex {
-    static RX: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
-    RX.get_or_init(|| {
-        let p = DENY_DEFAULT.replace(r"\bsend\b|", "");
-        assert!(!p.contains("send\\b|record"), "DENY_DEFAULT changed: update deny_without_send");
-        crate::text::compile_icase(&p).expect("deny pattern without send is valid")
-    })
-}
-
-/// `label` with surrounding and repeated whitespace removed, for exact
-/// `--allow-label` comparison (case and wording must match).
-pub(crate) fn norm_label(label: &str) -> String {
-    label.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// True when `label` is exactly one of the `--allow-label` values, `send` is the only
-/// built-in deny word in it, and it contains none of [`ICON_NAME_RISKY`] anywhere
-/// (the built-in `\bpay\b` does not match `payment`; this does). Money, destructive,
-/// call, mass-recipient, attachment and confirmation words are never let through.
-pub fn label_allowed_by_flag(label: &str, allow: &[String]) -> bool {
-    let l = norm_label(label);
-    let low = l.to_lowercase();
-    !l.is_empty()
-        && allow.iter().any(|a| norm_label(a) == l)
-        && matches!(deny_without_send().is_match(&l), Ok(false))
-        && !ICON_NAME_RISKY.iter().any(|w| low.contains(w))
-}
-
-/// Substrings that disqualify an element name from [`is_safe_icon_name`]: money,
-/// destructive, call/recording, mass-recipient, attachment and confirmation words.
-/// Matched anywhere in the lowercased name, so `sendtoall` and `small` both fail:
-/// a false refusal only costs the exception, a false pass could send money.
-const ICON_NAME_RISKY: &[&str] = &[
-    "pay", "buy", "purchase", "order", "checkout", "subscri", "fund", "money", "cash", "coin", "crypto", "wallet",
-    "transfer", "wire", "tip", "donat", "gift", "bill", "invoice", "price", "delet", "remov", "erase", "reset",
-    "unsend", "trash", "destroy", "wipe", "call", "phone", "dial", "facetime", "voice", "audio", "video", "record",
-    "mic", "all", "every", "broadcast", "group", "invite", "share", "forward", "attach", "file", "photo", "image",
-    "location", "contact", "accept", "decline", "confirm", "approve", "sign", "post", "publish",
-];
-
-/// True when `name` (an element's accessibility identifier, which WDA reports as
-/// `name` when set) looks like a developer identifier or SF Symbol for an icon-only
-/// button (`arrow.up.circle.fill`, `sendButton`, `composer-send`): 1-64 ASCII
-/// letters, digits, `.`, `_` or `-`, and none of [`ICON_NAME_RISKY`]. Sentences and
-/// anything with spaces never qualify.
-pub fn is_safe_icon_name(name: &str) -> bool {
-    let n = name.trim();
-    if n.is_empty() || n.len() > 64 || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
-        return false;
-    }
-    let low = n.to_ascii_lowercase();
-    !ICON_NAME_RISKY.iter().any(|w| low.contains(w))
-}
-
-/// `s` quoted for a refusal message, cut to 48 characters (element labels and names
-/// only; never typed text or values).
-pub(crate) fn short_repr(s: &str) -> String {
-    let mut t: String = s.chars().take(48).collect();
-    if t.len() < s.len() {
-        t.push_str("...");
-    }
-    json::py_repr_str(&t)
-}
-
 pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
-  open:APP              activate an app by display name or bundle ID (open:Spotify,
-                        open:com.apple.Preferences); names come from a per-device
+  open:APP              activate the caller's app by display name or bundle ID;
+                        names come from a per-device
                         devicectl cache (~1 ms; refreshed once on an unknown name)
   launch:APP            terminate + activate (fresh start)
   url:URL               open a URL or deep-link directly via WDA /url (https://, maps://,
@@ -122,17 +41,19 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   waitany:A|B|C         poll until ANY '|'-separated target appears (OCR-first, then
                         UI controls + Sauvola fallback; per-target @region supported);
                         returns the matched text
+  waitcontrol:LABEL     wait for an exact live accessibility label using --timeout;
+                        returns the control and sends no input or screenshot request
+  waitchange:LABEL      wait for a unique live control to change or disappear, using --timeout;
+                        waitchange:tapat:X,Y=LABEL requires its exact reported center
   gone:TEXT             poll until TEXT is no longer on screen
   assert:TEXT           single-frame non-mutating check that TEXT is on screen (OCR + UI
                         controls fallback; supports @region and 're:REGEX')
   assertnot:TEXT        single-frame non-mutating check that TEXT is NOT on screen (checks
                         both OCR and UI controls; supports @region and 're:REGEX')
-  tap:TEXT              wait until TEXT is on screen at the same spot twice, tap its
-                        centre, and re-tap once if the screen did not react; text
-                        OCR cannot see falls back to the control with that label.
-                        A Button labelled exactly TEXT beats a longer OCR line that
-                        only contains it; a switch row's label taps the toggle;
-                        Next/Previous prefer the form button over the keyboard bar
+  tap:TEXT              resolve caller-supplied text or accessibility label and tap once;
+                        reports an unconfirmed result if no visible reaction can be verified.
+                        Use an exact label and location when targets are ambiguous.
+                        A live iOS alert button can be selected by its exact label.
   tapif:TEXT            optional tap (~1 s max): tap TEXT (OCR + exact UI control
                         fallback, respects --deny and @region) or return 'skipped'
                         cleanly without failing the flow
@@ -140,12 +61,12 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         @region, checks --deny upfront); generic tapbatch:A,B,C re-resolves live
                         UI controls and --deny between every tap so layout changes never tap
                         stale coordinates; tapbatch:fixed:A,B,C opts into single-snapshot
-                        /wda/fastTapBatch dispatch for known stationary keypads (e.g. Calculator)
+                        /wda/fastTapBatch dispatch for stationary controls explicitly selected by the caller
   toggle:LABEL[=on|off] idempotently set or flip an iOS Switch control (supports @region;
                         =on|off|1|0|true|false skips tap when already in desired state and
                         verifies state after tapping; respects --deny)
   TEXT@below:HEADER     (tap/tapif/tapbatch/toggle/longpress/doubletap/swipe:left|right/wait/waitany/assert/assertnot/scrollto) only match under HEADER,
-  TEXT@above:T TEXT@y>N e.g. tap:Alice@below:Chats skips the stories carousel
+  TEXT@above:HEADER TEXT@y>N match only in the caller-specified screen region
   longpress:TEXT        long-press TEXT (~0.65 s) for context menus/action sheets (supports
                         @region, OCR + UI fallback, respects --deny)
   longpressxy:X,Y[,MS]  long-press points (default 650 ms; optional MS or Ns, e.g. 800 or 0.8s)
@@ -154,7 +75,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   doubletapxy:X,Y       double-tap points via /wda/fastDoubleTap
   zoom:in|out|SCALE[@X,Y] two-finger pinch/zoom via /wda/fastPinch (in=2.0, out=0.5, or
                         positive scale; defaults to screen center)
-  search:QUERY          tap the app's search field/Search button, type QUERY, settle
+  search:QUERY          fill the visible native SearchField with a literal query
+  searchfield:FIELD=VALUE  select an input explicitly (same value syntax as fill:)
   readel:TEXT           labels of controls containing TEXT (accessibility tree)
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
@@ -165,7 +87,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         point; returns the label; no control there is refused with the
                         nearest labels. tapat:X,Y=LABEL presses only the one enabled control
                         labelled exactly LABEL there, read fresh; anything else is refused
-                        with nothing pressed
+                        with nothing pressed; reports an unconfirmed result if no reaction is observed
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys;
                         these are hardware-keyboard key events to whatever has focus
@@ -173,32 +95,40 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         a warning (marks only, nothing is refused)
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
   fill:FIELD=VALUE      type into the input named FIELD (label, identifier or placeholder) only: clear,
-                        focus (tap fallback), probe focus for secrets/long text, type at 200 chars/s,
-                        verify (exact; secrets and secure fields by length). VALUE: text, file:PATH,
-                        env:V or cmd:C; never printed unless env:/file:
+                        focus (tap fallback), probe secrets/long text, retry a focus miss once,
+                        type and verify (secure fields by length). VALUE: text, file:PATH, env:V or cmd:C
   readfield:FIELD       the exact value of the input named FIELD (label, identifier or placeholder),
-                        blank lines included; read-only; a secure field gives only len=N
+                        blank lines included; read-only; secure fields give len=N or len=unavailable
   assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V, cmd:C); read-only;
-                        a secure field is checked by length only (iOS shows only bullets)
+                        secure fields are checked by length. If a non-secret field reports no value,
+                        compare visible text via WDA Vision OCR (host OCR on older runners)
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
   slider:[LABEL=]PCT    set an XCUIElementTypeSlider to 0%-100% or 0.0-1.0 (first slider or
                         matched by label/name; rejects disabled sliders; respects --deny)
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
-  setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
-  dismisskb             tap Done/Ferdig/Hide keyboard on the keyboard toolbar if present
-  banner:dismiss        swipe away a notification banner over the app (only when SpringBoard
-                        is in front and the phone is unlocked; otherwise nothing is sent)
-  alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert
+  setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS may ask permission to paste)
+  banner:dismiss:TEXT   swipe from an exact observed banner line and report visual evidence
+  dismisskb             gesture to dismiss an observed docked keyboard
+  dismisskb:LABEL       tap the unique enabled control with this exact accessibility label
+  dismisskb:tapat:X,Y=LABEL  tap the exact labelled control at the caller's location hint
+                        reports dismissed, kb-visible, no-kb or dismissal-unverified
+  alert:text            read the active iOS alert
+  alert:accept[:LABEL]  request the native action or press the exact live button
+  alert:dismiss[:LABEL] request the native dismissal or press the exact live button
+                        supply LABEL when a caller deny filter is active
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
   scrollto:TEXT         scroll down (max 8x) until TEXT is visible; at the end of the list
                         it turns and searches back up (scrollto:up:TEXT / scrollto:down:TEXT
                         scroll one way only)
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
+  swipe:points:X0,Y0:X1,Y1  swipe between two caller-selected screen points
   swipe:left|right:TEXT horizontal row swipe on TEXT's row (damped 80%->30% / 20%->70% to reveal
                         row actions without triggering full-width destructive delete)
-  back                  iOS edge-swipe back gesture
+  back                  send the iOS edge-swipe gesture
+  back:LABEL            tap the unique enabled control with this exact accessibility label
+  back:tapat:X,Y=LABEL   tap the exact labelled control at the caller's location hint
   read                  OCR text once it holds still + labelled controls with (x, y)
   read:ocr / read:Y0-Y1 OCR only (whole screen / a band)
   read:vision[:fast]    on-device Apple Vision OCR via wda-turbo v6 /wda/fastOCR (accurate
@@ -207,9 +137,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   settle                wait until two frames in a row are identical
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
-taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.
-with the built-in --deny only, a control labelled exactly Send or Send message is allowed while a live check confirms an
-allowlisted app (allowed_apps) is in front; every other label (Send payment, pay, delete, ...) stays refused.
+taps, toggles, sliders, double-taps, and long-presses on text matching --deny or --deny-also are refused
+unless --no-deny is passed. With neither a caller pattern nor a configured deny_also, there is no label filter.
 with allowed_apps in config.json (or TURBOTAP_ALLOWED_APPS / --allow-app), every input step is refused unless
 the live foreground app is on that list; open:/launch: check the target app, url: is refused (iOS picks the receiving app).
 --no-deny never disables this app guard. while a configured stop_file (or TURBOTAP_STOP_FILE) exists,
@@ -220,7 +149,7 @@ flow/unlock/deploy/tap-ocr/otp-type exit 6 before contacting WDA.";
 /// [`flow_needs_ocr`]; pixel-only steps (`shot`, `settle`, `scroll`, `search`) never touch Tesseract.
 pub const IMAGE_STEP_VERBS: &[&str] = &[
     "wait", "expect", "waitany", "gone", "assert", "assertnot", "tap", "tapif", "longpress", "doubletap", "scrollto",
-    "swipe", "back", "read", "readfield", "assertfield",
+    "swipe", "back", "banner", "read", "readfield", "assertfield",
 ];
 pub const STALE_UI_BACKOFF: [f64; 3] = [0.05, 0.08, 0.12];
 /// Text this long (chars) is typed with a landing probe and a read-back (see `type_long`).
@@ -263,6 +192,12 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
     }
 }
 
+fn wda_element_ref(value: &Value) -> Option<&str> {
+    value.get("ELEMENT").or_else(|| value.get("element-6066-11e4-a52e-4f735466cecf"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
 /// True when the step enters a credential: `pintap`/`typedigits`/`cleartype` in any
 /// form, or `type`/`setclip` with an `env:`/`cmd:` value (the documented way to pass
 /// secrets). Its value is scrubbed from all flow output, and if it fails no screen
@@ -271,7 +206,7 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
 pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
     let verb = verb.trim();
-    if verb.eq_ignore_ascii_case("assertfield") || verb.eq_ignore_ascii_case("fill") {
+    if verb.eq_ignore_ascii_case("assertfield") || verb.eq_ignore_ascii_case("fill") || verb.eq_ignore_ascii_case("searchfield") {
         let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
         return value.starts_with("env:") || value.starts_with("cmd:");
     }
@@ -287,10 +222,13 @@ pub fn safe_step(spec: &str) -> String {
         return spec.to_string();
     };
     let trimmed = verb.trim();
-    if trimmed.eq_ignore_ascii_case("assertfield") || trimmed.eq_ignore_ascii_case("fill") {
-        // FIELD=VALUE: the field name is shown; the value only as env:NAME or file:PATH.
+    if trimmed.eq_ignore_ascii_case("assertfield") || trimmed.eq_ignore_ascii_case("fill") || trimmed.eq_ignore_ascii_case("searchfield") {
+        if is_secret_step(spec) {
+            return format!("{}:<redacted>", trimmed.to_ascii_lowercase());
+        }
+        // For non-secret FIELD=VALUE, retain the field name and any file path.
         return match arg.split_once('=') {
-            Some((_, value)) if value.starts_with("env:") || value.starts_with("file:") => spec.to_string(),
+            Some((_, value)) if value.starts_with("file:") => spec.to_string(),
             Some((field, _)) => format!("{verb}:{field}=<redacted>"),
             None => spec.to_string(),
         };
@@ -325,28 +263,6 @@ pub struct CtlCache {
     pub img: Frame,
 }
 
-/// Compiled `--deny` guard. The built-in [`DENY_DEFAULT`] regex is compiled lazily on
-/// first [`Flow::guard`] evaluation and cached process-wide in a `OnceLock` (saving
-/// ~3-4 ms on every `turbotap flow` call and completely skipping compilation on
-/// non-tapping flows like `flow ui`). Custom `--deny` patterns are compiled and
-/// validated eagerly in [`Flow::new`].
-pub enum DenyGuard {
-    Default,
-    Custom(fancy_regex::Regex),
-}
-
-impl DenyGuard {
-    fn regex(&self) -> &fancy_regex::Regex {
-        match self {
-            DenyGuard::Default => {
-                static DEFAULT_RX: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
-                DEFAULT_RX.get_or_init(|| crate::text::compile_icase(DENY_DEFAULT).expect("DENY_DEFAULT regex is valid"))
-            }
-            DenyGuard::Custom(rx) => rx,
-        }
-    }
-}
-
 /// How long `open:`/`launch:` re-reads the front app while another app is still there.
 pub const OPEN_RECEIPT_GRACE: f64 = 1.0;
 
@@ -354,7 +270,7 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub c: WdaClient,
     pub r: R,
     pub timeout: f64,
-    pub deny: Option<DenyGuard>,
+    pub deny: Option<fancy_regex::Regex>,
     /// The caller's own extra deny patterns (`--deny-also`, config `deny_also`):
     /// refused on top of `deny`, never relaxed, and used by the submit guard.
     pub deny_also: Option<fancy_regex::Regex>,
@@ -385,6 +301,9 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub last_tap_small_delta: bool,
     pub last_alert_text: Option<String>,
     pub last_alert_buttons: Option<Vec<String>>,
+    // A waitany alert match must never turn into a tap on an identically labelled
+    // foreground control if the alert closes before the next action.
+    waitany_alert_button: Option<String>,
     pub last_ui_retried_stale: bool,
     /// Secret values this flow typed, tapped or copied (inline, `env:` or `cmd:`);
     /// scrubbed from every string the flow outputs.
@@ -396,30 +315,18 @@ pub struct Flow<R: Reader = ScreenReader> {
 }
 
 impl<R: Reader> Flow<R> {
-    /// Python `Flow(client, reader, timeout=8.0, deny=DENY_DEFAULT, log=None)`.
-    /// `deny` None or "" disables the guard.
+    /// Compile the optional caller pattern and any additional patterns from the client.
     pub fn new(c: WdaClient, r: R, timeout: f64, deny: Option<&str>, log: bool) -> Result<Flow<R>> {
-        let deny_off = deny.map_or(true, |d| d.is_empty());
-        if deny_off && !c.deny_also.is_empty() {
-            crate::errln!(
-                "turbotap: warning: --no-deny: ignoring {} deny_also pattern(s) from --deny-also/config",
-                c.deny_also.len()
-            );
-        }
-        let deny_also = if c.deny_also.is_empty() || deny_off {
+        let deny_also = if c.deny_also.is_empty() {
             None
         } else {
             let joined = c.deny_also.iter().map(|p| format!("(?:{p})")).collect::<Vec<_>>().join("|");
             Some(crate::text::compile_icase(&joined).ok_or_else(|| Error::value(format!("invalid --deny-also regex: {}", json::py_repr_str(&joined))))?)
         };
-        let deny = match deny.filter(|d| !d.is_empty()) {
-            Some(d) if d == DENY_DEFAULT => Some(DenyGuard::Default),
-            Some(d) => Some(DenyGuard::Custom(
-                crate::text::compile_icase(d)
-                    .ok_or_else(|| Error::value(format!("invalid --deny regex: {}", json::py_repr_str(d))))?,
-            )),
-            None => None,
-        };
+        let deny = deny
+            .filter(|d| !d.is_empty())
+            .map(|d| crate::text::compile_icase(d).ok_or_else(|| Error::value(format!("invalid --deny regex: {}", json::py_repr_str(d)))))
+            .transpose()?;
         Ok(Flow {
             c,
             r,
@@ -448,6 +355,7 @@ impl<R: Reader> Flow<R> {
             last_tap_small_delta: false,
             last_alert_text: None,
             last_alert_buttons: None,
+            waitany_alert_button: None,
             last_ui_retried_stale: false,
             secrets: Vec::new(),
             #[cfg(test)]
@@ -488,6 +396,7 @@ impl<R: Reader> Flow<R> {
     }
 
     pub fn mark_action(&mut self, keep_ctl_cache: bool, typing: bool) {
+        self.waitany_alert_button = None;
         self.last_action_ts = clock::now();
         self.last_action_is_typing = typing;
         self.last_reaction_diff = 0.0;
@@ -497,102 +406,24 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// Refuse taps on text matching `--deny`. `text` must be the actual target's text
-    /// (the matched OCR line or control label); see [`Flow::guard_with`].
-    pub fn guard(&mut self, text: &str, action: &str) -> Result<()> {
-        self.guard_with(text, action, true)
+    fn has_deny_patterns(&self) -> bool {
+        self.deny.is_some() || self.deny_also.is_some()
     }
 
-    /// [`Flow::guard`]. With the built-in default only, and only when `may_relax` (the
-    /// caller verified `text` is the target's own label): a label that is exactly a
-    /// [`PLAIN_SEND_LABELS`] entry is allowed while the app guard is on and a live
-    /// `/wda/activeAppInfo` confirms an allowlisted app in front. An explicit
-    /// `--deny`, no allowlist, an unconfirmed foreground app or any other label stays
-    /// refused.
-    pub fn guard_with(&mut self, text: &str, action: &str, may_relax: bool) -> Result<()> {
-        self.guard_relax(text, action, if may_relax { Ok(()) } else { Err(String::new()) })
-    }
-
-    /// [`Flow::guard_with`] where `relax` is `Ok` when the caller verified `text` is
-    /// the target's own label, else `Err(why not)`. A refusal of a Send-like target
-    /// says why the plain-Send exception did not apply (element check, explicit
-    /// `--deny`, foreground check), so the caller can see what to fix.
-    pub fn guard_relax(&mut self, text: &str, action: &str, relax: std::result::Result<(), String>) -> Result<()> {
-        if self.deny.is_none() || text.is_empty() {
-            return Ok(());
-        }
-        // The caller's own additions: refused whatever the built-in exceptions say.
-        if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(text).unwrap_or(true)) {
-            return Err(Error::flow(format!("refusing to {action} {}: matches --deny-also", json::py_repr_str(text))));
-        }
-        let Some(guard) = self.deny.as_ref() else {
-            return Ok(());
-        };
+    /// Refuse actions on target text matching a caller-provided deny pattern.
+    pub fn guard(&self, text: &str, action: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
-        let is_default = matches!(guard, DenyGuard::Default);
-        match guard.regex().is_match(text) {
+        if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(text).unwrap_or(true)) {
+            return Err(Error::flow(format!("refusing to {action} {}: matches --deny-also", json::py_repr_str(text))));
+        }
+        let Some(rx) = &self.deny else {
+            return Ok(());
+        };
+        match rx.is_match(text) {
             Ok(false) => Ok(()),
-            Ok(true) => {
-                let plain = is_plain_send(text);
-                let mut why: Vec<String> = Vec::new();
-                // --allow-label: an exact label, send its only deny word, the target's
-                // own label, the built-in default, and an --allow-app app in front.
-                let flagged = is_default && label_allowed_by_flag(text, &self.c.allow_labels);
-                if flagged && !plain {
-                    if let Err(note) = &relax {
-                        if !note.is_empty() {
-                            why.push(note.clone());
-                        }
-                    } else {
-                        match self.c.allow_label_foreground() {
-                            Ok(b) => {
-                                crate::errln!("turbotap: --allow-label let {} through in {b}", json::py_repr_str(text));
-                                return Ok(());
-                            }
-                            Err(fg) => why.push(format!("--allow-label: {fg}")),
-                        }
-                    }
-                    if why.is_empty() {
-                        why.push("the text is not the target's own label".into());
-                    }
-                    let mut msg = format!("refusing to {action} {}: matches --deny", json::py_repr_str(text));
-                    msg.push_str("; --allow-label not applied: ");
-                    msg.push_str(&why.join("; "));
-                    return Err(Error::flow(msg));
-                }
-                if !is_default {
-                    if plain {
-                        why.push("an explicit --deny is never relaxed".into());
-                    }
-                } else {
-                    match &relax {
-                        Err(note) if !note.is_empty() => why.push(note.clone()),
-                        Err(_) => {}
-                        Ok(()) if !plain => {}
-                        Ok(()) => match self.c.foreground_status() {
-                            Ok(_) => return Ok(()),
-                            Err(fg) => why.push(format!("foreground: {fg}")),
-                        },
-                    }
-                    // Element check failed: still report the foreground result.
-                    if matches!(&relax, Err(n) if !n.is_empty()) {
-                        match self.c.foreground_status() {
-                            Ok(b) => why.push(format!("foreground: {b} confirmed allowlisted")),
-                            Err(fg) => why.push(format!("foreground: {fg}")),
-                        }
-                    }
-                }
-                let mut msg = format!("refusing to {action} {}: matches --deny", json::py_repr_str(text));
-                if !why.is_empty() {
-                    msg.push_str("; plain-Send exception not applied: ");
-                    msg.push_str(&why.join("; "));
-                }
-                Err(Error::flow(msg))
-            }
-            // An evaluation error (e.g. backtrack limit) is an unverified result, not a
-            // non-match: fail closed before any action is dispatched.
+            Ok(true) => Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text)))),
             Err(e) => Err(Error::flow(format!(
                 "refusing to {action} {}: --deny could not be evaluated ({e})",
                 json::py_repr_str(text)
@@ -642,15 +473,7 @@ impl<R: Reader> Flow<R> {
     /// The element with keyboard focus (`GET /element/active`), if WDA names one.
     fn active_element_id(&mut self) -> Option<String> {
         let p = self.c.spath("/element/active");
-        let r = self.c.get(&p);
-        if json::has_err(&r) {
-            return None;
-        }
-        let m = json::get(&r, "value").as_object()?.clone();
-        m.get("ELEMENT")
-            .or_else(|| m.get("element-6066-11e4-a52e-4f735466cecf"))
-            .map(json::py_str)
-            .filter(|s| !s.is_empty())
+        wda_element_ref(&self.c.strict_get_value(&p).ok()?).map(str::to_owned)
     }
 
     /// The value WDA reports for `eid` ("" when it has none).
@@ -770,7 +593,7 @@ impl<R: Reader> Flow<R> {
     fn bound_write(&mut self, eid: &str, text: &str) -> Value {
         let chars: Vec<Value> = text.chars().map(|c| Value::String(c.to_string())).collect();
         let p = self.c.spath(&format!("/element/{eid}/value"));
-        self.c.post(&p, &j!({"text": text, "value": chars}))
+        self.c.req_2xx("POST", &p, Some(&j!({"text": text, "value": chars})), crate::wda::DEFAULT_TIMEOUT, None)
     }
 
     /// Clear `eid` when its value holds the secret or a piece of it (3+ characters),
@@ -870,37 +693,92 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// Before `key:return`/`key:enter` or text with a newline: a newline can submit
-    /// (a keyboard whose return key reads like Send). Only the caller's own extra
-    /// patterns (`--deny-also`, config `deny_also`) refuse the step, with nothing sent;
-    /// an explicit `--deny` match only warns (existing callers did not opt into a new
-    /// refusal). Without caller patterns nothing is read: the default path costs no
-    /// extra request. A keyboard that cannot be read keeps going, with a warning.
+    /// Read the keyboard directly from an unfiltered source snapshot. The
+    /// ordinary UI views intentionally omit soft-keyboard keys.
+    fn live_keyboard_labels(&mut self) -> Result<(Vec<String>, usize)> {
+        fn collect(node: &Value, inside: bool, labels: &mut Vec<String>, unreadable: &mut usize) {
+            let element_type = node.get("type").and_then(Value::as_str).unwrap_or("");
+            let kind = element_type.strip_prefix("XCUIElementType").unwrap_or(element_type);
+            let inside = inside || kind == "Keyboard";
+            if inside {
+                let visible = node.get("isVisible").or_else(|| node.get("visible"));
+                if visible.and_then(ui::parse_wda_bool) == Some(false) {
+                    return;
+                }
+                if matches!(kind, "Button" | "Key") {
+                    let before = labels.len();
+                    for attribute in ["label", "name"] {
+                        if let Some(label) = node.get(attribute).and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                            labels.push(label.to_owned());
+                        }
+                    }
+                    if labels.len() == before {
+                        *unreadable += 1;
+                    }
+                }
+            }
+            if let Some(children) = node.get("children").and_then(Value::as_array) {
+                for child in children {
+                    collect(child, inside, labels, unreadable);
+                }
+            }
+        }
+
+        let path = self.c.spath("/source?format=json");
+        let source = self.c.strict_get_value(&path)
+            .map_err(|_| Error::flow("live accessibility source could not be read"))?;
+        if !source.is_object() {
+            return Err(Error::flow("live accessibility source was invalid"));
+        }
+        let mut labels = Vec::new();
+        let mut unreadable = 0;
+        collect(&source, false, &mut labels, &mut unreadable);
+        if labels.is_empty() && unreadable == 0 {
+            return Err(Error::flow("no live keyboard key labels were available"));
+        }
+        labels.sort_unstable();
+        labels.dedup();
+        Ok((labels, unreadable))
+    }
+
+    /// Before Return, Enter or multiline text, check live labels against the
+    /// caller's patterns. An unavailable observation cannot clear deny_also.
     fn guard_submit(&mut self, what: &str) -> Result<()> {
-        let explicit = matches!(&self.deny, Some(DenyGuard::Custom(_)));
-        if self.deny_also.is_none() && !explicit {
+        if !self.has_deny_patterns() {
             return Ok(());
         }
-        let ctl = match self.controls(false, None, None, false, true) {
-            Ok(ctl) => ctl,
+        let (keys, unreadable) = match self.live_keyboard_labels() {
+            Ok(observation) => observation,
+            Err(e) if self.deny_also.is_some() => {
+                return Err(Error::flow(format!(
+                    "refusing {what}: could not check the live keyboard against --deny-also ({e}); requested Return or newline input was not sent"
+                )));
+            }
             Err(e) => {
-                crate::errln!("turbotap: warning: {what}: could not read the keyboard to check your deny patterns ({e}); continuing");
+                crate::errln!("turbotap: warning: {what}: could not check the live keyboard against --deny ({e})");
                 return Ok(());
             }
         };
-        let keys: Vec<String> = ctl.iter().filter(|c| c.in_keyboard && !c.label.trim().is_empty()).map(|c| c.label.clone()).collect();
-        for k in &keys {
-            if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(k).unwrap_or(true)) {
+        for key in &keys {
+            if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(key).unwrap_or(true)) {
                 return Err(Error::flow(format!(
-                    "refusing {what}: the keyboard key {} matches --deny-also, so a newline may submit; nothing sent",
-                    json::py_repr_str(k)
+                    "refusing {what}: the keyboard key {} matches --deny-also, so a newline may submit; requested Return or newline input was not sent",
+                    json::py_repr_str(key)
                 )));
             }
-            if let Some(DenyGuard::Custom(rx)) = &self.deny {
-                if rx.is_match(k).unwrap_or(false) {
-                    crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(k));
-                }
+            if self.deny.as_ref().is_some_and(|rx| rx.is_match(key).unwrap_or(false)) {
+                crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(key));
             }
+        }
+        if unreadable > 0 {
+            if self.deny_also.is_some() {
+                return Err(Error::flow(format!(
+                    "refusing {what}: {unreadable} live keyboard controls have no readable label or name for --deny-also; requested Return or newline input was not sent"
+                )));
+            }
+            crate::errln!(
+                "turbotap: warning: {what}: {unreadable} live keyboard controls have no readable label or name for --deny"
+            );
         }
         Ok(())
     }
@@ -914,6 +792,44 @@ impl<R: Reader> Flow<R> {
             self.c.ensure_url_allowed(label, Some(arg.trim()))?;
         }
         self.step_inner(spec)
+    }
+
+    fn tap_navigation_target(&mut self, verb: &str, arg: &str) -> Result<String> {
+        let usage = || Error::flow(format!("use {verb}:LABEL or {verb}:tapat:X,Y=LABEL"));
+        let position = match arg.strip_prefix("tapat:") {
+            Some(spec) => {
+                let (x, y, label) = parse_tap_at(spec)?;
+                Some((x, y, label.ok_or_else(usage)?))
+            }
+            None if arg.trim().is_empty() => return Err(usage()),
+            None => None,
+        };
+
+        let keyboard_before = if verb == "dismisskb" {
+            match self.keyboard_visible()? {
+                Some(false) => return Ok("no-kb".into()),
+                observed => observed,
+            }
+        } else {
+            None
+        };
+        let result = match position {
+            Some((x, y, label)) => self.tap_at(x, y, Some(label)).map(|_| ()),
+            None => self.tap_exact_label(arg),
+        };
+        self.invalidate_ctl_cache();
+        result?;
+        if verb == "back" {
+            return Ok("tap-sent".into());
+        }
+
+        clock::sleep(0.3);
+        match self.keyboard_visible() {
+            Ok(Some(false)) if keyboard_before == Some(true) => Ok("dismissed".into()),
+            Ok(Some(true)) => Ok("kb-visible".into()),
+            Ok(_) => Ok("dismissal-unverified".into()),
+            Err(e) => Err(Error::flow(format!("dismisskb sent the tap but could not verify keyboard state: {e}"))),
+        }
     }
 
     fn step_inner(&mut self, spec: &str) -> Result<Option<Value>> {
@@ -983,10 +899,17 @@ impl<R: Reader> Flow<R> {
             "url" => return some(self.open_url(arg)?),
             "wait" | "expect" => return some(self.wait(arg, None, false, None, true)?.text),
             "waitany" => return some(self.wait_any(arg, None)?.text),
+            "waitcontrol" => return Ok(Some(self.wait_control(arg)?.to_value())),
+            "waitchange" => return Ok(Some(self.wait_change(arg)?)),
             "gone" => self.gone(arg, None)?,
             "assert" => return some(self.assert_text(arg)?),
             "assertnot" => return some(self.assert_not_text(arg)?),
-            "tap" => return some(self.tap_text(arg)?.text),
+            "tap" => {
+                if let Some(button) = self.tap_named_alert(arg)? {
+                    return some(button);
+                }
+                return some(self.tap_text(arg)?.into_step_text());
+            }
             "tapif" => return some(self.tap_if(arg, 1.0)?),
             "tapbatch" => return some(self.tap_batch(arg)?),
             "toggle" => return some(self.toggle(arg)?),
@@ -1004,16 +927,8 @@ impl<R: Reader> Flow<R> {
                 self.tap_point(x, y, "", None)?;
             }
             "tapat" => {
-                // tapat:X,Y or tapat:X,Y=LABEL (press only a control labelled exactly LABEL).
-                let (coords, expect) = match arg.split_once('=') {
-                    Some((c, l)) => (c, Some(l)),
-                    None => (arg, None),
-                };
-                let parts: Vec<&str> = coords.split(',').collect();
-                if parts.len() != 2 || expect.is_some_and(|l| l.trim().is_empty()) {
-                    return Err(Error::value(format!("tapat expects X,Y or X,Y=LABEL, got {}", json::py_repr_str(arg))));
-                }
-                return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?, expect)?);
+                let (x, y, label) = parse_tap_at(arg)?;
+                return some(self.tap_at(x, y, label)?);
             }
             "longpress" => return some(self.long_press_text(arg, 0.65)?.text),
             "longpressxy" => {
@@ -1097,6 +1012,9 @@ impl<R: Reader> Flow<R> {
                 if target.is_none() && text.chars().count() >= LONG_TEXT {
                     return some(self.type_long(&text)?);
                 }
+                if is_secret {
+                    crate::redaction::before_input(&[&text])?;
+                }
                 let r = match target.as_deref() {
                     Some(eid) => self.bound_write(eid, &text),
                     None => self.c.fast_keys(&text, None),
@@ -1131,15 +1049,12 @@ impl<R: Reader> Flow<R> {
             "readfield" => return some(self.read_field(arg)?),
             "assertfield" => return some(self.assert_field(arg)?),
             "fill" => return some(self.fill(arg)?),
-            "dismisskb" => return some(self.dismiss_kb()?),
-            "banner" if arg.trim() == "dismiss" => return some(self.dismiss_banner()?),
-            "banner" => return Err(Error::flow("banner: use banner:dismiss")),
+            "dismisskb" if !spec.contains(':') => return some(self.dismiss_keyboard()?),
+            "dismisskb" => return some(self.tap_navigation_target(&verb, arg)?),
             "typedigits" => return some(self.type_digits(arg)?),
             "pintap" => return some(self.pin_tap(arg)?),
             "alert" => {
-                let action = arg.trim().to_lowercase();
-                let action = if action.is_empty() { "accept".to_string() } else { action };
-                if action == "text" {
+                if arg.trim().eq_ignore_ascii_case("text") {
                     let (status, txt) = Self::query_alert_text(&mut self.c, None);
                     return match status {
                         AlertStatus::Present => {
@@ -1153,17 +1068,19 @@ impl<R: Reader> Flow<R> {
                         }
                     };
                 }
-                if action != "accept" && action != "dismiss" {
-                    return Err(Error::flow("alert step must be alert:accept, alert:dismiss, or alert:text"));
-                }
-                self.mark_action(false, false);
-                let p = self.c.spath(&format!("/alert/{action}"));
-                let r = self.c.post(&p, &j!({}));
-                if json::has_err(&r) {
-                    return some("no-alert".into());
-                }
-                clock::sleep(0.5);
-                return some(action);
+                let usage = || Error::flow("alert expects alert:text, alert:accept[:LABEL], or alert:dismiss[:LABEL]");
+                let (action, label) = arg.split_once(':').map_or((arg, None), |(action, label)| (action, Some(label)));
+                let (suffix, receipt) = match action.trim().to_ascii_lowercase().as_str() {
+                    "accept" => ("/alert/accept", "accept-sent"),
+                    "dismiss" => ("/alert/dismiss", "dismiss-sent"),
+                    _ => return Err(usage()),
+                };
+                let result = match label {
+                    Some(label) if label.trim().is_empty() => return Err(usage()),
+                    Some(label) => self.act_on_named_alert(label, suffix, "alert")?,
+                    None => self.act_on_native_alert(suffix, receipt)?,
+                };
+                return some(result.unwrap_or_else(|| "no-alert".into()));
             }
             "scroll" => {
                 let dir = if arg.is_empty() { "down" } else { arg };
@@ -1183,6 +1100,7 @@ impl<R: Reader> Flow<R> {
                 return some(self.scroll_to(&label, where_.as_deref(), 8, &direction)?.text);
             }
             "swipe" => return some(self.swipe_gesture(arg)?),
+            "banner" => return some(self.dismiss_banner(arg)?),
             "picker" => return some(self.set_picker(arg)?),
             "slider" => return some(self.set_slider(arg)?),
             "clipboard" | "copy" => {
@@ -1191,7 +1109,11 @@ impl<R: Reader> Flow<R> {
                 return some(self.clipboard(&ct)?);
             }
             "setclip" => return some(self.set_clipboard(arg, "plaintext")?),
-            "back" => self.back()?,
+            "back" if !spec.contains(':') => {
+                self.back()?;
+                return some("edge-swipe-sent".into());
+            }
+            "back" => return some(self.tap_navigation_target(&verb, arg)?),
             "read" => return self.read_step(arg).map(|n| Some(j!(n))),
             "ui" => {
                 self.last_alert_text = None;
@@ -1223,6 +1145,7 @@ impl<R: Reader> Flow<R> {
                 return some(hits[0].label.clone());
             }
             "search" => return some(self.search(arg)?),
+            "searchfield" => return some(self.search_field(arg)?),
             "settle" => {
                 self.settle(2.0, None, 0.6)?;
             }
@@ -1236,6 +1159,7 @@ impl<R: Reader> Flow<R> {
             }
             "shot" => {
                 let img = self.r.grab(&mut self.c, 0, None, None, None)?;
+                crate::redaction::before_image_export()?;
                 save_frame(&img, arg)?;
             }
             _ => return Err(Error::flow(format!("unknown step {}", json::py_repr_str(spec)))),
@@ -1326,18 +1250,31 @@ impl<R: Reader> Flow<R> {
             (eid, secure)
         };
         let redact = is_secret || secure;
+        // A registry failure must leave the existing field value intact.
+        if redact && !text.is_empty() {
+            crate::redaction::before_input(&[&text])?;
+        }
+        let guard_multiline = self.has_deny_patterns() && text.contains(['\n', '\r']);
+        if guard_multiline {
+            self.focus_cleartype_target(&eid, &text, redact)?;
+            if !self.wait_focus_on(&eid, 1.0) {
+                return Err(Error::flow("cleartype: could not verify keyboard focus; existing value was not cleared"));
+            }
+            self.guard_submit("multi-line cleartype:")?;
+        }
         let p = self.c.spath(&format!("/element/{eid}/clear"));
         let r = self.c.post(&p, &j!({}));
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype clear", red)?;
         clock::sleep(0.15);
-        let p = self.c.spath(&format!("/element/{eid}/click"));
-        let r = self.c.post(&p, &j!({}));
-        let red = redact || crate::wda::echoes_secret(&r, &text);
-        check_wda_ok(r, "cleartype click", red)?;
-        clock::sleep(0.15);
-        if text.contains('\n') {
-            self.guard_submit("multi-line cleartype:")?;
+        self.focus_cleartype_target(&eid, &text, redact)?;
+        if guard_multiline {
+            if !self.wait_focus_on(&eid, 1.0) {
+                return Err(Error::flow("cleartype: field was cleared but keyboard focus could not be verified; replacement text was not sent"));
+            }
+            self.guard_submit("multi-line cleartype:").map_err(|e| {
+                Error::flow(format!("field was already cleared; replacement text was not sent: {e}"))
+            })?;
         }
         // Right before the secret: the target itself must hold keyboard focus.
         if is_secret && !self.wait_focus_on(&eid, 1.0) {
@@ -1384,6 +1321,15 @@ impl<R: Reader> Flow<R> {
         Ok(format!("len={}", text.chars().count()))
     }
 
+    fn focus_cleartype_target(&mut self, eid: &str, text: &str, redact: bool) -> Result<()> {
+        let path = self.c.spath(&format!("/element/{eid}/click"));
+        let response = self.c.post(&path, &j!({}));
+        let redact = redact || crate::wda::echoes_secret(&response, text);
+        check_wda_ok(response, "cleartype click", redact)?;
+        clock::sleep(0.15);
+        Ok(())
+    }
+
     fn type_digits(&mut self, arg: &str) -> Result<String> {
         self.mark_action(false, true);
         let raw = if let Some(var) = arg.strip_prefix("env:") {
@@ -1405,6 +1351,7 @@ impl<R: Reader> Flow<R> {
         let Some(eid) = Self::first_element_id(&els) else {
             return Err(Error::flow("no TextField on screen for typedigits"));
         };
+        crate::redaction::before_input(&[&raw, &digits])?;
         let mut got = 0usize;
         for _attempt in 0..2 {
             let p = self.c.spath(&format!("/element/{eid}/click"));
@@ -1469,6 +1416,7 @@ impl<R: Reader> Flow<R> {
             return Err(Error::flow(format!("pintap found no key rects for {} of the PIN's digits", missing.len())));
         }
         let pts: Vec<(i64, i64)> = digits.chars().map(|d| coords[&d]).collect();
+        crate::redaction::before_input(&[&digits])?;
         let r = self.c.fast_tap_batch(&pts, 0.15, 0.02);
         check_wda_ok(r, "pintap", true)?;
         Ok(format!("tapped {} digits", digits.chars().count()))
@@ -1538,6 +1486,7 @@ impl<R: Reader> Flow<R> {
         let f = |m: String| self.scrub(&m);
         match e {
             Error::Flow(m) => Error::Flow(f(m)),
+            Error::SecretField(_) => e,
             Error::DeadlineExceeded(m) => Error::DeadlineExceeded(f(m)),
             Error::StaleApp(m) => Error::StaleApp(f(m)),
             Error::Runtime(m) => Error::Runtime(f(m)),
@@ -1562,13 +1511,20 @@ impl<R: Reader> Flow<R> {
     }
 
     fn run_outcome_inner(&mut self, steps: &[String], take_reads: bool) -> Result<(bool, Value)> {
+        let is_bounded_wait = |spec: &str| {
+            let verb = spec.split_once(':').map_or(spec, |(verb, _)| verb);
+            let verb = verb.trim();
+            ["waitcontrol", "waitchange", "gone"].iter().any(|wait| verb.eq_ignore_ascii_case(wait))
+        };
         let t0 = clock::real_now();
         let mut done: Vec<Value> = Vec::with_capacity(steps.len());
         for spec in steps {
             let s0 = clock::real_now();
             let secret_step = is_secret_step(spec);
-            if let Some((_, arg)) = spec.split_once(':').filter(|_| secret_step) {
-                if !arg.starts_with("env:") && !arg.starts_with("cmd:") {
+            if let Some((verb, arg)) = spec.split_once(':').filter(|_| secret_step) {
+                if CREDENTIAL_VERBS.iter().any(|v| verb.trim().eq_ignore_ascii_case(v))
+                    && !arg.starts_with("env:") && !arg.starts_with("cmd:")
+                {
                     self.note_secret(arg);
                 }
             }
@@ -1596,9 +1552,9 @@ impl<R: Reader> Flow<R> {
                     }
                     done.push(item);
                 }
-                Err(e) if e.is_flow() && secret_step => {
-                    // A credential step failed: the screen may show what was being
-                    // entered, so no screen diagnostics at all.
+                Err(e) if e.is_flow() && (secret_step || matches!(&e, Error::SecretField(_)) || is_bounded_wait(spec)) => {
+                    // Screen diagnostics could expose credentials or run beyond a
+                    // bounded wait's deadline or STOP check.
                     let mut res = j!({
                         "ok": false,
                         "failed_step": safe_step(spec),
@@ -1609,6 +1565,11 @@ impl<R: Reader> Flow<R> {
                         "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
                     });
                     self.scrub_value(&mut res);
+                    if let Error::SecretField(reason) = e {
+                        res["error"] = j!(reason);
+                        let verb = spec.split_once(':').map_or(spec.as_str(), |(v, _)| v);
+                        res["failed_step"] = j!(format!("{}:<redacted>", verb.trim().to_ascii_lowercase()));
+                    }
                     return Ok((false, res));
                 }
                 Err(e) if e.is_flow() => {
@@ -1617,7 +1578,7 @@ impl<R: Reader> Flow<R> {
                         .read(&mut self.c, ReadOpts::full())
                         .map(|ls| ls.into_iter().take(40).map(|l| l.text).collect())
                         .unwrap_or_default();
-                    let ui: Vec<Control> = match self.controls(false, None, None, false, false) {
+                    let ui: Vec<Control> = match self.controls(false, None, None, false, true) {
                         Ok(ctl) => {
                             let mut v: Vec<Control> =
                                 ctl.into_iter().filter(|c| ui::INTERACTIVE_TYPES.contains(&c.kind.as_str())).collect();
@@ -1636,6 +1597,9 @@ impl<R: Reader> Flow<R> {
                         "ui": ui::controls_to_value(&ui),
                         "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
                     });
+                    if let Some(entry) = res.as_object_mut() {
+                        self.add_alert_meta(entry);
+                    }
                     // Earlier credential steps may still be visible on screen.
                     self.scrub_value(&mut res);
                     return Ok((false, res));
@@ -1646,7 +1610,7 @@ impl<R: Reader> Flow<R> {
         // A flow that ends right after open:/launch: (no read or tap to wait lazily)
         // returns once the app is in front, so the caller's next command does not see
         // the previous app.
-        if self.pending_bundle.is_some() {
+        if self.pending_bundle.is_some() && !steps.last().is_some_and(|spec| is_bounded_wait(spec)) {
             self.wait_active_app(1.5, 0.03, None);
         }
         let reads = if take_reads { std::mem::take(&mut self.reads) } else { self.reads.clone() };
@@ -1686,7 +1650,11 @@ impl<R: Reader> Flow<R> {
             target,
             req_kinds: Some(&self.c.req_kinds),
         };
-        crate::timings::append(&rec.to_value(|t| self.scrub(t)));
+        let secret_error = match err {
+            Some(Error::SecretField(reason)) => Some(*reason),
+            _ => None,
+        };
+        crate::timings::append_step(&rec, |t| self.scrub(t), secret_error);
     }
 }
 
@@ -1699,6 +1667,17 @@ impl<R: Reader> Drop for Flow<R> {
 /// Python `float(s)` (accepts surrounding whitespace, `inf`, `nan`).
 pub fn py_float(s: &str) -> Result<f64> {
     s.trim().parse::<f64>().map_err(|_| Error::value(format!("could not convert string to float: {}", json::py_repr_str(s))))
+}
+
+fn parse_tap_at(arg: &str) -> Result<(i64, i64, Option<&str>)> {
+    let invalid = || Error::value(format!("tapat expects X,Y or X,Y=LABEL, got {}", json::py_repr_str(arg)));
+    let (coords, label) = match arg.split_once('=') {
+        Some((coords, label)) if !label.trim().is_empty() => (coords, Some(label)),
+        Some(_) => return Err(invalid()),
+        None => (arg, None),
+    };
+    let (x, y) = coords.split_once(',').filter(|(_, y)| !y.contains(',')).ok_or_else(invalid)?;
+    Ok((parse_coord(x)?, parse_coord(y)?, label))
 }
 
 /// `int(float(v))`.
@@ -1731,15 +1710,16 @@ pub fn cmd_tap_ocr(client: WdaClient, text: &str) -> Result<()> {
         client.ensure_session(None, true)?;
         ScreenReader::default_reader()
     };
-    let mut flow = Flow::new(client, reader, 8.0, Some(DENY_DEFAULT), false)?;
+    let mut flow = Flow::new(client, reader, 8.0, None, false)?;
     flow.c.guard_action = Some("tap-ocr".into());
     flow.c.ensure_allowed_app("tap-ocr", None)?;
     let t0 = clock::real_now();
-    let m = flow.tap_text(text);
-    let m: Match = flow.c.guard_result(m)?;
+    let outcome = flow.tap_text(text);
+    let outcome = flow.c.guard_result(outcome)?;
+    let m = outcome.target;
     crate::outln!(
         "{}",
-        json::dumps(&j!({"ok": true, "matched": m.text, "x": m.x, "y": m.y, "ms": ((clock::real_now() - t0) * 1000.0).round() as i64}))
+        json::dumps(&j!({"ok": true, "matched": m.text, "x": m.x, "y": m.y, "reaction_observed": outcome.reaction_observed, "ms": ((clock::real_now() - t0) * 1000.0).round() as i64}))
     );
     flow.close();
     Ok(())
@@ -1758,7 +1738,7 @@ pub fn flow_needs_ocr(steps: &[String]) -> bool {
             return !engine.eq_ignore_ascii_case("vision");
         }
         if v.eq_ignore_ascii_case("swipe") {
-            return arg.split_once(':').is_some_and(|(_, target)| !target.trim().is_empty());
+            return arg.split_once(':').is_some_and(|(kind, target)| !kind.trim().eq_ignore_ascii_case("points") && !target.trim().is_empty());
         }
         IMAGE_STEP_VERBS.iter().any(|iv| iv.eq_ignore_ascii_case(v))
     })
@@ -1789,7 +1769,6 @@ pub fn cmd_flow(client: WdaClient, steps: &[String], timeout: f64, scale: f64, d
 #[cfg(test)]
 mod unit {
     use super::*;
-    use crate::testutil::FakeReader;
 
     #[test]
     fn flow_needs_ocr_skips_vision_shot_settle_scroll_and_directional_swipe() {
@@ -1806,7 +1785,7 @@ mod unit {
             "swipe:right",
             "swipe:up",
             "swipe:down",
-            "search:coffee",
+            "search:Lookup=coffee",
             "ui",
             "url:https://example.com",
             "open:Spotify",
@@ -1832,17 +1811,5 @@ mod unit {
         ] {
             assert!(flow_needs_ocr(&[needs_ocr.to_string()]), "{needs_ocr} must pre-warm Tesseract");
         }
-    }
-
-    #[test]
-    fn deny_default_is_lazy_and_cached_while_custom_invalid_regex_errors_eagerly() {
-        let c = WdaClient::new("http://127.0.0.1:9", "", None);
-        let mut flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
-        assert!(flow.guard("Delete Account", "tap").is_err());
-        assert!(flow.guard("Settings", "tap").is_ok());
-
-        let c2 = WdaClient::new("http://127.0.0.1:9", "", None);
-        let err = Flow::new(c2, FakeReader::new(vec![]), 1.0, Some("[unclosed"), false).err().unwrap();
-        assert!(err.to_string().contains("invalid --deny regex"), "{err}");
     }
 }

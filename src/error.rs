@@ -10,6 +10,8 @@ use std::fmt;
 pub enum Error {
     /// Python `FlowError`.
     Flow(String),
+    /// Fixed client diagnostic with no caller, credential or runner text.
+    SecretField(&'static str),
     /// Python `_DeadlineExceeded(FlowError)`.
     DeadlineExceeded(String),
     /// Python `_StaleAppError(FlowError)`.
@@ -48,7 +50,7 @@ impl Error {
     }
     /// True for `FlowError` and its subclasses (what `Flow::run` catches).
     pub fn is_flow(&self) -> bool {
-        matches!(self, Error::Flow(_) | Error::DeadlineExceeded(_) | Error::StaleApp(_))
+        matches!(self, Error::Flow(_) | Error::SecretField(_) | Error::DeadlineExceeded(_) | Error::StaleApp(_))
     }
     /// True for Python `RuntimeError` and subclasses (incl. `VisionUnsupported`).
     pub fn is_runtime(&self) -> bool {
@@ -62,6 +64,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::SecretField(m) => f.write_str(m),
             Error::Flow(m)
             | Error::DeadlineExceeded(m)
             | Error::StaleApp(m)

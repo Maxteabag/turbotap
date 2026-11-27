@@ -775,14 +775,14 @@ pub struct WdaClient {
     pub allowed_apps: Vec<String>,
     /// Bundles given with `--allow-app` in this run (a subset of `allowed_apps`).
     pub run_allowed_apps: Vec<String>,
-    /// Exact labels given with `--allow-label` in this run.
-    pub allow_labels: Vec<String>,
     /// Custom URL schemes given with `--allow-url-scheme` in this run (lowercased).
     pub allow_url_schemes: Vec<String>,
     /// First app guard refusal in this invocation (sticky: later input is refused).
     pub guard_refusal: Option<String>,
     /// Label of the action in progress, used in guard refusals (a flow step, a command).
     pub guard_action: Option<String>,
+    /// Exact foreground required for the current input request, if any.
+    required_input_foreground: Option<&'static str>,
     /// Set while `unlock_phone` runs: SpringBoard may receive the passcode taps.
     guard_unlock_scope: bool,
     /// Set when the guard policy could not be read (invalid, unreadable or unstable
@@ -840,10 +840,10 @@ impl WdaClient {
             cache_dir: crate::config::cache_dir(),
             allowed_apps: Vec::new(),
             run_allowed_apps: Vec::new(),
-            allow_labels: Vec::new(),
             allow_url_schemes: Vec::new(),
             guard_refusal: None,
             guard_action: None,
+            required_input_foreground: None,
             guard_unlock_scope: false,
             guard_policy_error: None,
             pinned_addrs: None,
@@ -862,10 +862,9 @@ impl WdaClient {
         self.allowed_apps = apps;
     }
 
-    /// The `--allow-app` bundles and `--allow-label` labels given for this run.
-    pub fn set_run_allow(&mut self, apps: Vec<String>, labels: Vec<String>) {
+    /// The `--allow-app` bundles given for this run.
+    pub fn set_run_allow(&mut self, apps: Vec<String>) {
         self.run_allowed_apps = apps.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
-        self.allow_labels = labels;
     }
 
     /// The `--allow-url-scheme` schemes given for this run (lowercased; system schemes
@@ -914,15 +913,7 @@ impl WdaClient {
         }
     }
 
-    /// For `--allow-label`: `Ok(bundle)` when the app guard is on and a live
-    /// `/wda/activeAppInfo` names an app given with `--allow-app` in this run (not
-    /// only one from config), else `Err(why not)`.
-    pub fn allow_label_foreground(&mut self) -> std::result::Result<String, String> {
-        self.run_allow_foreground("--allow-label")
-    }
-
-    /// [`WdaClient::allow_label_foreground`] for any per-run flag that needs an
-    /// `--allow-app` app confirmed in front; `flag` names it in the reason.
+    /// Confirm a live foreground app given with --allow-app in this run.
     pub fn run_allow_foreground(&mut self, flag: &str) -> std::result::Result<String, String> {
         if self.run_allowed_apps.is_empty() {
             return Err(format!("{flag} works only together with --allow-app"));
@@ -1067,6 +1058,18 @@ impl WdaClient {
             return Ok(false);
         }
         let mut first = self.live_foreground_app(deadline);
+        if let Some(expected) = self.required_input_foreground {
+            return match first {
+                _ if expired(deadline) => Ok(false),
+                Ok(actual) if actual != expected => Err(Error::flow(format!(
+                    "foreground changed before input: expected {expected}, found {actual}; input was not sent"
+                ))),
+                Ok(actual) if !self.app_guard_active()
+                    || self.allowed_apps.iter().any(|bundle| bundle == &actual) => Ok(true),
+                Ok(actual) => Err(self.guard_refuse(crate::guard::refuse_foreground(action, &actual, &self.allowed_apps))),
+                Err(why) => Err(Error::flow(format!("could not verify foreground before input: {why}; input was not sent"))),
+            };
+        }
         // A notification banner makes SpringBoard active for a moment. Re-check (live,
         // nothing is sent meanwhile) for up to BANNER_RECHECK before refusing; every
         // wait is printed with what was in front, so a real takeover still shows.
@@ -1157,19 +1160,21 @@ impl WdaClient {
         crate::stop::check(&self.stop_paths).inspect_err(|_| crate::stop::mark_stopped())
     }
 
-    fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
-        // The user's brake first, with or without an app guard: a stop file created
-        // while a command runs stops it before its next input, not only at its start.
-        if !crate::guard::is_safe_method(method) && !self.stop_paths.is_empty() {
-            let kind = crate::guard::classify(path, body);
-            if !matches!(kind, crate::guard::RequestKind::ReadOnly) {
-                if let Err(r) = self.stop_check() {
-                    let what = self.guard_action.clone().unwrap_or_else(|| format!("{method} {}", path.split('?').next().unwrap_or(path)));
-                    return Err(format!("{r}; stopped before {what}"));
-                }
-            }
+    fn check_request_stop(&self, method: &str, path: &str, body: Option<&[u8]>) -> std::result::Result<(), String> {
+        if self.stop_paths.is_empty() || crate::guard::is_safe_method(method)
+            || matches!(crate::guard::classify(path, body), crate::guard::RequestKind::ReadOnly)
+        {
+            return Ok(());
         }
-        if !self.app_guard_active() || crate::guard::is_safe_method(method) {
+        self.stop_check().map_err(|reason| {
+            let what = self.guard_action.clone().unwrap_or_else(|| format!("{method} {}", path.split('?').next().unwrap_or(path)));
+            format!("{reason}; stopped before {what}")
+        })
+    }
+
+    fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
+        self.check_request_stop(method, path, body)?;
+        if (self.required_input_foreground.is_none() && !self.app_guard_active()) || crate::guard::is_safe_method(method) {
             return Ok(true);
         }
         use crate::guard::RequestKind;
@@ -1188,7 +1193,13 @@ impl WdaClient {
             }
             // A caller deadline that ends before the foreground check answers means
             // "nothing sent, deadline exceeded" (e.g. tapif: skips cleanly).
-            _ => return self.check_foreground(&label, deadline).map_err(|e| e.to_string()),
+            _ => {
+                let checked = self.check_foreground(&label, deadline);
+                if !matches!(&checked, Ok(true)) {
+                    self.check_request_stop(method, path, body)?;
+                }
+                return checked.map_err(|e| e.to_string());
+            }
         };
         r.map(|_| true).map_err(|e| e.to_string())
     }
@@ -1211,7 +1222,6 @@ impl WdaClient {
         side.cache_dir = self.cache_dir.clone();
         side.allowed_apps = self.allowed_apps.clone();
         side.run_allowed_apps = self.run_allowed_apps.clone();
-        side.allow_labels = self.allow_labels.clone();
         side.allow_url_schemes = self.allow_url_schemes.clone();
         side.guard_policy_error = self.guard_policy_error.clone();
         side.pinned_addrs = self.pinned_addrs.clone();
@@ -1421,14 +1431,18 @@ impl WdaClient {
             if let Some(d) = deadline {
                 let rem = d - clock::now();
                 if rem <= 0.0 {
+                    self.check_request_stop(method, path, body)?;
                     return Ok(None);
                 }
                 eff_timeout = timeout.min(rem).max(0.05);
             }
             let mut sent = false;
             let t_req = std::time::Instant::now();
+            let connection = self.ensure_conn(eff_timeout);
+            // The foreground lookup and connection setup can both finish after STOP.
+            self.check_request_stop(method, path, body)?;
             let res: std::io::Result<(u16, Option<T>, Option<String>)> = (|| {
-                self.ensure_conn(eff_timeout)?;
+                connection?;
                 #[cfg(test)]
                 if self.test_fail_post_presend > 0 && method.eq_ignore_ascii_case("POST") {
                     self.test_fail_post_presend -= 1;
@@ -1499,14 +1513,17 @@ impl WdaClient {
             if let Some(d) = deadline {
                 let rem = d - clock::now();
                 if rem <= 0.0 {
+                    self.check_request_stop(method, path, body)?;
                     return Ok(None);
                 }
                 eff_timeout = timeout.min(rem).max(0.05);
             }
             let mut sent = false;
             let t_req = std::time::Instant::now();
+            let connection = self.ensure_conn(eff_timeout);
+            self.check_request_stop(method, path, body)?;
             let res: std::io::Result<(HttpResponse, Option<T>)> = (|| {
-                self.ensure_conn(eff_timeout)?;
+                connection?;
                 #[cfg(test)]
                 if self.test_fail_post_presend > 0 && method.eq_ignore_ascii_case("POST") {
                     self.test_fail_post_presend -= 1;
@@ -1559,6 +1576,22 @@ impl WdaClient {
     /// errors give `{"error": "<message>"}`; an expired deadline gives
     /// [`json::deadline_value`].
     pub fn req(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>) -> Value {
+        self.req_json(method, path, data, timeout, deadline, false)
+    }
+
+    /// Like `req`, but a redirect or other non-2xx response is never success.
+    pub(crate) fn req_2xx(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>) -> Value {
+        self.req_json(method, path, data, timeout, deadline, true)
+    }
+
+    pub(crate) fn post_in_foreground(&mut self, path: &str, body: &Value, foreground: &'static str, deadline: f64) -> Value {
+        let previous = self.required_input_foreground.replace(foreground);
+        let result = self.req_2xx("POST", path, Some(body), DEFAULT_TIMEOUT, Some(deadline));
+        self.required_input_foreground = previous;
+        result
+    }
+
+    fn req_json(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>, require_2xx: bool) -> Value {
         let body = data.map(|d| serde_json::to_vec(d).unwrap_or_default());
         let headers: &[(&str, &str)] = if data.is_some() { &[("Content-Type", "application/json")] } else { &[] };
         match self.exchange_borrowed(method, path, body.as_deref(), headers, timeout, deadline, true, |b| {
@@ -1566,7 +1599,7 @@ impl WdaClient {
         }) {
             Ok(None) => json::deadline_value(),
             Ok(Some((status, parsed, err_body))) => {
-                if status >= 400 {
+                if status >= 400 || (require_2xx && !(200..300).contains(&status)) {
                     j!({"error": status, "body": err_body.unwrap_or_default()})
                 } else {
                     parsed.unwrap_or(Value::Null)
@@ -2903,7 +2936,7 @@ impl WdaClient {
     }
 
     /// L676-701. `/wda/fastKeys` (wda-turbo v3+), stock `/wda/keys` only on a
-    /// definitive 404 (never replays an accepted request).
+    /// 404 identifying a missing route. Other failures may follow a partial write.
     pub fn fast_keys(&mut self, text: &str, frequency: Option<i64>) -> Value {
         self.fast_keys_timeout(text, frequency, DEFAULT_TIMEOUT)
     }
@@ -2920,7 +2953,7 @@ impl WdaClient {
             if let Some(f) = freq {
                 body["frequency"] = j!(f);
             }
-            let r = self.req("POST", "/wda/fastKeys", Some(&body), timeout, None);
+            let r = self.req_2xx("POST", "/wda/fastKeys", Some(&body), timeout, None);
             if !r.is_object() {
                 return json::error_value("invalid response from /wda/fastKeys");
             }
@@ -2928,7 +2961,7 @@ impl WdaClient {
                 self.fast_keys = Some(true);
                 return r;
             }
-            if !json::err_is(&r, 404) {
+            if !fast_mutation_route_missing(&r) {
                 return r;
             }
             self.fast_keys = Some(false);
@@ -2939,7 +2972,7 @@ impl WdaClient {
             legacy["frequency"] = j!(f);
         }
         let path = self.spath("/wda/keys");
-        self.req("POST", &path, Some(&legacy), timeout, None)
+        self.req_2xx("POST", &path, Some(&legacy), timeout, None)
     }
 
     /// L703-741. `/wda/fastLaunch` (wda-turbo v5); on 404 optional terminate +
@@ -3313,6 +3346,19 @@ pub fn echoes_secret(res: &Value, secret: &str) -> bool {
     text.contains(secret) || text.contains(&base64::engine::general_purpose::STANDARD.encode(secret.as_bytes()))
 }
 
+pub(crate) fn fast_mutation_route_missing(response: &Value) -> bool {
+    if !json::err_is(response, 404) {
+        return false;
+    }
+    let body = json::get(response, "body").as_str().unwrap_or_default().trim();
+    if matches!(body, "unknown route" | "unknown command") {
+        return true;
+    }
+    serde_json::from_str::<Value>(body).ok().is_some_and(|body| {
+        json::get(json::get(&body, "value"), "error").as_str() == Some("unknown command")
+    })
+}
+
 pub const UNSUPPORTED_ROUTE_STATUS: [i64; 3] = [404, 405, 501];
 pub const UNSUPPORTED_ROUTE_ERRORS: [&str; 3] = ["unknown command", "unknown method", "unsupported operation"];
 
@@ -3491,7 +3537,7 @@ pub fn readiness(locked: &Value, app: &Value, w: &Value, capture: &str) -> (bool
     if app.as_str().is_some_and(|a| a.starts_with("local.pid.")) {
         not_ready.push(j!({
             "why": "WDA has no UI-testing access (XCTest error 41: front app reads as local.pid.0)",
-            "recover": "turbotap deploy --no-build once while the phone is unlocked and not in use (it restarts the runner and retries once); if it stays: on the phone, Settings > Developer > Enable UI Automation off and on"
+            "recover": "turbotap deploy --no-build once while the phone is unlocked and not in use (it restarts the runner and retries once); if it stays, verify UI testing authorization in the device developer settings"
         }));
     }
     if capture != "ok" && locked.as_bool() != Some(true) {

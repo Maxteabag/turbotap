@@ -1,6 +1,6 @@
 //! Regressions for the PR #10 review: no secret echo in flow output, fail-closed
 //! `--deny` evaluation (the daemon recovery test lives in `test_daemon.rs`).
-use crate::flow::{safe_step, Flow, DENY_DEFAULT};
+use crate::flow::{safe_step, Flow};
 use crate::json;
 use crate::testutil::capture::Capture;
 use crate::testutil::{isolated_cache, make_line, set_env, solid_img, FakeReader, MockState, MockWda};
@@ -24,7 +24,7 @@ fn keypad_xml(digits: &str) -> String {
 fn run_flow(mock: &MockWda, steps: &[&str]) -> (serde_json::Value, String, String) {
     let cap = Capture::start();
     let r = FakeReader::new(vec![(solid_img(240, (430, 932)), vec![make_line("Enter PIN", 100.0, 200.0, 300.0, 220.0)])]);
-    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), true).unwrap();
+    let mut flow = Flow::new(mock.client(), r, 1.0, None, true).unwrap();
     let steps: Vec<String> = steps.iter().map(|s| s.to_string()).collect();
     let res = flow.run(&steps).unwrap();
     flow.close();
@@ -125,7 +125,7 @@ fn test_credential_helper_spawn_and_exit_failures_never_name_the_helper() {
     let mock = MockWda::start(MockState { source_xml: keypad_xml(PIN), ..Default::default() });
     let cap = Capture::start();
     let r = FakeReader::new(vec![]);
-    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), true).unwrap();
+    let mut flow = Flow::new(mock.client(), r, 1.0, None, true).unwrap();
     let e = flow.run(&[format!("pintap:cmd:{}", missing.display())]).unwrap_err();
     flow.close();
     for text in [e.to_string(), cap.stdout(), cap.stderr()] {
@@ -154,7 +154,7 @@ fn test_failed_credential_step_prints_no_screen_diagnostics() {
     let _cache = isolated_cache();
     let (mock, r) = pin_on_screen();
     let cap = Capture::start();
-    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), true).unwrap();
+    let mut flow = Flow::new(mock.client(), r, 1.0, None, true).unwrap();
     // Keys for 4 and 7 only: pintap fails while the PIN is visible in OCR and the UI tree.
     let res = flow.run(&["pintap:4729".to_string()]).unwrap();
     flow.close();
@@ -169,7 +169,7 @@ fn test_later_failure_and_reads_scrub_an_earlier_credential() {
     let (mock, r) = pin_on_screen();
     mock.state().source_xml = keypad_xml(PIN);
     let cap = Capture::start();
-    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), true).unwrap();
+    let mut flow = Flow::new(mock.client(), r, 1.0, None, true).unwrap();
     // pintap succeeds, read sees the PIN on screen, then an unrelated tap fails.
     let steps: Vec<String> = ["pintap:4729", "read", "tap:Nowhere"].iter().map(|s| s.to_string()).collect();
     let res = flow.run(&steps).unwrap();
@@ -189,7 +189,7 @@ fn test_plain_type_text_stays_readable() {
     let mock = MockWda::start(MockState::default());
     let img = solid_img(240, (430, 932));
     let r = FakeReader::new(vec![(img, vec![make_line("Angry Birds", 100.0, 290.0, 330.0, 310.0)])]);
-    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(mock.client(), r, 1.0, None, false).unwrap();
     let res = flow.run(&["type:Angry Birds".to_string(), "read:ocr".to_string()]).unwrap();
     flow.close();
     assert_eq!(res["steps"][0]["step"], json!("type:<redacted>"));

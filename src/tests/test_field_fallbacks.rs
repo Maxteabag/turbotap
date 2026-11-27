@@ -49,10 +49,92 @@ fn hash_n_picks_inputs_in_reading_order_and_ocr_reads_an_empty_value() {
 fn assertfield_compares_ocr_text_without_caring_about_line_breaks() {
     let _c = isolated_cache();
     let m = MockWda::start(composer());
+    m.set_custom_handler(|_, method, path, _| {
+        (method == "POST" && path == "/wda/fastOCR")
+            .then(|| json!({"error": 404, "body": "unknown command"}))
+    });
     let mut f = flow(&m);
     let ok = f.step(&format!("assertfield:#1={TITLE}")).unwrap().unwrap();
-    assert!(ok.as_str().unwrap().contains("read by OCR"), "{ok}");
+    assert!(ok.as_str().unwrap().contains("read by OCR (host)"), "{ok}");
     let e = f.step("assertfield:#1=A different title").unwrap_err().to_string();
-    assert!(e.contains("read by OCR") && e.contains("first difference"), "{e}");
+    assert!(e.contains("read by OCR (host)") && e.contains("first difference"), "{e}");
     f.close();
+}
+
+#[test]
+fn assertfield_prefers_vision_and_rejects_a_single_glyph_mismatch() {
+    let _c = isolated_cache();
+    let mock = MockWda::start(composer());
+    mock.set_custom_handler(|_, method, path, _| {
+        (method == "POST" && path == "/wda/fastOCR").then(|| json!({"value": {
+            "mode": "accurate",
+            "image": {"capture": "cgimage", "scale": 0.5, "sourcePixels": [860, 1800], "inputPixels": [430, 900]},
+            "lines": [
+                {"text": "AI title", "x": 0.1, "y": 0.18, "width": 0.3, "height": 0.02, "confidence": 1.0},
+                {"text": "Outside the field", "x": 0.1, "y": 0.05, "width": 0.3, "height": 0.02, "confidence": 1.0}
+            ]
+        }}))
+    });
+    // Give the host OCR a conflicting answer. A Vision mismatch must not
+    // fall through to a successful match on the host.
+    let host = vec![make_line("Al title", 20.0, 160.0, 200.0, 180.0)];
+    let reader = FakeReader::with(vec![(solid_img(255, (120, 240)), host)], (430, 900), 2.0);
+    let mut f = Flow::new(mock.client(), reader, 0.5, None, false).unwrap();
+    let ok = f.step("assertfield:#1=AI title").unwrap().unwrap();
+    assert!(ok.as_str().unwrap().contains("OCR (WDA Vision)"), "{ok}");
+    let ambiguous = f.step("assertfield:#1=Al title").unwrap_err().to_string();
+    assert!(ambiguous.contains("unverified by OCR (WDA Vision)") && ambiguous.contains("at char 1 (I vs l)"), "{ambiguous}");
+    let mismatch = f.step("assertfield:#1=AC title").unwrap_err().to_string();
+    assert!(mismatch.contains("OCR (WDA Vision)") && mismatch.contains("first difference at char 1"), "{mismatch}");
+}
+
+#[test]
+fn exact_field_read_uses_full_tree_editor_before_ocr() {
+    let _c = isolated_cache();
+    const NAME: &str = "example.editor.heading";
+    const VALUE: &str = "AI title\n\nwith blank lines";
+    let pred = format!("{INPUT_TYPES_PRED} AND (label ==[c] '{NAME}' OR name ==[c] '{NAME}' OR placeholderValue ==[c] '{NAME}')");
+    let mut st = composer();
+    st.elements_map.insert(ekey(&["predicate string", &pred]), vec![json!({"ELEMENT": "t1"})]);
+    st.element_names.insert("t1".into(), json!(NAME));
+    let wrapper = json!({"type":"TextView", "name":NAME, "isVisible":"1", "isAccessible":"0",
+        "rect":{"x":16,"y":150,"width":398,"height":114}});
+    let editor = json!({"type":"TextView", "name":"Heading", "label":"Heading", "isVisible":"1",
+        "isAccessible":"1", "value":VALUE, "rect":{"x":16,"y":150,"width":398,"height":110}});
+    st.element_rects.insert("t1".into(), wrapper["rect"].clone());
+    let nested = |children| {
+        let mut anchor = wrapper.clone();
+        anchor["children"] = children;
+        json!({"type":"Application","children":[anchor]})
+    };
+    st.source_tree = Dyn::one(nested(json!([{"type":"Other","children":[editor]}])));
+    let mock = MockWda::start(st);
+    let mut f = flow(&mock);
+
+    let value = f.step(&format!("readfield:{NAME}")).unwrap().unwrap();
+    assert_eq!(value, json!(VALUE));
+    let assert_step = format!("assertfield:{NAME}={VALUE}");
+    assert!(f.step(&assert_step).is_ok());
+    assert!(mock.paths().iter().any(|p| p.ends_with("/source?format=json")));
+    assert!(!mock.paths().iter().any(|p| p.contains("fastOCR")));
+
+    // A nearby sibling and two nested candidates are both insufficient.
+    mock.state().source_tree = Dyn::one(json!({"type":"Application","children":[wrapper,editor]}));
+    assert!(f.step(&assert_step).is_err());
+    mock.state().source_tree = Dyn::one(nested(json!([editor,editor])));
+    assert!(f.step(&assert_step).is_err());
+    let mut taller_editor = editor.clone();
+    taller_editor["rect"]["height"] = json!(118);
+    mock.state().source_tree = Dyn::one(nested(json!([taller_editor])));
+    assert!(f.step(&assert_step).is_err());
+
+    // A matching snapshot after a foreground switch is stale for this lookup.
+    mock.state().source_tree = Dyn::one(nested(json!([editor])));
+    mock.set_custom_handler(|st, method, path, _| {
+        if method == "POST" && path.ends_with("/elements") {
+            st.active_app = Seq::one(json!("com.example.other"));
+        }
+        None
+    });
+    assert!(f.step(&assert_step).is_err());
 }

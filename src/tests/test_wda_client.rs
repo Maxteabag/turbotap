@@ -357,7 +357,13 @@ fn test_fast_keys_turbo_fallback_and_frequency_override() {
     }
 
     // 404 on /wda/fastKeys remembers fast_keys=false and falls back to /session/{sid}/wda/keys.
-    let (m404, mut c404) = mk(MockState { fast_keys_404: true, ..Default::default() });
+    let (m404, mut c404) = mk(MockState::default());
+    m404.set_custom_handler(|_, _, path, _| {
+        (path == "/wda/fastKeys").then(|| {
+            let body = json!({"value": {"error": "unknown command", "message": "Unhandled endpoint: /wda/fastKeys", "traceback": ""}});
+            json!({"error": 404, "body": body.to_string()})
+        })
+    });
     c404.fast_keys("abc", Some(200));
     assert_eq!(c404.fast_keys, Some(false));
     assert_eq!(

@@ -9,8 +9,7 @@ use crate::ocr::{ReadOpts, Reader};
 use crate::text::{casefold, clean_text, controls_in_region, find_text, split_where, Line, Match, DEFAULT_FUZZY};
 use crate::ui::{self, exact_control, find_control, find_control_match, parse_switch_state, Control};
 use crate::wda::check_wda_ok;
-use serde_json::{json as j, Map, Value};
-use std::collections::HashSet;
+use serde_json::{json as j, Value};
 
 /// `el_obj.get("ELEMENT") or next(iter(el_obj.values()), None)` for a WDA element
 /// reference dict; None for non-dicts, empty dicts and falsy ids.
@@ -33,29 +32,6 @@ fn value_list(r: &Value) -> Vec<Value> {
     }
 }
 
-/// A numeric rect field (`rc.get(key, 0)`); missing or non-numeric counts as 0.
-fn num(v: &Value, key: &str) -> f64 {
-    json::get(v, key).as_f64().unwrap_or(0.0)
-}
-
-/// Python `_parse_wda_bool` (set_slider): bool, 0/1 numbers, and yes/no strings.
-fn parse_wda_bool(val: &Value) -> Option<bool> {
-    match val {
-        Value::Bool(b) => Some(*b),
-        Value::Number(n) => match n.as_f64() {
-            Some(f) if f == 0.0 => Some(false),
-            Some(f) if f == 1.0 => Some(true),
-            _ => None,
-        },
-        Value::String(s) => match casefold(s.trim()).as_str() {
-            "1" | "true" | "yes" => Some(true),
-            "0" | "false" | "no" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 fn on_off(b: bool) -> &'static str {
     if b {
         "on"
@@ -73,9 +49,6 @@ fn runtime_to_flow(e: Error) -> Error {
     }
 }
 
-/// One stock-WDA keyboard dismiss candidate `(priority, cy, cx, eid)`.
-type DismissCand = (i64, i64, i64, String);
-
 impl<R: Reader> Flow<R> {
     /// `self._fresh_lines() or self.lines()` (an empty fresh read also falls back).
     fn act_fresh_lines(&mut self) -> Result<Vec<Line>> {
@@ -91,47 +64,94 @@ impl<R: Reader> Flow<R> {
 
     /// L3920. Defaults: duration 0.12, release 0.02.
     pub fn drag(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, duration: f64, release: f64) -> Result<()> {
+        self.send_drag((x0, y0), (x1, y1), duration, release, None)
+    }
+
+    fn send_drag(
+        &mut self, (x0, y0): (i64, i64), (x1, y1): (i64, i64), duration: f64, release: f64,
+        observed: Option<(&'static str, f64)>,
+    ) -> Result<()> {
         self.mark_action(false, false);
+        let post = |client: &mut crate::wda::WdaClient, path, data: &Value| match observed {
+            Some((foreground, deadline)) => client.post_in_foreground(path, data, foreground, deadline),
+            None => client.req_2xx("POST", path, Some(data), crate::wda::DEFAULT_TIMEOUT, None),
+        };
         let body = j!({"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration, "release": release});
-        if self.c.turbo != Some(false) {
-            let r = self.c.post("/wda/fastDrag", &body);
-            if r.is_object() && !json::has_err(&r) {
-                return Ok(());
+        let acknowledge = |response: &Value| {
+            if let Some(reason) = response.get("error").and_then(Value::as_str) {
+                return Err(Error::flow(format!("drag: WDA did not acknowledge the gesture ({reason})")));
             }
-            if r.is_object() && !json::err_is(&r, 404) {
-                check_wda_ok(r, "drag", false)?;
+            let value = crate::guard::success_value(response)
+                .map_err(|reason| Error::flow(format!("drag: WDA did not acknowledge the gesture ({reason})")))?;
+            // Both stock and turbo drag return FBResponseWithOK(), whose value is null.
+            if !value.is_null() {
+                return Err(Error::flow("drag: WDA did not acknowledge the gesture (expected null response value)"));
+            }
+            Ok(())
+        };
+        if self.c.turbo != Some(false) {
+            let r = post(&mut self.c, "/wda/fastDrag", &body);
+            if !crate::wda::fast_mutation_route_missing(&r) {
+                return acknowledge(&r);
             }
         }
         let p = self.c.spath("/wda/dragfromtoforduration");
         let stock = j!({"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration.max(0.2)});
-        check_wda_ok(self.c.post(&p, &stock), "drag", false)?;
-        Ok(())
+        let r = post(&mut self.c, &p, &stock);
+        acknowledge(&r)
     }
 
-    /// `banner:dismiss`: a notification banner over the app makes SpringBoard the front
-    /// app for a moment and covers the top of the screen. When SpringBoard is in front
-    /// of the flow's app and the phone is not locked, swipe the banner up (top band) and
-    /// wait up to 1 s for the app to be back. Otherwise nothing is sent ("none"). One
-    /// foreground read, so it fits before a final check without slowing every read.
-    pub fn dismiss_banner(&mut self) -> Result<String> {
-        let Ok(front) = self.c.live_foreground_app(None) else { return Ok("none".into()) };
-        if front != crate::wda::SPRINGBOARD {
-            return Ok("none".into());
+    /// Dismiss a caller-identified banner after observing its exact text in the
+    /// top of an unlocked system overlay. Foreground ownership alone is not evidence.
+    pub(super) fn dismiss_banner(&mut self, arg: &str) -> Result<String> {
+        let label = arg.strip_prefix("dismiss:").map(str::trim).filter(|label| !label.is_empty())
+            .ok_or_else(|| Error::flow("banner expects banner:dismiss:TEXT with the exact observed banner line"))?;
+        let deadline = clock::now() + self.timeout;
+        self.c.stop_check().map_err(Error::flow)?;
+        let shell = crate::wda::SPRINGBOARD;
+        let foreground = self.c.live_foreground_app(Some(deadline)).map_err(Error::flow)?;
+        if foreground != shell {
+            return Ok("overlay-not-observed".into());
         }
-        let locked = self.c.get("/wda/locked");
-        if json::get(&locked, "value").as_bool() == Some(true) {
-            return Ok("none (locked)".into());
+        let locked = self.c.req_2xx("GET", "/wda/locked", None, crate::wda::DEFAULT_TIMEOUT, Some(deadline));
+        if crate::guard::success_value(&locked).ok().and_then(Value::as_bool) != Some(false) {
+            return Ok("overlay-unverified".into());
         }
-        let (w, _) = self.act_pt_size()?;
-        self.drag(w / 2, 60, w / 2, 4, 0.12, 0.02)?;
-        let end = clock::now() + 1.0;
-        while clock::now() < end {
-            if self.c.live_foreground_app(None).is_ok_and(|f| f != crate::wda::SPRINGBOARD) {
-                return Ok("dismissed".into());
+
+        let (w, h) = self.act_pt_size()?;
+        let upper_band = h as f64 / 5.0;
+        let lines = self.lines(None, Some(deadline))?;
+        let mut matches = lines.iter().filter(|line| line.text == label);
+        let Some(line) = matches.next() else {
+            return Ok(if lines.is_empty() { "overlay-unverified" } else { "overlay-not-observed" }.into());
+        };
+        let in_top_band = 0.0 <= line.x0 && line.x0 < line.x1 && line.x1 <= w as f64
+            && 8.0 < line.y0 && line.y0 < line.y1 && line.y1 <= upper_band;
+        if matches.next().is_some() || !in_top_band {
+            return Ok("overlay-unverified".into());
+        }
+        self.guard(&line.text, "dismiss banner")?;
+        self.c.stop_check().map_err(Error::flow)?;
+        if clock::now() >= deadline {
+            return Ok("overlay-unverified".into());
+        }
+        let x = ((line.x0 + line.x1) / 2.0) as i64;
+        let y = ((line.y0 + line.y1) / 2.0) as i64;
+        self.send_drag((x, y), (x, 4), 0.12, 0.02, Some((shell, deadline)))?;
+
+        self.c.stop_check().map_err(Error::flow)?;
+        if clock::now() >= deadline {
+            return Ok("dismissal-unverified".into());
+        }
+        let observed = self.lines(None, Some(deadline));
+        self.c.stop_check().map_err(Error::flow)?;
+        match observed {
+            Ok(lines) if !lines.is_empty() && clock::now() < deadline => {
+                Ok(if lines.iter().any(|line| line.text == label) { "banner-text-visible" } else { "banner-text-gone" }.into())
             }
-            clock::sleep(0.1);
+            Ok(_) => Ok("dismissal-unverified".into()),
+            Err(e) => Err(Error::flow(format!("banner gesture sent; the follow-up observation failed: {e}"))),
         }
-        Ok("swiped (SpringBoard still in front)".into())
     }
 
     /// L3935. Scroll 54% of the screen without momentum (wda-turbo fastDrag crawls
@@ -156,6 +176,21 @@ impl<R: Reader> Flow<R> {
         let (direction, target) = spec.split_once(':').unwrap_or((spec, ""));
         let direction = direction.trim().to_lowercase();
         let target = target.trim();
+        if direction == "points" {
+            let usage = || Error::flow("swipe:points expects X0,Y0:X1,Y1");
+            let (from, to) = target.split_once(':').ok_or_else(usage)?;
+            let (x0, y0, label0) = super::parse_tap_at(from).map_err(|_| usage())?;
+            let (x1, y1, label1) = super::parse_tap_at(to).map_err(|_| usage())?;
+            if label0.is_some() || label1.is_some() || (x0, y0) == (x1, y1) {
+                return Err(usage());
+            }
+            let (w, h) = self.act_pt_size()?;
+            if [(x0, y0), (x1, y1)].iter().any(|&(x, y)| !(0..w).contains(&x) || !(0..h).contains(&y)) {
+                return Err(Error::flow("swipe:points requires two points inside the current screen"));
+            }
+            self.drag(x0, y0, x1, y1, 0.18, 0.02)?;
+            return Ok("gesture-sent".into());
+        }
         if !matches!(direction.as_str(), "left" | "right" | "up" | "down") {
             return Err(Error::flow(format!(
                 "swipe:{}? use swipe:left|right|up|down or swipe:left|right:TEXT",
@@ -390,29 +425,25 @@ impl<R: Reader> Flow<R> {
 
     /// `_read_slider_aliases`: cleaned (label, name) and whether either lookup failed.
     fn read_slider_aliases(&mut self, eid: &str) -> (String, String, bool) {
-        let lp = self.c.spath(&format!("/element/{eid}/attribute/label"));
-        let lab_r = self.c.get(&lp);
-        let np = self.c.spath(&format!("/element/{eid}/attribute/name"));
-        let name_r = self.c.get(&np);
-        let lab_err = !lab_r.is_object() || json::has_err(&lab_r);
-        let name_err = !name_r.is_object() || json::has_err(&name_r);
-        let alias = |err: bool, r: &Value| {
-            let v = if err { &json::NULL } else { json::get(r, "value") };
-            if json::truthy(v) {
-                clean_text(&json::py_str(v))
-            } else {
-                String::new()
+        let mut alias = |attr| {
+            let path = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
+            match self.c.strict_get_value(&path) {
+                Ok(Value::String(s)) => Some(clean_text(&s)),
+                Ok(Value::Null) => Some(String::new()),
+                _ => None,
             }
         };
-        (alias(lab_err, &lab_r), alias(name_err, &name_r), lab_err || name_err)
+        let (label, name) = (alias("label"), alias("name"));
+        let failed = label.is_none() || name.is_none();
+        (label.unwrap_or_default(), name.unwrap_or_default(), failed)
     }
 
     /// L4116. Set an XCUIElementTypeSlider to a normalized fraction [0.0, 1.0]:
-    /// slider:50%, slider:0.5, slider:Brightness=70%, slider:Lysstyrke=0.4.
+    /// slider:50%, slider:0.5, slider:LABEL=70%.
     pub fn set_slider(&mut self, spec: &str) -> Result<String> {
         let raw = spec.trim();
         if raw.is_empty() {
-            return Err(Error::flow("slider requires PCT or LABEL=PCT (e.g. slider:50% or slider:Brightness=70%)"));
+            return Err(Error::flow("slider requires PCT or LABEL=PCT"));
         }
         let (target_label, val_str) = match raw.rsplit_once('=') {
             Some((label_part, val_part)) => {
@@ -502,7 +533,7 @@ impl<R: Reader> Flow<R> {
 
         // Enforce --deny across BOTH label and name aliases; if deny is active and
         // either attribute lookup failed, refuse rather than treating error as empty.
-        if self.deny.is_some() && sel_attr_err {
+        if self.has_deny_patterns() && sel_attr_err {
             return Err(Error::flow("cannot verify slider label/name against --deny"));
         }
         for alias in [&sel_lab, &sel_name] {
@@ -521,7 +552,7 @@ impl<R: Reader> Flow<R> {
             let ep = self.c.spath(&suffix);
             let en_resp = self.c.get(&ep);
             if en_resp.is_object() && !json::has_err(&en_resp) {
-                if let Some(parsed) = parse_wda_bool(json::get(&en_resp, "value")) {
+                if let Some(parsed) = ui::parse_wda_bool(json::get(&en_resp, "value")) {
                     en_state = Some(parsed);
                     break;
                 }
@@ -549,7 +580,11 @@ impl<R: Reader> Flow<R> {
     /// L4243. Read iOS pasteboard text via /wda/getPasteboard and record it in reads.
     pub fn clipboard(&mut self, content_type: &str) -> Result<String> {
         let text = self.c.get_pasteboard(content_type).map_err(runtime_to_flow)?;
-        self.reads.push(j!({"clipboard": text}));
+        let mut read = j!({"clipboard": text});
+        if text.is_empty() {
+            read["empty"] = j!(true);
+        }
+        self.reads.push(read);
         Ok(text)
     }
 
@@ -559,6 +594,7 @@ impl<R: Reader> Flow<R> {
         let val = secret_arg("setclip", arg)?;
         if arg.starts_with("env:") || arg.starts_with("cmd:") {
             self.note_secret(&val);
+            crate::redaction::before_input(&[&val])?;
         }
         self.c.set_pasteboard(&val, content_type).map_err(runtime_to_flow)?;
         Ok(format!("len={}", val.chars().count()))
@@ -672,287 +708,88 @@ impl<R: Reader> Flow<R> {
         Err(Error::flow(format!("{} not found while scrolling {dir}", json::py_repr_str(&label))))
     }
 
-    /// `_find_search` inside `search`.
-    fn find_search(ctl: &[Control]) -> Option<Control> {
-        ctl.iter()
-            .find(|x| x.kind == "SearchField")
-            .or_else(|| find_control(ctl, "Search", Some(&["Button", "Tab", "TextField", "Other"]), false))
-            .or_else(|| find_control(ctl, "Søk", Some(&["Button", "Tab", "TextField", "SearchField"]), false))
-            .cloned()
-    }
-
-    /// L4894. Tap the app's search field (or Search button/tab), type query, wait
-    /// until the results hold still. Then tap the result with tap:TEXT@y>...
-    pub fn search(&mut self, query: &str) -> Result<String> {
-        let mut ctl = self.controls(false, None, None, false, false)?;
-        let mut c = Self::find_search(&ctl);
-        // Right after a fast cold launch (~120 ms via /wda/fastLaunch), the app's
-        // initial splash screen may not have rendered its Search tab/field yet:
-        // poll briefly instead of failing on the first empty/splash tree.
-        if c.is_none()
-            && (ctl.is_empty() || (self.last_action_ts != 0.0 && (clock::now() - self.last_action_ts) < 3.0))
-        {
-            let poll_end = clock::now() + 2.5f64.min(self.timeout);
-            while c.is_none() && clock::now() < poll_end {
-                clock::sleep(0.12f64.min(0.01f64.max(poll_end - clock::now())));
-                ctl = match self.controls(false, None, None, false, false) {
-                    Ok(v) => v,
-                    Err(e) if e.is_flow() => Vec::new(),
-                    Err(e) => return Err(e),
-                };
-                c = Self::find_search(&ctl);
-            }
-        }
-        let Some(c) = c else {
-            return Err(Error::flow("no search field or Search button on screen"));
-        };
-        let before = self.r.last();
-        self.tap_point(c.x, c.y, &c.label, None)?;
-        // A Search tab/button opens a page whose field may still need focus: wait for
-        // the transition to react, find the field, and tap it unless already active.
-        if c.kind != "SearchField" && c.kind != "TextField" {
-            if before.is_some() {
-                self.changed_since(before, 0.6, Some(c.x), Some(c.y))?;
-            } else {
-                self.settle(0.8, None, 0.6)?;
-            }
-            let ctl2 = self.controls(false, None, None, false, false)?;
-            if let Some(f) = ctl2.iter().find(|x| x.kind == "SearchField" || x.kind == "TextField") {
-                let already_focused = (f.x - c.x).abs() <= 15
-                    && (f.y - c.y).abs() <= 15
-                    && ctl2
-                        .iter()
-                        .any(|x| matches!(casefold(&x.label).as_str(), "cancel" | "avbryt" | "clear text" | "tøm tekst"));
-                if !already_focused {
-                    let f = f.clone();
-                    self.tap_point(f.x, f.y, &f.label, None)?;
-                }
-            }
-        }
-        let focus_rem = 0.18 - (clock::now() - self.last_tap_ts);
-        if focus_rem > 0.0 {
-            clock::sleep(focus_rem); // brief keyboard focus beat after the last fast_tap
-        }
-        self.mark_action(false, true);
-        check_wda_ok(self.c.fast_keys(query, None), "search", false)?;
-        self.settle(2.0, None, 0.5)?;
-        Ok(c.label)
-    }
-
-    /// L4947.
+    /// Send the explicitly requested edge gesture.
     pub fn back(&mut self) -> Result<()> {
         self.wait_active_app(1.5, 0.03, None);
-        let long_texts = |lines: &[Line]| -> HashSet<String> {
-            lines.iter().filter(|l| l.text.chars().count() > 3).map(|l| l.text.clone()).collect()
-        };
-        let lines0 = self.act_fresh_lines()?;
-        let was = long_texts(&lines0);
-        let before = self.r.last();
         let (w, h) = self.act_pt_size()?;
         self.drag(2, h / 2, (w as f64 * 0.8) as i64, h / 2, 0.22, 0.02)?;
-        self.changed_since(before, 0.6, None, None)?;
         self.settle(1.5, None, 0.4)?;
-        let now = long_texts(&self.lines(None, None)?);
-        if !was.is_empty() && (was.intersection(&now).count() as f64) >= 0.7 * was.len() as f64 {
-            // The swipe moved the page but it sprang back (Spotify playlists) or never
-            // moved (Microsoft Teams): tap the labelled Back control, else the chevron.
-            let ctl = self.controls(false, None, None, false, false)?;
-            let c = ctl.iter().find(|c| ui::BACK_LABELS.contains(&c.label.to_lowercase().as_str()));
-            let (x, y) = c.map(|c| (c.x, c.y)).unwrap_or((22, 75));
-            self.tap_point(x, y, "back", None)?;
-            self.settle(2.0, None, 0.6)?;
-        }
         Ok(())
     }
 
-    /// L5061. Return the visible XCUIElementTypeKeyboard rect dict or None via stock WDA.
-    fn visible_keyboard_rect(&mut self) -> Result<Option<Value>> {
-        let p = self.c.spath("/element");
-        let kb_el = self.c.post(&p, &j!({"using": "class name", "value": "XCUIElementTypeKeyboard"}));
-        let k_eid = json::get(json::get(&kb_el, "value"), "ELEMENT");
-        if !json::truthy(k_eid) {
+    /// Report only keyboard state observed in this read, including on stock WDA.
+    pub(super) fn keyboard_visible(&mut self) -> Result<Option<bool>> {
+        Ok(self.keyboard_observation()?.map(|(visible, _)| visible))
+    }
+
+    fn keyboard_observation(&mut self) -> Result<Option<(bool, Option<Value>)>> {
+        self.c.last_fast_ui_kb = None;
+        if self.controls_opt(false, None, None, true, false)?.is_some() {
+            if let Some((Some(visible), rect)) = &self.c.last_fast_ui_kb {
+                return Ok(Some((*visible, rect.clone())));
+            }
+        }
+        let path = self.c.spath("/elements");
+        let query = j!({"using": "class name", "value": "XCUIElementTypeKeyboard"});
+        let response = self.c.req_2xx("POST", &path, Some(&query), crate::wda::DEFAULT_TIMEOUT, None);
+        let Some(elements) = crate::guard::success_value(&response).ok().and_then(Value::as_array) else {
             return Ok(None);
+        };
+        if elements.is_empty() {
+            return Ok(Some((false, None)));
         }
-        let rp = self.c.spath(&format!("/element/{}/rect", json::py_str(k_eid)));
-        let kr = json::get(&self.c.get(&rp), "value").clone();
-        if !kr.is_object() {
-            return Ok(None);
+
+        let (_, screen_height) = self.act_pt_size()?;
+        let mut observed = None;
+        for element in elements {
+            let Some(id) = super::wda_element_ref(element) else { continue };
+            let path = self.c.spath(&format!("/element/{id}/rect"));
+            let Ok(rect) = self.c.strict_get_value(&path) else { continue };
+            if let (Some(y), Some(width), Some(height)) = (
+                rect["y"].as_f64(),
+                rect["width"].as_f64(),
+                rect["height"].as_f64(),
+            ) {
+                if width > 0.0 && height > 0.0 && y < screen_height as f64 && y + height > 0.0 {
+                    if observed.is_some() {
+                        return Ok(Some((true, None)));
+                    }
+                    observed = Some(rect);
+                }
+            }
         }
-        let (kw, kh, ky) = (num(&kr, "width"), num(&kr, "height"), num(&kr, "y"));
-        let (_, sh) = self.act_pt_size()?;
-        if kw > 0.0 && kh > 0.0 && ky < sh as f64 && ky + kh > 0.0 {
-            return Ok(Some(kr));
-        }
-        Ok(None)
+        Ok(observed.map(|rect| (true, (elements.len() == 1).then_some(rect))))
     }
 
-    /// `_add_el` of `_stock_keyboard_dismiss_candidates`.
-    fn add_dismiss_el(
-        &mut self,
-        el_obj: &Value,
-        priority: i64,
-        rect_bounds: Option<(f64, f64, f64, f64)>,
-        seen: &mut HashSet<String>,
-        cands: &mut Vec<DismissCand>,
-    ) {
-        if !el_obj.is_object() {
-            return;
-        }
-        let Some(eid) = element_id(el_obj) else { return };
-        if seen.contains(&eid) {
-            return;
-        }
-        let rp = self.c.spath(&format!("/element/{eid}/rect"));
-        let rc = json::get(&self.c.get(&rp), "value").clone();
-        if !rc.is_object() || !json::truthy(json::get(&rc, "width")) || !json::truthy(json::get(&rc, "height")) {
-            return;
-        }
-        let cx = (num(&rc, "x") + num(&rc, "width") / 2.0) as i64;
-        let cy = (num(&rc, "y") + num(&rc, "height") / 2.0) as i64;
-        if let Some((bx0, by0, bx1, by1)) = rect_bounds {
-            let (fx, fy) = (cx as f64, cy as f64);
-            if !(bx0 - 4.0 <= fx && fx <= bx1 + 4.0 && by0 - 4.0 <= fy && fy <= by1 + 4.0) {
-                return;
-            }
-        }
-        seen.insert(eid.clone());
-        cands.push((priority, cy, cx, eid));
-    }
-
-    /// L5081. Query buttons strictly under XCUIElementTypeKeyboard or a verified flush
-    /// keyboard accessory XCUIElementTypeToolbar on stock WDA.
-    fn stock_keyboard_dismiss_candidates(&mut self, kb_rect: &Value) -> Vec<DismissCand> {
-        let labels_pred = ui::DISMISS_KB_LABELS.iter().map(|l| format!("'{l}'")).collect::<Vec<_>>().join(", ");
-        let mut cands = Vec::new();
-        let mut seen = HashSet::new();
-
-        // 1. Direct descendants of XCUIElementTypeKeyboard (true keyboard ancestry).
-        let kb_chain = format!(
-            "**/XCUIElementTypeKeyboard/**/XCUIElementTypeButton[`label IN {{{labels_pred}}} OR name IN {{{labels_pred}}}`]"
-        );
-        let p = self.c.spath("/elements");
-        let kb_res = self.c.post(&p, &j!({"using": "class chain", "value": kb_chain}));
-        for el_obj in value_list(&kb_res) {
-            self.add_dismiss_el(&el_obj, 0, None, &mut seen, &mut cands);
-        }
-
-        // 2. Direct descendants of a verified flush keyboard-accessory XCUIElementTypeToolbar.
-        let kb_x0 = num(kb_rect, "x");
-        let kb_x1 = kb_x0 + num(kb_rect, "width");
-        let kb_y = num(kb_rect, "y");
-        let tb_res = self.c.post(&p, &j!({"using": "class name", "value": "XCUIElementTypeToolbar"}));
-        let mut acc_toolbars = Vec::new();
-        for tb_obj in value_list(&tb_res) {
-            if !tb_obj.is_object() {
-                continue;
-            }
-            let Some(tb_eid) = element_id(&tb_obj) else { continue };
-            let rp = self.c.spath(&format!("/element/{tb_eid}/rect"));
-            let tr = json::get(&self.c.get(&rp), "value").clone();
-            if !tr.is_object() || !json::truthy(json::get(&tr, "width")) || !json::truthy(json::get(&tr, "height")) {
-                continue;
-            }
-            let (tx, ty, tw, th) = (num(&tr, "x"), num(&tr, "y"), num(&tr, "width"), num(&tr, "height"));
-            let t_bot = ty + th;
-            if ty >= kb_y - 72.0
-                && kb_y - 16.0 <= t_bot
-                && t_bot <= kb_y + 16.0
-                && tx >= kb_x0 - 8.0
-                && (tx + tw) <= kb_x1 + 8.0
-            {
-                acc_toolbars.push((tb_eid, (tx, ty, tx + tw, t_bot)));
-            }
-        }
-        for (tb_eid, bounds) in acc_toolbars {
-            let bp = self.c.spath(&format!("/element/{tb_eid}/elements"));
-            let pred = format!(
-                "type == 'XCUIElementTypeButton' AND (label IN {{{labels_pred}}} OR name IN {{{labels_pred}}})"
-            );
-            let btn_res = self.c.post(&bp, &j!({"using": "predicate string", "value": pred}));
-            for el_obj in value_list(&btn_res) {
-                self.add_dismiss_el(&el_obj, 1, Some(bounds), &mut seen, &mut cands);
-            }
-        }
-        cands
-    }
-
-    /// L5150. Dismiss the iOS keyboard only when a keyboard is visible AND the button
-    /// has verified keyboard or keyboard-accessory toolbar provenance (never tapping
-    /// ordinary app buttons outside the keyboard/accessory, including with floating
-    /// keyboards).
-    pub fn dismiss_kb(&mut self) -> Result<String> {
-        // Python `controls(fast_only=True)` returns None when /wda/fastUI is off or
-        // unavailable; the Rust signature returns a Vec, so mirror the None cases here:
-        // skip when the probes already say no fast UI, clear the keyboard metadata so
-        // only this fetch's answer counts, and treat a fast-UI failure as None.
-        let fast_off = |c: &crate::wda::WdaClient| c.turbo == Some(false) || c.fast_ui == Some(false);
-        let ctl = if fast_off(&self.c) {
-            None
-        } else {
-            self.c.last_fast_ui_kb = None;
-            let v = self.controls(false, None, None, true, false)?;
-            if fast_off(&self.c) {
-                None
-            } else {
-                Some(v)
-            }
+    /// Send one dismissal gesture when a native keyboard occupies the bottom edge.
+    pub(super) fn dismiss_keyboard(&mut self) -> Result<String> {
+        let rect = match self.keyboard_observation()? {
+            Some((false, _)) => return Ok("no-kb".into()),
+            Some((true, Some(rect))) => rect,
+            Some((true, None)) => return Ok("kb-visible".into()),
+            None => return Ok("dismissal-unverified".into()),
         };
-        if let Some(ctl) = ctl {
-            let (has_kb, _kb_rect) = self.c.last_fast_ui_kb.clone().unwrap_or((None, None));
-            if has_kb == Some(false) {
-                return Ok("no-kb".to_string());
-            }
-            if has_kb == Some(true) {
-                static DISMISS_SET: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-                let dismiss_set = DISMISS_SET.get_or_init(|| ui::DISMISS_KB_LABELS.iter().map(|l| casefold(l)).collect());
-                // Require actual keyboard or flush keyboard-accessory toolbar provenance
-                // for ALL dismiss labels (never authorize unmarked app buttons by position).
-                let hits: Vec<&Control> = ctl
-                    .iter()
-                    .filter(|c| c.kind == "Button" && !c.is_disabled() && (c.in_keyboard || c.in_keyboard_accessory))
-                    .filter(|c| dismiss_set.iter().any(|d| d == &casefold(&c.label)))
-                    .collect();
-                let best = hits.into_iter().min_by_key(|item| {
-                    let low = casefold(&item.label);
-                    (!item.in_keyboard, low != "hide keyboard" && low != "skjul tastatur", -item.y, item.x)
-                });
-                let Some(c) = best.cloned() else {
-                    return Ok("no-kb".to_string());
-                };
-                self.tap_point(c.x, c.y, &c.label, None)?;
-                self.invalidate_ctl_cache();
-                self.settle(0.6, None, 0.6)?;
-                return Ok("dismissed".to_string());
-            }
-            // Older wda-turbo <= v4 did not emit hasKeyboard/inKeyboard provenance:
-            // fall through to verified stock WDA keyboard/accessory ancestry queries.
+        let (w, h) = self.act_pt_size()?;
+        let (Some(x), Some(y), Some(width), Some(height)) = (
+            rect["x"].as_f64(), rect["y"].as_f64(),
+            rect["width"].as_f64(), rect["height"].as_f64(),
+        ) else {
+            return Ok("kb-visible".into());
+        };
+        if x.abs() > 8.0 || width < w as f64 - 16.0 || height <= 0.0
+            || (y + height - h as f64).abs() > 50.0 || y < 140.0 || y + 60.0 >= h as f64
+        {
+            return Ok("kb-visible".into());
         }
-        let Some(kb_rect) = self.visible_keyboard_rect()? else {
-            return Ok("no-kb".to_string());
-        };
-        let cands = self.stock_keyboard_dismiss_candidates(&kb_rect);
-        let Some((_, cy, cx, eid)) = cands.into_iter().min_by_key(|(p, cy, cx, _)| (*p, -*cy, *cx)) else {
-            return Ok("no-kb".to_string());
-        };
-        let lp = self.c.spath(&format!("/element/{eid}/attribute/label"));
-        let lbl_r = self.c.get(&lp);
-        let lbl = if lbl_r.is_object() && !json::has_err(&lbl_r) {
-            let v = json::get(&lbl_r, "value");
-            if json::truthy(v) {
-                json::py_str(v)
-            } else {
-                "dismisskb".to_string()
-            }
-        } else {
-            "dismisskb".to_string()
-        };
-        let _ = (cx, cy); // Python guard(x, y, text): the coordinates are unused.
-        self.guard(&lbl, "tap")?;
-        self.mark_action(false, false);
-        let cp = self.c.spath(&format!("/element/{eid}/click"));
-        check_wda_ok(self.c.post(&cp, &Map::new().into()), "dismisskb", false)?;
+        self.drag(w / 2, y as i64 - 48, w / 2, y as i64 + 60, 0.2, 0.0)?;
+        self.invalidate_ctl_cache();
         clock::sleep(0.3);
-        Ok("dismissed".to_string())
+        match self.keyboard_visible() {
+            Ok(Some(false)) => Ok("dismissed".into()),
+            Ok(Some(true)) => Ok("kb-visible".into()),
+            Ok(None) => Ok("dismissal-unverified".into()),
+            Err(e) => Err(Error::flow(format!("dismisskb sent the gesture but could not verify keyboard state: {e}"))),
+        }
     }
 }
 

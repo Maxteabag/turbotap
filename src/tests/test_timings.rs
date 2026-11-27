@@ -1,6 +1,6 @@
 //! v1.5: per-step timing log written by `turbotap flow`, and `turbotap timings`.
 
-use crate::flow::{Flow, DENY_DEFAULT};
+use crate::flow::Flow;
 use crate::testutil::*;
 use serde_json::{json, Value};
 
@@ -29,7 +29,7 @@ fn test_each_flow_step_appends_one_redacted_line_with_request_counts() {
     let mock = MockWda::start(MockState { active_app: Seq::one(json!("com.example.app")), ..Default::default() });
     let img = solid_img(200, (430, 932));
     let r = FakeReader::with(vec![(img.clone(), vec![]), (copy_img(&img), vec![])], (430, 932), 1.0);
-    let mut flow = Flow::new(mock.client(), r, 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(mock.client(), r, 1.0, None, false).unwrap();
     let steps: Vec<String> = ["tapxy:5,6", "type:hunter2-secret", "tapel:No such thing"].iter().map(|s| s.to_string()).collect();
     let _ = flow.run_outcome(&steps);
     flow.close();
@@ -70,7 +70,8 @@ fn test_tapat_logs_the_label_it_resolved_to() {
     let _l = log_to(&path);
     let ui = json!([{"type": "Button", "label": "Settings", "x": 380, "y": 60}]);
     let mock = MockWda::start(MockState::default().with_fast_ui(fast_ui(ui, "Example", "com.example.app")));
-    let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 1.0, None, false).unwrap();
+    flow.changed_since_hook = Some(true);
     let (ok, _) = flow.run_outcome(&["tapat:372,66".to_string()]).unwrap();
     assert!(ok);
     flow.close();
@@ -131,7 +132,7 @@ fn test_timing_line_names_the_app_the_guard_saw_without_open() {
     let mock = MockWda::start(MockState { active_app: Seq::one(json!("com.example.app")), ..Default::default() });
     let mut c = mock.client();
     c.set_allowed_apps(vec!["com.example.app".to_string()]);
-    let mut flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(c, FakeReader::new(vec![]), 1.0, None, false).unwrap();
     let (ok, _) = flow.run_outcome(&["tapxy:5,6".to_string()]).unwrap();
     assert!(ok);
     flow.close();
@@ -158,7 +159,7 @@ fn test_cleartype_with_no_text_accepts_a_placeholder_only_field() {
                 None
             }
         });
-        let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 0.5, Some(DENY_DEFAULT), false).unwrap();
+        let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 0.5, None, false).unwrap();
         let r = flow.step("cleartype:");
         flow.close();
         r
