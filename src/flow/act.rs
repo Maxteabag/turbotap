@@ -549,7 +549,11 @@ impl<R: Reader> Flow<R> {
     /// L4243. Read iOS pasteboard text via /wda/getPasteboard and record it in reads.
     pub fn clipboard(&mut self, content_type: &str) -> Result<String> {
         let text = self.c.get_pasteboard(content_type).map_err(runtime_to_flow)?;
-        self.reads.push(j!({"clipboard": text}));
+        let mut read = j!({"clipboard": text});
+        if text.is_empty() {
+            read["empty"] = j!(true);
+        }
+        self.reads.push(read);
         Ok(text)
     }
 

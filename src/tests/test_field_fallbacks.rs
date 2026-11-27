@@ -78,6 +78,8 @@ fn assertfield_prefers_vision_and_rejects_a_single_glyph_mismatch() {
     let mut f = Flow::new(mock.client(), reader, 0.5, None, false).unwrap();
     let ok = f.step("assertfield:#1=AI title").unwrap().unwrap();
     assert!(ok.as_str().unwrap().contains("OCR (WDA Vision)"), "{ok}");
-    let error = f.step("assertfield:#1=Al title").unwrap_err().to_string();
-    assert!(error.contains("OCR (WDA Vision)") && error.contains("first difference at char 1"), "{error}");
+    let ambiguous = f.step("assertfield:#1=Al title").unwrap_err().to_string();
+    assert!(ambiguous.contains("unverified by OCR (WDA Vision)") && ambiguous.contains("at char 1 (I vs l)"), "{ambiguous}");
+    let mismatch = f.step("assertfield:#1=AC title").unwrap_err().to_string();
+    assert!(mismatch.contains("OCR (WDA Vision)") && mismatch.contains("first difference at char 1"), "{mismatch}");
 }

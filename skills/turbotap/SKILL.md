@@ -18,12 +18,12 @@ Use `turbotap` to operate any app on a real iPhone over Wi-Fi without AirPlay sc
 
 ### Compose a draft (a post, a message, a form) in few turns
 
-Each turn costs seconds of thinking, so do each phase in ONE `flow` call and read only what the next decision needs.
+Each turn costs seconds of thinking, so do each phase in ONE `flow` call and read only what the next decision needs. Use `flow --quiet` when consuming the final JSON in a tool that merges stdout and stderr. Check the exit code and any `failed_step` before proceeding.
 1. **Open the composer:** `open:APP`, the create/compose control, then `ui` in the same flow.
 2. **Destination first** (community, channel, recipient), then `ui` again: the destination can change the composer (rules banners, required fields, which attachment types exist). Check here whether the attachment you need is offered at all; if not, say so instead of searching for it.
 3. **Attachment next**, if offered: pick the exact item (name, duration, date) in the picker in one flow.
 4. **Text last, all fields in ONE flow:** `fill:<title field>=file:TITLE.txt fill:<body field>=file:BODY.txt`. Each `fill:` finds the named input (label, identifier, placeholder, or `#N` from the top), focuses it, types at 200 chars/s and reads it back exactly, so no separate tap or check is needed. If a field is not found while the keyboard is up, `fill:` closes the keyboard and looks again. Use `tap:`+`type:` only for a field `fill:` cannot name.
-5. **Final check in one flow:** `banner:dismiss read` (add `assertfield:` for any field typed without `fill:`) clears a notification banner first and shows destination and attachment. A field whose placeholder disappears once text is in can be named `#N` (the Nth text input from the top; an error lists them with their y); when WDA reports no value for it, the check reads the field's frame by OCR (visible lines, whitespace-insensitive).
+5. **Final check in one flow:** `banner:dismiss read` (add `assertfield:` for any field typed without `fill:`) clears a notification banner first and shows destination and attachment. A field whose placeholder disappears once text is in can be named `#N` (the Nth text input from the top; an error lists them with their y); when WDA reports no value for it, the check reads the field's frame by OCR (visible lines, whitespace-insensitive). An I/l-only difference is reported as unverified, with the positions of the ambiguous glyphs. Use an earlier exact field-value read-back as evidence of what the field held at that point.
    With several rows of the same label (repeated chips or list rows), `tapat:X,Y=LABEL` presses the one nearest X,Y and reports an unconfirmed step if the tap was sent without a verified visual reaction. Inspect the returned screen before deciding whether to tap again.
 6. **Stop at the draft.** Never press the composer's submit control (Post, Send, a top-bar Next in a filled composer) unless the user asked to publish.
 

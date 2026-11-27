@@ -754,6 +754,22 @@ impl<R: Reader> Flow<R> {
                 if a == b {
                     return Ok(format!("{}: len={n} (read by OCR ({engine}): the field reports no value)", f.name));
                 }
+                if a.chars().count() == b.chars().count() {
+                    let differences: Vec<_> = a.chars().zip(b.chars()).enumerate()
+                        .filter(|(_, (observed, expected))| observed != expected)
+                        .collect();
+                    if differences.iter().all(|(_, (observed, expected))| {
+                        matches!((*observed, *expected), ('I', 'l') | ('l', 'I'))
+                    }) {
+                        let positions = differences.iter().take(8)
+                            .map(|(position, (observed, expected))| format!("{position} ({observed} vs {expected})"))
+                            .collect::<Vec<_>>().join(", ");
+                        return Err(Error::flow(format!(
+                            "assertfield: {} unverified by OCR ({engine}); {} I/l-ambiguous difference(s) at char {positions}. Exact read-back requires the field's value",
+                            f.describe(), differences.len(),
+                        )));
+                    }
+                }
                 let i = first_diff(&a, &b);
                 let ctx = |s: &str| -> String { s.chars().skip(i.saturating_sub(10)).take(30).collect() };
                 return Err(Error::flow(format!(

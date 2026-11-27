@@ -1327,6 +1327,9 @@ fn test_picker_key_cleartype_typedigits_and_clipboard() {
     assert_eq!(res, "len=11");
     assert_eq!(step_s(&mut flow, "clipboard"), "copied text");
     assert_eq!(*flow.reads.last().unwrap(), json!({"clipboard": "copied text"}));
+    flow.step("setclip:").unwrap();
+    assert_eq!(step_s(&mut flow, "clipboard"), "");
+    assert_eq!(*flow.reads.last().unwrap(), json!({"clipboard": "", "empty": true}));
     flow.close();
 }
 
