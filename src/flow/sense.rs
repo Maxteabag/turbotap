@@ -199,9 +199,9 @@ fn alert_get(c: &mut WdaClient, path: &str, deadline: Option<f64>) -> Option<Val
                 return None;
             }
             let eff_to = rem.min(4.0).max(0.05);
-            Some(c.req_with_deadline("GET", path, None, eff_to, Some(d)))
+            Some(c.req_2xx("GET", path, None, eff_to, Some(d)))
         }
-        None => Some(c.req("GET", path, None, 4.0, None)),
+        None => Some(c.req_2xx("GET", path, None, 4.0, None)),
     }
 }
 
@@ -216,8 +216,8 @@ fn query_alert_text_on(c: &mut WdaClient, deadline: Option<f64>) -> (AlertStatus
     }
     let val = json::get(&r, "value");
     if !json::has_err(&r) {
-        return match val {
-            Value::String(s) => {
+        return match crate::guard::success_value(&r) {
+            Ok(Value::String(s)) => {
                 let cleaned = clean_text(s);
                 if cleaned.is_empty() {
                     (AlertStatus::Absent, None)
@@ -225,8 +225,9 @@ fn query_alert_text_on(c: &mut WdaClient, deadline: Option<f64>) -> (AlertStatus
                     (AlertStatus::Present, Some(cleaned))
                 }
             }
-            Value::Null => (AlertStatus::Absent, None),
-            other => (AlertStatus::Error, Some(format!("unexpected alert value: {}", json::py_repr(other)))),
+            Ok(Value::Null) => (AlertStatus::Absent, None),
+            Ok(other) => (AlertStatus::Error, Some(format!("unexpected alert value: {}", json::py_repr(other)))),
+            Err(reason) => (AlertStatus::Error, Some(reason)),
         };
     }
     let err = json::get(&r, "error");
@@ -238,7 +239,7 @@ fn query_alert_text_on(c: &mut WdaClient, deadline: Option<f64>) -> (AlertStatus
         parts.push(part(json::get(val, "message")));
     }
     let blob = text::casefold(&parts.join(" "));
-    const NO_ALERT_MARKERS: &[&str] = &["no such alert", "nosuchalert", "no alert", "modal dialog", "unable to find an alert"];
+    const NO_ALERT_MARKERS: &[&str] = &["no such alert", "nosuchalert", "no alert", "unable to find an alert"];
     if json::err_is(&r, 404) && NO_ALERT_MARKERS.iter().any(|m| blob.contains(m)) {
         return (AlertStatus::Absent, None);
     }
@@ -265,6 +266,44 @@ fn alert_buttons_on(c: &mut WdaClient, deadline: Option<f64>) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+/// Read the live alert and its raw button labels. The named WDA action takes the
+/// original label, so OCR, UI trees and normalized display labels are unsuitable.
+fn named_alert_on(c: &mut WdaClient, deadline: Option<f64>) -> Result<Option<(String, Vec<String>)>> {
+    let title = match query_alert_text_on(c, deadline) {
+        (AlertStatus::Absent, _) => return Ok(None),
+        (AlertStatus::Present, Some(title)) => title,
+        (_, detail) => return Err(Error::flow(format!("could not verify active iOS alert ({})", detail.unwrap_or_default()))),
+    };
+    let path = c.spath("/wda/alert/buttons");
+    let buttons = alert_get(c, &path, deadline)
+        .and_then(|r| {
+            crate::guard::success_value(&r)
+                .ok()?
+                .as_array()?
+                .iter()
+                .map(|item| item.as_str().filter(|s| !clean_text(s).is_empty()).map(String::from))
+                .collect::<Option<Vec<_>>>()
+        })
+        .filter(|buttons| !buttons.is_empty())
+        .ok_or_else(|| Error::flow(format!("active iOS alert {} has no usable button metadata", json::py_repr_str(&title))))?;
+    Ok(Some((title, buttons)))
+}
+
+/// A duplicate label is ambiguous even on a single alert.
+fn exact_alert_button<'a>(buttons: &'a [String], label: &str) -> Option<&'a str> {
+    let mut matches = buttons.iter().filter(|button| button.as_str() == label);
+    let button = matches.next()?;
+    matches.next().is_none().then_some(button.as_str())
+}
+
+fn alert_match_error(title: &str, buttons: &[String]) -> Error {
+    Error::flow(format!(
+        "active iOS alert {} has no unique exact match for this step (buttons: {})",
+        json::py_repr_str(title),
+        json::py_repr(&serde_json::json!(buttons))
+    ))
 }
 
 /// `find_text(lines, label, where=where)`.
@@ -557,9 +596,42 @@ impl<R: Reader> Flow<R> {
         )))
     }
 
+    /// Flow tap may act by name on the live alert. Once an alert is detected, any
+    /// mismatch or WDA failure ends the step before ordinary tap resolution.
+    pub(super) fn tap_named_alert(&mut self, label: &str) -> Result<Option<String>> {
+        let Some((title, buttons)) = named_alert_on(&mut self.c, None)? else {
+            if self.waitany_alert_button.as_deref() == Some(label.trim()) {
+                return Err(Error::flow("tap: the iOS alert matched by waitany is no longer active"));
+            }
+            return Ok(None);
+        };
+        let button = exact_alert_button(&buttons, label.trim()).ok_or_else(|| alert_match_error(&title, &buttons))?;
+        self.guard(button, "tap")?;
+        self.mark_action(false, false);
+        let path = self.c.spath("/alert/accept");
+        let response = self.c.req_2xx("POST", &path, Some(&serde_json::json!({"buttonLabel": button})), 4.0, None);
+        let response = self.c.guard_result(crate::wda::check_wda_ok(response, "tap active iOS alert", false))?;
+        match crate::guard::success_value(&response) {
+            Ok(Value::Null) => Ok(Some(button.to_owned())),
+            _ => Err(Error::flow("tap active iOS alert failed: invalid WDA acknowledgment")),
+        }
+    }
+
+    fn match_named_alert(&mut self, candidates: &[String], deadline: f64) -> Result<Option<Match>> {
+        let Some((title, buttons)) = named_alert_on(&mut self.c, Some(deadline))? else {
+            return Ok(None);
+        };
+        let button = candidates.iter().find_map(|label| exact_alert_button(&buttons, label))
+            .ok_or_else(|| alert_match_error(&title, &buttons))?;
+        self.wait_settled_ts = clock::now();
+        self.waitany_alert_button = Some(button.to_owned());
+        // waitany only returns the text. The alert endpoint supplies no coordinates.
+        Ok(Some(Match::new(0, 0, button, None, 0)))
+    }
+
     /// L2895.
     pub fn wait_any(&mut self, spec: &str, timeout: Option<f64>) -> Result<Match> {
-        self.wait_active_app(1.5, 0.03, None);
+        self.waitany_alert_button = None;
         let parts: Vec<String> = split_unescaped_pipes(spec)
             .into_iter()
             .filter(|p| !p.trim().is_empty())
@@ -568,6 +640,11 @@ impl<R: Reader> Flow<R> {
         if parts.is_empty() {
             return Err(Error::flow("waitany requires at least one candidate (e.g. waitany:A|B)"));
         }
+        let alert_deadline = clock::now() + self.eff_timeout(timeout);
+        if let Some(m) = self.match_named_alert(&parts, alert_deadline)? {
+            return Ok(m);
+        }
+        self.wait_active_app(1.5, 0.03, None);
         let cands: Vec<(String, Option<String>)> = parts.iter().map(|p| split_where(p)).collect();
         let first_hit = |lines: &[Line]| cands.iter().find_map(|(label, w)| find(lines, label, w.as_deref()));
         let start = clock::wall();
@@ -618,6 +695,12 @@ impl<R: Reader> Flow<R> {
             };
             let now = clock::wall();
             if (frames >= 2 || now - start >= 0.4) && (last_ui == 0.0 || now - last_ui >= 0.8) {
+                let remaining = end - now;
+                if remaining > 0.0 {
+                    if let Some(m) = self.match_named_alert(&parts, clock::now() + remaining)? {
+                        return Ok(m);
+                    }
+                }
                 let raw_ctl = self.text_controls()?;
                 last_ui = clock::wall();
                 for (label, w) in &cands {

@@ -132,7 +132,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         OCR cannot see falls back to the control with that label.
                         A Button labelled exactly TEXT beats a longer OCR line that
                         only contains it; a switch row's label taps the toggle;
-                        Next/Previous prefer the form button over the keyboard bar
+                        Next/Previous prefer the form button over the keyboard bar.
+                        With an active iOS alert, waitany: can match an exact button
+                        label and tap: presses it by name. The app guard still applies.
   tapif:TEXT            optional tap (~1 s max): tap TEXT (OCR + exact UI control
                         fallback, respects --deny and @region) or return 'skipped'
                         cleanly without failing the flow
@@ -386,6 +388,9 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub last_tap_small_delta: bool,
     pub last_alert_text: Option<String>,
     pub last_alert_buttons: Option<Vec<String>>,
+    // A waitany alert match must never turn into a tap on an identically labelled
+    // foreground control if the alert closes before the next action.
+    waitany_alert_button: Option<String>,
     pub last_ui_retried_stale: bool,
     /// Secret values this flow typed, tapped or copied (inline, `env:` or `cmd:`);
     /// scrubbed from every string the flow outputs.
@@ -449,6 +454,7 @@ impl<R: Reader> Flow<R> {
             last_tap_small_delta: false,
             last_alert_text: None,
             last_alert_buttons: None,
+            waitany_alert_button: None,
             last_ui_retried_stale: false,
             secrets: Vec::new(),
             #[cfg(test)]
@@ -489,6 +495,7 @@ impl<R: Reader> Flow<R> {
     }
 
     pub fn mark_action(&mut self, keep_ctl_cache: bool, typing: bool) {
+        self.waitany_alert_button = None;
         self.last_action_ts = clock::now();
         self.last_action_is_typing = typing;
         self.last_reaction_diff = 0.0;
@@ -987,7 +994,12 @@ impl<R: Reader> Flow<R> {
             "gone" => self.gone(arg, None)?,
             "assert" => return some(self.assert_text(arg)?),
             "assertnot" => return some(self.assert_not_text(arg)?),
-            "tap" => return some(self.tap_text(arg)?.text),
+            "tap" => {
+                if let Some(button) = self.tap_named_alert(arg)? {
+                    return some(button);
+                }
+                return some(self.tap_text(arg)?.text);
+            }
             "tapif" => return some(self.tap_if(arg, 1.0)?),
             "tapbatch" => return some(self.tap_batch(arg)?),
             "toggle" => return some(self.toggle(arg)?),

@@ -68,6 +68,29 @@ fn test_stop_file_created_during_a_read_stops_before_the_next_step() {
 }
 
 #[test]
+fn test_stop_created_during_alert_lookup_blocks_named_alert_input() {
+    let _c = isolated_cache();
+    let dir = TempDir::new("tt-stop-alert-");
+    let stop = dir.path().join("phone.STOP");
+    let mut st = MockState::default();
+    st.alert_text = Some(Dyn::one(json!("Allow tracking?")));
+    st.alert_buttons = Some(Dyn::one(json!(["Don't Allow"])));
+    let mock = MockWda::start(st);
+    let stop_in_handler = stop.clone();
+    mock.set_custom_handler(move |_, method, path, _| {
+        if method == "GET" && path.ends_with("/wda/alert/buttons") {
+            std::fs::write(&stop_in_handler, "").unwrap();
+        }
+        None
+    });
+
+    let (code, out) = run_flow(&mock, &stop, &["tap:Don't Allow"]);
+    assert_eq!(code, crate::stop::STOP_EXIT, "{out}");
+    assert!(!mock.paths().iter().any(|path| path.ends_with("/alert/accept")));
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
 fn test_without_a_stop_file_the_flow_runs_as_before() {
     let _c = isolated_cache();
     let dir = TempDir::new("tt-stop-c-");

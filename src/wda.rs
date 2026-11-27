@@ -1559,6 +1559,15 @@ impl WdaClient {
     /// errors give `{"error": "<message>"}`; an expired deadline gives
     /// [`json::deadline_value`].
     pub fn req(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>) -> Value {
+        self.req_json(method, path, data, timeout, deadline, false)
+    }
+
+    /// Like `req`, but a redirect or other non-2xx response is never success.
+    pub(crate) fn req_2xx(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>) -> Value {
+        self.req_json(method, path, data, timeout, deadline, true)
+    }
+
+    fn req_json(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>, require_2xx: bool) -> Value {
         let body = data.map(|d| serde_json::to_vec(d).unwrap_or_default());
         let headers: &[(&str, &str)] = if data.is_some() { &[("Content-Type", "application/json")] } else { &[] };
         match self.exchange_borrowed(method, path, body.as_deref(), headers, timeout, deadline, true, |b| {
@@ -1566,7 +1575,7 @@ impl WdaClient {
         }) {
             Ok(None) => json::deadline_value(),
             Ok(Some((status, parsed, err_body))) => {
-                if status >= 400 {
+                if status >= 400 || (require_2xx && !(200..300).contains(&status)) {
                     j!({"error": status, "body": err_body.unwrap_or_default()})
                 } else {
                     parsed.unwrap_or(Value::Null)

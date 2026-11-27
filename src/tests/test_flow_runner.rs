@@ -1080,6 +1080,76 @@ fn test_tapif_hits_ocr_ui_respects_deny_and_skips_cleanly() {
 }
 
 #[test]
+fn test_waitany_and_tap_use_live_named_alert_instead_of_foreground_controls() {
+    let _cache = isolated_cache();
+    const LABEL: &str = "Be appen om ikke å spore";
+    let img = solid_img(240, (430, 932));
+    let lines = [ml("Settings", 40, 200, 120, 220), ml(LABEL, 40, 300, 230, 325)];
+    let r = FakeReader::new(vec![fr(&img, &lines)]);
+    let mut st = MockState::default();
+    st.active_app = Seq::one(json!("com.apple.springboard"));
+    st.fast_ui = Some(Dyn::one(fast_ui(
+        json!([{"type": "Button", "label": "Settings", "x": 90, "y": 220}]),
+        "SpringBoard",
+        "com.apple.springboard",
+    )));
+    st.alert_text = Some(Dyn::one(json!("Vil du tillate sporing?")));
+    st.alert_buttons = Some(Dyn::one(json!([LABEL, "Tillat", "Delete Account"])));
+    let mock = MockWda::start(st);
+    let mut flow = mk_flow(&mock, &r, 1.0);
+    flow.c.set_allowed_apps(vec!["com.example.target".into(), "com.apple.springboard".into()]);
+    step_v(&mut flow, "open:com.example.target");
+
+    // The unrelated exact OCR hit comes first. The live alert owns the match.
+    assert_eq!(step_s(&mut flow, &format!("waitany:Settings|{LABEL}")), LABEL);
+    assert!(mock.tapped_points().is_empty());
+
+    for step in ["tap:Settings", "tap:spore"] {
+        assert!(flow_err(flow.step(step)).contains("no unique exact match"));
+    }
+    assert!(flow_err(flow.step("tap:Delete Account")).contains("matches --deny"));
+    mock.state().alert_buttons = Some(Dyn::one(json!([LABEL, 17])));
+    assert!(flow_err(flow.step(&format!("tap:{LABEL}"))).contains("no usable button metadata"));
+    mock.state().alert_buttons = None;
+    assert!(flow_err(flow.step(&format!("tap:{LABEL}"))).contains("no usable button metadata"));
+    let path = flow.c.spath("/alert/accept");
+    assert!(mock.calls_to(&path).is_empty());
+    assert!(mock.tapped_points().is_empty());
+
+    mock.state().alert_buttons = Some(Dyn::one(json!([LABEL, "Tillat", "Delete Account"])));
+    assert_eq!(step_s(&mut flow, &format!("tap:{LABEL}")), LABEL);
+    assert_eq!(mock.calls_to(&path), vec![("POST".into(), path.clone(), json!({"buttonLabel": LABEL}))]);
+    assert!(mock.tapped_points().is_empty());
+
+    // If the alert closes after waitany, a foreground control with the same label
+    // is not a substitute. A new wait can still match ordinary foreground text.
+    assert_eq!(step_s(&mut flow, &format!("waitany:{LABEL}")), LABEL);
+    mock.state().alert_text = None;
+    mock.state().active_app = Seq::one(json!("com.example.target"));
+    assert!(flow_err(flow.step(&format!("tap:{LABEL}"))).contains("no longer active"));
+    assert_eq!(step_s(&mut flow, &format!("waitany:Settings|{LABEL}")), "Settings");
+    assert_eq!(mock.calls_to(&path).len(), 1);
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
+fn test_tap_named_alert_rechecks_foreground_before_input() {
+    let _cache = isolated_cache();
+    let r = FakeReader::new(vec![fr(&solid_img(240, (430, 932)), &[])]);
+    let mut st = MockState::default();
+    st.active_app = Seq::of(vec![json!("com.apple.springboard"), json!("com.example.other")]);
+    st.alert_text = Some(Dyn::one(json!("Allow tracking?")));
+    st.alert_buttons = Some(Dyn::one(json!(["Don't Allow"])));
+    let mock = MockWda::start(st);
+    let mut flow = mk_flow(&mock, &r, 1.0);
+    flow.c.set_allowed_apps(vec!["com.apple.springboard".into()]);
+
+    assert!(matches!(flow.step("tap:Don't Allow"), Err(Error::AppGuard(message)) if message.contains("com.example.other")));
+    assert!(!mock.paths().iter().any(|path| path.ends_with("/alert/accept")));
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
 fn test_waitany_matches_ocr_ui_region_and_escaped_pipe() {
     let _cache = isolated_cache();
     let img = solid_img(240, (120, 240));
