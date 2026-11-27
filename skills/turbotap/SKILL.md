@@ -115,3 +115,4 @@ Every flow step and standalone command appends one JSON line to `~/.local/state/
 - Speed internals (session cache, strip-parallel OCR, zero-momentum drag, trimmed `/source`): [docs/HOW_IT_WORKS.md](../../docs/HOW_IT_WORKS.md)
 - After a non-trivial task, run [`turbotap-retro`](../turbotap-retro/SKILL.md): fix what slowed you down once, in `turbotap` itself, with generic primitives only.
 - Improvements from test runs go into general turbotap steps (reading, waiting, tapping, fields, alerts, honest results). Never add a step for one app, one store or one course.
+- turbotap's Rust code never contains UI words or labels, in any language, and never guesses what a control means. The agent decides that by reading the screen with this skill; turbotap's code only provides exact steps (read, tap this element, type, wait for this control, report what happened).
