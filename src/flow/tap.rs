@@ -1133,6 +1133,9 @@ impl<R: Reader> Flow<R> {
     /// equally near at different places, or a disabled one: refused with nothing sent.
     pub fn tap_at(&mut self, x: i64, y: i64, expect: Option<&str>) -> Result<String> {
         self.wait_active_app(1.5, 0.03, None);
+        // Take the baseline before looking up the live control. A screenshot
+        // between lookup and tap would extend the stale-coordinate window.
+        let baseline = self.tap_grab().ok();
         let ctl = self.tap_ctl(None)?;
         let d2 = |c: &Control| (c.x - x).pow(2) + (c.y - y).pow(2);
         let near = |c: &&Control| (c.x - x).abs() <= TAPAT_RADIUS && (c.y - y).abs() <= TAPAT_RADIUS;
@@ -1162,7 +1165,7 @@ impl<R: Reader> Flow<R> {
             if c.is_disabled() {
                 return Err(Error::flow(format!("{} at {x},{y} is disabled; nothing pressed", json::py_repr_str(&c.label))));
             }
-            self.tap_at_check_reaction(&c)?;
+            self.tap_at_check_reaction(&c, baseline)?;
             return Ok(c.label);
         }
         let hit = ctl
@@ -1182,12 +1185,11 @@ impl<R: Reader> Flow<R> {
         if c.is_disabled() {
             return Err(Error::flow(format!("{} at {x},{y} is disabled", json::py_repr_str(&c.label))));
         }
-        self.tap_at_check_reaction(&c)?;
+        self.tap_at_check_reaction(&c, baseline)?;
         Ok(c.label)
     }
 
-    fn tap_at_check_reaction(&mut self, control: &Control) -> Result<()> {
-        let baseline = self.tap_grab().ok();
+    fn tap_at_check_reaction(&mut self, control: &Control, baseline: Option<Frame>) -> Result<()> {
         self.tap_point(control.x, control.y, &control.label, None)?;
         // An acknowledged tap may have a nonvisual effect. Do not replay it based on pixels.
         let reaction = match baseline {
