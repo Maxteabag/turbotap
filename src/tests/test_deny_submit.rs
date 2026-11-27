@@ -41,7 +41,7 @@ fn test_return_and_multiline_are_refused_when_the_keyboard_matches_the_callers_p
     let m = MockWda::start(state("Senden"));
     let mut f = flow_with(&m, None, &["senden"]);
     let e = f.step("key:return").unwrap_err().to_string();
-    assert!(e.contains("may submit") && e.contains("no key input sent"), "{e}");
+    assert!(e.contains("may submit") && e.contains("requested Return or newline input was not sent"), "{e}");
     assert_eq!(keys_sent(&m), 0);
     // Multi-line text too; single-line text is typed with no keyboard read at all.
     let e = f.step("type:line one\nline two").unwrap_err().to_string();
@@ -64,6 +64,62 @@ fn test_return_and_multiline_are_refused_when_the_keyboard_matches_the_callers_p
     assert_eq!(keys_sent(&m), 1);
     assert!(cap.stderr().contains("matches --deny"), "{}", cap.stderr());
     f.close();
+}
+
+#[test]
+fn unreadable_keyboard_key_is_not_hidden_by_a_readable_neighbor() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let mut state = state("other");
+    state.source_tree = Dyn::one(json!({"type":"Application", "children":[
+        {"type":"Keyboard", "children":[
+            {"type":"Key","label":"q","isVisible":"1"},
+            {"type":"Key","label":null,"name":"","isVisible":"1"}
+        ]}
+    ]}));
+    let mock = MockWda::start(state);
+    let mut blocked = flow_with(&mock, None, &["unseen"]);
+    let error = blocked.step("key:return").unwrap_err().to_string();
+    assert!(error.contains("no readable label or name"), "{error}");
+    assert_eq!(keys_sent(&mock), 0);
+    blocked.close();
+
+    let mut warned = flow_with(&mock, Some("unseen"), &[]);
+    let cap = Capture::start();
+    warned.step("key:return").unwrap();
+    assert!(cap.stderr().contains("no readable label or name"));
+    assert_eq!(keys_sent(&mock), 1);
+    warned.close();
+}
+
+#[test]
+fn cleartype_checks_keyboard_before_clear_and_identifies_late_refusal() {
+    let _c = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    for late in [false, true] {
+        let mut state = state("ordinary");
+        state.elements_map.insert("XCUIElementTypeTextField".into(), vec![json!({"ELEMENT":"input"})]);
+        state.set_element_value("input", Dyn::one(json!("existing value")));
+        let mock = MockWda::start(state);
+        mock.set_custom_handler(move |st, _, path, _| {
+            path.contains("/source?format=json").then(|| {
+                let cleared = st.element_values.get_mut("input").unwrap().next(&Value::Null) == json!("");
+                let key = if !late || cleared { "protected" } else { "ordinary" };
+                json!({"value":{"type":"Application","children":[
+                    {"type":"Keyboard","children":[{"type":"Key","label":key}]}
+                ]}})
+            })
+        });
+        let mut flow = flow_with(&mock, None, &["^protected$"]);
+        let e = flow.step("cleartype:one\ntwo").unwrap_err().to_string();
+        assert!(e.contains("matches --deny-also"), "{e}");
+        assert_eq!(e.contains("field was already cleared"), late, "{e}");
+        assert_eq!(keys_sent(&mock), 0);
+        assert_eq!(mock.paths().iter().any(|p| p.ends_with("/element/input/clear")), late);
+        let value = mock.state().element_values.get_mut("input").unwrap().next(&Value::Null);
+        assert_eq!(value, json!(if late { "" } else { "existing value" }));
+        flow.close();
+    }
 }
 
 #[test]

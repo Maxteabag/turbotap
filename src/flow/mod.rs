@@ -690,8 +690,8 @@ impl<R: Reader> Flow<R> {
 
     /// Read the keyboard directly from an unfiltered source snapshot. The
     /// ordinary UI views intentionally omit soft-keyboard keys.
-    fn live_keyboard_labels(&mut self) -> Result<Vec<String>> {
-        fn collect(node: &Value, inside: bool, labels: &mut Vec<String>) {
+    fn live_keyboard_labels(&mut self) -> Result<(Vec<String>, usize)> {
+        fn collect(node: &Value, inside: bool, labels: &mut Vec<String>, unreadable: &mut usize) {
             let element_type = node.get("type").and_then(Value::as_str).unwrap_or("");
             let kind = element_type.strip_prefix("XCUIElementType").unwrap_or(element_type);
             let inside = inside || kind == "Keyboard";
@@ -701,16 +701,20 @@ impl<R: Reader> Flow<R> {
                     return;
                 }
                 if matches!(kind, "Button" | "Key") {
+                    let before = labels.len();
                     for attribute in ["label", "name"] {
                         if let Some(label) = node.get(attribute).and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
                             labels.push(label.to_owned());
                         }
                     }
+                    if labels.len() == before {
+                        *unreadable += 1;
+                    }
                 }
             }
             if let Some(children) = node.get("children").and_then(Value::as_array) {
                 for child in children {
-                    collect(child, inside, labels);
+                    collect(child, inside, labels, unreadable);
                 }
             }
         }
@@ -722,13 +726,14 @@ impl<R: Reader> Flow<R> {
             return Err(Error::flow("live accessibility source was invalid"));
         }
         let mut labels = Vec::new();
-        collect(&source, false, &mut labels);
-        if labels.is_empty() {
+        let mut unreadable = 0;
+        collect(&source, false, &mut labels, &mut unreadable);
+        if labels.is_empty() && unreadable == 0 {
             return Err(Error::flow("no live keyboard key labels were available"));
         }
         labels.sort_unstable();
         labels.dedup();
-        Ok(labels)
+        Ok((labels, unreadable))
     }
 
     /// Before Return, Enter or multiline text, check live labels against the
@@ -737,11 +742,11 @@ impl<R: Reader> Flow<R> {
         if !self.has_deny_patterns() {
             return Ok(());
         }
-        let keys = match self.live_keyboard_labels() {
-            Ok(keys) => keys,
+        let (keys, unreadable) = match self.live_keyboard_labels() {
+            Ok(observation) => observation,
             Err(e) if self.deny_also.is_some() => {
                 return Err(Error::flow(format!(
-                    "refusing {what}: could not check the live keyboard against --deny-also ({e}); no key input sent"
+                    "refusing {what}: could not check the live keyboard against --deny-also ({e}); requested Return or newline input was not sent"
                 )));
             }
             Err(e) => {
@@ -752,13 +757,23 @@ impl<R: Reader> Flow<R> {
         for key in &keys {
             if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(key).unwrap_or(true)) {
                 return Err(Error::flow(format!(
-                    "refusing {what}: the keyboard key {} matches --deny-also, so a newline may submit; no key input sent",
+                    "refusing {what}: the keyboard key {} matches --deny-also, so a newline may submit; requested Return or newline input was not sent",
                     json::py_repr_str(key)
                 )));
             }
             if self.deny.as_ref().is_some_and(|rx| rx.is_match(key).unwrap_or(false)) {
                 crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(key));
             }
+        }
+        if unreadable > 0 {
+            if self.deny_also.is_some() {
+                return Err(Error::flow(format!(
+                    "refusing {what}: {unreadable} live keyboard controls have no readable label or name for --deny-also; requested Return or newline input was not sent"
+                )));
+            }
+            crate::errln!(
+                "turbotap: warning: {what}: {unreadable} live keyboard controls have no readable label or name for --deny"
+            );
         }
         Ok(())
     }
@@ -1233,18 +1248,27 @@ impl<R: Reader> Flow<R> {
         if redact && !text.is_empty() {
             crate::redaction::before_input(&[&text])?;
         }
+        let guard_multiline = self.has_deny_patterns() && text.contains(['\n', '\r']);
+        if guard_multiline {
+            self.focus_cleartype_target(&eid, &text, redact)?;
+            if !self.wait_focus_on(&eid, 1.0) {
+                return Err(Error::flow("cleartype: could not verify keyboard focus; existing value was not cleared"));
+            }
+            self.guard_submit("multi-line cleartype:")?;
+        }
         let p = self.c.spath(&format!("/element/{eid}/clear"));
         let r = self.c.post(&p, &j!({}));
         let red = redact || crate::wda::echoes_secret(&r, &text);
         check_wda_ok(r, "cleartype clear", red)?;
         clock::sleep(0.15);
-        let p = self.c.spath(&format!("/element/{eid}/click"));
-        let r = self.c.post(&p, &j!({}));
-        let red = redact || crate::wda::echoes_secret(&r, &text);
-        check_wda_ok(r, "cleartype click", red)?;
-        clock::sleep(0.15);
-        if text.contains('\n') {
-            self.guard_submit("multi-line cleartype:")?;
+        self.focus_cleartype_target(&eid, &text, redact)?;
+        if guard_multiline {
+            if !self.wait_focus_on(&eid, 1.0) {
+                return Err(Error::flow("cleartype: field was cleared but keyboard focus could not be verified; replacement text was not sent"));
+            }
+            self.guard_submit("multi-line cleartype:").map_err(|e| {
+                Error::flow(format!("field was already cleared; replacement text was not sent: {e}"))
+            })?;
         }
         // Right before the secret: the target itself must hold keyboard focus.
         if is_secret && !self.wait_focus_on(&eid, 1.0) {
@@ -1289,6 +1313,15 @@ impl<R: Reader> Flow<R> {
             }
         }
         Ok(format!("len={}", text.chars().count()))
+    }
+
+    fn focus_cleartype_target(&mut self, eid: &str, text: &str, redact: bool) -> Result<()> {
+        let path = self.c.spath(&format!("/element/{eid}/click"));
+        let response = self.c.post(&path, &j!({}));
+        let redact = redact || crate::wda::echoes_secret(&response, text);
+        check_wda_ok(response, "cleartype click", redact)?;
+        clock::sleep(0.15);
+        Ok(())
     }
 
     fn type_digits(&mut self, arg: &str) -> Result<String> {
