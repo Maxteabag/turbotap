@@ -1480,6 +1480,34 @@ fn test_swipe_points_sends_one_gesture_to_the_requested_coordinates() {
 }
 
 #[test]
+fn test_swipe_points_requires_ack_and_only_falls_back_for_a_missing_route() {
+    let _cache = isolated_cache();
+    let img = solid_img(240, (430, 932));
+    for (fast, stock, expected_ok, expected_stock) in [
+        (json!({}), json!({"value": null}), false, false),
+        (json!({"value": {"error": "injection failed"}}), json!({"value": null}), false, false),
+        (json!({"error": 404, "body": "element missing"}), json!({"value": null}), false, false),
+        (json!({"error": 404, "body": "unknown route"}), json!({"status": 13, "value": null}), false, true),
+        (json!({"error": 404, "body": "unknown route"}), json!({"value": null}), true, true),
+    ] {
+        let mock = MockWda::start(MockState::default());
+        mock.set_custom_handler(move |_, _, path, _| {
+            if path == "/wda/fastDrag" {
+                Some(fast.clone())
+            } else if path.ends_with("/wda/dragfromtoforduration") {
+                Some(stock.clone())
+            } else {
+                None
+            }
+        });
+        let mut flow = mk_flow(&mock, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
+        assert_eq!(flow.step("swipe:points:215,80:215,12").is_ok(), expected_ok);
+        assert_eq!(mock.paths().iter().any(|p| p.ends_with("/wda/dragfromtoforduration")), expected_stock);
+        flow.close();
+    }
+}
+
+#[test]
 fn test_back_only_sends_the_requested_gesture_or_exact_tap() {
     let _cache = isolated_cache();
     let (_s, _g) = skip_sleep();

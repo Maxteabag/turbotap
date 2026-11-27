@@ -66,19 +66,24 @@ impl<R: Reader> Flow<R> {
     pub fn drag(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, duration: f64, release: f64) -> Result<()> {
         self.mark_action(false, false);
         let body = j!({"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration, "release": release});
-        if self.c.turbo != Some(false) {
-            let r = self.c.post("/wda/fastDrag", &body);
-            if r.is_object() && !json::has_err(&r) {
-                return Ok(());
+        let acknowledge = |response: &Value| {
+            let value = crate::guard::success_value(response)
+                .map_err(|reason| Error::flow(format!("drag: WDA did not acknowledge the gesture ({reason})")))?;
+            if value.get("error").is_some() || value.get("status").is_some_and(|status| status.as_i64() != Some(0)) {
+                return Err(Error::flow("drag: WDA reported a failed gesture"));
             }
-            if r.is_object() && !json::err_is(&r, 404) {
-                check_wda_ok(r, "drag", false)?;
+            Ok(())
+        };
+        if self.c.turbo != Some(false) {
+            let r = self.c.req_2xx("POST", "/wda/fastDrag", Some(&body), crate::wda::DEFAULT_TIMEOUT, None);
+            if !crate::wda::fast_mutation_route_missing(&r) {
+                return acknowledge(&r);
             }
         }
         let p = self.c.spath("/wda/dragfromtoforduration");
         let stock = j!({"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration.max(0.2)});
-        check_wda_ok(self.c.post(&p, &stock), "drag", false)?;
-        Ok(())
+        let r = self.c.req_2xx("POST", &p, Some(&stock), crate::wda::DEFAULT_TIMEOUT, None);
+        acknowledge(&r)
     }
 
     /// Dismiss a caller-identified banner after observing its exact text in the

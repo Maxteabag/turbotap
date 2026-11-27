@@ -2939,7 +2939,7 @@ impl WdaClient {
                 self.fast_keys = Some(true);
                 return r;
             }
-            if !fast_keys_route_missing(&r) {
+            if !fast_mutation_route_missing(&r) {
                 return r;
             }
             self.fast_keys = Some(false);
@@ -3324,7 +3324,7 @@ pub fn echoes_secret(res: &Value, secret: &str) -> bool {
     text.contains(secret) || text.contains(&base64::engine::general_purpose::STANDARD.encode(secret.as_bytes()))
 }
 
-fn fast_keys_route_missing(response: &Value) -> bool {
+pub(crate) fn fast_mutation_route_missing(response: &Value) -> bool {
     if !json::err_is(response, 404) {
         return false;
     }

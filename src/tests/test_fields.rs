@@ -51,7 +51,7 @@ fn multiline_fill_checks_before_clear_and_reports_late_refusal() {
     let (_sleep, _guard) = skip_sleep();
     for (step, changes_after_clear) in [
         ("fill:Body=one\ntwo", false),
-        ("search:Body=one\ntwo", false),
+        ("searchfield:Body=one\ntwo", false),
         ("fill:Body=one\ntwo", true),
     ] {
         let mut st = composer(BODY);
@@ -550,7 +550,15 @@ fn visible_search_inputs(_: &mut MockState, _: &str, path: &str, _: &Value) -> O
 fn search_after_open_prefers_the_native_role_over_a_focused_plain_input() {
     let _cache = isolated_cache();
     let mock = MockWda::start(MockState::default());
-    mock.set_custom_handler(visible_search_inputs);
+    let mut first_lookup = true;
+    mock.set_custom_handler(move |st, method, path, data| {
+        if method == "POST" && path.ends_with("/elements") && data["value"] == INPUT_TYPES_PRED && first_lookup {
+            first_lookup = false;
+            st.focused_eid = Some("plain".into());
+            return Some(json!({"value": [{"ELEMENT": "plain"}]}));
+        }
+        visible_search_inputs(st, method, path, data)
+    });
     mock.set_on_action(|st, action, _| {
         if action == "app" {
             st.active_app = Seq::one(json!("com.example.catalog"));
@@ -568,7 +576,7 @@ fn search_after_open_prefers_the_native_role_over_a_focused_plain_input() {
     let mut f = flow(&mock);
     f.step("open:com.example.catalog").unwrap();
     for _ in 0..2 {
-        assert_eq!(f.step("search:=a=env:B").unwrap(), Some(json!("len=7")));
+        assert_eq!(f.step("search:a=env:B").unwrap(), Some(json!("len=7")));
     }
     assert_eq!(f.step("readfield:#1").unwrap(), Some(json!("keep this")));
     let calls = mock.paths();
@@ -578,25 +586,26 @@ fn search_after_open_prefers_the_native_role_over_a_focused_plain_input() {
 }
 
 #[test]
-fn search_requires_unique_focus_for_plain_inputs_and_honors_an_explicit_override() {
+fn search_preserves_plain_inputs_and_honors_an_explicit_override() {
     let mut st = typing_composer();
     st.focused_eid = None;
     let mock = MockWda::start(st);
     mock.set_custom_handler(visible_search_inputs);
     let mut f = flow(&mock);
     let error = f.step("search:cedar").unwrap_err().to_string();
-    assert!(error.contains("2 visible plain text inputs") && error.contains("verified focus"), "{error}");
+    assert!(error.contains("no visible native SearchField"), "{error}");
 
     mock.state().focused_eid = Some("b1".into());
-    let error = f.step("search:Unknown=cedar").unwrap_err().to_string();
+    let error = f.step("search:cedar").unwrap_err().to_string();
+    assert!(error.contains("no visible native SearchField"), "{error}");
+    let error = f.step("searchfield:Unknown=cedar").unwrap_err().to_string();
     assert!(error.contains("no text input named"), "{error}");
     assert!(mock.calls().iter().all(|(m, p, _)| m == "GET" || p.ends_with("/elements")));
 
-    assert_eq!(f.step("search:cedar").unwrap(), Some(json!("len=5")));
-    assert_eq!(f.step("search:Title=oak=leaf").unwrap(), Some(json!("Title: len=8")));
-    assert_eq!(f.step("search:Title=oak=leaf").unwrap(), Some(json!("Title: len=8")));
+    assert_eq!(f.step("searchfield:Title=oak=leaf").unwrap(), Some(json!("Title: len=8")));
+    assert_eq!(f.step("searchfield:Title=oak=leaf").unwrap(), Some(json!("Title: len=8")));
     assert_eq!(f.step("readfield:Title").unwrap(), Some(json!("oak=leaf")));
-    assert_eq!(f.step("readfield:Body").unwrap(), Some(json!("cedar")));
+    assert_eq!(f.step("readfield:Body").unwrap(), Some(json!("")));
     assert_eq!(keys_typed(&mock).len(), 1);
 }
 
@@ -627,6 +636,7 @@ fn search_reports_direct_readback_failure_without_replaying_the_write() {
         ekey(&["predicate string", INPUT_TYPES_PRED]),
         vec![json!({"ELEMENT": "p1"}), json!({"element-6066-11e4-a52e-4f735466cecf": "t1"})],
     );
+    st.element_types.insert("t1".into(), json!("XCUIElementTypeSearchField"));
     st.focused_eid = None;
     let mock = MockWda::start(st);
     mock.set_custom_handler(visible_search_inputs);

@@ -387,6 +387,37 @@ fn waitchange_requires_a_tree_from_legacy_wda() {
 }
 
 #[test]
+fn waitchange_cannot_use_a_different_apps_empty_legacy_tree() {
+    let _cache = isolated_cache();
+    let (_clock, _hook) = virtual_clock();
+    let dir = TempDir::new("tt-waitchange-legacy-switch-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(MockState {
+        source_tree: Dyn::of(vec![
+            json!({"type": "Application", "name": "Shared name", "children": [
+                {"type": "Button", "label": "Sync", "rect": {"x": 20, "y": 30, "width": 40, "height": 20}}
+            ]}),
+            json!({"type": "Application", "name": "Shared name", "children": []}),
+        ]),
+        ..Default::default()
+    });
+    let mut source_reads = 0;
+    mock.set_custom_handler(move |st, _, path, _| {
+        if path.contains("/source") {
+            source_reads += 1;
+            if source_reads == 2 {
+                st.active_app = Seq::one(json!("com.example.other"));
+            }
+        }
+        None
+    });
+    let (code, out) = run_flow(&mock, &stop, &["--timeout", "1", "waitchange:Sync"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("could not confirm the same app"), "{out}");
+    assert!(!out.contains("disappeared"), "{out}");
+}
+
+#[test]
 fn stop_during_waitchange_wins_over_disappearance() {
     let _cache = isolated_cache();
     let (_clock, _hook) = virtual_clock();

@@ -75,9 +75,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   doubletapxy:X,Y       double-tap points via /wda/fastDoubleTap
   zoom:in|out|SCALE[@X,Y] two-finger pinch/zoom via /wda/fastPinch (in=2.0, out=0.5, or
                         positive scale; defaults to screen center)
-  search:QUERY          fill the visible native SearchField, or the focused/only plain input
-  search:FIELD=VALUE    select an input explicitly (same value syntax as fill:)
-  search:=QUERY         literal query, including any '=' (the first '=' normally selects FIELD)
+  search:QUERY          fill the visible native SearchField with a literal query
+  searchfield:FIELD=VALUE  select an input explicitly (same value syntax as fill:)
   readel:TEXT           labels of controls containing TEXT (accessibility tree)
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
@@ -193,10 +192,6 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
     }
 }
 
-pub(crate) fn field_assignment<'a>(verb: &str, arg: &'a str) -> Option<(&'a str, &'a str)> {
-    arg.split_once('=').filter(|(field, _)| !verb.eq_ignore_ascii_case("search") || !field.is_empty())
-}
-
 fn wda_element_ref(value: &Value) -> Option<&str> {
     value.get("ELEMENT").or_else(|| value.get("element-6066-11e4-a52e-4f735466cecf"))
         .and_then(Value::as_str)
@@ -211,8 +206,8 @@ fn wda_element_ref(value: &Value) -> Option<&str> {
 pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
     let verb = verb.trim();
-    if verb.eq_ignore_ascii_case("assertfield") || verb.eq_ignore_ascii_case("fill") || verb.eq_ignore_ascii_case("search") {
-        let value = field_assignment(verb, arg).map(|(_, v)| v).unwrap_or("");
+    if verb.eq_ignore_ascii_case("assertfield") || verb.eq_ignore_ascii_case("fill") || verb.eq_ignore_ascii_case("searchfield") {
+        let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
         return value.starts_with("env:") || value.starts_with("cmd:");
     }
     CREDENTIAL_VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb))
@@ -227,12 +222,12 @@ pub fn safe_step(spec: &str) -> String {
         return spec.to_string();
     };
     let trimmed = verb.trim();
-    if trimmed.eq_ignore_ascii_case("assertfield") || trimmed.eq_ignore_ascii_case("fill") || trimmed.eq_ignore_ascii_case("search") {
+    if trimmed.eq_ignore_ascii_case("assertfield") || trimmed.eq_ignore_ascii_case("fill") || trimmed.eq_ignore_ascii_case("searchfield") {
         if is_secret_step(spec) {
             return format!("{}:<redacted>", trimmed.to_ascii_lowercase());
         }
         // For non-secret FIELD=VALUE, retain the field name and any file path.
-        return match field_assignment(trimmed, arg) {
+        return match arg.split_once('=') {
             Some((_, value)) if value.starts_with("file:") => spec.to_string(),
             Some((field, _)) => format!("{verb}:{field}=<redacted>"),
             None => spec.to_string(),
@@ -1150,6 +1145,7 @@ impl<R: Reader> Flow<R> {
                 return some(hits[0].label.clone());
             }
             "search" => return some(self.search(arg)?),
+            "searchfield" => return some(self.search_field(arg)?),
             "settle" => {
                 self.settle(2.0, None, 0.6)?;
             }

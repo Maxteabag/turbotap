@@ -701,7 +701,7 @@ impl<R: Reader> Flow<R> {
     fn search_flag(&mut self, id: &str, attr: &str) -> Result<bool> {
         let path = self.c.spath(&format!("/element/{id}/attribute/{attr}"));
         self.c.strict_get_value(&path).ok().as_ref().and_then(crate::ui::parse_wda_bool)
-            .ok_or_else(|| Error::flow(format!("search: could not verify input {attr}; use search:FIELD=VALUE")))
+            .ok_or_else(|| Error::flow(format!("search: could not verify input {attr}; use searchfield:FIELD=VALUE")))
     }
 
     fn discover_search_input(&mut self) -> Result<Option<String>> {
@@ -715,41 +715,31 @@ impl<R: Reader> Flow<R> {
         ids.sort_unstable();
         ids.dedup();
         let mut search = Vec::new();
-        let mut plain = Vec::new();
         for id in ids {
             let path = self.c.spath(&format!("/element/{id}/name"));
-            let candidates = match self.c.strict_get_value(&path).ok().as_ref().and_then(Value::as_str) {
-                Some(SECURE) => continue,
-                Some(SEARCH) => &mut search,
-                Some("XCUIElementTypeTextField" | "XCUIElementTypeTextView") => &mut plain,
+            match self.c.strict_get_value(&path).ok().as_ref().and_then(Value::as_str) {
+                Some(SEARCH) if self.search_flag(id, "visible")? => search.push(id),
+                Some(SEARCH | SECURE | "XCUIElementTypeTextField" | "XCUIElementTypeTextView") => {}
                 _ => return Err(Error::flow("search: could not verify a native text input role")),
-            };
-            if self.search_flag(id, "visible")? {
-                candidates.push(id);
             }
         }
         match search.as_slice() {
-            [id] => return Ok(Some((*id).to_owned())),
-            [] => {}
-            many => return Err(Error::flow(format!(
-                "search: {} visible native SearchFields are ambiguous; use search:FIELD=VALUE", many.len()
-            ))),
-        }
-        match plain.as_slice() {
-            [] => Ok(None),
             [id] => Ok(Some((*id).to_owned())),
-            many => self.active_element_id().filter(|id| many.contains(&id.as_str())).map(Some).ok_or_else(|| Error::flow(format!(
-                "search: {} visible plain text inputs and none has verified focus; focus the intended input or use search:FIELD=VALUE", many.len()
+            [] => Ok(None),
+            many => Err(Error::flow(format!(
+                "search: {} visible native SearchFields are ambiguous; use searchfield:FIELD=VALUE", many.len()
             ))),
         }
     }
 
-    pub(super) fn search(&mut self, arg: &str) -> Result<String> {
+    pub(super) fn search_field(&mut self, arg: &str) -> Result<String> {
+        let (field, spec) = arg.split_once('=').filter(|(field, _)| !field.trim().is_empty())
+            .ok_or_else(|| Error::flow("searchfield requires FIELD=VALUE"))?;
+        self.fill_named(field, spec, true)
+    }
+
+    pub(super) fn search(&mut self, query: &str) -> Result<String> {
         self.c.stop_check().map_err(Error::flow)?;
-        if let Some((field, spec)) = super::field_assignment("search", arg) {
-            return self.fill_named(field, spec, true);
-        }
-        let query = arg.strip_prefix('=').unwrap_or(arg);
         if query.trim().is_empty() || query.chars().any(char::is_control) {
             return Err(Error::flow("search: expected a nonempty query without control characters"));
         }
@@ -770,7 +760,7 @@ impl<R: Reader> Flow<R> {
             }
             let remaining = deadline - clock::now();
             if opened.is_none() || remaining <= 0.0 {
-                return Err(Error::flow("search: no visible native SearchField or plain text input; reveal the input first"));
+                return Err(Error::flow("search: no visible native SearchField; reveal it or use searchfield:FIELD=VALUE"));
             }
             clock::sleep(remaining.min(0.05));
         };
@@ -835,8 +825,6 @@ impl<R: Reader> Flow<R> {
 
     fn fill_named(&mut self, field: &str, spec: &str, search: bool) -> Result<String> {
         let secret_src = spec.starts_with("env:") || spec.starts_with("cmd:");
-        // Named search must resolve its selector before interpreting the value,
-        // since an unescaped '=' may have been intended as query text.
         let resolved = if search {
             None
         } else {

@@ -36,7 +36,6 @@ type UiFetch = (Option<Vec<Control>>, String, String);
 struct ChangeBaseline {
     initial: Control,
     last: Control,
-    app_name: String,
     bundle_id: String,
 }
 
@@ -841,9 +840,12 @@ impl<R: Reader> Flow<R> {
                 break;
             }
             let poll_deadline = deadline.min(now + 30.0);
+            let before = self.c.live_foreground_app(Some(poll_deadline));
+            self.c.stop_check().map_err(Error::flow)?;
+            let before = before.map_err(|e| fail(&format!("could not verify the foreground app ({e})"), baseline.as_ref()))?;
             let snapshot = self.controls_snapshot(false, None, Some(poll_deadline), false, false);
             self.c.stop_check().map_err(Error::flow)?;
-            let (controls, app_name, bundle_id) = match snapshot {
+            let (controls, _, reported_bundle) = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(e) if !matches!(e, Error::StaleApp(_)) && clock::now() >= deadline => {
                     timeout_reason.push_str(&format!(" while reading live accessibility controls ({e})"));
@@ -855,14 +857,17 @@ impl<R: Reader> Flow<R> {
                 break;
             }
             let controls = controls.ok_or_else(|| fail("could not read live accessibility controls", baseline.as_ref()))?;
-            let app_changed = baseline.as_ref().is_some_and(|b| {
-                if !b.bundle_id.is_empty() && !bundle_id.is_empty() {
-                    b.bundle_id != bundle_id
-                } else {
-                    !b.app_name.is_empty() && b.app_name != app_name
-                }
-            });
-            if app_changed {
+            let bundle_id = if reported_bundle.is_empty() {
+                let after = self.c.live_foreground_app(Some(poll_deadline));
+                self.c.stop_check().map_err(Error::flow)?;
+                after.map_err(|e| fail(&format!("could not verify the foreground app ({e})"), baseline.as_ref()))?
+            } else {
+                reported_bundle
+            };
+            if clock::now() >= deadline {
+                break;
+            }
+            if bundle_id != before || baseline.as_ref().is_some_and(|b| b.bundle_id != bundle_id) {
                 return Err(fail("could not confirm the same app in the latest snapshot", baseline.as_ref()));
             }
             let mut matches = controls.into_iter().filter(|control| {
@@ -875,7 +880,7 @@ impl<R: Reader> Flow<R> {
             match (baseline.as_mut(), observed) {
                 (None, None) => return Err(fail("found no initial exact match", None)),
                 (None, Some(initial)) => {
-                    baseline = Some(ChangeBaseline { last: initial.clone(), initial, app_name, bundle_id });
+                    baseline = Some(ChangeBaseline { last: initial.clone(), initial, bundle_id });
                 }
                 (Some(b), Some(last)) if last == b.initial => b.last = last,
                 (Some(b), last) => {
