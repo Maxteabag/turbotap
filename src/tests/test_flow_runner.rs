@@ -3010,3 +3010,93 @@ fn test_tap_prefers_the_one_row_whose_label_part_is_exactly_the_text() {
     assert_ne!(pts.first(), Some(&(200, 400)), "{pts:?}");
     assert!(!pts.is_empty());
 }
+
+#[test]
+fn appinstall_waits_for_the_scoped_ready_control_after_one_tap() {
+    let _cache = isolated_cache();
+    let (_clock, _hook) = virtual_clock();
+    const STORE: &str = "com.apple.AppStore";
+    let decoy = json!({"type": "Button", "label": "Startklar", "x": 352, "y": 720});
+    let install = json!({"type": "Button", "label": "Hent appen", "x": 352, "y": 590});
+    let blocked = json!({"type": "Button", "label": "Startklar", "x": 352, "y": 590, "enabled": false});
+    let ready = json!({"type": "Button", "label": "Startklar", "x": 354, "y": 590});
+    let mock = MockWda::start(MockState {
+        active_app: Seq::one(json!(STORE)),
+        fast_ui: Some(Dyn::one(fast_ui(json!([decoy, install]), "", STORE))),
+        ..Default::default()
+    });
+    mock.set_on_action(move |st, kind, _| {
+        if kind == "tap" {
+            st.fast_ui = Some(Dyn::of(vec![
+                fast_ui(json!([decoy, blocked]), "", STORE),
+                fast_ui(json!([decoy, ready]), "", STORE),
+            ]));
+        }
+    });
+    let mut flow = mk_flow(&mock, &FakeReader::new(vec![]), 4.0);
+    let (ok, result) = flow.run_outcome(&["appinstall:350,588=Hent appen|Startklar".into()]).unwrap();
+    assert!(ok, "{result}");
+    assert_eq!(result["steps"][0]["result"], json!({
+        "status": "ready",
+        "bundle": STORE,
+        "pressed": {"label": "Hent appen", "x": 352, "y": 590},
+        "ready": {"label": "Startklar", "x": 354, "y": 590}
+    }));
+    assert_eq!(tapped_xy(&mock), vec![(352, 590)]);
+    flow.close();
+}
+
+#[test]
+fn appinstall_reports_live_alert_instead_of_using_ready_behind_it() {
+    let _cache = isolated_cache();
+    const STORE: &str = "com.apple.AppStore";
+    let mock = MockWda::start(MockState {
+        active_app: Seq::one(json!(STORE)),
+        fast_ui: Some(Dyn::one(fast_ui(json!([{"type": "Button", "label": "Hent", "x": 350, "y": 588}]), "", STORE))),
+        ..Default::default()
+    });
+    mock.set_on_action(|st, kind, _| {
+        if kind == "tap" {
+            st.fast_ui = Some(Dyn::one(fast_ui(json!([{"type": "Button", "label": "Klar", "x": 350, "y": 588}]), "", STORE)));
+            st.alert_text = Some(Dyn::one(json!("Bekreft konto")));
+            st.alert_buttons = Some(Dyn::one(json!(["Fortsett", "Avbryt"])));
+        }
+    });
+    let mut flow = mk_flow(&mock, &FakeReader::new(vec![]), 4.0);
+    let (ok, result) = flow.run_outcome(&["appinstall:350,588=Hent|Klar".into()]).unwrap();
+    assert!(!ok && result["error"].as_str().unwrap().contains("tap acknowledged"), "{result}");
+    assert_eq!(result["alert"], "Bekreft konto");
+    assert_eq!(result["alert_buttons"], json!(["Fortsett", "Avbryt"]));
+    let posts: Vec<_> = mock.calls().into_iter().filter(|(method, _, _)| method == "POST").collect();
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    assert!(posts[0].1.ends_with("/wda/tap"));
+    flow.close();
+}
+
+#[test]
+fn appinstall_refuses_wrong_foreground_and_does_not_retry_a_presend_failure() {
+    let _cache = isolated_cache();
+    const STORE: &str = "com.apple.AppStore";
+    for front in ["com.example.other", STORE] {
+        let mock = MockWda::start(MockState {
+            active_app: Seq::one(json!(front)),
+            fast_ui: Some(Dyn::one(fast_ui(json!([{"type": "Button", "label": "Hent", "x": 350, "y": 588}]), "", STORE))),
+            ..Default::default()
+        });
+        let mut client = mock.client();
+        client.allowed_apps = vec![STORE.into(), "com.example.other".into()];
+        if front == STORE {
+            client.test_fail_post_presend = 1;
+        }
+        let mut flow = Flow::new(client, FakeReader::new(vec![]), 4.0, Some(DENY_DEFAULT), false).unwrap();
+        let (ok, result) = flow.run_outcome(&["appinstall:350,588=Hent|Klar".into()]).unwrap();
+        assert!(!ok && result["error"].as_str().unwrap().contains("tap unconfirmed"), "{result}");
+        if front != STORE {
+            assert!(result["error"].as_str().unwrap().contains("nothing sent"), "{result}");
+        } else {
+            assert_eq!(flow.c.test_fail_post_presend, 0);
+        }
+        assert!(!mock.calls().iter().any(|(method, _, _)| method == "POST"));
+        flow.close();
+    }
+}

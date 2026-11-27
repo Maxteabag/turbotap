@@ -980,7 +980,7 @@ impl WdaClient {
     /// whose body passes [`crate::guard::success_value`]. Redirects, error statuses,
     /// failed protocol envelopes and a missing `value` are Err(reason).
     pub fn strict_get_value(&mut self, path: &str) -> std::result::Result<Value, String> {
-        match self.exchange_borrowed("GET", path, None, &[], DEFAULT_TIMEOUT, None, false, |b| {
+        match self.exchange_borrowed("GET", path, None, &[], DEFAULT_TIMEOUT, None, false, None, |b| {
             serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
         }) {
             Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => {
@@ -995,7 +995,7 @@ impl WdaClient {
     pub fn live_foreground_app(&mut self, deadline: Option<f64>) -> std::result::Result<String, String> {
         // Raw status on purpose: the shared typed helper treats every status below 400
         // (redirects included) as success, but only an actual 2xx may authorize input.
-        match self.exchange_borrowed("GET", "/wda/activeAppInfo", None, &[], 5.0, deadline, false, |b| {
+        match self.exchange_borrowed("GET", "/wda/activeAppInfo", None, &[], 5.0, deadline, false, None, |b| {
             serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
         }) {
             Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => {
@@ -1405,16 +1405,27 @@ impl WdaClient {
         timeout: f64,
         deadline: Option<f64>,
         capture_err_body: bool,
+        single_input_bundle: Option<&str>,
         mut parser: F,
     ) -> std::result::Result<Option<(u16, Option<T>, Option<String>)>, String>
     where
         F: FnMut(&[u8]) -> std::result::Result<Option<T>, String>,
     {
         let idempotent = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
-        for attempt in 0..2 {
+        let attempts = if single_input_bundle.is_some() { 1 } else { 2 };
+        for attempt in 0..attempts {
             // The app guard runs inside every attempt: a retry after a failed pre-send
             // connect asks for the foreground app again instead of reusing the answer.
-            if !self.guard_request(method, path, body, deadline)? {
+            if let Some(expected) = single_input_bundle {
+                self.stop_check()?;
+                let action = self.guard_action.clone().unwrap_or_else(|| format!("{method} {path}"));
+                self.ensure_allowed_target(&action, Some(expected)).map_err(|e| e.to_string())?;
+                let actual = self.live_foreground_app(deadline)?;
+                if actual != expected {
+                    return Err(format!("expected {expected} in front, saw {actual}; nothing sent"));
+                }
+                self.stop_check()?;
+            } else if !self.guard_request(method, path, body, deadline)? {
                 return Ok(None);
             }
             let mut eff_timeout = timeout;
@@ -1459,7 +1470,7 @@ impl WdaClient {
                 Err(e) if e.to_string() == "__deadline__" => return Ok(None),
                 Err(e) => {
                     self.conn = None;
-                    if attempt == 1 || (sent && !idempotent) {
+                    if attempt + 1 == attempts || (sent && !idempotent) {
                         let msg = match e.kind() {
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "timed out".to_string(),
                             _ => py_os_error(&e),
@@ -1570,7 +1581,7 @@ impl WdaClient {
     fn req_json(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>, require_2xx: bool) -> Value {
         let body = data.map(|d| serde_json::to_vec(d).unwrap_or_default());
         let headers: &[(&str, &str)] = if data.is_some() { &[("Content-Type", "application/json")] } else { &[] };
-        match self.exchange_borrowed(method, path, body.as_deref(), headers, timeout, deadline, true, |b| {
+        match self.exchange_borrowed(method, path, body.as_deref(), headers, timeout, deadline, true, None, |b| {
             serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
         }) {
             Ok(None) => json::deadline_value(),
@@ -1608,7 +1619,7 @@ impl WdaClient {
                 timeout.min(rem).max(0.05)
             }
         };
-        match self.exchange_borrowed(method, path, None, &[], eff, deadline, false, |b| {
+        match self.exchange_borrowed(method, path, None, &[], eff, deadline, false, None, |b| {
             parser(b).map(Some).map_err(|e| e.to_string())
         }) {
             Ok(None) => TypedHttpResult::DeadlineExceeded,
@@ -2646,7 +2657,7 @@ fn sid_is_set(sid: &Option<String>) -> bool {
 
 impl WdaClient {
     fn fetch_status_typed(&mut self, timeout: f64) -> StatusFetch {
-        match self.exchange_borrowed("GET", "/status", None, &[], timeout, None, true, |b| {
+        match self.exchange_borrowed("GET", "/status", None, &[], timeout, None, true, None, |b| {
             let parsed: RawStatusResp = serde_json::from_slice(b).map_err(|e| e.to_string())?;
             if parsed.is_object && !parsed.has_err {
                 Ok(Some(StatusFetch::Ok(parsed.session_id)))
@@ -2778,6 +2789,25 @@ impl WdaClient {
         }
         let path = if duration.is_some() { self.spath("/wda/touchAndHold") } else { self.spath("/wda/tap") };
         self.req_with_deadline("POST", &path, Some(&body), DEFAULT_TIMEOUT, deadline)
+    }
+
+    /// Send a single coordinate tap with fresh bundle proof and no endpoint or
+    /// transport replay, even if the first attempt failed before dispatch.
+    pub(crate) fn tap_once_in_app(&mut self, x: i64, y: i64, bundle: &str, deadline: f64) -> Result<()> {
+        let path = self.spath("/wda/tap");
+        let body = serde_json::to_vec(&j!({"x": x, "y": y})).map_err(|e| Error::flow(e.to_string()))?;
+        let reply = self.exchange_borrowed(
+            "POST", &path, Some(&body), &[("Content-Type", "application/json")],
+            DEFAULT_TIMEOUT, Some(deadline), false, Some(bundle),
+            |bytes| serde_json::from_slice::<Value>(bytes).map(Some).map_err(|e| e.to_string()),
+        );
+        match reply {
+            Ok(Some((status, Some(v), _))) if (200..300).contains(&status)
+                && crate::guard::success_value(&v).is_ok_and(|value| value.get("error").is_none()) => Ok(()),
+            Ok(Some((status, _, _))) => Err(Error::flow(format!("tap was not acknowledged (HTTP {status})"))),
+            Ok(None) => Err(Error::flow("tap was not acknowledged before the deadline")),
+            Err(reason) => Err(Error::flow(reason)),
+        }
     }
 
     /// L582-601. `/wda/fastDoubleTap` (wda-turbo v4), stock `/wda/doubleTap` on 404.
