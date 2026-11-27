@@ -110,6 +110,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         matched by label/name; rejects disabled sliders; respects --deny)
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS may ask permission to paste)
+  banner:dismiss:TEXT   swipe from an exact observed banner line and report visual evidence
   dismisskb             gesture to dismiss an observed docked keyboard
   dismisskb:LABEL       tap the unique enabled control with this exact accessibility label
   dismisskb:tapat:X,Y=LABEL  tap the exact labelled control at the caller's location hint
@@ -149,7 +150,7 @@ flow/unlock/deploy/tap-ocr/otp-type exit 6 before contacting WDA.";
 /// [`flow_needs_ocr`]; pixel-only steps (`shot`, `settle`, `scroll`, `search`) never touch Tesseract.
 pub const IMAGE_STEP_VERBS: &[&str] = &[
     "wait", "expect", "waitany", "gone", "assert", "assertnot", "tap", "tapif", "longpress", "doubletap", "scrollto",
-    "swipe", "back", "read", "readfield", "assertfield",
+    "swipe", "back", "banner", "read", "readfield", "assertfield",
 ];
 pub const STALE_UI_BACKOFF: [f64; 3] = [0.05, 0.08, 0.12];
 /// Text this long (chars) is typed with a landing probe and a read-back (see `type_long`).
@@ -1104,6 +1105,7 @@ impl<R: Reader> Flow<R> {
                 return some(self.scroll_to(&label, where_.as_deref(), 8, &direction)?.text);
             }
             "swipe" => return some(self.swipe_gesture(arg)?),
+            "banner" => return some(self.dismiss_banner(arg)?),
             "picker" => return some(self.set_picker(arg)?),
             "slider" => return some(self.set_slider(arg)?),
             "clipboard" | "copy" => {

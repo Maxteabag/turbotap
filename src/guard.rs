@@ -569,7 +569,7 @@ pub fn refuse_policy(action: &str, reason: &str) -> String {
 pub const INPUT_VERBS: &[&str] = &[
     "tap", "tapif", "tapbatch", "toggle", "tapel", "tapxy", "tapat", "longpress", "longpressxy", "doubletap", "doubletapxy", "zoom",
     "type", "key", "cleartype", "dismisskb", "typedigits", "pintap", "scroll", "scrollto", "swipe", "picker", "slider",
-    "setclip", "back", "search", "fill",
+    "setclip", "back", "search", "fill", "banner",
 ];
 
 /// True when flow step `verb:arg` sends input to the foreground app.

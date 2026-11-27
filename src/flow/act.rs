@@ -81,6 +81,62 @@ impl<R: Reader> Flow<R> {
         Ok(())
     }
 
+    /// Dismiss a caller-identified banner after observing its exact text in the
+    /// top of an unlocked system overlay. Foreground ownership alone is not evidence.
+    pub(super) fn dismiss_banner(&mut self, arg: &str) -> Result<String> {
+        let label = arg.strip_prefix("dismiss:").map(str::trim).filter(|label| !label.is_empty())
+            .ok_or_else(|| Error::flow("banner expects banner:dismiss:TEXT with the exact observed banner line"))?;
+        let deadline = clock::now() + self.timeout;
+        self.c.stop_check().map_err(Error::flow)?;
+        let shell = crate::wda::SPRINGBOARD;
+        let foreground = self.c.live_foreground_app(Some(deadline)).map_err(Error::flow)?;
+        if foreground != shell {
+            return Ok("overlay-not-observed".into());
+        }
+        let locked = self.c.req_2xx("GET", "/wda/locked", None, crate::wda::DEFAULT_TIMEOUT, Some(deadline));
+        if crate::guard::success_value(&locked).ok().and_then(Value::as_bool) != Some(false) {
+            return Ok("overlay-unverified".into());
+        }
+
+        let (w, h) = self.act_pt_size()?;
+        let upper_band = h as f64 / 5.0;
+        let lines = self.lines(None, Some(deadline))?;
+        let mut matches = lines.iter().filter(|line| line.text == label);
+        let Some(line) = matches.next() else {
+            return Ok(if lines.is_empty() { "overlay-unverified" } else { "overlay-not-observed" }.into());
+        };
+        let in_top_band = 0.0 <= line.x0 && line.x0 < line.x1 && line.x1 <= w as f64
+            && 8.0 < line.y0 && line.y0 < line.y1 && line.y1 <= upper_band;
+        if matches.next().is_some() || !in_top_band {
+            return Ok("overlay-unverified".into());
+        }
+        self.guard(&line.text, "dismiss banner")?;
+        self.c.stop_check().map_err(Error::flow)?;
+        if clock::now() >= deadline {
+            return Ok("overlay-unverified".into());
+        }
+        if self.c.live_foreground_app(Some(deadline)).as_deref() != Ok(shell) || clock::now() >= deadline {
+            return Ok("overlay-unverified".into());
+        }
+        let x = ((line.x0 + line.x1) / 2.0) as i64;
+        let y = ((line.y0 + line.y1) / 2.0) as i64;
+        self.drag(x, y, x, 4, 0.12, 0.02)?;
+
+        self.c.stop_check().map_err(Error::flow)?;
+        if clock::now() >= deadline {
+            return Ok("dismissal-unverified".into());
+        }
+        let observed = self.lines(None, Some(deadline));
+        self.c.stop_check().map_err(Error::flow)?;
+        match observed {
+            Ok(lines) if !lines.is_empty() && clock::now() < deadline => {
+                Ok(if lines.iter().any(|line| line.text == label) { "banner-text-visible" } else { "banner-text-gone" }.into())
+            }
+            Ok(_) => Ok("dismissal-unverified".into()),
+            Err(e) => Err(Error::flow(format!("banner gesture sent; the follow-up observation failed: {e}"))),
+        }
+    }
+
     /// L3935. Scroll 54% of the screen without momentum (wda-turbo fastDrag crawls
     /// 1 pt during the 80 ms hold, so the release velocity is ~0 while keeping 46%
     /// viewport overlap so no row is skipped).
