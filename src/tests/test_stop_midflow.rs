@@ -91,6 +91,81 @@ fn test_stop_created_during_alert_lookup_blocks_named_alert_input() {
 }
 
 #[test]
+fn test_waitcontrol_reports_exact_live_control_without_input() {
+    let _c = isolated_cache();
+    let dir = TempDir::new("tt-waitcontrol-");
+    let stop = dir.path().join("phone.STOP");
+    let tree = |label| json!({
+        "type": "Application", "name": "Example",
+        "children": [{"type": "Switch", "label": label, "value": "0",
+            "rect": {"x": 20, "y": 30, "width": 40, "height": 20}}]
+    });
+    let mut state = MockState::default();
+    state.source_tree = Dyn::of(vec![tree("sync | status: now"), tree("Sync | status: now")]);
+    let mock = MockWda::start(state);
+
+    let (code, out) = run_flow(&mock, &stop, &["--timeout", "1", "waitcontrol:Sync | status: now"]);
+
+    assert_eq!(code, 0, "{out}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(result["steps"][0]["result"], json!({
+        "type": "Switch", "label": "Sync | status: now", "x": 40, "y": 40, "value": "0"
+    }));
+    let calls = mock.calls();
+    assert!(calls.iter().filter(|(_, path, _)| path.contains("/source?")).count() >= 2);
+    assert!(calls.iter().all(|(method, path, _)| {
+        method == "GET" || (method == "POST" && (path == "/session" || path.ends_with("/appium/settings")))
+    }), "{calls:?}");
+    assert!(!calls.iter().any(|(_, path, _)| path.to_ascii_lowercase().contains("screenshot")));
+}
+
+#[test]
+fn test_waitcontrol_distinguishes_absence_from_failed_observation() {
+    let _c = isolated_cache();
+    let (_clock, _hook) = virtual_clock();
+    let dir = TempDir::new("tt-waitcontrol-error-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(MockState::default());
+    let args = ["--timeout", "0.2", "waitcontrol:Missing"];
+
+    let (code, absent) = run_flow(&mock, &stop, &args);
+    assert_eq!(code, 1, "{absent}");
+    assert!(absent.contains("waitcontrol timed out after 0.2 s"), "{absent}");
+
+    mock.set_custom_handler(|_, _, path, _| path.starts_with("/wda/fastUI").then(|| json!({"__close__": true})));
+    let (code, failed) = run_flow(&mock, &stop, &args);
+    assert_eq!(code, 1, "{failed}");
+    assert!(failed.contains("waitcontrol could not read live accessibility controls"), "{failed}");
+    assert!(!failed.contains("waitcontrol timed out"), "{failed}");
+    assert!(!mock.paths().iter().any(|path| path.to_ascii_lowercase().contains("screenshot")));
+}
+
+#[test]
+fn test_stop_during_waitcontrol_wins_over_the_matching_reply() {
+    let _c = isolated_cache();
+    let dir = TempDir::new("tt-stop-waitcontrol-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(MockState::default());
+    let stop_in_handler = stop.clone();
+    mock.set_custom_handler(move |_, method, path, _| {
+        if method == "GET" && path == "/wda/fastUI" {
+            std::fs::write(&stop_in_handler, "").unwrap();
+            return Some(fast_ui(json!([{"type": "Button", "label": "Ready", "x": 40, "y": 40}]), "Example", "com.example.app"));
+        }
+        None
+    });
+
+    let (code, out) = run_flow(&mock, &stop, &["--timeout", "1", "waitcontrol:Ready", "tapxy:40,40"]);
+
+    assert_eq!(code, crate::stop::STOP_EXIT, "{out}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(result["failed_step"], "waitcontrol:Ready");
+    assert_eq!(result["steps"], json!([]));
+    assert!(mock.tapped_points().is_empty());
+    assert!(!mock.paths().iter().any(|path| path.to_ascii_lowercase().contains("screenshot")));
+}
+
+#[test]
 fn test_without_a_stop_file_the_flow_runs_as_before() {
     let _c = isolated_cache();
     let dir = TempDir::new("tt-stop-c-");

@@ -994,6 +994,7 @@ impl<R: Reader> Flow<R> {
             "url" => return some(self.open_url(arg)?),
             "wait" | "expect" => return some(self.wait(arg, None, false, None, true)?.text),
             "waitany" => return some(self.wait_any(arg, None)?.text),
+            "waitcontrol" => return Ok(Some(self.wait_control(arg)?.to_value())),
             "gone" => self.gone(arg, None)?,
             "assert" => return some(self.assert_text(arg)?),
             "assertnot" => return some(self.assert_not_text(arg)?),
@@ -1579,6 +1580,10 @@ impl<R: Reader> Flow<R> {
     }
 
     fn run_outcome_inner(&mut self, steps: &[String], take_reads: bool) -> Result<(bool, Value)> {
+        let is_control_wait = |spec: &str| {
+            let verb = spec.split_once(':').map_or(spec, |(verb, _)| verb);
+            verb.trim().eq_ignore_ascii_case("waitcontrol")
+        };
         let t0 = clock::real_now();
         let mut done: Vec<Value> = Vec::with_capacity(steps.len());
         for spec in steps {
@@ -1615,9 +1620,9 @@ impl<R: Reader> Flow<R> {
                     }
                     done.push(item);
                 }
-                Err(e) if e.is_flow() && (secret_step || matches!(&e, Error::SecretField(_))) => {
-                    // A credential step failed: the screen may show what was being
-                    // entered, so no screen diagnostics at all.
+                Err(e) if e.is_flow() && (secret_step || matches!(&e, Error::SecretField(_)) || is_control_wait(spec)) => {
+                    // Screen diagnostics could expose credentials or run beyond a
+                    // control wait's deadline or STOP check.
                     let mut res = j!({
                         "ok": false,
                         "failed_step": safe_step(spec),
@@ -1673,7 +1678,7 @@ impl<R: Reader> Flow<R> {
         // A flow that ends right after open:/launch: (no read or tap to wait lazily)
         // returns once the app is in front, so the caller's next command does not see
         // the previous app.
-        if self.pending_bundle.is_some() {
+        if self.pending_bundle.is_some() && !steps.last().is_some_and(|spec| is_control_wait(spec)) {
             self.wait_active_app(1.5, 0.03, None);
         }
         let reads = if take_reads { std::mem::take(&mut self.reads) } else { self.reads.clone() };

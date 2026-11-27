@@ -733,6 +733,43 @@ impl<R: Reader> Flow<R> {
         )))
     }
 
+    /// Observe a live accessibility control by its displayed label.
+    pub(super) fn wait_control(&mut self, label: &str) -> Result<Control> {
+        if label.trim().is_empty() {
+            return Err(Error::flow("waitcontrol requires a non-empty control label"));
+        }
+        let timeout = self.timeout;
+        if !timeout.is_finite() || timeout <= 0.0 {
+            return Err(Error::flow("waitcontrol requires a finite, positive --timeout"));
+        }
+
+        let deadline = clock::now() + timeout;
+        loop {
+            self.c.stop_check().map_err(Error::flow)?;
+            let now = clock::now();
+            if now >= deadline {
+                break;
+            }
+            // Use the ordinary UI tree request budget when the caller allows a
+            // longer wait, and keep every poll within the overall deadline.
+            let controls = self.controls(false, None, Some(deadline.min(now + 30.0)), false, true);
+            self.c.stop_check().map_err(Error::flow)?;
+            let controls = controls.map_err(|e| Error::flow(format!("waitcontrol could not read live accessibility controls: {e}")))?;
+            let remaining = deadline - clock::now();
+            if remaining <= 0.0 {
+                break;
+            }
+            if let Some(control) = controls.into_iter().find(|control| control.label == label) {
+                return Ok(control);
+            }
+            clock::sleep(remaining.min(0.1));
+        }
+        Err(Error::flow(format!(
+            "waitcontrol timed out after {timeout} s waiting for {}",
+            json::py_repr_str(label)
+        )))
+    }
+
     /// L2976.
     pub fn gone(&mut self, label: &str, timeout: Option<f64>) -> Result<()> {
         self.wait_active_app(1.5, 0.03, None);
