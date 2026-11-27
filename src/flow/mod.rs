@@ -1349,6 +1349,10 @@ impl<R: Reader> Flow<R> {
             (eid, secure)
         };
         let redact = is_secret || secure;
+        // A registry failure must leave the existing field value intact.
+        if redact && !text.is_empty() {
+            crate::redaction::before_input(&[&text])?;
+        }
         let p = self.c.spath(&format!("/element/{eid}/clear"));
         let r = self.c.post(&p, &j!({}));
         let red = redact || crate::wda::echoes_secret(&r, &text);
@@ -1365,9 +1369,6 @@ impl<R: Reader> Flow<R> {
         // Right before the secret: the target itself must hold keyboard focus.
         if is_secret && !self.wait_focus_on(&eid, 1.0) {
             return Err(Error::flow("cleartype: the target field did not get keyboard focus (nothing typed)"));
-        }
-        if !text.is_empty() {
-            crate::redaction::before_input(&[&text])?;
         }
         // A secret is written through the target element, never sent to whatever has focus.
         if !is_secret && text.chars().count() >= LONG_TEXT {

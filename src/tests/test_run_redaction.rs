@@ -226,6 +226,27 @@ fn separate_cli_processes_mask_visible_credentials_only_for_the_same_run_and_dev
 }
 
 #[test]
+fn scoped_cleartype_preserves_existing_text_if_secret_registration_fails() {
+    let tmp = TempDir::new("tt-run-cleartype-");
+    std::fs::write(tmp.path().join("config.json"), "{}").unwrap();
+    let scope = private_dir(tmp.path(), "workflow");
+    let phone = phone();
+    let literal = "ordinary text ".repeat(22);
+    let literal_step = format!("cleartype:{literal}");
+    let output = subprocess(tmp.path(), &phone, Some(&scope), &["flow", "--quiet", &literal_step]);
+    assert!(output.status.success(), "ordinary long text was rejected in scoped mode");
+
+    phone.clear_calls();
+    let secret_step = format!("cleartype:cmd:printf '%s' '{}'", "x".repeat(257));
+    let rejected = subprocess(tmp.path(), &phone, Some(&scope), &["flow", "--quiet", &secret_step]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(!phone.paths().iter().any(|p| p.ends_with("/element/input/clear")));
+    assert!(!phone.paths().iter().any(|p| p.ends_with("/element/input/value")));
+    let field = phone.state().element_values.get_mut("input").unwrap().next(&Value::Null);
+    assert_eq!(field, json!(literal));
+}
+
+#[test]
 fn same_process_cli_calls_share_the_run_and_refuse_writes_when_state_disappears() {
     // This test mutates process-wide CLI configuration. Give its two dispatches
     // one isolated process so unrelated tests cannot see that configuration.
