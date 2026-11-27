@@ -135,8 +135,7 @@ fn allow_app_arg() -> Arg {
 
 fn allow_label_arg() -> Arg {
     Arg::new("allow-label").long("allow-label").value_name("EXACT_LABEL").action(ArgAction::Append).help(
-        "let a control with exactly this label through the built-in --deny for this run, only if 'send' is the only \
-         deny word in it and only while an app given with --allow-app is confirmed in front (repeatable)",
+        "deprecated compatibility option with no effect",
     )
 }
 
@@ -166,28 +165,6 @@ fn many_values(m: &ArgMatches, sm: &ArgMatches, name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for mm in [m, sm] {
         if let Ok(Some(v)) = mm.try_get_many::<String>(name) {
-            out.extend(v.cloned());
-        }
-    }
-    out
-}
-
-/// `--allow-label` values given before and after the subcommand.
-fn allow_label_values(m: &ArgMatches, sm: &ArgMatches) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for mm in [m, sm] {
-        if let Ok(Some(v)) = mm.try_get_many::<String>("allow-label") {
-            out.extend(v.cloned());
-        }
-    }
-    out
-}
-
-/// `--allow-app` values given before and after the subcommand.
-fn allow_app_values(m: &ArgMatches, sm: &ArgMatches) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for mm in [m, sm] {
-        if let Ok(Some(v)) = mm.try_get_many::<String>("allow-app") {
             out.extend(v.cloned());
         }
     }
@@ -303,15 +280,15 @@ pub fn build_command() -> Command {
                 .arg(Arg::new("steps").value_name("STEP").required(true).num_args(1..).action(ArgAction::Append).allow_negative_numbers(true))
                 .arg(float_arg("timeout").default_value("8.0").help("per waiting step (s)"))
                 .arg(float_arg("scale").default_value("1.5").help("OCR px per point"))
-                .arg(Arg::new("deny").long("deny").help("regex of tap labels to refuse"))
+                .arg(Arg::new("deny").long("deny").help("regex of target labels to refuse"))
                 .arg(
                     Arg::new("deny-also")
                         .long("deny-also")
                         .value_name("REGEX")
                         .action(ArgAction::Append)
-                        .help("extra labels to refuse on top of --deny or the default (repeatable; also config deny_also); never relaxed, and used to refuse key:return or multi-line text when the keyboard's keys match"),
+                        .help("additional regex of target labels to refuse (repeatable; also config deny_also); never relaxed, and used to refuse key:return or multi-line text when the keyboard's keys match"),
                 )
-                .arg(Arg::new("no-deny").long("no-deny").action(ArgAction::SetTrue))
+                .arg(Arg::new("no-deny").long("no-deny").action(ArgAction::SetTrue).help("disable --deny and --deny-also, including configured deny_also"))
                 .arg(flag("quiet", "no per-step progress on stderr"))
                 .arg(allow_app_arg())
                 .arg(allow_label_arg())
@@ -406,15 +383,14 @@ fn main_inner(argv: &[String]) -> Result<i32> {
     let url = target.url.clone().ok_or_else(crate::config::no_url_error)?;
     let allowed = match target.identity_error.as_ref() {
         Some(e) => Err(e.clone()),
-        None => crate::guard::resolve_allowlist(target.dev_key.as_deref(), &allow_app_values(&m, sm)),
+        None => crate::guard::resolve_allowlist(target.dev_key.as_deref(), &many_values(&m, sm, "allow-app")),
     };
     crate::redaction::configure(&url, &target.udid)?;
     let mut client = WdaClient::new(&url, &target.udid, target.dev_key.as_deref());
     // Connect only to the addresses the identity, allowlist and stop file were
     // resolved for; the host name is not resolved again.
     client.pin_addrs(target.addrs.clone());
-    // --allow-label only ever works together with --allow-app in the same run.
-    client.set_run_allow(allow_app_values(&m, sm), allow_label_values(&m, sm));
+    client.set_run_allow(many_values(&m, sm, "allow-app"));
     client.set_allow_url_schemes(many_values(&m, sm, "allow-url-scheme"));
     if crate::stop::STOP_CMDS.contains(&cmd) {
         let keys: Vec<&str> = target.dev_key.iter().map(String::as_str).collect();
@@ -450,21 +426,24 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         "tap-ocr" => crate::flow::cmd_tap_ocr(client, s(sm, "text").unwrap_or(""))?,
         "flow" => {
             let steps: Vec<String> = sm.get_many::<String>("steps").map(|v| v.cloned().collect()).unwrap_or_default();
-            // An explicit --deny is never relaxed, even when it spells the built-in
-            // pattern: wrap it so it is compiled as a custom pattern.
-            if b(sm, "no-deny") && !allow_label_values(&m, sm).is_empty() {
-                crate::errln!("turbotap: warning: --allow-label has no effect with --no-deny (the whole --deny filter is off)");
-            }
-            let explicit_default = format!("(?:{})", crate::flow::DENY_DEFAULT);
-            let deny = if b(sm, "no-deny") {
-                None
+            let mut deny = s(sm, "deny");
+            let disabled_by = if b(sm, "no-deny") {
+                Some("--no-deny")
+            } else if deny == Some("") {
+                Some("empty --deny")
             } else {
-                match s(sm, "deny") {
-                    Some(d) if d == crate::flow::DENY_DEFAULT => Some(explicit_default.as_str()),
-                    Some(d) => Some(d),
-                    None => Some(crate::flow::DENY_DEFAULT),
-                }
+                None
             };
+            if let Some(flag) = disabled_by {
+                if !client.deny_also.is_empty() {
+                    crate::errln!(
+                        "turbotap: warning: {flag}: ignoring {} deny_also pattern(s) from --deny-also/config",
+                        client.deny_also.len()
+                    );
+                    client.deny_also.clear();
+                }
+                deny = None;
+            }
             return crate::flow::cmd_flow(
                 client,
                 &steps,

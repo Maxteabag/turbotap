@@ -775,8 +775,6 @@ pub struct WdaClient {
     pub allowed_apps: Vec<String>,
     /// Bundles given with `--allow-app` in this run (a subset of `allowed_apps`).
     pub run_allowed_apps: Vec<String>,
-    /// Exact labels given with `--allow-label` in this run.
-    pub allow_labels: Vec<String>,
     /// Custom URL schemes given with `--allow-url-scheme` in this run (lowercased).
     pub allow_url_schemes: Vec<String>,
     /// First app guard refusal in this invocation (sticky: later input is refused).
@@ -840,7 +838,6 @@ impl WdaClient {
             cache_dir: crate::config::cache_dir(),
             allowed_apps: Vec::new(),
             run_allowed_apps: Vec::new(),
-            allow_labels: Vec::new(),
             allow_url_schemes: Vec::new(),
             guard_refusal: None,
             guard_action: None,
@@ -862,10 +859,9 @@ impl WdaClient {
         self.allowed_apps = apps;
     }
 
-    /// The `--allow-app` bundles and `--allow-label` labels given for this run.
-    pub fn set_run_allow(&mut self, apps: Vec<String>, labels: Vec<String>) {
+    /// The `--allow-app` bundles given for this run.
+    pub fn set_run_allow(&mut self, apps: Vec<String>) {
         self.run_allowed_apps = apps.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
-        self.allow_labels = labels;
     }
 
     /// The `--allow-url-scheme` schemes given for this run (lowercased; system schemes
@@ -914,15 +910,7 @@ impl WdaClient {
         }
     }
 
-    /// For `--allow-label`: `Ok(bundle)` when the app guard is on and a live
-    /// `/wda/activeAppInfo` names an app given with `--allow-app` in this run (not
-    /// only one from config), else `Err(why not)`.
-    pub fn allow_label_foreground(&mut self) -> std::result::Result<String, String> {
-        self.run_allow_foreground("--allow-label")
-    }
-
-    /// [`WdaClient::allow_label_foreground`] for any per-run flag that needs an
-    /// `--allow-app` app confirmed in front; `flag` names it in the reason.
+    /// Confirm a live foreground app given with --allow-app in this run.
     pub fn run_allow_foreground(&mut self, flag: &str) -> std::result::Result<String, String> {
         if self.run_allowed_apps.is_empty() {
             return Err(format!("{flag} works only together with --allow-app"));
@@ -1211,7 +1199,6 @@ impl WdaClient {
         side.cache_dir = self.cache_dir.clone();
         side.allowed_apps = self.allowed_apps.clone();
         side.run_allowed_apps = self.run_allowed_apps.clone();
-        side.allow_labels = self.allow_labels.clone();
         side.allow_url_schemes = self.allow_url_schemes.clone();
         side.guard_policy_error = self.guard_policy_error.clone();
         side.pinned_addrs = self.pinned_addrs.clone();

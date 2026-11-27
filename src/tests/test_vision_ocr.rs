@@ -1,7 +1,7 @@
 //! Port of tests/test_vision_ocr.py: on-device Apple Vision OCR (`turbotap
 //! vision-ocr` and the read:vision flow verb).
 use crate::error::Error;
-use crate::flow::{Flow, DENY_DEFAULT, FLOW_HELP};
+use crate::flow::{Flow, FLOW_HELP};
 use crate::testutil::capture::Capture;
 use crate::testutil::{isolated_cache, FakeReader, MockState, MockWda, Seq};
 use crate::vision::vision_ocr_raw;
@@ -221,7 +221,7 @@ fn float_rounding_at_the_screen_edge_is_clamped_not_rejected() {
 }
 
 fn flow(v: &Vision) -> Flow<FakeReader> {
-    Flow::new(v.client(), FakeReader::with(vec![], (400, 800), 1.5), 1.0, Some(DENY_DEFAULT), false).unwrap()
+    Flow::new(v.client(), FakeReader::with(vec![], (400, 800), 1.5), 1.0, None, false).unwrap()
 }
 
 #[test]
@@ -298,7 +298,7 @@ fn host_ocr_read_variants_are_unchanged() {
     let _c = isolated_cache();
     assert!(FLOW_HELP.contains("read:vision"));
     let mock = MockWda::start(MockState::default());
-    let mut f = Flow::new(mock.client(), FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut f = Flow::new(mock.client(), FakeReader::new(vec![]), 1.0, None, false).unwrap();
     let res = f.step("read:ocr");
     f.close();
     res.unwrap();

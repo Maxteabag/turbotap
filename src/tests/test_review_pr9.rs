@@ -2,7 +2,7 @@
 //! Regression tests for the PR #9 review: request isolation in the warm daemon,
 //! OCR backend/model selection, strict 304 validators, clipped Vision boxes and the
 //! deferred fused /wda/fastRead route.
-use crate::flow::{Flow, UiWorker, DENY_DEFAULT};
+use crate::flow::{Flow, UiWorker};
 use crate::ocr::{self, ScreenReader};
 use crate::testutil::{isolated_cache, router_json, RouterReply, RouterServer};
 use crate::wda::{self, WdaClient};
@@ -77,7 +77,7 @@ fn test_failed_frame_waits_for_delayed_ui_before_recycling_connections() {
     // Request 1: the parallel tree fetch starts, then the frame fails.
     let mut client = WdaClient::new(&srv.url, "", None);
     client.sid = Some("sid-1".into());
-    let mut flow = Flow::new(client, ScreenReader::new(1.5, None, 11, false), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(client, ScreenReader::new(1.5, None, 11, false), 1.0, None, false).unwrap();
     let res = flow.read_full(true, 1.0);
     let err = res.expect_err("the frame must fail");
     assert!(err.is_runtime(), "expected a RuntimeError, got {err:?}");

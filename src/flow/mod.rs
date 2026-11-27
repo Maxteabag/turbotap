@@ -26,87 +26,6 @@ pub mod worker;
 pub use sense::{AlertStatus, UiExpectation};
 pub use worker::{ProbeSnapshot, UiWorker};
 
-pub const DENY_DEFAULT: &str = r"cancel booking|cancel appointment|delete account|erase all|reset all|confirm purchase|\bbuy\b|\bpay\b|\bsubscribe\b|start (audio|video) call|\bsend\b|record voice|delete|unsend|remove|^(accept|decline|maybe)$";
-
-/// The only labels the built-in [`DENY_DEFAULT`] lets through, and only while the app
-/// guard confirms (live) that an allowlisted app is in front: exactly `Send` or
-/// `Send message` (case, surrounding and repeated whitespace ignored). Anything else
-/// containing "send" (`Send payment`, `Send all funds`, `Send attachment`, ...) stays
-/// refused like every other default entry.
-pub const PLAIN_SEND_LABELS: &[&str] = &["send", "send message"];
-
-/// True when `label`, normalized, is exactly one of [`PLAIN_SEND_LABELS`].
-pub fn is_plain_send(label: &str) -> bool {
-    let norm = label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    PLAIN_SEND_LABELS.contains(&norm.as_str())
-}
-
-/// [`DENY_DEFAULT`] without its `\bsend\b` entry: a label `--allow-label` names may
-/// pass only if it does not match this (send is the only deny word in it).
-fn deny_without_send() -> &'static fancy_regex::Regex {
-    static RX: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
-    RX.get_or_init(|| {
-        let p = DENY_DEFAULT.replace(r"\bsend\b|", "");
-        assert!(!p.contains("send\\b|record"), "DENY_DEFAULT changed: update deny_without_send");
-        crate::text::compile_icase(&p).expect("deny pattern without send is valid")
-    })
-}
-
-/// `label` with surrounding and repeated whitespace removed, for exact
-/// `--allow-label` comparison (case and wording must match).
-pub(crate) fn norm_label(label: &str) -> String {
-    label.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// True when `label` is exactly one of the `--allow-label` values, `send` is the only
-/// built-in deny word in it, and it contains none of [`ICON_NAME_RISKY`] anywhere
-/// (the built-in `\bpay\b` does not match `payment`; this does). Money, destructive,
-/// call, mass-recipient, attachment and confirmation words are never let through.
-pub fn label_allowed_by_flag(label: &str, allow: &[String]) -> bool {
-    let l = norm_label(label);
-    let low = l.to_lowercase();
-    !l.is_empty()
-        && allow.iter().any(|a| norm_label(a) == l)
-        && matches!(deny_without_send().is_match(&l), Ok(false))
-        && !ICON_NAME_RISKY.iter().any(|w| low.contains(w))
-}
-
-/// Substrings that disqualify an element name from [`is_safe_icon_name`]: money,
-/// destructive, call/recording, mass-recipient, attachment and confirmation words.
-/// Matched anywhere in the lowercased name, so `sendtoall` and `small` both fail:
-/// a false refusal only costs the exception, a false pass could send money.
-const ICON_NAME_RISKY: &[&str] = &[
-    "pay", "buy", "purchase", "order", "checkout", "subscri", "fund", "money", "cash", "coin", "crypto", "wallet",
-    "transfer", "wire", "tip", "donat", "gift", "bill", "invoice", "price", "delet", "remov", "erase", "reset",
-    "unsend", "trash", "destroy", "wipe", "call", "phone", "dial", "facetime", "voice", "audio", "video", "record",
-    "mic", "all", "every", "broadcast", "group", "invite", "share", "forward", "attach", "file", "photo", "image",
-    "location", "contact", "accept", "decline", "confirm", "approve", "sign", "post", "publish",
-];
-
-/// True when `name` (an element's accessibility identifier, which WDA reports as
-/// `name` when set) looks like a developer identifier or SF Symbol for an icon-only
-/// button (`arrow.up.circle.fill`, `sendButton`, `composer-send`): 1-64 ASCII
-/// letters, digits, `.`, `_` or `-`, and none of [`ICON_NAME_RISKY`]. Sentences and
-/// anything with spaces never qualify.
-pub fn is_safe_icon_name(name: &str) -> bool {
-    let n = name.trim();
-    if n.is_empty() || n.len() > 64 || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
-        return false;
-    }
-    let low = n.to_ascii_lowercase();
-    !ICON_NAME_RISKY.iter().any(|w| low.contains(w))
-}
-
-/// `s` quoted for a refusal message, cut to 48 characters (element labels and names
-/// only; never typed text or values).
-pub(crate) fn short_repr(s: &str) -> String {
-    let mut t: String = s.chars().take(48).collect();
-    if t.len() < s.len() {
-        t.push_str("...");
-    }
-    json::py_repr_str(&t)
-}
-
 pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
@@ -212,9 +131,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   settle                wait until two frames in a row are identical
   sleep:MS|Ns           fixed wait (ms or Ns, e.g. sleep:500 or sleep:1.5s)
   shot:PATH             save a fresh screenshot as PNG
-taps, toggles, sliders, double-taps, and long-presses on text matching --deny are refused unless --no-deny is passed.
-with the built-in --deny only, a control labelled exactly Send or Send message is allowed while a live check confirms an
-allowlisted app (allowed_apps) is in front; every other label (Send payment, pay, delete, ...) stays refused.
+taps, toggles, sliders, double-taps, and long-presses on text matching --deny or --deny-also are refused
+unless --no-deny is passed. With neither a caller pattern nor a configured deny_also, there is no label filter.
 with allowed_apps in config.json (or TURBOTAP_ALLOWED_APPS / --allow-app), every input step is refused unless
 the live foreground app is on that list; open:/launch: check the target app, url: is refused (iOS picks the receiving app).
 --no-deny never disables this app guard. while a configured stop_file (or TURBOTAP_STOP_FILE) exists,
@@ -333,28 +251,6 @@ pub struct CtlCache {
     pub img: Frame,
 }
 
-/// Compiled `--deny` guard. The built-in [`DENY_DEFAULT`] regex is compiled lazily on
-/// first [`Flow::guard`] evaluation and cached process-wide in a `OnceLock` (saving
-/// ~3-4 ms on every `turbotap flow` call and completely skipping compilation on
-/// non-tapping flows like `flow ui`). Custom `--deny` patterns are compiled and
-/// validated eagerly in [`Flow::new`].
-pub enum DenyGuard {
-    Default,
-    Custom(fancy_regex::Regex),
-}
-
-impl DenyGuard {
-    fn regex(&self) -> &fancy_regex::Regex {
-        match self {
-            DenyGuard::Default => {
-                static DEFAULT_RX: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
-                DEFAULT_RX.get_or_init(|| crate::text::compile_icase(DENY_DEFAULT).expect("DENY_DEFAULT regex is valid"))
-            }
-            DenyGuard::Custom(rx) => rx,
-        }
-    }
-}
-
 /// How long `open:`/`launch:` re-reads the front app while another app is still there.
 pub const OPEN_RECEIPT_GRACE: f64 = 1.0;
 
@@ -362,7 +258,7 @@ pub struct Flow<R: Reader = ScreenReader> {
     pub c: WdaClient,
     pub r: R,
     pub timeout: f64,
-    pub deny: Option<DenyGuard>,
+    pub deny: Option<fancy_regex::Regex>,
     /// The caller's own extra deny patterns (`--deny-also`, config `deny_also`):
     /// refused on top of `deny`, never relaxed, and used by the submit guard.
     pub deny_also: Option<fancy_regex::Regex>,
@@ -407,30 +303,18 @@ pub struct Flow<R: Reader = ScreenReader> {
 }
 
 impl<R: Reader> Flow<R> {
-    /// Python `Flow(client, reader, timeout=8.0, deny=DENY_DEFAULT, log=None)`.
-    /// `deny` None or "" disables the guard.
+    /// Compile the optional caller pattern and any additional patterns from the client.
     pub fn new(c: WdaClient, r: R, timeout: f64, deny: Option<&str>, log: bool) -> Result<Flow<R>> {
-        let deny_off = deny.map_or(true, |d| d.is_empty());
-        if deny_off && !c.deny_also.is_empty() {
-            crate::errln!(
-                "turbotap: warning: --no-deny: ignoring {} deny_also pattern(s) from --deny-also/config",
-                c.deny_also.len()
-            );
-        }
-        let deny_also = if c.deny_also.is_empty() || deny_off {
+        let deny_also = if c.deny_also.is_empty() {
             None
         } else {
             let joined = c.deny_also.iter().map(|p| format!("(?:{p})")).collect::<Vec<_>>().join("|");
             Some(crate::text::compile_icase(&joined).ok_or_else(|| Error::value(format!("invalid --deny-also regex: {}", json::py_repr_str(&joined))))?)
         };
-        let deny = match deny.filter(|d| !d.is_empty()) {
-            Some(d) if d == DENY_DEFAULT => Some(DenyGuard::Default),
-            Some(d) => Some(DenyGuard::Custom(
-                crate::text::compile_icase(d)
-                    .ok_or_else(|| Error::value(format!("invalid --deny regex: {}", json::py_repr_str(d))))?,
-            )),
-            None => None,
-        };
+        let deny = deny
+            .filter(|d| !d.is_empty())
+            .map(|d| crate::text::compile_icase(d).ok_or_else(|| Error::value(format!("invalid --deny regex: {}", json::py_repr_str(d)))))
+            .transpose()?;
         Ok(Flow {
             c,
             r,
@@ -510,102 +394,24 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// Refuse taps on text matching `--deny`. `text` must be the actual target's text
-    /// (the matched OCR line or control label); see [`Flow::guard_with`].
-    pub fn guard(&mut self, text: &str, action: &str) -> Result<()> {
-        self.guard_with(text, action, true)
+    fn has_deny_patterns(&self) -> bool {
+        self.deny.is_some() || self.deny_also.is_some()
     }
 
-    /// [`Flow::guard`]. With the built-in default only, and only when `may_relax` (the
-    /// caller verified `text` is the target's own label): a label that is exactly a
-    /// [`PLAIN_SEND_LABELS`] entry is allowed while the app guard is on and a live
-    /// `/wda/activeAppInfo` confirms an allowlisted app in front. An explicit
-    /// `--deny`, no allowlist, an unconfirmed foreground app or any other label stays
-    /// refused.
-    pub fn guard_with(&mut self, text: &str, action: &str, may_relax: bool) -> Result<()> {
-        self.guard_relax(text, action, if may_relax { Ok(()) } else { Err(String::new()) })
-    }
-
-    /// [`Flow::guard_with`] where `relax` is `Ok` when the caller verified `text` is
-    /// the target's own label, else `Err(why not)`. A refusal of a Send-like target
-    /// says why the plain-Send exception did not apply (element check, explicit
-    /// `--deny`, foreground check), so the caller can see what to fix.
-    pub fn guard_relax(&mut self, text: &str, action: &str, relax: std::result::Result<(), String>) -> Result<()> {
-        if self.deny.is_none() || text.is_empty() {
-            return Ok(());
-        }
-        // The caller's own additions: refused whatever the built-in exceptions say.
-        if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(text).unwrap_or(true)) {
-            return Err(Error::flow(format!("refusing to {action} {}: matches --deny-also", json::py_repr_str(text))));
-        }
-        let Some(guard) = self.deny.as_ref() else {
-            return Ok(());
-        };
+    /// Refuse actions on target text matching a caller-provided deny pattern.
+    pub fn guard(&self, text: &str, action: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
-        let is_default = matches!(guard, DenyGuard::Default);
-        match guard.regex().is_match(text) {
+        if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(text).unwrap_or(true)) {
+            return Err(Error::flow(format!("refusing to {action} {}: matches --deny-also", json::py_repr_str(text))));
+        }
+        let Some(rx) = &self.deny else {
+            return Ok(());
+        };
+        match rx.is_match(text) {
             Ok(false) => Ok(()),
-            Ok(true) => {
-                let plain = is_plain_send(text);
-                let mut why: Vec<String> = Vec::new();
-                // --allow-label: an exact label, send its only deny word, the target's
-                // own label, the built-in default, and an --allow-app app in front.
-                let flagged = is_default && label_allowed_by_flag(text, &self.c.allow_labels);
-                if flagged && !plain {
-                    if let Err(note) = &relax {
-                        if !note.is_empty() {
-                            why.push(note.clone());
-                        }
-                    } else {
-                        match self.c.allow_label_foreground() {
-                            Ok(b) => {
-                                crate::errln!("turbotap: --allow-label let {} through in {b}", json::py_repr_str(text));
-                                return Ok(());
-                            }
-                            Err(fg) => why.push(format!("--allow-label: {fg}")),
-                        }
-                    }
-                    if why.is_empty() {
-                        why.push("the text is not the target's own label".into());
-                    }
-                    let mut msg = format!("refusing to {action} {}: matches --deny", json::py_repr_str(text));
-                    msg.push_str("; --allow-label not applied: ");
-                    msg.push_str(&why.join("; "));
-                    return Err(Error::flow(msg));
-                }
-                if !is_default {
-                    if plain {
-                        why.push("an explicit --deny is never relaxed".into());
-                    }
-                } else {
-                    match &relax {
-                        Err(note) if !note.is_empty() => why.push(note.clone()),
-                        Err(_) => {}
-                        Ok(()) if !plain => {}
-                        Ok(()) => match self.c.foreground_status() {
-                            Ok(_) => return Ok(()),
-                            Err(fg) => why.push(format!("foreground: {fg}")),
-                        },
-                    }
-                    // Element check failed: still report the foreground result.
-                    if matches!(&relax, Err(n) if !n.is_empty()) {
-                        match self.c.foreground_status() {
-                            Ok(b) => why.push(format!("foreground: {b} confirmed allowlisted")),
-                            Err(fg) => why.push(format!("foreground: {fg}")),
-                        }
-                    }
-                }
-                let mut msg = format!("refusing to {action} {}: matches --deny", json::py_repr_str(text));
-                if !why.is_empty() {
-                    msg.push_str("; plain-Send exception not applied: ");
-                    msg.push_str(&why.join("; "));
-                }
-                Err(Error::flow(msg))
-            }
-            // An evaluation error (e.g. backtrack limit) is an unverified result, not a
-            // non-match: fail closed before any action is dispatched.
+            Ok(true) => Err(Error::flow(format!("refusing to {action} {}: matches --deny", json::py_repr_str(text)))),
             Err(e) => Err(Error::flow(format!(
                 "refusing to {action} {}: --deny could not be evaluated ({e})",
                 json::py_repr_str(text)
@@ -883,15 +689,11 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// Before `key:return`/`key:enter` or text with a newline: a newline can submit
-    /// (a keyboard whose return key reads like Send). Only the caller's own extra
-    /// patterns (`--deny-also`, config `deny_also`) refuse the step, with nothing sent;
-    /// an explicit `--deny` match only warns (existing callers did not opt into a new
-    /// refusal). Without caller patterns nothing is read: the default path costs no
-    /// extra request. A keyboard that cannot be read keeps going, with a warning.
+    /// Before return, enter or multiline text, check the keyboard's labels against
+    /// the caller's patterns. A deny_also match refuses input and a --deny match
+    /// warns. An unreadable keyboard also warns.
     fn guard_submit(&mut self, what: &str) -> Result<()> {
-        let explicit = matches!(&self.deny, Some(DenyGuard::Custom(_)));
-        if self.deny_also.is_none() && !explicit {
+        if !self.has_deny_patterns() {
             return Ok(());
         }
         let ctl = match self.controls(false, None, None, false, true) {
@@ -909,7 +711,7 @@ impl<R: Reader> Flow<R> {
                     json::py_repr_str(k)
                 )));
             }
-            if let Some(DenyGuard::Custom(rx)) = &self.deny {
+            if let Some(rx) = &self.deny {
                 if rx.is_match(k).unwrap_or(false) {
                     crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(k));
                 }
@@ -1785,7 +1587,7 @@ pub fn cmd_tap_ocr(client: WdaClient, text: &str) -> Result<()> {
         client.ensure_session(None, true)?;
         ScreenReader::default_reader()
     };
-    let mut flow = Flow::new(client, reader, 8.0, Some(DENY_DEFAULT), false)?;
+    let mut flow = Flow::new(client, reader, 8.0, None, false)?;
     flow.c.guard_action = Some("tap-ocr".into());
     flow.c.ensure_allowed_app("tap-ocr", None)?;
     let t0 = clock::real_now();
@@ -1843,7 +1645,6 @@ pub fn cmd_flow(client: WdaClient, steps: &[String], timeout: f64, scale: f64, d
 #[cfg(test)]
 mod unit {
     use super::*;
-    use crate::testutil::FakeReader;
 
     #[test]
     fn flow_needs_ocr_skips_vision_shot_settle_scroll_and_directional_swipe() {
@@ -1886,17 +1687,5 @@ mod unit {
         ] {
             assert!(flow_needs_ocr(&[needs_ocr.to_string()]), "{needs_ocr} must pre-warm Tesseract");
         }
-    }
-
-    #[test]
-    fn deny_default_is_lazy_and_cached_while_custom_invalid_regex_errors_eagerly() {
-        let c = WdaClient::new("http://127.0.0.1:9", "", None);
-        let mut flow = Flow::new(c, FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
-        assert!(flow.guard("Delete Account", "tap").is_err());
-        assert!(flow.guard("Settings", "tap").is_ok());
-
-        let c2 = WdaClient::new("http://127.0.0.1:9", "", None);
-        let err = Flow::new(c2, FakeReader::new(vec![]), 1.0, Some("[unclosed"), false).err().unwrap();
-        assert!(err.to_string().contains("invalid --deny regex"), "{err}");
     }
 }

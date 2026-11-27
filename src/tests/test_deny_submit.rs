@@ -1,9 +1,7 @@
-//! Caller-provided deny additions (`--deny-also`, config `deny_also`) refuse labels in
-//! the caller's own locale on top of the active --deny, with no new built-in words; and
-//! `key:return` or multi-line text is refused when the keyboard's keys match the
-//! caller's patterns (a newline may submit). The built-in default alone only warns.
+//! Caller patterns apply to selected controls and, when present, keyboard labels.
+//! Keyboard matches refuse with --deny-also and warn with --deny.
 
-use crate::flow::{Flow, DENY_DEFAULT};
+use crate::flow::Flow;
 use crate::testutil::capture::Capture;
 use crate::testutil::*;
 use serde_json::{json, Value};
@@ -28,39 +26,12 @@ fn keys_sent(m: &MockWda) -> usize {
 }
 
 #[test]
-fn test_deny_also_refuses_a_label_in_the_callers_locale_and_the_default_does_not() {
-    let _c = isolated_cache();
-    let (_s, _g) = skip_sleep();
-    // Default only: no built-in word matches this label, so it is tapped (no new block).
-    let m = MockWda::start(MockState::default().with_fast_ui(screen("return")));
-    let mut f = flow_with(&m, Some(DENY_DEFAULT), &[]);
-    f.changed_since_hook = Some(true);
-    f.step("tapat:200,300").unwrap();
-    assert_eq!(m.tapped_points().len(), 1);
-    f.close();
-    // The caller adds their word: refused, nothing tapped.
-    let m = MockWda::start(MockState::default().with_fast_ui(screen("return")));
-    let mut f = flow_with(&m, Some(DENY_DEFAULT), &["kaufen"]);
-    let e = f.step("tapat:200,300").unwrap_err().to_string();
-    assert!(e.contains("matches --deny-also"), "{e}");
-    assert!(m.tapped_points().is_empty());
-    f.close();
-    // With --no-deny the whole filter is off, additions included.
-    let m = MockWda::start(MockState::default().with_fast_ui(screen("return")));
-    let mut f = flow_with(&m, None, &["kaufen"]);
-    f.changed_since_hook = Some(true);
-    f.step("tapat:200,300").unwrap();
-    assert_eq!(m.tapped_points().len(), 1);
-    f.close();
-}
-
-#[test]
 fn test_return_and_multiline_are_refused_when_the_keyboard_matches_the_callers_patterns() {
     let _c = isolated_cache();
     let (_s, _g) = skip_sleep();
     // Caller pattern matches the keyboard's return key: key:return refused, nothing sent.
     let m = MockWda::start(MockState::default().with_fast_ui(screen("Senden")));
-    let mut f = flow_with(&m, Some(DENY_DEFAULT), &["senden"]);
+    let mut f = flow_with(&m, None, &["senden"]);
     let e = f.step("key:return").unwrap_err().to_string();
     assert!(e.contains("may submit") && e.contains("nothing sent"), "{e}");
     assert_eq!(keys_sent(&m), 0);
@@ -73,7 +44,7 @@ fn test_return_and_multiline_are_refused_when_the_keyboard_matches_the_callers_p
     assert_eq!(keys_sent(&m), 1);
     assert_eq!(m.paths().iter().filter(|p| p.ends_with("/wda/fastUI")).count(), ui_reads, "single-line typing read the keyboard");
     f.close();
-    // An explicit --deny did not opt into a new refusal: it only warns.
+    // The primary --deny pattern warns and allows the key to go through.
     let m = MockWda::start(MockState::default().with_fast_ui(screen("Send")));
     let mut f = flow_with(&m, Some("send"), &[]);
     let cap = Capture::start();
@@ -84,34 +55,23 @@ fn test_return_and_multiline_are_refused_when_the_keyboard_matches_the_callers_p
 }
 
 #[test]
-fn test_the_built_in_default_reads_and_refuses_nothing_on_return() {
+fn test_return_without_deny_patterns_skips_the_keyboard_read() {
     let _c = isolated_cache();
     let (_s, _g) = skip_sleep();
     let m = MockWda::start(MockState::default().with_fast_ui(screen("send")));
-    let mut f = flow_with(&m, Some(DENY_DEFAULT), &[]);
+    let mut f = flow_with(&m, None, &[]);
     let cap = Capture::start();
     f.step("key:return").unwrap();
-    assert_eq!(keys_sent(&m), 1, "the default must not take this power away");
-    // The default path reads nothing extra and says nothing.
+    assert_eq!(keys_sent(&m), 1);
     assert_eq!(m.paths().iter().filter(|p| p.ends_with("/wda/fastUI")).count(), 0);
     assert!(!cap.stderr().contains("a newline may submit"), "{}", cap.stderr());
     f.close();
 }
 
 #[test]
-fn test_no_deny_warns_that_it_drops_deny_also() {
-    let _c = isolated_cache();
-    let m = MockWda::start(MockState::default().with_fast_ui(screen("Send")));
-    let cap = Capture::start();
-    let mut f = flow_with(&m, None, &["send"]);
-    assert!(cap.stderr().contains("ignoring 1 deny_also pattern"), "{}", cap.stderr());
-    f.close();
-}
-
-#[test]
 fn test_config_deny_also_per_device_is_used_by_the_cli() {
     let _c = isolated_cache();
-    let m = MockWda::start(MockState::default().with_fast_ui(screen("return")));
+    let m = MockWda::start(MockState::default().with_fast_ui(screen("Kaufen")));
     let home = TempDir::new("tt-deny-also-");
     let cfg = home.path().join("config.json");
     std::fs::write(&cfg, json!({"devices": {"d": {"url": m.url, "deny_also": ["kaufen"]}}}).to_string()).unwrap();
@@ -119,8 +79,20 @@ fn test_config_deny_also_per_device_is_used_by_the_cli() {
     let _env = set_env(&[("HOME", Some(h.as_str())), ("XDG_STATE_HOME", Some(h.as_str())), ("WDA_CONFIG", Some(c.as_str())),
                          ("WDA_URL", None), ("WDA_DEVICE", None), ("TURBOTAP_DAEMON", None), ("TURBOTAP_TIMINGS", Some("0"))]);
     let cap = Capture::start();
-    let argv: Vec<String> = ["--no-daemon", "--device", "d", "flow", "--quiet", "tapat:200,300"].iter().map(|s| s.to_string()).collect();
-    let code = crate::cli::run_cli(&argv);
-    assert_ne!(code, 0, "{}{}", cap.stdout(), cap.stderr());
+    let run = |flags: &[&str], step: &str| {
+        let mut args = vec!["--no-daemon", "--device", "d", "flow", "--quiet"];
+        args.extend_from_slice(flags);
+        args.push(step);
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        crate::cli::run_cli(&argv)
+    };
+    assert_eq!(run(&[], "tapat:200,300"), 1, "{}{}", cap.stdout(), cap.stderr());
+    assert!(cap.stdout().contains("'Kaufen': matches --deny-also"), "{}", cap.stdout());
     assert!(m.tapped_points().is_empty());
+
+    assert_eq!(run(&[], "key:return"), 1, "{}{}", cap.stdout(), cap.stderr());
+    assert_eq!(keys_sent(&m), 0);
+    assert_eq!(run(&["--no-deny", "--deny", "kaufen"], "key:return"), 0, "{}{}", cap.stdout(), cap.stderr());
+    assert!(cap.stderr().contains("--no-deny: ignoring 1 deny_also pattern"), "{}", cap.stderr());
+    assert_eq!(keys_sent(&m), 1);
 }

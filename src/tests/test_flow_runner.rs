@@ -7,7 +7,7 @@
 //! `skip_sleep()`.
 use crate::clock;
 use crate::error::Error;
-use crate::flow::{Flow, DENY_DEFAULT, FLOW_HELP, IMAGE_STEP_VERBS, STALE_UI_BACKOFF};
+use crate::flow::{Flow, FLOW_HELP, IMAGE_STEP_VERBS, STALE_UI_BACKOFF};
 use crate::image::{content_pixel_still, Frame};
 use crate::json;
 use crate::ocr::{ReadOpts, Reader};
@@ -35,9 +35,9 @@ fn fr(img: &Frame, lines: &[Line]) -> (Frame, Vec<Line>) {
     (img.clone(), lines.to_vec())
 }
 
-/// `cli.Flow(c, reader=r, timeout=T)` (default --deny).
+/// Flow with no caller deny patterns.
 fn mk_flow(mock: &MockWda, r: &FakeReader, timeout: f64) -> Flow<FakeReader> {
-    Flow::new(mock.client(), r.clone(), timeout, Some(DENY_DEFAULT), false).unwrap()
+    Flow::new(mock.client(), r.clone(), timeout, None, false).unwrap()
 }
 
 fn mk_flow_deny(mock: &MockWda, r: &FakeReader, timeout: f64, deny: Option<&str>) -> Flow<FakeReader> {
@@ -1140,7 +1140,7 @@ fn test_waitany_and_tap_use_live_named_alert_instead_of_foreground_controls() {
     st.alert_text = Some(Dyn::one(json!("Vil du tillate sporing?")));
     st.alert_buttons = Some(Dyn::one(json!([LABEL, "Tillat", "Delete Account"])));
     let mock = MockWda::start(st);
-    let mut flow = mk_flow(&mock, &r, 1.0);
+    let mut flow = mk_flow_deny(&mock, &r, 1.0, Some("^Delete Account$"));
     flow.c.set_allowed_apps(vec!["com.example.target".into(), "com.apple.springboard".into()]);
     step_v(&mut flow, "open:com.example.target");
 
@@ -1375,22 +1375,6 @@ fn test_picker_key_cleartype_typedigits_and_clipboard() {
     assert_eq!(step_s(&mut flow, "clipboard"), "");
     assert_eq!(*flow.reads.last().unwrap(), json!({"clipboard": "", "empty": true}));
     flow.close();
-}
-
-#[test]
-fn test_deny_guard_blocks_default_dangerous_actions_unless_disabled() {
-    let _cache = isolated_cache();
-    let c = MockWda::start(MockState::default());
-    let mut flow_guarded = Flow::new(c.client(), FakeReader::new(vec![]), 8.0, Some(DENY_DEFAULT), false).unwrap();
-    let mut flow_open = Flow::new(c.client(), FakeReader::new(vec![]), 8.0, None, false).unwrap();
-    for dangerous in ["Send", "Delete", "Buy", "Pay", "Cancel booking", "Accept"] {
-        flow_err(flow_guarded.tap_point(100, 100, dangerous, None));
-    }
-    // With deny=None (--no-deny), tap proceeds.
-    flow_open.tap_point(100, 100, "Send", None).unwrap();
-    assert_eq!(last_tap_xy(&c), (100, 100));
-    flow_guarded.close();
-    flow_open.close();
 }
 
 #[test]
@@ -2278,7 +2262,7 @@ fn test_slider_parsing_matching_guards_disabled_and_errors() {
     st.element_enabled.insert("sa1".into(), json!(true));
     st.element_enabled.insert("sa2".into(), json!(true));
     let c_alias = MockWda::start(st);
-    let mut flow_alias = mk_flow(&c_alias, &FakeReader::new(vec![fr(&img, &[])]), 8.0);
+    let mut flow_alias = mk_flow_deny(&c_alias, &FakeReader::new(vec![fr(&img, &[])]), 8.0, Some("^Delete Threshold$"));
     // Named match via name='SafeID' must still block on label='Delete Threshold'.
     let msg = flow_err(flow_alias.step("slider:SafeID=50%"));
     assert!(msg.contains("--deny"), "{msg}");
@@ -2291,7 +2275,9 @@ fn test_slider_parsing_matching_guards_disabled_and_errors() {
     // Label/name lookup error while --deny is active refuses with ZERO value POSTs.
     let c_aerr = MockWda::start(slider_state(&["s1"]));
     c_aerr.set_custom_handler(|_, _, p, _| p.contains("/attribute/name").then(|| json!({"error": 500, "body": "attr err"})));
-    let mut flow_aerr = mk_flow(&c_aerr, &FakeReader::new(vec![fr(&img, &[])]), 8.0);
+    let mut client = c_aerr.client();
+    client.deny_also = vec!["^Delete Threshold$".into()];
+    let mut flow_aerr = Flow::new(client, FakeReader::new(vec![fr(&img, &[])]), 8.0, None, false).unwrap();
     let msg = flow_err(flow_aerr.step("slider:50%"));
     assert!(msg.contains("--deny"), "{msg}");
     assert_eq!(paths_suffix(&c_aerr, "/value"), Vec::<String>::new());
@@ -2409,7 +2395,7 @@ fn test_scrollto_then_tap_reuses_settled_lines_without_redundant_ocr() {
         1.0,
     );
     let r = AgingReadReader(inner.clone());
-    let mut flow = Flow::new(c.client(), r, 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(c.client(), r, 1.0, None, false).unwrap();
     let res_scroll = step_s(&mut flow, "scrollto:Generelt");
     assert_eq!(res_scroll, "Generelt");
     let d = drags(&c);
@@ -2774,7 +2760,7 @@ fn test_ui_only_flow_skips_ocr_warmup() {
     let mock = MockWda::start(with_fast_ui(fui(json!([{"type": "Button", "label": "Settings", "x": 100, "y": 200}]))));
     let steps: Vec<String> = vec!["ui".into(), "tapxy:100,200".into()];
     assert!(!crate::flow::flow_needs_ocr(&steps));
-    let code = crate::flow::cmd_flow(mock.client(), &steps, 2.0, 1.5, Some(DENY_DEFAULT), true).unwrap();
+    let code = crate::flow::cmd_flow(mock.client(), &steps, 2.0, 1.5, None, true).unwrap();
     assert_eq!(code, 0);
 }
 
@@ -2785,7 +2771,7 @@ fn test_url_only_flow_skips_ocr_warmup() {
     let mock = MockWda::start(MockState::default());
     let steps: Vec<String> = vec!["url:https://example.com".into()];
     assert!(!crate::flow::flow_needs_ocr(&steps));
-    let code = crate::flow::cmd_flow(mock.client(), &steps, 2.0, 1.5, Some(DENY_DEFAULT), true).unwrap();
+    let code = crate::flow::cmd_flow(mock.client(), &steps, 2.0, 1.5, None, true).unwrap();
     assert_eq!(code, 0);
     assert_eq!(mock.state().opened_urls, vec![json!("https://example.com")]);
 }

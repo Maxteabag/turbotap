@@ -377,7 +377,7 @@ pub fn clean_text(s: &str) -> String {
 /// syntax (lookaround supported). None when invalid.
 pub fn compile_icase(pattern: &str) -> Option<fancy_regex::Regex> {
     // An inline `(?i)` group: fancy-regex 0.14 ignores `RegexBuilder::case_insensitive`
-    // for patterns it delegates to the `regex` crate (e.g. the default --deny list).
+    // for patterns it delegates to the `regex` crate.
     fancy_regex::Regex::new(&format!("(?i:{pattern})")).ok()
 }
 

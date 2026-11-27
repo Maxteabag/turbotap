@@ -484,7 +484,7 @@ impl<R: Reader> Flow<R> {
 
         // Enforce --deny across BOTH label and name aliases; if deny is active and
         // either attribute lookup failed, refuse rather than treating error as empty.
-        if self.deny.is_some() && sel_attr_err {
+        if self.has_deny_patterns() && sel_attr_err {
             return Err(Error::flow("cannot verify slider label/name against --deny"));
         }
         for alias in [&sel_lab, &sel_name] {

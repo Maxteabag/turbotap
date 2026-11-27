@@ -2,7 +2,7 @@
 //! read_full overlaps host capture/OCR with /wda/fastUI on an isolated side client.
 use crate::clock;
 use crate::error::Result;
-use crate::flow::{Flow, DENY_DEFAULT};
+use crate::flow::Flow;
 use crate::image::Frame;
 use crate::ocr::{ReadOpts, Reader, ScreenReader, ShotValidator};
 use crate::text::Line;
@@ -108,7 +108,7 @@ fn run(ui_reply: Value, flow_setup: Option<fn(&mut Flow<OverlapReader>)>) -> Run
         overlapped: overlapped.clone(),
         read_thread: read_thread.clone(),
     };
-    let mut flow = Flow::new(mock.client(), reader, 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(mock.client(), reader, 1.0, None, false).unwrap();
     if let Some(setup) = flow_setup {
         setup(&mut flow);
     }
@@ -209,7 +209,7 @@ fn test_transitioning_screen_defers_the_tree_until_frames_settle() {
     }));
     let mock = MockWda::start(st);
     let reader = OrderReader { inner: FakeReader::new(vec![(img.clone(), lines.clone()), (copy_img(&img), lines)]), order: order.clone() };
-    let mut flow = Flow::new(mock.client(), reader, 1.0, Some(DENY_DEFAULT), false).unwrap();
+    let mut flow = Flow::new(mock.client(), reader, 1.0, None, false).unwrap();
     flow.last_action_ts = clock::now();
     // Python patched `_wait_active_app` to return False; with no pending switch the
     // real one returns False without a request.

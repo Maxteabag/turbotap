@@ -101,59 +101,6 @@ thread_local! {
 }
 
 
-/// An element attribute as read from WDA.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ElAttr {
-    /// Read successfully, non-empty.
-    Value(String),
-    /// Read successfully: null or empty.
-    Empty,
-    /// The request failed or the answer was not a string.
-    Failed,
-}
-
-impl ElAttr {
-    fn value(&self) -> Option<&str> {
-        match self {
-            ElAttr::Value(s) => Some(s),
-            _ => None,
-        }
-    }
-}
-
-/// The plain-Send exception's element check for a `tapel:` target: `Ok(label)` when
-/// the label was read and is exactly a plain Send, and the name was read and is
-/// empty, the same text, another plain Send, or an icon-style identifier with no
-/// risky word ([`super::is_safe_icon_name`], e.g. `arrow.up` or `sendButton`).
-/// Unreadable or disagreeing attributes: `Err(why)`, quoting the element's label and
-/// name (never its value).
-fn plain_send_target(label: &ElAttr, name: &ElAttr, allow: &[String]) -> std::result::Result<String, String> {
-    use super::{is_plain_send, is_safe_icon_name, label_allowed_by_flag, short_repr};
-    let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    let l = match label {
-        ElAttr::Value(l) if is_plain_send(l) || label_allowed_by_flag(l, allow) => l,
-        ElAttr::Value(l) if !allow.is_empty() => {
-            return Err(format!(
-                "element label {} is not exactly Send or Send message, nor an --allow-label label with send as its only deny word",
-                short_repr(l)
-            ))
-        }
-        ElAttr::Value(l) => return Err(format!("element label {} is not exactly Send or Send message", short_repr(l))),
-        ElAttr::Empty => return Err("element label is empty".into()),
-        ElAttr::Failed => return Err("element label could not be read".into()),
-    };
-    match name {
-        ElAttr::Empty => Ok(l.clone()),
-        ElAttr::Value(n) if fold(n) == fold(l) || is_plain_send(n) || is_safe_icon_name(n) => Ok(l.clone()),
-        ElAttr::Value(n) => Err(format!(
-            "element label {} but name {} is not empty, a plain Send or a safe icon identifier",
-            short_repr(l),
-            short_repr(n)
-        )),
-        ElAttr::Failed => Err(format!("element label {} but its name could not be read", short_repr(l))),
-    }
-}
-
 /// `tapat:` takes the labelled control whose centre is within this many points of the
 /// tap point on both axes.
 pub const TAPAT_RADIUS: i64 = 24;
@@ -227,13 +174,11 @@ impl<R: Reader> Flow<R> {
 
     /// L3134.
     pub fn tap_point(&mut self, x: i64, y: i64, text: &str, deadline: Option<f64>) -> Result<()> {
-        self.tap_point_with(x, y, text, deadline, true)
+        self.guard(text, "tap")?;
+        self.tap_point_after_label_check(x, y, deadline)
     }
 
-    /// [`Flow::tap_point`]; `may_relax` false when `text` is not verified to be the
-    /// target's own label (see [`Flow::guard_with`]).
-    pub fn tap_point_with(&mut self, x: i64, y: i64, text: &str, deadline: Option<f64>, may_relax: bool) -> Result<()> {
-        self.guard_with(text, "tap", may_relax)?;
+    fn tap_point_after_label_check(&mut self, x: i64, y: i64, deadline: Option<f64>) -> Result<()> {
         if let Some(d) = deadline {
             if clock::now() >= d {
                 return Err(Error::DeadlineExceeded("tap deadline exceeded".into()));
@@ -1101,19 +1046,11 @@ impl<R: Reader> Flow<R> {
         Ok(Some(Match::new(x, y, text, None, 0)))
     }
 
-    /// L3760. Returns the tapped point (the `tapel:` step result is `[x, y]`).
-    /// One accessibility attribute of element `eid`, keeping a failed lookup apart
-    /// from a successful empty one.
-    fn element_attr(&mut self, eid: &str, attr: &str) -> ElAttr {
-        // Same strict success envelope as the foreground check: HTTP 2xx, no error,
-        // status absent or 0, `value` present. Only then is null/"" a real empty.
+    /// Read a selected element's label or name from a successful WDA response.
+    fn element_attr(&mut self, eid: &str, attr: &str) -> Option<String> {
         let p = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
-        match self.c.strict_get_value(&p) {
-            Ok(Value::Null) => ElAttr::Empty,
-            Ok(Value::String(s)) if s.trim().is_empty() => ElAttr::Empty,
-            Ok(Value::String(s)) => ElAttr::Value(s.trim().to_string()),
-            _ => ElAttr::Failed,
-        }
+        let value = self.c.strict_get_value(&p).ok()?;
+        value.as_str().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
     }
 
     /// `tapat:X,Y`: a label tap with a location hint. The target is the labelled
@@ -1239,41 +1176,17 @@ impl<R: Reader> Flow<R> {
                         let f = |k: &str| json::get(rect, k).as_f64().unwrap_or(0.0);
                         let x = (f("x") + f("width") / 2.0).trunc() as i64;
                         let y = (f("y") + f("height") / 2.0).trunc() as i64;
-                        if self.deny.is_none() {
-                            self.tap_point(x, y, label, None)?;
-                            return Ok((x, y));
-                        }
-                        // The element may have been found by a substring or by its name:
-                        // check what it actually is, not only the query.
-                        let (el_label, el_name) = (self.element_attr(&eid, "label"), self.element_attr(&eid, "name"));
-                        let allow = self.c.allow_labels.clone();
-                        let own = plain_send_target(&el_label, &el_name, &allow);
-                        let mut seen: Vec<&str> = Vec::new();
-                        for t in [Some(label), el_label.value(), el_name.value()].into_iter().flatten() {
-                            // The identical text twice (query == label == name) is checked
-                            // once: each plain-Send check costs a live foreground request.
-                            // Exact comparison only; a custom --deny may be case-sensitive.
-                            if seen.contains(&t) {
-                                continue;
+                        self.guard(label, "tap")?;
+                        if self.has_deny_patterns() {
+                            // The query can match a substring or an alias. Check both attributes
+                            // of the selected element before sending the tap.
+                            for attr in ["label", "name"] {
+                                if let Some(text) = self.element_attr(&eid, attr).filter(|text| text.as_str() != label) {
+                                    self.guard(&text, "tap")?;
+                                }
                             }
-                            seen.push(t);
-                            // The name the exception accepted as an icon identifier
-                            // (`chat-send-message`, `send-button`) was already checked
-                            // against the stricter risky-word list; `\bsend\b` in the
-                            // built-in pattern would match it at a hyphen. Only for the
-                            // built-in default: an explicit --deny still applies to it.
-                            let vetted_name = own.is_ok()
-                                && el_name.value() == Some(t)
-                                && super::is_safe_icon_name(t)
-                                && matches!(self.deny, Some(super::DenyGuard::Default));
-                            if vetted_name {
-                                continue;
-                            }
-                            self.guard_relax(t, "tap", own.as_ref().map(|_| ()).map_err(Clone::clone))?;
                         }
-                        let may_relax = own.is_ok();
-                        let own = own.ok();
-                        self.tap_point_with(x, y, own.as_deref().unwrap_or(label), None, may_relax)?;
+                        self.tap_point_after_label_check(x, y, None)?;
                         return Ok((x, y));
                     }
                 }

@@ -1,7 +1,7 @@
 //! `readfield:` / `assertfield:` against the mock WDA: exact multi-paragraph
 //! read-back, placeholder echo, ambiguity, secure fields, redaction.
 use crate::flow::fields::INPUT_TYPES_PRED;
-use crate::flow::{safe_step, Flow, DENY_DEFAULT};
+use crate::flow::{safe_step, Flow};
 use crate::testutil::mock_wda::ekey;
 use crate::testutil::*;
 use serde_json::json;
@@ -42,7 +42,7 @@ fn composer(body: &str) -> MockState {
 }
 
 fn flow(mock: &MockWda) -> Flow<FakeReader> {
-    Flow::new(mock.client(), FakeReader::new(vec![]), 0.5, Some(DENY_DEFAULT), false).unwrap()
+    Flow::new(mock.client(), FakeReader::new(vec![]), 0.5, None, false).unwrap()
 }
 
 #[test]
@@ -366,7 +366,7 @@ fn fill_reads_back_by_ocr_when_the_field_reports_no_value() {
     st.element_rects.insert("t1".into(), json!({"x": 16, "y": 150, "width": 398, "height": 90}));
     let mock = MockWda::start(st);
     let lines = vec![make_line("My title", 20.0, 160.0, 200.0, 180.0)];
-    let mut f = Flow::new(mock.client(), FakeReader::new(vec![(solid_img(255, (120, 240)), lines)]), 0.5, Some(DENY_DEFAULT), false).unwrap();
+    let mut f = Flow::new(mock.client(), FakeReader::new(vec![(solid_img(255, (120, 240)), lines)]), 0.5, None, false).unwrap();
     let r = f.step("fill:Title=My title").unwrap().unwrap();
     assert!(r.as_str().unwrap().contains("read back by OCR"), "{r}");
     f.close();
