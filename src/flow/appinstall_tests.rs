@@ -17,7 +17,9 @@ fn control(kind: &str, label: &str, x: i64, y: i64) -> Value {
 
 fn result_row(bundle: &str, offer: &str, y: i64) -> Value {
     let mut title = control("StaticText", "Reader", 100, y);
-    title["name"] = json!(bundle);
+    if !bundle.is_empty() {
+        title["name"] = json!(bundle);
+    }
     json!({"type": "Cell", "children": [title, control("Button", offer, 310, y)]})
 }
 
@@ -116,10 +118,7 @@ fn appinstall_presses_only_the_exact_product_and_waits_for_open_before_launching
 fn appinstall_refuses_unverified_or_paid_offers_and_unallowed_targets() {
     let _cache = isolated_cache();
     let _clock = virtual_clock();
-    let mock = mock_search(json!([
-        result_row(TARGET, "$4.99", 240),
-        result_row("org.example.imposter", "Get", 360),
-    ]));
+    let mock = mock_search(json!([result_row(TARGET, "Get", 300)]));
     let refused = flow(&mock, &[STORE], 8.0).step(STEP);
     assert!(matches!(refused, Err(Error::AppGuard(_))));
     assert!(!mock
@@ -127,16 +126,25 @@ fn appinstall_refuses_unverified_or_paid_offers_and_unallowed_targets() {
         .iter()
         .any(|p| p.ends_with("/wda/apps/activate")));
 
-    let err = flow(&mock, &[STORE, TARGET], 2.0).step(STEP).unwrap_err();
-    assert!(
-        err.to_string().contains("waiting for an enabled Open"),
-        "{err}"
-    );
-    assert_eq!(
-        mock.tapped_points()
-            .iter()
-            .map(|(_, y, _)| *y)
-            .collect::<Vec<_>>(),
-        [870, 90]
-    );
+    for results in [
+        json!([
+            result_row(TARGET, "$4.99", 240),
+            result_row("org.example.imposter", "Get", 360),
+        ]),
+        json!([result_row("", "Last ned igjen", 360)]),
+    ] {
+        let mock = mock_search(results);
+        let err = flow(&mock, &[STORE, TARGET], 2.0).step(STEP).unwrap_err();
+        assert!(
+            err.to_string().contains("exact title and bundle ID"),
+            "{err}"
+        );
+        assert_eq!(
+            mock.tapped_points()
+                .iter()
+                .map(|(_, y, _)| *y)
+                .collect::<Vec<_>>(),
+            [870, 90]
+        );
+    }
 }

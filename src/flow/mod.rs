@@ -114,7 +114,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
   appinstall:NAME|BUNDLE[|open]
-                        install a free App Store product and wait for its Open control
+                        install a free App Store product whose listing exposes its bundle ID
+                        and wait for its Open control. Set --timeout 180 for slower downloads
+                        (the flow default is 8 s and includes App Store search).
   open:APP              activate an app by display name or bundle ID (open:Spotify,
                         open:com.apple.Preferences); names come from a per-device
                         devicectl cache (~1 ms; refreshed once on an unknown name)

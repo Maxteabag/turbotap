@@ -384,11 +384,12 @@ impl<R: Reader> Flow<R> {
                     requested = true;
                 }
             }
-            Self::install_poll(
-                end,
-                if requested { 1.0 } else { 0.3 },
-                "an enabled Open/Åpne control for the exact product (check title, bundle metadata, and install prompts)",
-            )?;
+            let (interval, waiting_for) = if requested {
+                (1.0, "an enabled Open/Åpne control for the verified product after requesting download; allow more time with --timeout")
+            } else {
+                (0.3, "an enabled free Get/redownload or Open/Åpne control for an exact title and bundle ID in the same product listing")
+            };
+            Self::install_poll(end, interval, waiting_for)?;
         }
     }
 }
