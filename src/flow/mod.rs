@@ -1116,6 +1116,9 @@ impl<R: Reader> Flow<R> {
                 if target.is_none() && text.chars().count() >= LONG_TEXT {
                     return some(self.type_long(&text)?);
                 }
+                if is_secret {
+                    crate::redaction::before_input(&[&text])?;
+                }
                 let r = match target.as_deref() {
                     Some(eid) => self.bound_write(eid, &text),
                     None => self.c.fast_keys(&text, None),
@@ -1255,6 +1258,7 @@ impl<R: Reader> Flow<R> {
             }
             "shot" => {
                 let img = self.r.grab(&mut self.c, 0, None, None, None)?;
+                crate::redaction::before_image_export()?;
                 save_frame(&img, arg)?;
             }
             _ => return Err(Error::flow(format!("unknown step {}", json::py_repr_str(spec)))),
@@ -1362,6 +1366,9 @@ impl<R: Reader> Flow<R> {
         if is_secret && !self.wait_focus_on(&eid, 1.0) {
             return Err(Error::flow("cleartype: the target field did not get keyboard focus (nothing typed)"));
         }
+        if !text.is_empty() {
+            crate::redaction::before_input(&[&text])?;
+        }
         // A secret is written through the target element, never sent to whatever has focus.
         if !is_secret && text.chars().count() >= LONG_TEXT {
             // Long text: fast, with a landing probe (the read-back below still applies).
@@ -1424,6 +1431,7 @@ impl<R: Reader> Flow<R> {
         let Some(eid) = Self::first_element_id(&els) else {
             return Err(Error::flow("no TextField on screen for typedigits"));
         };
+        crate::redaction::before_input(&[&raw, &digits])?;
         let mut got = 0usize;
         for _attempt in 0..2 {
             let p = self.c.spath(&format!("/element/{eid}/click"));
@@ -1488,6 +1496,7 @@ impl<R: Reader> Flow<R> {
             return Err(Error::flow(format!("pintap found no key rects for {} of the PIN's digits", missing.len())));
         }
         let pts: Vec<(i64, i64)> = digits.chars().map(|d| coords[&d]).collect();
+        crate::redaction::before_input(&[&digits])?;
         let r = self.c.fast_tap_batch(&pts, 0.15, 0.02);
         check_wda_ok(r, "pintap", true)?;
         Ok(format!("tapped {} digits", digits.chars().count()))
@@ -1720,12 +1729,11 @@ impl<R: Reader> Flow<R> {
             target,
             req_kinds: Some(&self.c.req_kinds),
         };
-        let mut receipt = rec.to_value(|t| self.scrub(t));
-        if let Some(Error::SecretField(reason)) = err {
-            receipt["error"] = j!(reason);
-            receipt["arg"] = Value::Null;
-        }
-        crate::timings::append(&receipt);
+        let secret_error = match err {
+            Some(Error::SecretField(reason)) => Some(*reason),
+            _ => None,
+        };
+        crate::timings::append_step(&rec, |t| self.scrub(t), secret_error);
     }
 }
 

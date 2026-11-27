@@ -616,6 +616,9 @@ impl<R: Reader> Flow<R> {
         let twin_before = twin.as_ref().filter(|_| !secret).and_then(|t| self.field_attribute(&t.id, "value"));
         if secret || twin.is_some() {
             // Bind the payload to the representation that was prepared.
+            if secret {
+                crate::redaction::before_input(&[&text])?;
+            }
             let r = self.bound_write(&f.id, &text);
             if secret {
                 // Check for a misplaced write even if WDA reported a failure.

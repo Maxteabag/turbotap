@@ -34,6 +34,39 @@ turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" t
 
 Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`/`tapbatch:fixed:`, `read:vision`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `assert:`, `assertnot:`, `alert:text`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
 
+When one CLI invocation enters a credential and a later invocation may see it,
+share a redaction scope across the workflow. Create a fresh private run directory
+under a trusted parent and generate a fresh random 32-byte key. Both environment
+variables are required for **every** device command in the scope, including
+read-only commands.
+
+```sh
+export TURBOTAP_REDACTION_DIR="$(mktemp -d)"
+export TURBOTAP_REDACTION_KEY="$(openssl rand -hex 32)"
+```
+
+Use the same resolved UDID throughout, or the same WDA host and port when no
+UDID is available. The user-owned `0700` directory stores bounded, per-device
+credential and fragment fingerprints in an authenticated `0600` registry.
+The key stays in the environment. After
+credential input, matching JSON string values and free-form lines are masked
+in CLI output, errors and timing receipts. Unrelated labels and diagnostics
+remain available, and JSON objects with masked values carry `"redacted":true`.
+Image exports for that device are refused for the rest of the scoped run.
+
+The matcher uses normalized, case-insensitive text, the whole credential,
+five-character contiguous text fragments, and four-digit contiguous numeric
+fragments with common separators ignored. Shorter credentials match by their
+whole value. Coincidental matches may be masked. Shorter partial fragments,
+OCR substitutions, and values split across separate OCR fields can still be
+visible. Scoped credential input rejects normalized values over 256 characters
+or a full registry. A missing key or unreadable or invalid registry refuses
+scoped output or input. Keep the directory, its contents and the key intact
+throughout the run. Clear the credential from the device before changing the
+scope or handing off the device, and keep the key out of shell traces and logs.
+With both variables unset, existing per-flow masking applies. Use
+`type:env:VAR` or `type:cmd:COMMAND` to enter a secret.
+
 ## Requirements
 
 - An iPhone running iOS 17+ on your local Wi-Fi

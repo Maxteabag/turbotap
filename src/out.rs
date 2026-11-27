@@ -34,6 +34,8 @@ pub fn set_sink(sink: Option<Arc<dyn Sink>>) {
 }
 
 pub fn print_out(s: &str) {
+    let masked = crate::redaction::output(s);
+    let s = masked.as_ref();
     let sink = current_sink();
     match sink {
         Some(k) => k.stdout(s),
@@ -46,6 +48,8 @@ pub fn print_out(s: &str) {
 }
 
 pub fn print_err(s: &str) {
+    let masked = crate::redaction::output(s);
+    let s = masked.as_ref();
     let sink = current_sink();
     match sink {
         Some(k) => k.stderr(s),

@@ -563,6 +563,7 @@ impl<R: Reader> Flow<R> {
         let val = secret_arg("setclip", arg)?;
         if arg.starts_with("env:") || arg.starts_with("cmd:") {
             self.note_secret(&val);
+            crate::redaction::before_input(&[&val])?;
         }
         self.c.set_pasteboard(&val, content_type).map_err(runtime_to_flow)?;
         Ok(format!("len={}", val.chars().count()))

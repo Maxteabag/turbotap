@@ -36,6 +36,7 @@ pub mod image;
 pub mod json;
 pub mod ocr;
 pub mod out;
+mod redaction;
 pub mod skills;
 pub mod stop;
 pub mod text;

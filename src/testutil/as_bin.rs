@@ -35,6 +35,9 @@ extern "C" fn as_bin_init(argc: c_int, argv: *const *const c_char, _envp: *const
             }
             args.push(CStr::from_ptr(p).to_string_lossy().into_owned());
         }
+        if let Some(path) = std::env::var_os("TURBOTAP_TEST_TIMINGS_FILE") {
+            crate::timings::TEST_PATH.with(|p| p.replace(Some(path.into())));
+        }
         let code = std::panic::catch_unwind(|| crate::cli::main_with(&args)).unwrap_or(101);
         std::process::exit(code);
     }

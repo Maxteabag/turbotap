@@ -33,12 +33,14 @@ pub fn main_with(argv: &[String]) -> i32 {
 /// One CLI invocation in this process (the warm daemon calls this per request).
 /// Errors print `turbotap: <message>` to stderr and return 1.
 pub fn run_cli(argv: &[String]) -> i32 {
+    let _redaction = crate::redaction::Invocation::begin();
     crate::stop::take_stopped();
     let r = main_inner(argv);
     // A stop file that appeared mid-run ends the command like one present at start.
     let stopped = crate::stop::take_stopped();
     match r {
         Ok(_) if stopped => crate::stop::STOP_EXIT,
+        Ok(_) if crate::redaction::failed() => 1,
         Ok(code) => code,
         Err(e) => {
             crate::errln!("turbotap: {e}");
@@ -406,6 +408,7 @@ fn main_inner(argv: &[String]) -> Result<i32> {
         Some(e) => Err(e.clone()),
         None => crate::guard::resolve_allowlist(target.dev_key.as_deref(), &allow_app_values(&m, sm)),
     };
+    crate::redaction::configure(&url, &target.udid)?;
     let mut client = WdaClient::new(&url, &target.udid, target.dev_key.as_deref());
     // Connect only to the addresses the identity, allowlist and stop file were
     // resolved for; the host name is not resolved again.
@@ -559,6 +562,7 @@ pub fn cmd_screenshot(client: &mut WdaClient, out: &str) -> Result<()> {
     let Some(b64) = b64.as_str() else {
         return Err(Error::value(format!("argument should be a bytes-like object or ASCII string, not {}", json::py_repr(b64))));
     };
+    crate::redaction::before_image_export()?;
     // Python opens the file before decoding: an unwritable path wins over bad data.
     let mut file = std::fs::File::create(out).map_err(|e| py_os_error(&e, out))?;
     let bytes = b64decode_lenient(b64)?;
@@ -649,6 +653,7 @@ fn otp_type_inner(
         client.req("POST", &client.spath(&format!("/element/{eid}/click")), Some(&j!({})), crate::wda::DEFAULT_TIMEOUT, None);
         crate::clock::sleep(0.25);
     }
+    crate::redaction::before_input(&[&code])?;
     for d in code.chars() {
         let r = client.fast_keys(&d.to_string(), None);
         if r.is_object() && json::truthy(json::get(&r, "error")) {

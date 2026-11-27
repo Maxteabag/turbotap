@@ -63,6 +63,10 @@ pub fn path_from(v: Option<String>) -> Option<PathBuf> {
 /// `(kind, arg)` for a step spec: the verb lowercased and, for [`ARG_VERBS`] only,
 /// the argument (secret prefixes dropped, cut to 80 characters).
 pub fn step_kind_arg(spec: &str) -> (String, Option<String>) {
+    step_kind_arg_with(spec, str::to_string)
+}
+
+fn step_kind_arg_with(spec: &str, scrub: impl Fn(&str) -> String) -> (String, Option<String>) {
     let (verb, arg) = match spec.split_once(':') {
         Some((v, a)) => (v.trim().to_ascii_lowercase(), Some(a)),
         None => (spec.trim().to_ascii_lowercase(), None),
@@ -72,7 +76,7 @@ pub fn step_kind_arg(spec: &str) -> (String, Option<String>) {
         if crate::flow::is_secret_step(spec) {
             return (verb, None);
         }
-        let field = arg.and_then(|a| a.split_once('=').map(|(f, _)| f.chars().take(60).collect::<String>()));
+        let field = arg.and_then(|a| a.split_once('=').map(|(f, _)| scrub(f).chars().take(60).collect::<String>()));
         return (verb, field);
     }
     // `read:ocr`, `read:vision`, `read:0-400`: keep the mode, it is what makes the time.
@@ -80,6 +84,7 @@ pub fn step_kind_arg(spec: &str) -> (String, Option<String>) {
         .filter(|_| ARG_VERBS.contains(&verb.as_str()))
         .filter(|a| !a.starts_with("env:") && !a.starts_with("cmd:"))
         .map(|a| {
+            let a = scrub(a);
             let mut t: String = a.chars().take(80).collect();
             if t.len() < a.len() {
                 t.push_str("...");
@@ -113,7 +118,11 @@ pub const TARGET_VERBS: &[&str] = &["tap", "tapif", "tapat"];
 
 impl StepRecord<'_> {
     pub fn to_value(&self, scrub: impl Fn(&str) -> String) -> Value {
-        let (kind, arg) = step_kind_arg(self.spec);
+        self.to_value_scoped(scrub, &str::to_string)
+    }
+
+    fn to_value_scoped(&self, scrub: impl Fn(&str) -> String, scope_scrub: &dyn Fn(&str) -> String) -> Value {
+        let (kind, arg) = step_kind_arg_with(self.spec, scope_scrub);
         let mut v = j!({
             "ts": (crate::clock::wall() * 1000.0).round() / 1000.0,
             "device": self.device,
@@ -142,13 +151,17 @@ impl StepRecord<'_> {
             v["req_ms"] = Value::Object(m);
         }
         if let Some(t) = self.target.filter(|_| TARGET_VERBS.contains(&kind.as_str())) {
-            let short: String = scrub(t).chars().take(80).collect();
+            let short: String = scrub(&scope_scrub(t)).chars().take(80).collect();
             v["target"] = Value::String(short);
         }
         if let Some(e) = self.error {
             // Only for verbs whose argument may be logged (a typing step's error could
             // quote what was typed), and only the first words: enough to group failures.
-            let short: String = if ARG_VERBS.contains(&kind.as_str()) { scrub(e).chars().take(120).collect() } else { "failed".into() };
+            let short: String = if ARG_VERBS.contains(&kind.as_str()) {
+                scrub(&scope_scrub(e)).chars().take(120).collect()
+            } else {
+                "failed".into()
+            };
             v["error"] = Value::String(short);
         }
         v
@@ -175,13 +188,30 @@ pub fn record_command(c: &crate::wda::WdaClient, cmd: &str, t0: f64, req0: ReqSt
         target: None,
         req_kinds: Some(&c.req_kinds),
     };
-    append(&rec.to_value(str::to_string));
+    append_step(&rec, str::to_string, None);
 }
 
 /// Append `line` to the log. Errors are ignored: timing must never fail a flow.
 pub fn append(line: &Value) {
     let Some(path) = log_path() else { return };
-    let _ = append_to(&path, line);
+    if let Ok(safe) = crate::redaction::receipt(|_| line.clone()) {
+        let _ = append_to(&path, &safe);
+    }
+}
+
+/// Apply the scoped filter to the original text before clipping it for storage.
+pub(crate) fn append_step(rec: &StepRecord<'_>, scrub: impl Fn(&str) -> String, secret_error: Option<&str>) {
+    let Some(path) = log_path() else { return };
+    if let Ok(safe) = crate::redaction::receipt(|scope_scrub| {
+        let mut value = rec.to_value_scoped(scrub, scope_scrub);
+        if let Some(reason) = secret_error {
+            value["error"] = j!(reason);
+            value["arg"] = Value::Null;
+        }
+        value
+    }) {
+        let _ = append_to(&path, &safe);
+    }
 }
 
 fn append_to(path: &std::path::Path, line: &Value) -> std::io::Result<()> {
