@@ -278,6 +278,145 @@ fn test_stop_during_waitcontrol_wins_over_the_matching_reply() {
 }
 
 #[test]
+fn waitchange_reports_the_exact_targets_change_or_disappearance() {
+    let _cache = isolated_cache();
+    let (_clock, _hook) = virtual_clock();
+    let dir = TempDir::new("tt-waitchange-");
+    let stop = dir.path().join("phone.STOP");
+    let control = |x, value| json!({"type": "Switch", "label": "Sync: project=A | B", "x": x, "y": 40, "value": value});
+    let initial = control(40, "0");
+    let changed = control(40, "1");
+    let other = control(140, "1");
+    for (step, before, after, status, expected_last) in [
+        (
+            "waitchange:Sync: project=A | B",
+            json!([initial]),
+            json!([changed]),
+            "changed",
+            changed.clone(),
+        ),
+        (
+            "waitchange:tapat:40,40=Sync: project=A | B",
+            json!([other, initial]),
+            json!([other]),
+            "disappeared",
+            json!(null),
+        ),
+    ] {
+        let mock = MockWda::start(MockState {
+            fast_ui: Some(Dyn::of(vec![fast_ui(before, "Example", ALLOWED), fast_ui(after, "Example", ALLOWED)])),
+            ..Default::default()
+        });
+        let (code, out) = run_flow(&mock, &stop, &["--timeout", "1", step]);
+        assert_eq!(code, 0, "{out}");
+        let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(result["steps"][0]["result"], json!({"status": status, "initial": initial, "last": expected_last}));
+        let calls = mock.calls();
+        assert!(calls.iter().all(|(method, path, _)| {
+            method == "GET" || (method == "POST" && (path == "/session" || path.ends_with("/appium/settings")))
+        }), "{calls:?}");
+        assert!(!calls.iter().any(|(_, path, _)| path.to_ascii_lowercase().contains("screenshot")));
+    }
+}
+
+#[test]
+fn waitchange_distinguishes_unusable_snapshots_from_disappearance_and_timeout() {
+    let _cache = isolated_cache();
+    let (_clock, _hook) = virtual_clock();
+    let dir = TempDir::new("tt-waitchange-errors-");
+    let stop = dir.path().join("phone.STOP");
+    let control = json!({"type": "Button", "label": "Sync", "x": 40, "y": 40});
+    let other = json!({"type": "Button", "label": "Sync", "x": 60, "y": 40});
+    let snapshot = |controls| fast_ui(controls, "Example", ALLOWED);
+    let baseline = snapshot(json!([control]));
+    for (step, snapshots, error, evidence) in [
+        ("waitchange:tapat:41,40=Sync", vec![baseline.clone()], "no initial exact match", json!(null)),
+        ("waitchange:Sync", vec![snapshot(json!([control, other]))], "ambiguous snapshot", json!(null)),
+        ("waitchange:Sync", vec![baseline.clone(), snapshot(json!([control, other]))], "ambiguous snapshot", control.clone()),
+        ("waitchange:Sync", vec![baseline.clone(), fast_ui(json!([]), "Old app", "com.example.old")], "same app", control.clone()),
+        ("waitchange:Sync", vec![baseline.clone(), json!({"__close__": true})], "could not read live accessibility controls", control.clone()),
+        (
+            "waitchange:tapat:40,40=Sync",
+            vec![snapshot(json!([other, control])), snapshot(json!([
+                {"type": "Button", "label": "Sync", "x": 60, "y": 40, "enabled": false},
+                control
+            ]))],
+            "timed out after 0.4 s",
+            control.clone(),
+        ),
+    ] {
+        let mock = MockWda::start(MockState { fast_ui: Some(Dyn::of(snapshots)), ..Default::default() });
+        let (code, out) = run_flow(&mock, &stop, &["--timeout", "0.4", step]);
+        assert_eq!(code, 1, "{out}");
+        let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(result["failed_step"], step);
+        assert_eq!(result["steps"], json!([]));
+        let message = result["error"].as_str().unwrap();
+        assert!(message.contains(error), "{message}");
+        let (_, observations) = message.split_once(" Evidence: ").unwrap();
+        let observations: serde_json::Value = serde_json::from_str(observations).unwrap();
+        assert_eq!(observations, json!({"initial": evidence, "last": evidence}));
+        assert!(!mock.paths().iter().any(|path| path.to_ascii_lowercase().contains("screenshot")));
+    }
+}
+
+#[test]
+fn waitchange_requires_a_tree_from_legacy_wda() {
+    let _cache = isolated_cache();
+    let (_clock, _hook) = virtual_clock();
+    let dir = TempDir::new("tt-waitchange-legacy-");
+    let stop = dir.path().join("phone.STOP");
+    let tree = |children| json!({"type": "Application", "name": "Example", "children": children});
+    let initial = tree(json!([{
+        "type": "Button", "label": "Sync", "rect": {"x": 20, "y": 30, "width": 40, "height": 20}
+    }]));
+    for (next, expected_code) in [(tree(json!([])), 0), (json!({}), 1)] {
+        let mock = MockWda::start(MockState {
+            source_tree: Dyn::of(vec![initial.clone(), next]),
+            ..Default::default()
+        });
+        let (code, out) = run_flow(&mock, &stop, &["--timeout", "1", "waitchange:Sync"]);
+        assert_eq!(code, expected_code, "{out}");
+        let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+        if code == 0 {
+            assert_eq!(result["steps"][0]["result"]["status"], "disappeared");
+        } else {
+            assert!(result["error"].as_str().unwrap().contains("could not read live accessibility controls"), "{out}");
+        }
+    }
+}
+
+#[test]
+fn stop_during_waitchange_wins_over_disappearance() {
+    let _cache = isolated_cache();
+    let (_clock, _hook) = virtual_clock();
+    let dir = TempDir::new("tt-stop-waitchange-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(MockState::default());
+    let stop_in_handler = stop.clone();
+    let mut reads = 0;
+    mock.set_custom_handler(move |_, method, path, _| {
+        (method == "GET" && path == "/wda/fastUI").then(|| {
+            reads += 1;
+            let controls = if reads == 1 {
+                json!([{"type": "Button", "label": "Sync", "x": 40, "y": 40}])
+            } else {
+                std::fs::write(&stop_in_handler, "").unwrap();
+                json!([])
+            };
+            fast_ui(controls, "Example", ALLOWED)
+        })
+    });
+
+    let (code, out) = run_flow(&mock, &stop, &["--timeout", "1", "waitchange:Sync", "tapxy:40,40"]);
+    assert_eq!(code, crate::stop::STOP_EXIT, "{out}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(result["failed_step"], "waitchange:Sync");
+    assert_eq!(result["steps"], json!([]));
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
 fn test_without_a_stop_file_the_flow_runs_as_before() {
     let _c = isolated_cache();
     let dir = TempDir::new("tt-stop-c-");

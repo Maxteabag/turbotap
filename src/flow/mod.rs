@@ -43,6 +43,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         returns the matched text
   waitcontrol:LABEL     wait for an exact live accessibility label using --timeout;
                         returns the control and sends no input or screenshot request
+  waitchange:LABEL      wait for a unique live control to change or disappear, using --timeout;
+                        waitchange:tapat:X,Y=LABEL requires its exact reported center
   gone:TEXT             poll until TEXT is no longer on screen
   assert:TEXT           single-frame non-mutating check that TEXT is on screen (OCR + UI
                         controls fallback; supports @region and 're:REGEX')
@@ -896,6 +898,7 @@ impl<R: Reader> Flow<R> {
             "wait" | "expect" => return some(self.wait(arg, None, false, None, true)?.text),
             "waitany" => return some(self.wait_any(arg, None)?.text),
             "waitcontrol" => return Ok(Some(self.wait_control(arg)?.to_value())),
+            "waitchange" => return Ok(Some(self.wait_change(arg)?)),
             "gone" => self.gone(arg, None)?,
             "assert" => return some(self.assert_text(arg)?),
             "assertnot" => return some(self.assert_not_text(arg)?),
@@ -1511,7 +1514,7 @@ impl<R: Reader> Flow<R> {
         let is_bounded_wait = |spec: &str| {
             let verb = spec.split_once(':').map_or(spec, |(verb, _)| verb);
             let verb = verb.trim();
-            verb.eq_ignore_ascii_case("waitcontrol") || verb.eq_ignore_ascii_case("gone")
+            ["waitcontrol", "waitchange", "gone"].iter().any(|wait| verb.eq_ignore_ascii_case(wait))
         };
         let t0 = clock::real_now();
         let mut done: Vec<Value> = Vec::with_capacity(steps.len());

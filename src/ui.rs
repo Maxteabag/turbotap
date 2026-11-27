@@ -1565,6 +1565,11 @@ fn parse_source_bytes(bytes: &[u8], screen: (i64, i64), text: bool) -> Result<Op
     let SourceEnvelope(Some(root)) = serde_json::from_slice(bytes)? else {
         return Ok(None);
     };
+    // Stock WDA may return an object without a tree, such as an error value.
+    // A valid empty tree still has a typed root.
+    if root.kind.as_deref().is_none_or(str::is_empty) {
+        return Ok(None);
+    }
     let mut out = Vec::new();
     let mut seen: HashMap<(i64, i64), DedupBucket> = HashMap::new();
     let app_name = if root.kind.as_deref() == Some("Application") {
@@ -1681,12 +1686,27 @@ pub fn fetch_ui_controls_full(
     fallback_on_miss: bool,
     timeout: Option<f64>,
 ) -> (Option<Vec<Control>>, String, String) {
+    fetch_ui_controls_before(client, screen, text, wait_bundle, wait_ms, fallback_on_miss, timeout, None)
+}
+
+/// Keep the request budget inside an existing absolute deadline, including
+/// when less than the ordinary 50 ms minimum request budget remains.
+pub(crate) fn fetch_ui_controls_before(
+    client: &mut WdaClient,
+    screen: (i64, i64),
+    text: bool,
+    wait_bundle: Option<&str>,
+    wait_ms: i64,
+    fallback_on_miss: bool,
+    timeout: Option<f64>,
+    outer_deadline: Option<f64>,
+) -> (Option<Vec<Control>>, String, String) {
     let none = || (None, String::new(), String::new());
     let budget = match timeout {
         None => 30.0,
         Some(t) => t.max(0.05),
     };
-    let deadline = clock::now() + budget;
+    let deadline = (clock::now() + budget).min(outer_deadline.unwrap_or(f64::INFINITY));
     if client.turbo != Some(false) && client.fast_ui != Some(false) {
         let rem = deadline - clock::now();
         if rem <= 0.0 {

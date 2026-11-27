@@ -33,6 +33,13 @@ pub struct UiExpectation {
 /// `(controls or None, app_name, bundle_id)` from a UI-tree fetch.
 type UiFetch = (Option<Vec<Control>>, String, String);
 
+struct ChangeBaseline {
+    initial: Control,
+    last: Control,
+    app_name: String,
+    bundle_id: String,
+}
+
 /// A UI-worker job result (Python `concurrent.futures.Future`).
 struct Pending<T> {
     rx: mpsc::Receiver<T>,
@@ -797,6 +804,93 @@ impl<R: Reader> Flow<R> {
         )))
     }
 
+    /// Compare fresh observations of one caller-selected accessibility control.
+    pub(super) fn wait_change(&mut self, arg: &str) -> Result<Value> {
+        let usage = || Error::flow("use waitchange:LABEL or waitchange:tapat:X,Y=LABEL with exact integer coordinates");
+        let (label, center) = if let Some(spec) = arg.strip_prefix("tapat:") {
+            let (coords, label) = spec.split_once('=').ok_or_else(usage)?;
+            let (x, y) = coords.split_once(',').ok_or_else(usage)?;
+            let x = x.trim().parse::<i64>().map_err(|_| usage())?;
+            let y = y.trim().parse::<i64>().map_err(|_| usage())?;
+            (label, Some((x, y)))
+        } else {
+            (arg, None)
+        };
+        if label.trim().is_empty() {
+            return Err(usage());
+        }
+        let timeout = self.timeout;
+        if !timeout.is_finite() || timeout <= 0.0 {
+            return Err(Error::flow("waitchange requires a finite, positive --timeout"));
+        }
+        let deadline = clock::now() + timeout;
+        let poll_interval = (timeout / 4.0).clamp(0.1, 1.0);
+        let fail = |reason: &str, baseline: Option<&ChangeBaseline>| {
+            let evidence = serde_json::json!({
+                "initial": baseline.map(|b| &b.initial),
+                "last": baseline.map(|b| &b.last),
+            });
+            Error::flow(format!("waitchange {reason} for {}. Evidence: {evidence}", json::py_repr_str(arg)))
+        };
+        let mut baseline: Option<ChangeBaseline> = None;
+        let mut timeout_reason = format!("timed out after {timeout} s");
+        loop {
+            self.c.stop_check().map_err(Error::flow)?;
+            let now = clock::now();
+            if now >= deadline {
+                break;
+            }
+            let poll_deadline = deadline.min(now + 30.0);
+            let snapshot = self.controls_snapshot(false, None, Some(poll_deadline), false, false);
+            self.c.stop_check().map_err(Error::flow)?;
+            let (controls, app_name, bundle_id) = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(e) if !matches!(e, Error::StaleApp(_)) && clock::now() >= deadline => {
+                    timeout_reason.push_str(&format!(" while reading live accessibility controls ({e})"));
+                    break;
+                }
+                Err(e) => return Err(fail(&format!("could not read live accessibility controls ({e})"), baseline.as_ref())),
+            };
+            if clock::now() >= deadline {
+                break;
+            }
+            let controls = controls.ok_or_else(|| fail("could not read live accessibility controls", baseline.as_ref()))?;
+            let app_changed = baseline.as_ref().is_some_and(|b| {
+                if !b.bundle_id.is_empty() && !bundle_id.is_empty() {
+                    b.bundle_id != bundle_id
+                } else {
+                    !b.app_name.is_empty() && b.app_name != app_name
+                }
+            });
+            if app_changed {
+                return Err(fail("could not confirm the same app in the latest snapshot", baseline.as_ref()));
+            }
+            let mut matches = controls.into_iter().filter(|control| {
+                control.label == label && center.is_none_or(|p| p == (control.x, control.y))
+            });
+            let observed = matches.next();
+            if matches.next().is_some() {
+                return Err(fail("found an ambiguous snapshot with several exact matches", baseline.as_ref()));
+            }
+            match (baseline.as_mut(), observed) {
+                (None, None) => return Err(fail("found no initial exact match", None)),
+                (None, Some(initial)) => {
+                    baseline = Some(ChangeBaseline { last: initial.clone(), initial, app_name, bundle_id });
+                }
+                (Some(b), Some(last)) if last == b.initial => b.last = last,
+                (Some(b), last) => {
+                    let status = if last.is_some() { "changed" } else { "disappeared" };
+                    return Ok(serde_json::json!({"status": status, "initial": b.initial, "last": last}));
+                }
+            }
+            let remaining = deadline - clock::now();
+            if remaining > 0.0 {
+                clock::sleep(remaining.min(poll_interval));
+            }
+        }
+        Err(fail(&timeout_reason, baseline.as_ref()))
+    }
+
     /// Wait for both the visual text and the live accessibility match to clear.
     pub fn gone(&mut self, label: &str, timeout: Option<f64>) -> Result<()> {
         let timeout = self.eff_timeout(timeout);
@@ -1132,8 +1226,19 @@ impl<R: Reader> Flow<R> {
         fast_only: bool,
         allow_alert: bool,
     ) -> Result<Option<Vec<Control>>> {
+        self.controls_snapshot(text, timeout, deadline, fast_only, allow_alert).map(|(ctl, _, _)| ctl)
+    }
+
+    fn controls_snapshot(
+        &mut self,
+        text: bool,
+        timeout: Option<f64>,
+        deadline: Option<f64>,
+        fast_only: bool,
+        allow_alert: bool,
+    ) -> Result<UiFetch> {
         if fast_only && (self.c.turbo == Some(false) || self.c.fast_ui == Some(false)) {
-            return Ok(None);
+            return Ok((None, String::new(), String::new()));
         }
         self.last_alert_text = None;
         self.last_alert_buttons = None;
@@ -1163,7 +1268,7 @@ impl<R: Reader> Flow<R> {
                 let rem = Self::ui_rem(deadline)?;
                 let wait_ms = if deadline.is_some() { 1500.min((rem * 1000.0) as i64) } else { 1500 };
                 (ctl, app_name, bundle_id) =
-                    ui::fetch_ui_controls_full(&mut self.c, screen_pt, text, Some(pending), wait_ms, false, budget(rem));
+                    ui::fetch_ui_controls_before(&mut self.c, screen_pt, text, Some(pending), wait_ms, false, budget(rem), deadline);
                 if ctl.is_some() {
                     if bundle_id == pending || bundle_id.is_empty() {
                         self.pending_bundle = None;
@@ -1173,14 +1278,14 @@ impl<R: Reader> Flow<R> {
                         self.wait_active_app(rem.min(1.5), 0.03, deadline);
                         let rem = Self::ui_rem(deadline)?;
                         (ctl, app_name, bundle_id) =
-                            ui::fetch_ui_controls_full(&mut self.c, screen_pt, text, None, 0, !fast_only, budget(rem));
+                            ui::fetch_ui_controls_before(&mut self.c, screen_pt, text, None, 0, !fast_only, budget(rem), deadline);
                     }
                 }
             }
         }
         if ctl.is_none() {
             if fast_only && self.c.fast_ui == Some(false) {
-                return Ok(None);
+                return Ok((None, String::new(), String::new()));
             }
             let rem = Self::ui_rem(deadline)?;
             self.wait_active_app(rem.min(1.5), 0.03, deadline);
@@ -1193,11 +1298,11 @@ impl<R: Reader> Flow<R> {
                 None => 0,
             };
             (ctl, app_name, bundle_id) =
-                ui::fetch_ui_controls_full(&mut self.c, screen_pt, text, wb, wb_ms, !fast_only, budget(rem));
+                ui::fetch_ui_controls_before(&mut self.c, screen_pt, text, wb, wb_ms, !fast_only, budget(rem), deadline);
         }
         let Some(mut ctl) = ctl else {
             if fast_only {
-                return Ok(None);
+                return Ok((None, String::new(), String::new()));
             }
             if deadline.is_some_and(|d| clock::now() >= d) {
                 return Err(timed_out());
@@ -1211,7 +1316,7 @@ impl<R: Reader> Flow<R> {
                 if let Some(alert_txt) = alert_text_on(&mut self.c, deadline) {
                     return self
                         .springboard_alert(alert_txt, &had_pending, allow_alert, &ctl, deadline, None, text, exp)
-                        .map(Some);
+                        .map(|ctl| (Some(ctl), app_name, bundle_id));
                 }
             }
             // /source or /wda/fastUI occasionally lags behind activeAppInfo right after open:;
@@ -1235,7 +1340,7 @@ impl<R: Reader> Flow<R> {
                             break;
                         }
                         let wb_ms = if wb.is_some() { 400.min((rem * 1000.0) as i64) } else { 0 };
-                        ui::fetch_ui_controls_full(&mut self.c, screen_pt, text, wb, wb_ms, !fast_only, Some(rem))
+                        ui::fetch_ui_controls_before(&mut self.c, screen_pt, text, wb, wb_ms, !fast_only, Some(rem), Some(d))
                     }
                     None => {
                         clock::sleep(delay);
@@ -1252,7 +1357,7 @@ impl<R: Reader> Flow<R> {
                     if let Some(alert_txt) = alert_text_on(&mut self.c, deadline) {
                         return self
                             .springboard_alert(alert_txt, &had_pending, allow_alert, &ctl, deadline, Some(screen_pt), text, exp)
-                            .map(Some);
+                            .map(|ctl| (Some(ctl), app_name, bundle_id));
                     }
                 }
             }
@@ -1260,7 +1365,7 @@ impl<R: Reader> Flow<R> {
             if let Some(alert_txt) = alert_text_on(&mut self.c, deadline) {
                 return self
                     .springboard_alert(alert_txt, &had_pending, allow_alert, &ctl, deadline, None, text, exp)
-                    .map(Some);
+                    .map(|ctl| (Some(ctl), app_name, bundle_id));
             }
         }
         if self.is_stale_ui(&app_name, &bundle_id, Some(&expectation)) {
@@ -1279,7 +1384,7 @@ impl<R: Reader> Flow<R> {
         self.record_app(&app_name, &bundle_id, &expected_bundle);
         let ctl = ui::strip_alert_meta(std::mem::take(&mut ctl));
         self.store_ctl_cache(&ctl, None);
-        Ok(Some(ctl))
+        Ok((Some(ctl), app_name, bundle_id))
     }
 
     /// Accept a fresh tree's provenance: clear the pending switch once the expected
