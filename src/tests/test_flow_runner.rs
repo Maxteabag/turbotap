@@ -698,6 +698,50 @@ fn test_gone_skips_ocr_while_pixel_still_and_detects_change_immediately() {
 }
 
 #[test]
+fn test_gone_polls_live_text_after_ocr_miss_and_reuses_identical_frames() {
+    let _cache = isolated_cache();
+    let present = fui(json!([{"type": "Text", "label": "Waiting for network", "x": 200, "y": 450}]));
+    let absent = fui(json!([]));
+    let mock = MockWda::start(MockState {
+        fast_ui: Some(Dyn::of(vec![present.clone(), present, absent])),
+        ..MockState::default()
+    });
+    let frame = solid_img(220, (430, 932));
+    let reader = FakeReader::with(vec![fr(&frame, &[])], (430, 932), 1.0);
+    let mut flow = mk_flow(&mock, &reader, 1.0);
+    let (_clock, _hook) = virtual_clock();
+    let (ok, output) = flow.run_outcome(&["gone:Waiting for network@y>300".into()]).unwrap();
+    assert!(ok, "{output}");
+    assert_eq!(mock.paths().iter().filter(|p| *p == "/wda/fastUI?text=1").count(), 3);
+    assert_eq!(reader.read_calls(), 1);
+    flow.close();
+}
+
+#[test]
+fn test_gone_honors_stop_during_accessibility_observation() {
+    let _cache = isolated_cache();
+    let dir = TempDir::new("tt-gone-stop-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(with_fast_ui(fui(json!([]))));
+    let path = stop.clone();
+    mock.set_custom_handler(move |_, _, p, _| {
+        if p == "/wda/fastUI?text=1" {
+            std::fs::write(&path, "").unwrap();
+        }
+        None
+    });
+    let reader = FakeReader::new(vec![]);
+    let mut flow = mk_flow(&mock, &reader, 1.0);
+    flow.c.stop_paths = vec![stop];
+    let (ok, output) = flow.run_outcome(&["gone:Loading".into(), "tapxy:10,10".into()]).unwrap();
+    assert!(!ok, "{output}");
+    assert!(crate::stop::take_stopped());
+    assert!(mock.tapped_points().is_empty());
+    assert_eq!(reader.read_calls(), 1);
+    flow.close();
+}
+
+#[test]
 fn test_tap_text_drains_transition_before_ocr() {
     let _cache = isolated_cache();
     // Simulate an active iOS slide transition right after a prior tap with large reaction diff.
@@ -1869,6 +1913,62 @@ fn test_search_polls_through_cold_launch_splash_until_search_control_renders() {
     assert_eq!(res, "Search");
     assert!(calls.load(Ordering::SeqCst) >= 3);
     assert!(c.state().typed_history.iter().any(|(_, txt, _)| txt == "Wikipedia"));
+    flow.close();
+}
+
+#[test]
+fn test_search_after_opening_the_search_tab_does_not_append_the_query_twice() {
+    let _cache = isolated_cache();
+    let mut st = with_fast_ui(fui(json!([{"type": "Button", "label": "Search", "x": 200, "y": 800}])));
+    st.element_rects.insert("query".into(), json!({"x": 50, "y": 80, "width": 300, "height": 40}));
+    st.element_types.insert("query".into(), json!("XCUIElementTypeSearchField"));
+    let mock = MockWda::start(st);
+    mock.set_on_action(|st, kind, _| {
+        if kind == "tap" && st.focused_eid.is_none() {
+            st.set_element_value("query", Dyn::one(json!("cedar")));
+            st.fast_ui = Some(Dyn::one(fui(json!([
+                {"type": "SearchField", "label": "Search", "value": "cedar", "x": 200, "y": 100}
+            ]))));
+        }
+    });
+    mock.set_custom_handler(|_, _, p, _| {
+        p.ends_with("/element/query/attribute/placeholderValue").then(|| json!({"value": "Search"}))
+    });
+    let img = solid_img(220, (430, 932));
+    let reader = FakeReader::new(vec![fr(&img, &[ml("Search", 170, 790, 230, 810)])]);
+    let mut flow = mk_flow(&mock, &reader, 1.0);
+    let (_clock, _hook) = virtual_clock();
+
+    step_s(&mut flow, "tap:Search");
+    assert_eq!(step_s(&mut flow, "search:cedar"), "Search");
+    assert_eq!(elval(&mock, "query"), json!("cedar"));
+    assert!(mock.state().typed_history.is_empty());
+    assert_eq!(step_s(&mut flow, "search:wood"), "Search");
+    assert_eq!(elval(&mock, "query"), json!("cedarwood"));
+    assert_eq!(mock.state().typed_history.len(), 1);
+    flow.close();
+}
+
+#[test]
+fn test_search_does_not_replay_a_fast_keys_write_after_an_ambiguous_404() {
+    let _cache = isolated_cache();
+    let search = fui(json!([{"type": "SearchField", "label": "Search", "x": 200, "y": 100}]));
+    let mut st = with_fast_ui(search);
+    st.set_element_value("query", Dyn::one(json!("")));
+    let mock = MockWda::start(st);
+    mock.set_custom_handler(|st, _, p, body| {
+        (p == "/wda/fastKeys").then(|| {
+            st.set_element_value("query", Dyn::one(body["value"].clone()));
+            json!({"error": 404, "body": "input target disappeared"})
+        })
+    });
+    let reader = FakeReader::new(vec![]);
+    let mut flow = mk_flow(&mock, &reader, 1.0);
+    let (_clock, _hook) = virtual_clock();
+    let (ok, output) = flow.run_outcome(&["search:cedar".into()]).unwrap();
+    assert!(!ok, "{output}");
+    assert_eq!(elval(&mock, "query"), json!("cedar"));
+    assert!(!mock.paths().iter().any(|p| p.ends_with("/wda/keys")));
     flow.close();
 }
 

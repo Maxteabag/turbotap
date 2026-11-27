@@ -158,7 +158,8 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   doubletapxy:X,Y       double-tap points via /wda/fastDoubleTap
   zoom:in|out|SCALE[@X,Y] two-finger pinch/zoom via /wda/fastPinch (in=2.0, out=0.5, or
                         positive scale; defaults to screen center)
-  search:QUERY          tap the app's search field/Search button, type QUERY, settle
+  search:QUERY          tap the app's search field/Search button, type QUERY unless already present
+                        in the focused search field, then settle without pressing Return
   readel:TEXT           labels of controls containing TEXT (accessibility tree)
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
@@ -180,7 +181,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         focus (tap fallback), probe secrets/long text, retry a focus miss once,
                         type and verify (secure fields by length). VALUE: text, file:PATH, env:V or cmd:C
   readfield:FIELD       the exact value of the input named FIELD (label, identifier or placeholder),
-                        blank lines included; read-only; a secure field gives only len=N
+                        blank lines included; read-only; secure fields give len=N or len=unavailable
   assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V, cmd:C); read-only;
                         secure fields are checked by length. If a non-secret field reports no value,
                         compare visible text via WDA Vision OCR (host OCR on older runners)
@@ -1592,9 +1593,10 @@ impl<R: Reader> Flow<R> {
     }
 
     fn run_outcome_inner(&mut self, steps: &[String], take_reads: bool) -> Result<(bool, Value)> {
-        let is_control_wait = |spec: &str| {
+        let is_bounded_wait = |spec: &str| {
             let verb = spec.split_once(':').map_or(spec, |(verb, _)| verb);
-            verb.trim().eq_ignore_ascii_case("waitcontrol")
+            let verb = verb.trim();
+            verb.eq_ignore_ascii_case("waitcontrol") || verb.eq_ignore_ascii_case("gone")
         };
         let t0 = clock::real_now();
         let mut done: Vec<Value> = Vec::with_capacity(steps.len());
@@ -1632,9 +1634,9 @@ impl<R: Reader> Flow<R> {
                     }
                     done.push(item);
                 }
-                Err(e) if e.is_flow() && (secret_step || matches!(&e, Error::SecretField(_)) || is_control_wait(spec)) => {
+                Err(e) if e.is_flow() && (secret_step || matches!(&e, Error::SecretField(_)) || is_bounded_wait(spec)) => {
                     // Screen diagnostics could expose credentials or run beyond a
-                    // control wait's deadline or STOP check.
+                    // bounded wait's deadline or STOP check.
                     let mut res = j!({
                         "ok": false,
                         "failed_step": safe_step(spec),
@@ -1690,7 +1692,7 @@ impl<R: Reader> Flow<R> {
         // A flow that ends right after open:/launch: (no read or tap to wait lazily)
         // returns once the app is in front, so the caller's next command does not see
         // the previous app.
-        if self.pending_bundle.is_some() && !steps.last().is_some_and(|spec| is_control_wait(spec)) {
+        if self.pending_bundle.is_some() && !steps.last().is_some_and(|spec| is_bounded_wait(spec)) {
             self.wait_active_app(1.5, 0.03, None);
         }
         let reads = if take_reads { std::mem::take(&mut self.reads) } else { self.reads.clone() };

@@ -771,57 +771,86 @@ impl<R: Reader> Flow<R> {
         )))
     }
 
-    /// L2976.
+    /// Wait for both the visual text and the live accessibility match to clear.
     pub fn gone(&mut self, label: &str, timeout: Option<f64>) -> Result<()> {
-        self.wait_active_app(1.5, 0.03, None);
+        let timeout = self.eff_timeout(timeout);
+        if !timeout.is_finite() || timeout <= 0.0 {
+            return Err(Error::flow("gone requires a finite, positive timeout"));
+        }
+        let end = clock::now() + timeout;
+        self.c.stop_check().map_err(Error::flow)?;
+        self.wait_active_app(1.5, 0.03, Some(end));
         let (label, where_) = split_where(label);
         let where_ = where_.as_deref();
-        let end = clock::wall() + self.eff_timeout(timeout);
-        let mut prev_img: Option<Frame> = None;
-        let mut m: Option<Match> = None;
+        let mut frame = None;
+        let mut lines = Vec::new();
+        let mut visual_hit = None;
         if self.wait_settled_ts >= self.last_action_ts {
-            if let Some(cached_lines) = self.fresh_cached_lines(0.15) {
-                m = find(&cached_lines, &label, where_);
-                if m.is_some() {
-                    prev_img = self.r.last();
+            if let Some(cached) = self.fresh_cached_lines(0.15) {
+                visual_hit = find(&cached, &label, where_);
+                if visual_hit.is_some() {
+                    frame = self.r.last();
+                    lines = cached;
                 }
             }
         }
-        if prev_img.is_none() {
-            let lines = self.lines(None, None)?;
-            m = find(&lines, &label, where_);
-            if m.is_none() {
-                self.wait_settled_ts = clock::now();
-                return Ok(());
+        let mut ui_error = None;
+        loop {
+            self.c.stop_check().map_err(Error::flow)?;
+            if clock::now() >= end {
+                break;
             }
-            prev_img = self.r.last();
-        }
-        let scale = self.r.scale();
-        let in_status = |m: Option<&Match>, img: Option<&Frame>| match (m, img) {
-            (Some(m), Some(img)) => (m.y as f64 * scale) < ((img.h as f64 * 0.06) as i64) as f64,
-            _ => false,
-        };
-        let mut match_in_status = in_status(m.as_ref(), prev_img.as_ref());
-        while clock::wall() < end {
-            let cur_img = self.grab()?;
-            if prev_img.is_some() && !match_in_status && still(prev_img.as_ref(), Some(&cur_img)) {
-                if !same(Some(&cur_img), prev_img.as_ref()) {
-                    let ll = self.r.last_lines();
-                    self.r.set_last(Some(cur_img), ll, None);
+            let current = self.r.grab(&mut self.c, 0, None, None, Some(end));
+            self.c.stop_check().map_err(Error::flow)?;
+            let current = match current {
+                Err(Error::Timeout(_) | Error::DeadlineExceeded(_)) if clock::now() >= end => break,
+                result => result?,
+            };
+            let reuse = frame.as_ref().is_some_and(|previous: &Frame| {
+                if let Some(hit) = visual_hit.as_ref() {
+                    let status_edge = (previous.h as f64 * 0.06) as i64;
+                    (hit.y as f64 * self.r.scale()) >= status_edge as f64 && still(Some(previous), Some(&current))
+                } else {
+                    // An OCR miss is reusable only when all pixels match. The
+                    // accessibility result must still be refreshed each poll.
+                    previous == &current
                 }
-                continue;
+            });
+            if !reuse {
+                let read = self.r.read(&mut self.c, ReadOpts::img(current.clone()));
+                self.c.stop_check().map_err(Error::flow)?;
+                lines = read?;
+                visual_hit = find(&lines, &label, where_);
+                frame = Some(current.clone());
             }
-            let lines = self.read_img(&cur_img)?;
-            self.r.set_last(Some(cur_img.clone()), Some(lines.clone()), None);
-            let mm = find(&lines, &label, where_);
-            if mm.is_none() {
-                self.wait_settled_ts = clock::now();
-                return Ok(());
+            if !reuse || !same(Some(&current), self.r.last().as_ref()) {
+                self.r.set_last(Some(current), Some(lines.clone()), None);
             }
-            prev_img = Some(cur_img);
-            match_in_status = in_status(mm.as_ref(), prev_img.as_ref());
+
+            if visual_hit.is_none() && clock::now() < end {
+                let controls = self.controls(true, None, Some(end), false, false);
+                self.c.stop_check().map_err(Error::flow)?;
+                match controls {
+                    Ok(raw) => {
+                        ui_error = None;
+                        let scoped = scope_controls(&raw, &lines, where_);
+                        if clock::now() < end && ui::find_control_match(&scoped, &label, Some(ui::WAIT_UI_TYPES), true).is_none() {
+                            self.wait_settled_ts = clock::now();
+                            return Ok(());
+                        }
+                    }
+                    Err(e) if e.is_flow() => ui_error = Some(e),
+                    Err(e) => return Err(e),
+                }
+                clock::sleep((end - clock::now()).clamp(0.0, 0.1));
+            }
         }
-        Err(Error::flow(format!("{} still on screen", json::py_repr_str(&label))))
+        self.c.stop_check().map_err(Error::flow)?;
+        let label = json::py_repr_str(&label);
+        match ui_error {
+            Some(e) => Err(Error::flow(format!("gone: could not verify that {label} disappeared: {e}"))),
+            None => Err(Error::flow(format!("gone: timed out waiting for {label} to disappear"))),
+        }
     }
 
     /// Shared single-frame lookup of `assert`/`assertnot`: OCR match text, else a

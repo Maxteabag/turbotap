@@ -6,7 +6,7 @@
 //! wheels, the tree cleans whitespace, and OCR sees only the visible lines, so none
 //! of them can prove a multi-paragraph text view. These steps read the element's
 //! own `value` attribute. Both are read-only (no tap, no keyboard change). A secure
-//! field is only ever reported by its length.
+//! field reports only its length when the runner supplies a value.
 use super::Flow;
 use crate::error::{Error, Result};
 use crate::json;
@@ -58,7 +58,7 @@ pub(crate) struct Field {
     /// How it was named in the step (messages only, never its value).
     pub name: String,
     pub placeholder: String,
-    pub value: String,
+    pub value: Option<String>,
 }
 
 impl Field {
@@ -67,10 +67,11 @@ impl Field {
     }
     /// The value with an echoed placeholder counted as empty.
     pub fn content(&self) -> &str {
-        if !self.placeholder.is_empty() && self.value == self.placeholder {
+        let value = self.value.as_deref().unwrap_or("");
+        if value == self.placeholder {
             ""
         } else {
-            &self.value
+            value
         }
     }
     fn describe(&self) -> String {
@@ -264,6 +265,13 @@ enum Focus {
 }
 
 impl<R: Reader> Flow<R> {
+    fn field_value(&mut self, id: &str) -> Option<String> {
+        let path = self.c.spath(&format!("/element/{id}/attribute/value"));
+        let response = self.c.req_2xx("GET", &path, None, crate::wda::DEFAULT_TIMEOUT, None);
+        let value = crate::guard::success_value(&response).ok()?;
+        value.as_str().map(str::to_owned)
+    }
+
     fn field_ids(&mut self, pred: &str) -> Vec<String> {
         let p = self.c.spath("/elements");
         let r = self.c.post(&p, &j!({"using": "predicate string", "value": pred}));
@@ -360,13 +368,42 @@ impl<R: Reader> Flow<R> {
     }
 
     fn load_field(&mut self, id: &str, name: &str) -> Field {
+        let kind = self.field_type(id);
+        let placeholder = self.field_attr(id, "placeholderValue");
+        let value = if kind == SECURE {
+            self.field_value(id)
+        } else {
+            self.field_attribute(id, "value")
+        };
         Field {
             id: id.to_string(),
-            kind: self.field_type(id),
+            kind,
             name: name.to_string(),
-            placeholder: self.field_attr(id, "placeholderValue"),
-            value: self.field_attr(id, "value"),
+            placeholder,
+            value,
         }
+    }
+
+    /// The compact UI tree sometimes substitutes the placeholder for the value.
+    /// Confirm that the selected control is the focused input and holds the query.
+    pub(super) fn focused_search_matches(&mut self, field: &crate::ui::Control, query: &str) -> bool {
+        let hint = field.value.as_deref().unwrap_or(&field.label);
+        if query.is_empty() || query.chars().any(char::is_control) || hint != crate::text::clean_text(query) {
+            return false;
+        }
+        let Some(id) = self.active_element_id() else { return false };
+        let Some((x, y, w, h)) = self.field_rect(&id) else { return false };
+        if w <= 0.0
+            || h <= 0.0
+            || (x + w / 2.0 - field.x as f64).abs() > 2.0
+            || (y + h / 2.0 - field.y as f64).abs() > 2.0
+        {
+            return false;
+        }
+        let expected_type = format!("XCUIElementType{}", field.kind);
+        self.field_type(&id) == expected_type
+            && self.field_value(&id).as_deref() == Some(query)
+            && self.field_attribute(&id, "placeholderValue").is_some_and(|placeholder| placeholder != query)
     }
 
     /// Candidates come from one enumeration. Keep unknown visibility for
@@ -534,7 +571,7 @@ impl<R: Reader> Flow<R> {
 
     fn field_value_len(&mut self, f: &Field) -> Option<usize> {
         let value = self.field_attribute(&f.id, "value")?;
-        Some(Field { value, ..f.clone() }.content().chars().count())
+        Some(Field { value: Some(value), ..f.clone() }.content().chars().count())
     }
 
     /// Total value length of every text input on screen except `f`.
@@ -742,7 +779,7 @@ impl<R: Reader> Flow<R> {
             self.fill_keys(&text, &format!("fill {}", f.describe()), false)?;
         }
         clock::sleep(0.25);
-        let v = self.field_attr(&f.id, "value");
+        let v = Some(self.field_attr(&f.id, "value"));
         let mut got = Field { value: v, ..f.clone() };
         let alternate = twin.filter(|_| got.content().is_empty()).zip(twin_before);
         if let Some((twin, before)) = alternate {
@@ -755,7 +792,7 @@ impl<R: Reader> Flow<R> {
                     None
                 }
             });
-            if let Some(readback) = readback.filter(|t| !t.content().is_empty() && (want == 0 || t.value != before)) {
+            if let Some(readback) = readback.filter(|t| !t.content().is_empty() && (want == 0 || t.value.as_deref() != Some(before.as_str()))) {
                 got = readback;
             }
         }
@@ -837,14 +874,19 @@ impl<R: Reader> Flow<R> {
 
     /// `readfield:FIELD`: the named input's exact value (an echoed placeholder reads
     /// as empty). Also added to the flow's `reads` as `{"field", "value", "len"}`. A
-    /// secure field gives only `len=N`.
+    /// secure field gives `len=N` when measured and `len=unavailable` otherwise.
     pub fn read_field(&mut self, arg: &str) -> Result<String> {
         let app = self.c.live_foreground_app(None).ok();
         let f = self.find_field("readfield", arg, app.as_deref())?.for_read();
         let n = f.content().chars().count();
         if f.secure() {
-            self.reads.push(j!({"field": f.name, "secure": true, "len": n}));
-            return Ok(format!("len={n}"));
+            let len = f.value.as_ref().map(|_| n);
+            self.reads.push(j!({"field": f.name, "secure": true, "len": len}));
+            return Ok(len.map_or_else(|| "len=unavailable".into(), |n| format!("len={n}")));
+        }
+        let kind = f.kind.trim_start_matches("XCUIElementType");
+        if !matches!(kind, "TextField" | "SearchField" | "TextView") {
+            return Err(Error::SecretField("readfield: could not verify the input type"));
         }
         let v = f.content().to_string();
         if v.is_empty() {
@@ -970,7 +1012,7 @@ mod unit {
             kind: "XCUIElementTypeTextView".into(),
             name: "Body".into(),
             placeholder: "body text (optional)".into(),
-            value: "body text (optional)".into(),
+            value: Some("body text (optional)".into()),
         };
         assert_eq!(f.content(), "");
         assert_eq!(first_diff("abcd", "abxd"), 2);

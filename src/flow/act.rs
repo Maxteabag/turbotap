@@ -697,31 +697,36 @@ impl<R: Reader> Flow<R> {
         self.tap_point(c.x, c.y, &c.label, None)?;
         // A Search tab/button opens a page whose field may still need focus: wait for
         // the transition to react, find the field, and tap it unless already active.
-        if c.kind != "SearchField" && c.kind != "TextField" {
+        let field = if matches!(c.kind.as_str(), "SearchField" | "TextField") {
+            Some(c.clone())
+        } else {
             if before.is_some() {
                 self.changed_since(before, 0.6, Some(c.x), Some(c.y))?;
             } else {
                 self.settle(0.8, None, 0.6)?;
             }
             let ctl2 = self.controls(false, None, None, false, false)?;
-            if let Some(f) = ctl2.iter().find(|x| x.kind == "SearchField" || x.kind == "TextField") {
+            let field = ctl2.iter().find(|x| matches!(x.kind.as_str(), "SearchField" | "TextField"));
+            if let Some(f) = field {
                 let already_focused = (f.x - c.x).abs() <= 15
                     && (f.y - c.y).abs() <= 15
                     && ctl2
                         .iter()
                         .any(|x| matches!(casefold(&x.label).as_str(), "cancel" | "avbryt" | "clear text" | "tøm tekst"));
                 if !already_focused {
-                    let f = f.clone();
                     self.tap_point(f.x, f.y, &f.label, None)?;
                 }
             }
-        }
+            field.cloned()
+        };
         let focus_rem = 0.18 - (clock::now() - self.last_tap_ts);
         if focus_rem > 0.0 {
             clock::sleep(focus_rem); // brief keyboard focus beat after the last fast_tap
         }
-        self.mark_action(false, true);
-        check_wda_ok(self.c.fast_keys(query, None), "search", false)?;
+        if !field.as_ref().is_some_and(|field| self.focused_search_matches(field, query)) {
+            self.mark_action(false, true);
+            check_wda_ok(self.c.fast_keys(query, None), "search", false)?;
+        }
         self.settle(2.0, None, 0.5)?;
         Ok(c.label)
     }

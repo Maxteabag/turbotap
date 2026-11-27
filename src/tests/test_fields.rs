@@ -116,6 +116,31 @@ fn secure_fields_are_compared_by_length_and_never_shown() {
 }
 
 #[test]
+fn readfield_reports_unavailable_secure_length_separately_from_empty() {
+    for (response, length, result) in [
+        (json!({"value": null}), json!(null), "len=unavailable"),
+        (json!({}), json!(null), "len=unavailable"),
+        (json!({"error": 500, "body": "attribute inaccessible"}), json!(null), "len=unavailable"),
+        (json!({"value": ""}), json!(0), "len=0"),
+    ] {
+        let mut st = composer(BODY);
+        st.element_rects.insert("p1".into(), json!({"x": 20, "y": 100, "width": 360, "height": 40}));
+        let mock = MockWda::start(st);
+        mock.set_custom_handler(move |_, _, path, _| {
+            path.ends_with("/element/p1/attribute/value").then(|| response.clone())
+        });
+        let reader = FakeReader::new(vec![]);
+        let mut f = Flow::new(mock.client(), reader.clone(), 0.5, Some(DENY_DEFAULT), false).unwrap();
+        let (ok, output) = f.run_outcome(&["readfield:Password".into()]).unwrap();
+        assert!(ok, "{output}");
+        assert_eq!(output["steps"][0]["result"], json!(result));
+        assert_eq!(output["reads"][0], json!({"field": "Password", "secure": true, "len": length}));
+        assert_eq!(reader.read_calls(), 0);
+        f.close();
+    }
+}
+
+#[test]
 fn unknown_or_ambiguous_names_fail_with_the_inputs_listed() {
     let mut st = composer(BODY);
     st.elements_map

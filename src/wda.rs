@@ -2912,7 +2912,7 @@ impl WdaClient {
     }
 
     /// L676-701. `/wda/fastKeys` (wda-turbo v3+), stock `/wda/keys` only on a
-    /// definitive 404 (never replays an accepted request).
+    /// 404 identifying a missing route. Other failures may follow a partial write.
     pub fn fast_keys(&mut self, text: &str, frequency: Option<i64>) -> Value {
         self.fast_keys_timeout(text, frequency, DEFAULT_TIMEOUT)
     }
@@ -2929,7 +2929,7 @@ impl WdaClient {
             if let Some(f) = freq {
                 body["frequency"] = j!(f);
             }
-            let r = self.req("POST", "/wda/fastKeys", Some(&body), timeout, None);
+            let r = self.req_2xx("POST", "/wda/fastKeys", Some(&body), timeout, None);
             if !r.is_object() {
                 return json::error_value("invalid response from /wda/fastKeys");
             }
@@ -2937,7 +2937,7 @@ impl WdaClient {
                 self.fast_keys = Some(true);
                 return r;
             }
-            if !json::err_is(&r, 404) {
+            if !fast_keys_route_missing(&r) {
                 return r;
             }
             self.fast_keys = Some(false);
@@ -2948,7 +2948,7 @@ impl WdaClient {
             legacy["frequency"] = j!(f);
         }
         let path = self.spath("/wda/keys");
-        self.req("POST", &path, Some(&legacy), timeout, None)
+        self.req_2xx("POST", &path, Some(&legacy), timeout, None)
     }
 
     /// L703-741. `/wda/fastLaunch` (wda-turbo v5); on 404 optional terminate +
@@ -3320,6 +3320,19 @@ pub fn echoes_secret(res: &Value, secret: &str) -> bool {
     use base64::Engine;
     let text = json::py_repr(res);
     text.contains(secret) || text.contains(&base64::engine::general_purpose::STANDARD.encode(secret.as_bytes()))
+}
+
+fn fast_keys_route_missing(response: &Value) -> bool {
+    if !json::err_is(response, 404) {
+        return false;
+    }
+    let body = json::get(response, "body").as_str().unwrap_or_default().trim();
+    if matches!(body, "unknown route" | "unknown command") {
+        return true;
+    }
+    serde_json::from_str::<Value>(body).ok().is_some_and(|body| {
+        json::get(json::get(&body, "value"), "error").as_str() == Some("unknown command")
+    })
 }
 
 pub const UNSUPPORTED_ROUTE_STATUS: [i64; 3] = [404, 405, 501];
