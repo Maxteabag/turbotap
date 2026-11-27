@@ -384,28 +384,6 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// The compact UI tree sometimes substitutes the placeholder for the value.
-    /// Confirm that the selected control is the focused input and holds the query.
-    pub(super) fn focused_search_matches(&mut self, field: &crate::ui::Control, query: &str) -> bool {
-        let hint = field.value.as_deref().unwrap_or(&field.label);
-        if query.is_empty() || query.chars().any(char::is_control) || hint != crate::text::clean_text(query) {
-            return false;
-        }
-        let Some(id) = self.active_element_id() else { return false };
-        let Some((x, y, w, h)) = self.field_rect(&id) else { return false };
-        if w <= 0.0
-            || h <= 0.0
-            || (x + w / 2.0 - field.x as f64).abs() > 2.0
-            || (y + h / 2.0 - field.y as f64).abs() > 2.0
-        {
-            return false;
-        }
-        let expected_type = format!("XCUIElementType{}", field.kind);
-        self.field_type(&id) == expected_type
-            && self.field_value(&id).as_deref() == Some(query)
-            && self.field_attribute(&id, "placeholderValue").is_some_and(|placeholder| placeholder != query)
-    }
-
     /// Candidates come from one enumeration. Keep unknown visibility for
     /// legacy ordinal lookups, but require positive visibility to pair nodes.
     fn field_snapshot(&mut self) -> Vec<FieldNode> {

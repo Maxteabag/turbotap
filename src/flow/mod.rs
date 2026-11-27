@@ -158,8 +158,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   doubletapxy:X,Y       double-tap points via /wda/fastDoubleTap
   zoom:in|out|SCALE[@X,Y] two-finger pinch/zoom via /wda/fastPinch (in=2.0, out=0.5, or
                         positive scale; defaults to screen center)
-  search:QUERY          tap the app's search field/Search button, type QUERY unless already present
-                        in the focused search field, then settle without pressing Return
+  search:FIELD=VALUE    fill the exact input selected by the caller (same as fill:)
   readel:TEXT           labels of controls containing TEXT (accessibility tree)
   ui                    all labelled on-screen controls with (x, y)
   tapel:LABEL           tap the element whose accessibility label/name == LABEL
@@ -277,7 +276,7 @@ pub(crate) fn scope_controls<'a>(ctl: &'a [Control], lines: &[Line], where_: Opt
 pub fn is_secret_step(spec: &str) -> bool {
     let Some((verb, arg)) = spec.split_once(':') else { return false };
     let verb = verb.trim();
-    if verb.eq_ignore_ascii_case("assertfield") || verb.eq_ignore_ascii_case("fill") {
+    if verb.eq_ignore_ascii_case("assertfield") || verb.eq_ignore_ascii_case("fill") || verb.eq_ignore_ascii_case("search") {
         let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
         return value.starts_with("env:") || value.starts_with("cmd:");
     }
@@ -293,7 +292,7 @@ pub fn safe_step(spec: &str) -> String {
         return spec.to_string();
     };
     let trimmed = verb.trim();
-    if trimmed.eq_ignore_ascii_case("assertfield") || trimmed.eq_ignore_ascii_case("fill") {
+    if trimmed.eq_ignore_ascii_case("assertfield") || trimmed.eq_ignore_ascii_case("fill") || trimmed.eq_ignore_ascii_case("search") {
         if is_secret_step(spec) {
             return format!("{}:<redacted>", trimmed.to_ascii_lowercase());
         }
@@ -1245,7 +1244,12 @@ impl<R: Reader> Flow<R> {
                 self.reads.push(j!({"el": ui::controls_to_value(&hits)}));
                 return some(hits[0].label.clone());
             }
-            "search" => return some(self.search(arg)?),
+            "search" => {
+                if !arg.contains('=') {
+                    return Err(Error::flow("search expects FIELD=VALUE; read the UI and choose the input first"));
+                }
+                return some(self.fill(arg)?);
+            }
             "settle" => {
                 self.settle(2.0, None, 0.6)?;
             }
@@ -1856,7 +1860,7 @@ mod unit {
             "swipe:right",
             "swipe:up",
             "swipe:down",
-            "search:coffee",
+            "search:Lookup=coffee",
             "ui",
             "url:https://example.com",
             "open:Spotify",

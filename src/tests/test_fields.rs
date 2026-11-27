@@ -509,6 +509,19 @@ fn ordinal_and_named_fill_treat_a_visible_title_pair_as_one_input() {
 }
 
 #[test]
+fn search_writes_only_the_input_named_by_the_caller() {
+    let mock = MockWda::start(typing_composer());
+    let mut f = flow(&mock);
+    let error = f.step("search:cedar").unwrap_err().to_string();
+    assert!(error.contains("choose the input first"), "{error}");
+    assert!(keys_typed(&mock).is_empty());
+    assert_eq!(f.step("search:Title=cedar").unwrap(), Some(json!("Title: len=5")));
+    assert_eq!(f.step("search:Title=cedar").unwrap(), Some(json!("Title: len=5")));
+    assert_eq!(f.step("readfield:Title").unwrap(), Some(json!("cedar")));
+    assert!(!mock.paths().iter().any(|p| p.ends_with("/element/b1/clear")));
+}
+
+#[test]
 fn fill_by_identifier_recovers_when_the_probe_changes_the_inset_editor() {
     let mut st = composer_with_title_twin();
     st.element_rects.insert("title-id".into(), json!({"x": 16, "y": 150, "width": 398, "height": 114}));

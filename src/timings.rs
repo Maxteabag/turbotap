@@ -72,7 +72,7 @@ fn step_kind_arg_with(spec: &str, scrub: impl Fn(&str) -> String) -> (String, Op
         None => (spec.trim().to_ascii_lowercase(), None),
     };
     // `assertfield:FIELD=VALUE` / `fill:FIELD=VALUE`: the field name only.
-    if verb == "assertfield" || verb == "fill" {
+    if matches!(verb.as_str(), "assertfield" | "fill" | "search") {
         if crate::flow::is_secret_step(spec) {
             return (verb, None);
         }
