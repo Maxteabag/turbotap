@@ -1486,6 +1486,8 @@ fn test_swipe_points_requires_ack_and_only_falls_back_for_a_missing_route() {
     for (fast, stock, expected_ok, expected_stock) in [
         (json!({}), json!({"value": null}), false, false),
         (json!({"value": {"error": "injection failed"}}), json!({"value": null}), false, false),
+        (json!({"value": false}), json!({"value": null}), false, false),
+        (json!({"error": 404, "body": "unknown route"}), json!({"value": "unexpected"}), false, true),
         (json!({"error": 404, "body": "element missing"}), json!({"value": null}), false, false),
         (json!({"error": 404, "body": "unknown route"}), json!({"status": 13, "value": null}), false, true),
         (json!({"error": 404, "body": "unknown route"}), json!({"value": null}), true, true),

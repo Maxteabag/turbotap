@@ -83,8 +83,9 @@ impl<R: Reader> Flow<R> {
             }
             let value = crate::guard::success_value(response)
                 .map_err(|reason| Error::flow(format!("drag: WDA did not acknowledge the gesture ({reason})")))?;
-            if value.get("error").is_some() || value.get("status").is_some_and(|status| status.as_i64() != Some(0)) {
-                return Err(Error::flow("drag: WDA reported a failed gesture"));
+            // Both stock and turbo drag return FBResponseWithOK(), whose value is null.
+            if !value.is_null() {
+                return Err(Error::flow("drag: WDA did not acknowledge the gesture (expected null response value)"));
             }
             Ok(())
         };
