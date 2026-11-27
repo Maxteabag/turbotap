@@ -4,7 +4,7 @@ use crate::flow::fields::INPUT_TYPES_PRED;
 use crate::flow::{safe_step, Flow};
 use crate::testutil::mock_wda::ekey;
 use crate::testutil::*;
-use serde_json::json;
+use serde_json::{json, Value};
 
 const BODY: &str = "First paragraph.\n\nSecond one, with \u{2019}quotes\u{2019}.\n\nThird.";
 
@@ -46,10 +46,14 @@ fn flow(mock: &MockWda) -> Flow<FakeReader> {
 }
 
 #[test]
-fn multiline_fill_and_search_check_the_focused_keyboard_before_clearing() {
+fn multiline_fill_checks_before_clear_and_reports_late_refusal() {
     let _cache = isolated_cache();
     let (_sleep, _guard) = skip_sleep();
-    for step in ["fill:Body=one\ntwo", "search:Body=one\ntwo"] {
+    for (step, changes_after_clear) in [
+        ("fill:Body=one\ntwo", false),
+        ("search:Body=one\ntwo", false),
+        ("fill:Body=one\ntwo", true),
+    ] {
         let mut st = composer(BODY);
         st.focused_eid = None;
         st.elements_map.insert(
@@ -57,14 +61,14 @@ fn multiline_fill_and_search_check_the_focused_keyboard_before_clearing() {
             vec![json!({"ELEMENT": "kb"})],
         );
         let mock = MockWda::start(st);
-        mock.set_custom_handler(|st, _, path, _| {
-            path.starts_with("/wda/fastUI").then(|| {
-                let keys = if st.focused_eid.as_deref() == Some("b1") {
-                    json!([{"type": "Button", "label": "Send", "x": 380, "y": 880, "inKeyboard": true}])
-                } else {
-                    json!([])
-                };
-                fast_ui(keys, "Example", "com.example.app")
+        mock.set_custom_handler(move |st, _, path, _| {
+            path.contains("/source?format=json").then(|| {
+                let cleared = st.element_values.get_mut("b1").unwrap().next(&Value::Null) == json!("");
+                let keyboard = st.focused_eid.as_deref() == Some("b1");
+                let key = if keyboard && (!changes_after_clear || cleared) { "Send" } else { "Return" };
+                json!({"value":{"type":"Application","children":[
+                    {"type":"Keyboard","children":[{"type":"Key","label":key,"isVisible":"1"}]}
+                ]}})
             })
         });
         let mut client = mock.client();
@@ -73,12 +77,12 @@ fn multiline_fill_and_search_check_the_focused_keyboard_before_clearing() {
 
         let error = flow.step(step).unwrap_err().to_string();
         assert!(error.contains("matches --deny-also") && error.contains("may submit"), "{step}: {error}");
-        assert_eq!(flow.step("readfield:Body").unwrap(), Some(json!(BODY)));
+        assert_eq!(error.contains("field was already cleared"), changes_after_clear, "{error}");
+        let expected = if changes_after_clear { "" } else { BODY };
+        assert_eq!(flow.step("readfield:Body").unwrap(), Some(json!(expected)));
         let calls = mock.calls();
         assert!(calls.iter().any(|(_, path, _)| path.ends_with("/element/b1/click")), "{calls:?}");
-        assert!(calls.iter().all(|(method, path, _)| {
-            method == "GET" || path.ends_with("/elements") || path.ends_with("/element/b1/click")
-        }), "{calls:?}");
+        assert!(!calls.iter().any(|(_, path, _)| path.ends_with("/wda/fastKeys") || path.ends_with("/wda/keys")));
     }
 }
 

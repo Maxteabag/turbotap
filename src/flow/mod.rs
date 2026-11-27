@@ -688,32 +688,76 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    /// Before return, enter or multiline text, check the keyboard's labels against
-    /// the caller's patterns. A deny_also match refuses input and a --deny match
-    /// warns. An unreadable keyboard also warns.
+    /// Read the keyboard directly from an unfiltered source snapshot. The
+    /// ordinary UI views intentionally omit soft-keyboard keys.
+    fn live_keyboard_labels(&mut self) -> Result<Vec<String>> {
+        fn collect(node: &Value, inside: bool, labels: &mut Vec<String>) {
+            let element_type = node.get("type").and_then(Value::as_str).unwrap_or("");
+            let kind = element_type.strip_prefix("XCUIElementType").unwrap_or(element_type);
+            let inside = inside || kind == "Keyboard";
+            if inside {
+                let visible = node.get("isVisible").or_else(|| node.get("visible"));
+                if visible.and_then(ui::parse_wda_bool) == Some(false) {
+                    return;
+                }
+                if matches!(kind, "Button" | "Key") {
+                    for attribute in ["label", "name"] {
+                        if let Some(label) = node.get(attribute).and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                            labels.push(label.to_owned());
+                        }
+                    }
+                }
+            }
+            if let Some(children) = node.get("children").and_then(Value::as_array) {
+                for child in children {
+                    collect(child, inside, labels);
+                }
+            }
+        }
+
+        let path = self.c.spath("/source?format=json");
+        let source = self.c.strict_get_value(&path)
+            .map_err(|_| Error::flow("live accessibility source could not be read"))?;
+        if !source.is_object() {
+            return Err(Error::flow("live accessibility source was invalid"));
+        }
+        let mut labels = Vec::new();
+        collect(&source, false, &mut labels);
+        if labels.is_empty() {
+            return Err(Error::flow("no live keyboard key labels were available"));
+        }
+        labels.sort_unstable();
+        labels.dedup();
+        Ok(labels)
+    }
+
+    /// Before Return, Enter or multiline text, check live labels against the
+    /// caller's patterns. An unavailable observation cannot clear deny_also.
     fn guard_submit(&mut self, what: &str) -> Result<()> {
         if !self.has_deny_patterns() {
             return Ok(());
         }
-        let ctl = match self.controls(false, None, None, false, true) {
-            Ok(ctl) => ctl,
+        let keys = match self.live_keyboard_labels() {
+            Ok(keys) => keys,
+            Err(e) if self.deny_also.is_some() => {
+                return Err(Error::flow(format!(
+                    "refusing {what}: could not check the live keyboard against --deny-also ({e}); no key input sent"
+                )));
+            }
             Err(e) => {
-                crate::errln!("turbotap: warning: {what}: could not read the keyboard to check your deny patterns ({e}); continuing");
+                crate::errln!("turbotap: warning: {what}: could not check the live keyboard against --deny ({e})");
                 return Ok(());
             }
         };
-        let keys: Vec<String> = ctl.iter().filter(|c| c.in_keyboard && !c.label.trim().is_empty()).map(|c| c.label.clone()).collect();
-        for k in &keys {
-            if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(k).unwrap_or(true)) {
+        for key in &keys {
+            if self.deny_also.as_ref().is_some_and(|rx| rx.is_match(key).unwrap_or(true)) {
                 return Err(Error::flow(format!(
-                    "refusing {what}: the keyboard key {} matches --deny-also, so a newline may submit; nothing sent",
-                    json::py_repr_str(k)
+                    "refusing {what}: the keyboard key {} matches --deny-also, so a newline may submit; no key input sent",
+                    json::py_repr_str(key)
                 )));
             }
-            if let Some(rx) = &self.deny {
-                if rx.is_match(k).unwrap_or(false) {
-                    crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(k));
-                }
+            if self.deny.as_ref().is_some_and(|rx| rx.is_match(key).unwrap_or(false)) {
+                crate::errln!("turbotap: warning: {what}: the keyboard key {} matches --deny; a newline may submit", json::py_repr_str(key));
             }
         }
         Ok(())
