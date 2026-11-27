@@ -86,7 +86,6 @@ pub const CONTROL_TYPES: &[&str] = &[
     "Slider", "SegmentedControl", "PickerWheel", "Stepper", "Image",
 ];
 pub const SOURCE_LITE: &str = "/source?format=json&excluded_attributes=visible,accessible,index,nativeAccessibilityElement,frame,nativeFrame,focused,traits,placeholderValue,minValue,maxValue";
-pub const CHEVRON_LABELS: &[&str] = &["chevron", "chevron.right", "chevron.forward"];
 pub const TEXT_DEDUPE_TYPES: &[&str] = &["Button", "Tab", "Cell", "Link", "Key"];
 pub const VALUE_CONTROL_TYPES: &[&str] = &["Switch", "Slider", "TextField", "SearchField", "PickerWheel", "Stepper"];
 /// Controls a tap:TEXT may land on instead of the OCR text, best type first.
@@ -108,9 +107,6 @@ pub const WAIT_UI_TYPES: &[&str] = &[
     "Button", "Key", "Tab", "Cell", "Link", "Switch", "Slider", "SegmentedControl", "PickerWheel", "Stepper",
     "SearchField", "TextField", "SecureTextField", "TextView", "Text", "Value",
 ];
-pub const KB_TOOLBAR_LABELS: &[&str] = &["next", "previous", "neste", "forrige"];
-pub const BACK_LABELS: &[&str] = &["back", "go back", "navigate up", "tilbake"];
-pub const DISMISS_KB_LABELS: &[&str] = &["Done", "Ferdig", "Hide keyboard", "Skjul tastatur", "Dismiss", "Lukk"];
 
 /// Named special keys for `key:NAME`.
 pub fn key_char(name: &str) -> Option<&'static str> {
@@ -149,13 +145,6 @@ fn is_control_type(t: &str) -> bool {
 #[inline]
 fn is_value_control_type(t: &str) -> bool {
     matches!(t, "Switch" | "Slider" | "TextField" | "SearchField" | "PickerWheel" | "Stepper")
-}
-
-#[inline]
-fn is_chevron_label(label: &str) -> bool {
-    label.eq_ignore_ascii_case("chevron")
-        || label.eq_ignore_ascii_case("chevron.right")
-        || label.eq_ignore_ascii_case("chevron.forward")
 }
 
 /// Python `isinstance(v, (int, float))` value (bools count as 0/1).
@@ -398,7 +387,7 @@ fn control_value(t: &str, lab: &str, val: &Value) -> Option<String> {
 ///
 /// Filters off-screen recycled cells, soft-keyboard typing keys (while keeping
 /// app keypad keys such as Calculator/dialer), internal CamelCase/asset Images,
-/// edge-clamped overlays, decorative row chevrons, and stacked (Cell, Button)
+/// edge-clamped overlays and stacked (Cell, Button)
 /// duplicates on the same row. Preserves `enabled: false` only when explicitly disabled.
 pub fn parse_ui_controls(root: &Value, screen: (i64, i64), text: bool) -> (Vec<Control>, String) {
     let mut out = Vec::new();
@@ -504,75 +493,48 @@ enum BtnPos {
     Many(Vec<(i64, bool)>),
 }
 
-/// Drop decorative disclosure 'chevron' buttons sitting on a list row, and
-/// stacked (Cell, Button) pairs on the same row with the exact same normalized
+/// Drop stacked (Cell, Button) pairs on the same row with the exact same normalized
 /// label (prefer Button; keep Cell if it carries extra info or Button is disabled).
 pub fn dedupe_ui_controls(mut out: Vec<Control>) -> Vec<Control> {
-    let mut has_chevron_btn = false;
     let mut btn_count = 0usize;
     let mut has_valueless_cell = false;
     for c in &out {
         if c.kind == "Button" {
             btn_count += 1;
-            if is_chevron_label(&c.label) {
-                has_chevron_btn = true;
-            }
         } else if c.kind == "Cell" && c.value.as_deref().unwrap_or("").is_empty() {
             has_valueless_cell = true;
         }
     }
-    if !has_chevron_btn && !(btn_count > 0 && has_valueless_cell) {
+    if btn_count == 0 || !has_valueless_cell {
         return out;
     }
 
-    let mut row_anchors: Vec<i64> = Vec::new();
-    if has_chevron_btn {
-        row_anchors.reserve(out.len());
-        for c in &out {
-            if (c.kind == "Cell" || c.kind == "Button") && !is_chevron_label(&c.label) {
-                row_anchors.push(c.y);
-            }
-        }
-        row_anchors.sort_unstable();
-    }
-
-    let mut buttons: HashMap<String, BtnPos> =
-        if btn_count > 0 && has_valueless_cell { HashMap::with_capacity(btn_count) } else { HashMap::new() };
-    if btn_count > 0 && has_valueless_cell {
-        for c in &out {
-            if c.kind == "Button" {
-                let bn = norm(&c.label);
-                let pos = (c.y, c.is_disabled());
-                match buttons.entry(bn) {
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(BtnPos::One(pos.0, pos.1));
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut e) => match e.get_mut() {
-                        BtnPos::Many(v) => v.push(pos),
-                        slot @ BtnPos::One(_, _) => {
-                            let first = match *slot {
-                                BtnPos::One(y, dis) => (y, dis),
-                                BtnPos::Many(_) => unreachable!(),
-                            };
-                            *slot = BtnPos::Many(vec![first, pos]);
-                        }
-                    },
+    let mut buttons: HashMap<String, BtnPos> = HashMap::with_capacity(btn_count);
+    for c in &out {
+        if c.kind == "Button" {
+            let bn = norm(&c.label);
+            let pos = (c.y, c.is_disabled());
+            match buttons.entry(bn) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(BtnPos::One(pos.0, pos.1));
                 }
+                std::collections::hash_map::Entry::Occupied(mut e) => match e.get_mut() {
+                    BtnPos::Many(v) => v.push(pos),
+                    slot @ BtnPos::One(_, _) => {
+                        let first = match *slot {
+                            BtnPos::One(y, dis) => (y, dis),
+                            BtnPos::Many(_) => unreachable!(),
+                        };
+                        *slot = BtnPos::Many(vec![first, pos]);
+                    }
+                },
             }
         }
     }
 
     let mut cell_norm_buf = String::new();
     out.retain(|c| {
-        if has_chevron_btn && c.kind == "Button" && is_chevron_label(&c.label) {
-            let lo = c.y.saturating_sub(10);
-            let hi = c.y.saturating_add(10);
-            let idx = row_anchors.partition_point(|&ry| ry < lo);
-            if idx < row_anchors.len() && row_anchors[idx] <= hi {
-                return false;
-            }
-        }
-        if !buttons.is_empty() && c.kind == "Cell" && c.value.as_deref().unwrap_or("").is_empty() {
+        if c.kind == "Cell" && c.value.as_deref().unwrap_or("").is_empty() {
             norm_into(&c.label, &mut cell_norm_buf);
             if let Some(entry) = buttons.get(cell_norm_buf.as_str()) {
                 let c_dis = c.is_disabled();

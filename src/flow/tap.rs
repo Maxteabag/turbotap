@@ -6,10 +6,10 @@ use crate::error::{Error, Result};
 use crate::image::{box_diff, content_pixel_still, thumb_diff, Frame, GrayImage};
 use crate::json;
 use crate::ocr::{ReadOpts, Reader};
-use crate::text::{casefold, clean_text, find_text, norm, region, split_where, Line, Match, DEFAULT_FUZZY};
+use crate::text::{casefold, clean_text, find_text, norm, split_where, Line, Match, DEFAULT_FUZZY};
 use crate::ui::{
-    exact_control, find_control, find_control_match, Control, BACK_LABELS, CTL_CACHE_MAX_DIFF, CTL_CACHE_TTL,
-    CTL_CACHE_TYPES, INPUT_TYPES, KB_TOOLBAR_LABELS, TAP_FORM_TYPES, WAIT_UI_TYPES,
+    exact_control, find_control, find_control_match, Control, CTL_CACHE_MAX_DIFF, CTL_CACHE_TTL, CTL_CACHE_TYPES,
+    INPUT_TYPES, TAP_FORM_TYPES, WAIT_UI_TYPES,
 };
 use serde_json::{json as j, Value};
 use std::borrow::Cow;
@@ -331,27 +331,6 @@ impl<R: Reader> Flow<R> {
         let (base, where_) = split_where(label);
         let where_ = where_set(where_.as_deref()).map(str::to_string);
         let wh = where_.as_deref();
-        let low_base = casefold(&base);
-        if BACK_LABELS.contains(&low_base.as_str()) {
-            // The nav-bar chevron OCRs as a lone '<' (Spotify, Messenger): tapping it
-            // skips a /source fetch (2.1 s on a long Spotify playlist). y > 55 skips the
-            // status bar's '< AppName' return link.
-            let lines = self.tap_fresh_or_lines()?;
-            let chev = lines
-                .iter()
-                .find(|l| ["<", "\u{2039}", "\u{3008}", "\u{ab}"].contains(&l.text.trim()) && l.x() < 70 && 55 < l.y() && l.y() < 130)
-                .cloned();
-            if let Some(chev) = chev {
-                self.tap_point(chev.x(), chev.y(), &base, None)?;
-                self.settle(1.5, None, 0.6)?;
-                return Ok(Match::new(chev.x(), chev.y(), "<", Some(chev), 0));
-            }
-        }
-        if KB_TOOLBAR_LABELS.contains(&low_base.as_str()) {
-            if let Some(m) = self.tap_form_button(&base, wh)? {
-                return Ok(m);
-            }
-        }
         if wh.is_none() && self.ctl_cache.is_some() {
             if let Some(m) = self.try_cached_tap(&base)? {
                 return Ok(m);
@@ -430,17 +409,8 @@ impl<R: Reader> Flow<R> {
             let fl = first_lines.as_deref().unwrap_or(&[]);
             let scoped = scope(&ctl, fl, wh);
             let ext = ext_types();
-            let mut c = exact_control(&scoped, &base, ext, false).cloned();
-            if c.is_none() && BACK_LABELS.contains(&low_base.as_str()) {
-                for alt in BACK_LABELS {
-                    c = exact_control(&scoped, alt, &["Button", "Link"], false).cloned();
-                    if c.is_some() {
-                        break;
-                    }
-                }
-            }
-            if let Some(c) = c {
-                return self.tap_control(&c, None);
+            if let Some(c) = exact_control(&scoped, &base, ext, false) {
+                return self.tap_control(c, None);
             }
             if exact_control(&scoped, &base, ext, true).is_some() {
                 return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
@@ -680,7 +650,7 @@ impl<R: Reader> Flow<R> {
     }
 
     /// Tap a control match (`re:` path) or control within the tap_if deadline.
-    fn tap_if_ctl_hit(&mut self, ctl: &[Control], base: &str, back_alts: bool, deadline: f64) -> Result<Option<String>> {
+    fn tap_if_ctl_hit(&mut self, ctl: &[Control], base: &str, deadline: f64) -> Result<Option<String>> {
         let ext = ext_types();
         if base.starts_with("re:") {
             if let Some(cm) = find_control_match(ctl, base, Some(ext), false) {
@@ -691,20 +661,11 @@ impl<R: Reader> Flow<R> {
                 return Ok(Some(cm.text));
             }
         } else {
-            let mut c = exact_control(ctl, base, ext, false).cloned();
-            if c.is_none() && back_alts && BACK_LABELS.contains(&casefold(base).as_str()) {
-                for alt in BACK_LABELS {
-                    c = exact_control(ctl, alt, &["Button", "Link"], false).cloned();
-                    if c.is_some() {
-                        break;
-                    }
-                }
-            }
-            if let Some(c) = c {
+            if let Some(c) = exact_control(ctl, base, ext, false) {
                 if clock::now() >= deadline {
                     return Ok(Some("skipped".into()));
                 }
-                return Ok(Some(self.tap_control(&c, Some(deadline))?.text));
+                return Ok(Some(self.tap_control(c, Some(deadline))?.text));
             }
         }
         Ok(None)
@@ -774,7 +735,7 @@ impl<R: Reader> Flow<R> {
                 // immediately (unless @below/@above needs fresh OCR lines).
                 if !is_header_where(wh) {
                     let ctl = scope(&raw_ctl, &[], wh);
-                    if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, true, deadline)? {
+                    if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, deadline)? {
                         return Ok(r);
                     }
                 }
@@ -875,7 +836,7 @@ impl<R: Reader> Flow<R> {
                     self.r.invalidate_last();
                     if !is_header_where(wh) {
                         let ctl = scope(&raw_ctl, &[], wh);
-                        if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, false, deadline)? {
+                        if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, deadline)? {
                             return Ok(r);
                         }
                     }
@@ -884,7 +845,7 @@ impl<R: Reader> Flow<R> {
                 if !stale_app && confirmed_fresh_app {
                     last_ctl = Some(raw_ctl.clone());
                     let ctl = scope(&raw_ctl, &lines, wh);
-                    if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, true, deadline)? {
+                    if let Some(r) = self.tap_if_ctl_hit(&ctl, &base, deadline)? {
                         return Ok(r);
                     }
                     if let Some(ci) = cur_img.as_ref() {
@@ -1015,42 +976,31 @@ impl<R: Reader> Flow<R> {
             .map(|c| (*c).clone()))
     }
 
-    /// L3742. Next/Previous also sit on the keyboard toolbar: tap the topmost exact
-    /// match from OCR or the tree, i.e. the form's own button when both show.
-    pub fn tap_form_button(&mut self, label: &str, where_: Option<&str>) -> Result<Option<Match>> {
-        let lines = self.lines(None, None)?;
-        let want = norm(label);
-        let wh = where_set(where_);
-        let region_lines: Vec<Line> = match wh {
-            Some(w) => region(&lines, w).unwrap_or_default(),
-            None => lines.clone(),
-        };
-        let mut cands: Vec<(bool, i64, i64, String)> = region_lines
-            .iter()
-            .filter(|l| norm(&l.text) == want)
-            .map(|l| (false, l.y(), l.x(), l.text.clone()))
-            .collect();
-        let ctl = self.tap_ctl(None)?;
-        let low = casefold(label);
-        cands.extend(
-            scope(&ctl, &lines, wh)
-                .iter()
-                .filter(|c| (c.kind == "Button" || c.kind == "Link") && !c.is_disabled() && casefold(&c.label) == low)
-                .map(|c| (false, c.y, c.x, c.label.clone())),
-        );
-        let Some((_, y, x, text)) = cands.into_iter().min() else {
-            return Ok(None);
-        };
-        self.tap_point(x, y, &text, None)?;
-        self.settle(1.5, None, 0.6)?;
-        Ok(Some(Match::new(x, y, text, None, 0)))
-    }
-
     /// Read a selected element's label or name from a successful WDA response.
     fn element_attr(&mut self, eid: &str, attr: &str) -> Option<String> {
         let p = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
         let value = self.c.strict_get_value(&p).ok()?;
         value.as_str().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+    }
+
+    /// Tap one exact, enabled accessibility control from a fresh tree.
+    pub(super) fn tap_exact_label(&mut self, label: &str) -> Result<()> {
+        self.wait_active_app(1.5, 0.03, None);
+        let controls = self.tap_ctl(None)?;
+        let mut matches = controls.iter().filter(|c| c.label == label);
+        let shown = json::py_repr_str(label);
+        let Some(control) = matches.next() else {
+            return Err(Error::flow(format!("no control labelled exactly {shown}; nothing pressed")));
+        };
+        if matches.any(|c| (c.x, c.y) != (control.x, control.y)) {
+            return Err(Error::flow(format!(
+                "several controls labelled {shown}; give the point of the one you mean with tapat:X,Y=LABEL; nothing pressed"
+            )));
+        }
+        if control.is_disabled() {
+            return Err(Error::flow(format!("{shown} is disabled; nothing pressed")));
+        }
+        self.tap_point(control.x, control.y, &control.label, None)
     }
 
     /// `tapat:X,Y`: a label tap with a location hint. The target is the labelled

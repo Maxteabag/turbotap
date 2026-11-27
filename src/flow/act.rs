@@ -9,8 +9,7 @@ use crate::ocr::{ReadOpts, Reader};
 use crate::text::{casefold, clean_text, controls_in_region, find_text, split_where, Line, Match, DEFAULT_FUZZY};
 use crate::ui::{self, exact_control, find_control, find_control_match, parse_switch_state, Control};
 use crate::wda::check_wda_ok;
-use serde_json::{json as j, Map, Value};
-use std::collections::HashSet;
+use serde_json::{json as j, Value};
 
 /// `el_obj.get("ELEMENT") or next(iter(el_obj.values()), None)` for a WDA element
 /// reference dict; None for non-dicts, empty dicts and falsy ids.
@@ -54,9 +53,6 @@ fn runtime_to_flow(e: Error) -> Error {
         e
     }
 }
-
-/// One stock-WDA keyboard dismiss candidate `(priority, cy, cx, eid)`.
-type DismissCand = (i64, i64, i64, String);
 
 impl<R: Reader> Flow<R> {
     /// `self._fresh_lines() or self.lines()` (an empty fresh read also falls back).
@@ -659,241 +655,49 @@ impl<R: Reader> Flow<R> {
         Err(Error::flow(format!("{} not found while scrolling {dir}", json::py_repr_str(&label))))
     }
 
-    /// L4947.
+    /// Send the explicitly requested edge gesture.
     pub fn back(&mut self) -> Result<()> {
         self.wait_active_app(1.5, 0.03, None);
-        let long_texts = |lines: &[Line]| -> HashSet<String> {
-            lines.iter().filter(|l| l.text.chars().count() > 3).map(|l| l.text.clone()).collect()
-        };
-        let lines0 = self.act_fresh_lines()?;
-        let was = long_texts(&lines0);
-        let before = self.r.last();
         let (w, h) = self.act_pt_size()?;
         self.drag(2, h / 2, (w as f64 * 0.8) as i64, h / 2, 0.22, 0.02)?;
-        self.changed_since(before, 0.6, None, None)?;
         self.settle(1.5, None, 0.4)?;
-        let now = long_texts(&self.lines(None, None)?);
-        if !was.is_empty() && (was.intersection(&now).count() as f64) >= 0.7 * was.len() as f64 {
-            // The swipe moved the page but it sprang back (Spotify playlists) or never
-            // moved (Microsoft Teams): tap the labelled Back control, else the chevron.
-            let ctl = self.controls(false, None, None, false, false)?;
-            let c = ctl.iter().find(|c| ui::BACK_LABELS.contains(&c.label.to_lowercase().as_str()));
-            let (x, y) = c.map(|c| (c.x, c.y)).unwrap_or((22, 75));
-            self.tap_point(x, y, "back", None)?;
-            self.settle(2.0, None, 0.6)?;
-        }
         Ok(())
     }
 
-    /// Try interactive dismissal only for a keyboard docked at the bottom.
-    fn dismiss_docked_keyboard(&mut self, rect: Option<&Value>) -> Result<String> {
-        let Some(rect) = rect else { return Ok("kb-visible".into()) };
-        let (w, h) = self.act_pt_size()?;
-        let (x, y, width, height) = (num(rect, "x"), num(rect, "y"), num(rect, "width"), num(rect, "height"));
-        if x.abs() > 8.0 || width < w as f64 - 16.0 || y + height < h as f64 - 50.0 || y < 140.0 || y > (h - 40) as f64 {
-            return Ok("kb-visible".into());
-        }
-        self.drag(w / 2, y as i64 - 48, w / 2, y as i64 + 60, 0.2, 0.0)?;
-        clock::sleep(0.3);
+    /// Report only keyboard state observed in this read, including on stock WDA.
+    pub(super) fn keyboard_visible(&mut self) -> Result<Option<bool>> {
         self.c.last_fast_ui_kb = None;
         if self.controls_opt(false, None, None, true, false)?.is_some() {
-            if let Some((Some(visible), _)) = self.c.last_fast_ui_kb.as_ref() {
-                return Ok(if *visible { "kb-visible" } else { "dismissed" }.into());
+            if let Some((Some(visible), _)) = &self.c.last_fast_ui_kb {
+                return Ok(Some(*visible));
             }
         }
-        // On stock WDA a missing keyboard element can also mean an observation
-        // failed. Keep the result unverified when the fast route cannot confirm.
-        Ok(if self.visible_keyboard_rect()?.is_some() { "kb-visible" } else { "dismissal-unverified" }.into())
-    }
+        let path = self.c.spath("/elements");
+        let query = j!({"using": "class name", "value": "XCUIElementTypeKeyboard"});
+        let response = self.c.req_2xx("POST", &path, Some(&query), crate::wda::DEFAULT_TIMEOUT, None);
+        let Some(elements) = crate::guard::success_value(&response).ok().and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        if elements.is_empty() {
+            return Ok(Some(false));
+        }
 
-    /// L5061. Return the visible XCUIElementTypeKeyboard rect dict or None via stock WDA.
-    fn visible_keyboard_rect(&mut self) -> Result<Option<Value>> {
-        let p = self.c.spath("/element");
-        let kb_el = self.c.post(&p, &j!({"using": "class name", "value": "XCUIElementTypeKeyboard"}));
-        let k_eid = json::get(json::get(&kb_el, "value"), "ELEMENT");
-        if !json::truthy(k_eid) {
-            return Ok(None);
-        }
-        let rp = self.c.spath(&format!("/element/{}/rect", json::py_str(k_eid)));
-        let kr = json::get(&self.c.get(&rp), "value").clone();
-        if !kr.is_object() {
-            return Ok(None);
-        }
-        let (kw, kh, ky) = (num(&kr, "width"), num(&kr, "height"), num(&kr, "y"));
-        let (_, sh) = self.act_pt_size()?;
-        if kw > 0.0 && kh > 0.0 && ky < sh as f64 && ky + kh > 0.0 {
-            return Ok(Some(kr));
+        let (_, screen_height) = self.act_pt_size()?;
+        for element in elements {
+            let Some(id) = element_id(element) else { continue };
+            let path = self.c.spath(&format!("/element/{id}/rect"));
+            let Ok(rect) = self.c.strict_get_value(&path) else { continue };
+            if let (Some(y), Some(width), Some(height)) = (
+                rect["y"].as_f64(),
+                rect["width"].as_f64(),
+                rect["height"].as_f64(),
+            ) {
+                if width > 0.0 && height > 0.0 && y < screen_height as f64 && y + height > 0.0 {
+                    return Ok(Some(true));
+                }
+            }
         }
         Ok(None)
-    }
-
-    /// `_add_el` of `_stock_keyboard_dismiss_candidates`.
-    fn add_dismiss_el(
-        &mut self,
-        el_obj: &Value,
-        priority: i64,
-        rect_bounds: Option<(f64, f64, f64, f64)>,
-        seen: &mut HashSet<String>,
-        cands: &mut Vec<DismissCand>,
-    ) {
-        if !el_obj.is_object() {
-            return;
-        }
-        let Some(eid) = element_id(el_obj) else { return };
-        if seen.contains(&eid) {
-            return;
-        }
-        let rp = self.c.spath(&format!("/element/{eid}/rect"));
-        let rc = json::get(&self.c.get(&rp), "value").clone();
-        if !rc.is_object() || !json::truthy(json::get(&rc, "width")) || !json::truthy(json::get(&rc, "height")) {
-            return;
-        }
-        let cx = (num(&rc, "x") + num(&rc, "width") / 2.0) as i64;
-        let cy = (num(&rc, "y") + num(&rc, "height") / 2.0) as i64;
-        if let Some((bx0, by0, bx1, by1)) = rect_bounds {
-            let (fx, fy) = (cx as f64, cy as f64);
-            if !(bx0 - 4.0 <= fx && fx <= bx1 + 4.0 && by0 - 4.0 <= fy && fy <= by1 + 4.0) {
-                return;
-            }
-        }
-        seen.insert(eid.clone());
-        cands.push((priority, cy, cx, eid));
-    }
-
-    /// L5081. Query buttons strictly under XCUIElementTypeKeyboard or a verified flush
-    /// keyboard accessory XCUIElementTypeToolbar on stock WDA.
-    fn stock_keyboard_dismiss_candidates(&mut self, kb_rect: &Value) -> Vec<DismissCand> {
-        let labels_pred = ui::DISMISS_KB_LABELS.iter().map(|l| format!("'{l}'")).collect::<Vec<_>>().join(", ");
-        let mut cands = Vec::new();
-        let mut seen = HashSet::new();
-
-        // 1. Direct descendants of XCUIElementTypeKeyboard (true keyboard ancestry).
-        let kb_chain = format!(
-            "**/XCUIElementTypeKeyboard/**/XCUIElementTypeButton[`label IN {{{labels_pred}}} OR name IN {{{labels_pred}}}`]"
-        );
-        let p = self.c.spath("/elements");
-        let kb_res = self.c.post(&p, &j!({"using": "class chain", "value": kb_chain}));
-        for el_obj in value_list(&kb_res) {
-            self.add_dismiss_el(&el_obj, 0, None, &mut seen, &mut cands);
-        }
-
-        // 2. Direct descendants of a verified flush keyboard-accessory XCUIElementTypeToolbar.
-        let kb_x0 = num(kb_rect, "x");
-        let kb_x1 = kb_x0 + num(kb_rect, "width");
-        let kb_y = num(kb_rect, "y");
-        let tb_res = self.c.post(&p, &j!({"using": "class name", "value": "XCUIElementTypeToolbar"}));
-        let mut acc_toolbars = Vec::new();
-        for tb_obj in value_list(&tb_res) {
-            if !tb_obj.is_object() {
-                continue;
-            }
-            let Some(tb_eid) = element_id(&tb_obj) else { continue };
-            let rp = self.c.spath(&format!("/element/{tb_eid}/rect"));
-            let tr = json::get(&self.c.get(&rp), "value").clone();
-            if !tr.is_object() || !json::truthy(json::get(&tr, "width")) || !json::truthy(json::get(&tr, "height")) {
-                continue;
-            }
-            let (tx, ty, tw, th) = (num(&tr, "x"), num(&tr, "y"), num(&tr, "width"), num(&tr, "height"));
-            let t_bot = ty + th;
-            if ty >= kb_y - 72.0
-                && kb_y - 16.0 <= t_bot
-                && t_bot <= kb_y + 16.0
-                && tx >= kb_x0 - 8.0
-                && (tx + tw) <= kb_x1 + 8.0
-            {
-                acc_toolbars.push((tb_eid, (tx, ty, tx + tw, t_bot)));
-            }
-        }
-        for (tb_eid, bounds) in acc_toolbars {
-            let bp = self.c.spath(&format!("/element/{tb_eid}/elements"));
-            let pred = format!(
-                "type == 'XCUIElementTypeButton' AND (label IN {{{labels_pred}}} OR name IN {{{labels_pred}}})"
-            );
-            let btn_res = self.c.post(&bp, &j!({"using": "predicate string", "value": pred}));
-            for el_obj in value_list(&btn_res) {
-                self.add_dismiss_el(&el_obj, 1, Some(bounds), &mut seen, &mut cands);
-            }
-        }
-        cands
-    }
-
-    /// L5150. Dismiss the iOS keyboard only when a keyboard is visible AND the button
-    /// has verified keyboard or keyboard-accessory toolbar provenance (never tapping
-    /// ordinary app buttons outside the keyboard/accessory, including with floating
-    /// keyboards).
-    pub fn dismiss_kb(&mut self) -> Result<String> {
-        // Python `controls(fast_only=True)` returns None when /wda/fastUI is off or
-        // unavailable; the Rust signature returns a Vec, so mirror the None cases here:
-        // skip when the probes already say no fast UI, clear the keyboard metadata so
-        // only this fetch's answer counts, and treat a fast-UI failure as None.
-        let fast_off = |c: &crate::wda::WdaClient| c.turbo == Some(false) || c.fast_ui == Some(false);
-        let ctl = if fast_off(&self.c) {
-            None
-        } else {
-            self.c.last_fast_ui_kb = None;
-            let v = self.controls(false, None, None, true, false)?;
-            if fast_off(&self.c) {
-                None
-            } else {
-                Some(v)
-            }
-        };
-        if let Some(ctl) = ctl {
-            let (has_kb, kb_rect) = self.c.last_fast_ui_kb.clone().unwrap_or((None, None));
-            if has_kb == Some(false) {
-                return Ok("no-kb".to_string());
-            }
-            if has_kb == Some(true) {
-                static DISMISS_SET: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-                let dismiss_set = DISMISS_SET.get_or_init(|| ui::DISMISS_KB_LABELS.iter().map(|l| casefold(l)).collect());
-                // Require actual keyboard or flush keyboard-accessory toolbar provenance
-                // for ALL dismiss labels (never authorize unmarked app buttons by position).
-                let hits: Vec<&Control> = ctl
-                    .iter()
-                    .filter(|c| c.kind == "Button" && !c.is_disabled() && (c.in_keyboard || c.in_keyboard_accessory))
-                    .filter(|c| dismiss_set.iter().any(|d| d == &casefold(&c.label)))
-                    .collect();
-                let best = hits.into_iter().min_by_key(|item| {
-                    let low = casefold(&item.label);
-                    (!item.in_keyboard, low != "hide keyboard" && low != "skjul tastatur", -item.y, item.x)
-                });
-                let Some(c) = best.cloned() else {
-                    return self.dismiss_docked_keyboard(kb_rect.as_ref());
-                };
-                self.tap_point(c.x, c.y, &c.label, None)?;
-                self.invalidate_ctl_cache();
-                self.settle(0.6, None, 0.6)?;
-                return Ok("dismissed".to_string());
-            }
-            // Older wda-turbo <= v4 did not emit hasKeyboard/inKeyboard provenance:
-            // fall through to verified stock WDA keyboard/accessory ancestry queries.
-        }
-        let Some(kb_rect) = self.visible_keyboard_rect()? else {
-            return Ok("no-kb".to_string());
-        };
-        let cands = self.stock_keyboard_dismiss_candidates(&kb_rect);
-        let Some((_, cy, cx, eid)) = cands.into_iter().min_by_key(|(p, cy, cx, _)| (*p, -*cy, *cx)) else {
-            return self.dismiss_docked_keyboard(Some(&kb_rect));
-        };
-        let lp = self.c.spath(&format!("/element/{eid}/attribute/label"));
-        let lbl_r = self.c.get(&lp);
-        let lbl = if lbl_r.is_object() && !json::has_err(&lbl_r) {
-            let v = json::get(&lbl_r, "value");
-            if json::truthy(v) {
-                json::py_str(v)
-            } else {
-                "dismisskb".to_string()
-            }
-        } else {
-            "dismisskb".to_string()
-        };
-        let _ = (cx, cy); // Python guard(x, y, text): the coordinates are unused.
-        self.guard(&lbl, "tap")?;
-        self.mark_action(false, false);
-        let cp = self.c.spath(&format!("/element/{eid}/click"));
-        check_wda_ok(self.c.post(&cp, &Map::new().into()), "dismisskb", false)?;
-        clock::sleep(0.3);
-        Ok("dismissed".to_string())
     }
 }
 

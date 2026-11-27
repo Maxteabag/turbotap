@@ -166,13 +166,11 @@ fn test_switch_toggle_offset_edge_bounds_and_invisible_char_cleaning() {
 }
 
 #[test]
-fn test_chevron_and_cell_button_dedupe_rules() {
+fn test_dedupe_keeps_different_labels_and_collapses_duplicate_cells() {
     let controls = vec![
-        // Row 1: Cell + decorative chevron on same row -> chevron dropped.
+        // Distinct labels on the same row are both observable.
         mk("Cell", "General", 200, 200),
         mk("Button", "chevron.right", 400, 202),
-        // Standalone chevron far from any row -> kept.
-        mk("Button", "chevron", 400, 500),
         // Row 2: Stacked Cell + enabled Button with same label -> Button kept, Cell dropped.
         mk("Cell", "About", 200, 280),
         mk("Button", "About", 200, 282),
@@ -188,7 +186,7 @@ fn test_chevron_and_cell_button_dedupe_rules() {
         pairs(&deduped),
         vec![
             p("Cell", "General"),
-            p("Button", "chevron"),
+            p("Button", "chevron.right"),
             p("Button", "About"),
             p("Cell", "Storage"),
             p("Button", "Storage"),

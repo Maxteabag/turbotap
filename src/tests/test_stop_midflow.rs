@@ -91,6 +91,29 @@ fn test_stop_created_during_alert_lookup_blocks_named_alert_input() {
 }
 
 #[test]
+fn test_stop_during_navigation_target_lookup_blocks_the_tap() {
+    let _c = isolated_cache();
+    let dir = TempDir::new("tt-stop-navigation-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(MockState::default());
+    let stop_in_handler = stop.clone();
+    mock.set_custom_handler(move |_, method, path, _| {
+        if method == "GET" && path.starts_with("/wda/fastUI") {
+            std::fs::write(&stop_in_handler, "").unwrap();
+            return Some(fast_ui(json!([{"type": "Button", "label": "Return to list", "x": 40, "y": 40}]), "Example", "com.example.app"));
+        }
+        None
+    });
+
+    let (code, out) = run_flow(&mock, &stop, &["back:Return to list"]);
+
+    assert_eq!(code, crate::stop::STOP_EXIT, "{out}");
+    assert!(out.contains("stopped before"), "{out}");
+    assert!(mock.tapped_points().is_empty());
+    assert!(!mock.paths().iter().any(|path| path.contains("Drag") || path.contains("/wda/tap")));
+}
+
+#[test]
 fn test_waitcontrol_reports_exact_live_control_without_input() {
     let _c = isolated_cache();
     let dir = TempDir::new("tt-waitcontrol-");

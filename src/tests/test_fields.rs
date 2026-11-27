@@ -130,7 +130,7 @@ fn readfield_reports_unavailable_secure_length_separately_from_empty() {
             path.ends_with("/element/p1/attribute/value").then(|| response.clone())
         });
         let reader = FakeReader::new(vec![]);
-        let mut f = Flow::new(mock.client(), reader.clone(), 0.5, Some(DENY_DEFAULT), false).unwrap();
+        let mut f = Flow::new(mock.client(), reader.clone(), 0.5, None, false).unwrap();
         let (ok, output) = f.run_outcome(&["readfield:Password".into()]).unwrap();
         assert!(ok, "{output}");
         assert_eq!(output["steps"][0]["result"], json!(result));

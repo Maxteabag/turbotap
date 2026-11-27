@@ -110,8 +110,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         matched by label/name; rejects disabled sliders; respects --deny)
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
-  dismisskb             use the keyboard's own dismiss control or try a short downward drag;
-                        kb-visible means the keyboard is still up
+  dismisskb:LABEL       tap the unique enabled control with this exact accessibility label
+  dismisskb:tapat:X,Y=LABEL  tap the exact labelled control at the caller's location hint
+                        reports dismissed, kb-visible, no-kb or dismissal-unverified
   banner:dismiss        swipe away a notification banner over the app (only when SpringBoard
                         is in front and the phone is unlocked; otherwise nothing is sent)
   alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert
@@ -122,7 +123,9 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
   swipe:left|right:TEXT horizontal row swipe on TEXT's row (damped 80%->30% / 20%->70% to reveal
                         row actions without triggering full-width destructive delete)
-  back                  iOS edge-swipe back gesture
+  back                  send the iOS edge-swipe gesture
+  back:LABEL            tap the unique enabled control with this exact accessibility label
+  back:tapat:X,Y=LABEL   tap the exact labelled control at the caller's location hint
   read                  OCR text once it holds still + labelled controls with (x, y)
   read:ocr / read:Y0-Y1 OCR only (whole screen / a band)
   read:vision[:fast]    on-device Apple Vision OCR via wda-turbo v6 /wda/fastOCR (accurate
@@ -731,6 +734,44 @@ impl<R: Reader> Flow<R> {
         self.step_inner(spec)
     }
 
+    fn tap_navigation_target(&mut self, verb: &str, arg: &str) -> Result<String> {
+        let usage = || Error::flow(format!("use {verb}:LABEL or {verb}:tapat:X,Y=LABEL"));
+        let position = match arg.strip_prefix("tapat:") {
+            Some(spec) => {
+                let (x, y, label) = parse_tap_at(spec)?;
+                Some((x, y, label.ok_or_else(usage)?))
+            }
+            None if arg.trim().is_empty() => return Err(usage()),
+            None => None,
+        };
+
+        let keyboard_before = if verb == "dismisskb" {
+            match self.keyboard_visible()? {
+                Some(false) => return Ok("no-kb".into()),
+                observed => observed,
+            }
+        } else {
+            None
+        };
+        let result = match position {
+            Some((x, y, label)) => self.tap_at(x, y, Some(label)).map(|_| ()),
+            None => self.tap_exact_label(arg),
+        };
+        self.invalidate_ctl_cache();
+        result?;
+        if verb == "back" {
+            return Ok("tap-sent".into());
+        }
+
+        clock::sleep(0.3);
+        match self.keyboard_visible() {
+            Ok(Some(false)) if keyboard_before == Some(true) => Ok("dismissed".into()),
+            Ok(Some(true)) => Ok("kb-visible".into()),
+            Ok(_) => Ok("dismissal-unverified".into()),
+            Err(e) => Err(Error::flow(format!("dismisskb sent the tap but could not verify keyboard state: {e}"))),
+        }
+    }
+
     fn step_inner(&mut self, spec: &str) -> Result<Option<Value>> {
         let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
         let verb_trimmed = verb.trim();
@@ -825,16 +866,8 @@ impl<R: Reader> Flow<R> {
                 self.tap_point(x, y, "", None)?;
             }
             "tapat" => {
-                // tapat:X,Y or tapat:X,Y=LABEL (press only a control labelled exactly LABEL).
-                let (coords, expect) = match arg.split_once('=') {
-                    Some((c, l)) => (c, Some(l)),
-                    None => (arg, None),
-                };
-                let parts: Vec<&str> = coords.split(',').collect();
-                if parts.len() != 2 || expect.is_some_and(|l| l.trim().is_empty()) {
-                    return Err(Error::value(format!("tapat expects X,Y or X,Y=LABEL, got {}", json::py_repr_str(arg))));
-                }
-                return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?, expect)?);
+                let (x, y, label) = parse_tap_at(arg)?;
+                return some(self.tap_at(x, y, label)?);
             }
             "longpress" => return some(self.long_press_text(arg, 0.65)?.text),
             "longpressxy" => {
@@ -955,7 +988,7 @@ impl<R: Reader> Flow<R> {
             "readfield" => return some(self.read_field(arg)?),
             "assertfield" => return some(self.assert_field(arg)?),
             "fill" => return some(self.fill(arg)?),
-            "dismisskb" => return some(self.dismiss_kb()?),
+            "dismisskb" => return some(self.tap_navigation_target(&verb, arg)?),
             "banner" if arg.trim() == "dismiss" => return some(self.dismiss_banner()?),
             "banner" => return Err(Error::flow("banner: use banner:dismiss")),
             "typedigits" => return some(self.type_digits(arg)?),
@@ -1015,7 +1048,11 @@ impl<R: Reader> Flow<R> {
                 return some(self.clipboard(&ct)?);
             }
             "setclip" => return some(self.set_clipboard(arg, "plaintext")?),
-            "back" => self.back()?,
+            "back" if !spec.contains(':') => {
+                self.back()?;
+                return some("edge-swipe-sent".into());
+            }
+            "back" => return some(self.tap_navigation_target(&verb, arg)?),
             "read" => return self.read_step(arg).map(|n| Some(j!(n))),
             "ui" => {
                 self.last_alert_text = None;
@@ -1555,6 +1592,17 @@ impl<R: Reader> Drop for Flow<R> {
 /// Python `float(s)` (accepts surrounding whitespace, `inf`, `nan`).
 pub fn py_float(s: &str) -> Result<f64> {
     s.trim().parse::<f64>().map_err(|_| Error::value(format!("could not convert string to float: {}", json::py_repr_str(s))))
+}
+
+fn parse_tap_at(arg: &str) -> Result<(i64, i64, Option<&str>)> {
+    let invalid = || Error::value(format!("tapat expects X,Y or X,Y=LABEL, got {}", json::py_repr_str(arg)));
+    let (coords, label) = match arg.split_once('=') {
+        Some((coords, label)) if !label.trim().is_empty() => (coords, Some(label)),
+        Some(_) => return Err(invalid()),
+        None => (arg, None),
+    };
+    let (x, y) = coords.split_once(',').filter(|(_, y)| !y.contains(',')).ok_or_else(invalid)?;
+    Ok((parse_coord(x)?, parse_coord(y)?, label))
 }
 
 /// `int(float(v))`.
