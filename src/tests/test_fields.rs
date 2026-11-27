@@ -474,6 +474,27 @@ fn ordinal_and_named_fill_treat_a_visible_title_pair_as_one_input() {
 }
 
 #[test]
+fn fill_by_identifier_recovers_when_the_probe_changes_the_inset_editor() {
+    let mut st = composer_with_title_twin();
+    st.element_rects.insert("title-id".into(), json!({"x": 16, "y": 150, "width": 398, "height": 114}));
+    st.element_rects.insert("t1".into(), json!({"x": 16, "y": 150, "width": 398, "height": 110}));
+    let mock = MockWda::start(st);
+    mock.set_custom_handler(|_, _, path, _| {
+        twin_visible(path)
+            .or_else(|| path.ends_with("/element/title-id/attribute/accessible").then(|| json!({"value": "false"})))
+            .or_else(|| path.ends_with("/element/t1/attribute/accessible").then(|| json!({"value": "true"})))
+            .or_else(|| path.ends_with("/element/title-id/click").then(|| json!({"value": null})))
+    });
+    let mut f = flow(&mock);
+    let title = "AI notes with enough text to exercise the focus probe";
+    let result = f.step(&format!("fill:form.title={title}")).unwrap();
+    assert_eq!(result, Some(json!(format!("form.title: len={}", title.len()))));
+    assert_eq!(f.step("readfield:form.title").unwrap(), Some(json!(title)));
+    assert_eq!(mock.paths().iter().filter(|p| p.ends_with("/element/t1/value")).count(), 1);
+    assert!(keys_typed(&mock).iter().all(|(text, _)| text == "x" || text == "\u{8}"));
+}
+
+#[test]
 fn fill_prefers_a_changed_direct_twin_value_and_never_replays_the_write() {
     let mock = MockWda::start(composer_with_title_twin());
     mock.set_custom_handler(|_, _, path, _| twin_visible(path));

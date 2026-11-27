@@ -92,8 +92,8 @@ impl FieldNode {
         (y as i64, x as i64, &self.id)
     }
 
-    fn near(&self, other: &Self) -> bool {
-        self.rect.zip(other.rect).is_some_and(|(a, b)| field_frames_match(a, b, false))
+    fn near(&self, other: &Self, allow_vertical_inset: bool) -> bool {
+        self.rect.zip(other.rect).is_some_and(|(a, b)| field_frames_match(a, b, allow_vertical_inset))
     }
 }
 
@@ -344,10 +344,10 @@ impl<R: Reader> Flow<R> {
     /// representation leaves all of them separate, even if its metadata is sparse.
     fn field_twin(&mut self, nodes: &[FieldNode], index: usize, name: &str) -> Option<(usize, FieldTarget)> {
         let node = &nodes[index];
-        let mut nearby = nodes.iter().enumerate().filter(|(i, other)| *i != index && node.near(other));
+        let mut nearby = nodes.iter().enumerate().filter(|(i, other)| *i != index && node.near(other, true));
         let (other_index, other) = nearby.next()?;
         if nearby.next().is_some()
-            || nodes.iter().enumerate().any(|(i, n)| i != index && i != other_index && other.near(n))
+            || nodes.iter().enumerate().any(|(i, n)| i != index && i != other_index && other.near(n, true))
             || ![node, other].iter().all(|n| n.visible.trim().eq_ignore_ascii_case("true"))
         {
             return None;
@@ -376,6 +376,18 @@ impl<R: Reader> Flow<R> {
             || !(alias.trim().is_empty() || alias.trim() == visible_label || alias.trim() == identifier.trim())
         {
             return None;
+        }
+
+        if !node.near(other, false) {
+            // Allow the extra height of a wrapper only with positive evidence
+            // that it is inaccessible and the named editor is accessible.
+            let wrapper_accessible = self.field_attr(&id_only.id, "accessible");
+            let editor_accessible = self.field_attr(&visible_alias.id, "accessible");
+            if !(wrapper_accessible == "0" || wrapper_accessible.eq_ignore_ascii_case("false"))
+                || !(editor_accessible == "1" || editor_accessible.eq_ignore_ascii_case("true"))
+            {
+                return None;
+            }
         }
 
         // Use the visible label for an ordinal or a name matched by both nodes.
