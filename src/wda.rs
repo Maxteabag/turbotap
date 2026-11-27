@@ -781,6 +781,8 @@ pub struct WdaClient {
     pub guard_refusal: Option<String>,
     /// Label of the action in progress, used in guard refusals (a flow step, a command).
     pub guard_action: Option<String>,
+    /// Exact foreground required for the current input request, if any.
+    required_input_foreground: Option<&'static str>,
     /// Set while `unlock_phone` runs: SpringBoard may receive the passcode taps.
     guard_unlock_scope: bool,
     /// Set when the guard policy could not be read (invalid, unreadable or unstable
@@ -841,6 +843,7 @@ impl WdaClient {
             allow_url_schemes: Vec::new(),
             guard_refusal: None,
             guard_action: None,
+            required_input_foreground: None,
             guard_unlock_scope: false,
             guard_policy_error: None,
             pinned_addrs: None,
@@ -1055,6 +1058,18 @@ impl WdaClient {
             return Ok(false);
         }
         let mut first = self.live_foreground_app(deadline);
+        if let Some(expected) = self.required_input_foreground {
+            return match first {
+                _ if expired(deadline) => Ok(false),
+                Ok(actual) if actual != expected => Err(Error::flow(format!(
+                    "foreground changed before input: expected {expected}, found {actual}; input was not sent"
+                ))),
+                Ok(actual) if !self.app_guard_active()
+                    || self.allowed_apps.iter().any(|bundle| bundle == &actual) => Ok(true),
+                Ok(actual) => Err(self.guard_refuse(crate::guard::refuse_foreground(action, &actual, &self.allowed_apps))),
+                Err(why) => Err(Error::flow(format!("could not verify foreground before input: {why}; input was not sent"))),
+            };
+        }
         // A notification banner makes SpringBoard active for a moment. Re-check (live,
         // nothing is sent meanwhile) for up to BANNER_RECHECK before refusing; every
         // wait is printed with what was in front, so a real takeover still shows.
@@ -1159,7 +1174,7 @@ impl WdaClient {
 
     fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
         self.check_request_stop(method, path, body)?;
-        if !self.app_guard_active() || crate::guard::is_safe_method(method) {
+        if (self.required_input_foreground.is_none() && !self.app_guard_active()) || crate::guard::is_safe_method(method) {
             return Ok(true);
         }
         use crate::guard::RequestKind;
@@ -1567,6 +1582,13 @@ impl WdaClient {
     /// Like `req`, but a redirect or other non-2xx response is never success.
     pub(crate) fn req_2xx(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>) -> Value {
         self.req_json(method, path, data, timeout, deadline, true)
+    }
+
+    pub(crate) fn post_in_foreground(&mut self, path: &str, body: &Value, foreground: &'static str, deadline: f64) -> Value {
+        let previous = self.required_input_foreground.replace(foreground);
+        let result = self.req_2xx("POST", path, Some(body), DEFAULT_TIMEOUT, Some(deadline));
+        self.required_input_foreground = previous;
+        result
     }
 
     fn req_json(&mut self, method: &str, path: &str, data: Option<&Value>, timeout: f64, deadline: Option<f64>, require_2xx: bool) -> Value {

@@ -52,3 +52,57 @@ fn banner_respects_caller_deny_and_foreground_app_policy() {
     assert!(mock.state().drags.is_empty());
     flow.close();
 }
+
+#[test]
+fn banner_never_dispatches_after_the_observed_shell_loses_foreground() {
+    let _cache = isolated_cache();
+    let img = solid_img(240, (430, 932));
+    let shell = "com.apple.springboard";
+    let app = "com.example.app";
+    for fallback in [false, true] {
+        let foreground = if fallback { vec![shell, shell, shell, app] } else { vec![shell, shell, app] };
+        let mock = MockWda::start(MockState {
+            active_app: Seq::of(foreground.into_iter().map(|bundle| json!(bundle)).collect()),
+            locked: Seq::one(json!(false)),
+            fast_drag_404: fallback,
+            ..Default::default()
+        });
+        let reader = FakeReader::new(vec![(img.clone(), vec![make_line("Parcel arrived", 100., 60., 260., 78.)])]);
+        let mut client = mock.client();
+        client.set_allowed_apps(vec![shell.into(), app.into()]);
+        let mut flow = Flow::new(client, reader, 0.5, None, false).unwrap();
+        let error = flow.step("banner:dismiss:Parcel arrived").unwrap_err().to_string();
+        assert!(error.contains("foreground changed before input"), "{error}");
+        let paths = mock.paths();
+        assert_eq!(paths.iter().any(|p| p == "/wda/fastDrag"), fallback);
+        assert!(!paths.iter().any(|p| p.ends_with("/wda/dragfromtoforduration")));
+        assert!(mock.state().drags.is_empty());
+        flow.close();
+    }
+}
+
+#[test]
+fn banner_fallback_uses_the_original_deadline() {
+    let _cache = isolated_cache();
+    let (clock, _hook) = virtual_clock();
+    let mock = MockWda::start(MockState {
+        active_app: Seq::one(json!("com.apple.springboard")),
+        locked: Seq::one(json!(false)),
+        ..Default::default()
+    });
+    mock.set_custom_handler(move |_, _, path, _| {
+        if path == "/wda/fastDrag" {
+            clock.advance(1.0);
+            return Some(json!({"error": 404, "body": "unknown route"}));
+        }
+        None
+    });
+    let img = solid_img(240, (430, 932));
+    let reader = FakeReader::new(vec![(img, vec![make_line("Parcel arrived", 100., 60., 260., 78.)])]);
+    let mut flow = Flow::new(mock.client(), reader, 0.5, None, false).unwrap();
+    let error = flow.step("banner:dismiss:Parcel arrived").unwrap_err().to_string();
+    assert!(error.contains("deadline"), "{error}");
+    assert!(mock.paths().iter().any(|p| p == "/wda/fastDrag"));
+    assert!(mock.state().drags.is_empty());
+    flow.close();
+}

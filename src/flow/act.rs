@@ -64,9 +64,23 @@ impl<R: Reader> Flow<R> {
 
     /// L3920. Defaults: duration 0.12, release 0.02.
     pub fn drag(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, duration: f64, release: f64) -> Result<()> {
+        self.send_drag((x0, y0), (x1, y1), duration, release, None)
+    }
+
+    fn send_drag(
+        &mut self, (x0, y0): (i64, i64), (x1, y1): (i64, i64), duration: f64, release: f64,
+        observed: Option<(&'static str, f64)>,
+    ) -> Result<()> {
         self.mark_action(false, false);
+        let post = |client: &mut crate::wda::WdaClient, path, data: &Value| match observed {
+            Some((foreground, deadline)) => client.post_in_foreground(path, data, foreground, deadline),
+            None => client.req_2xx("POST", path, Some(data), crate::wda::DEFAULT_TIMEOUT, None),
+        };
         let body = j!({"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration, "release": release});
         let acknowledge = |response: &Value| {
+            if let Some(reason) = response.get("error").and_then(Value::as_str) {
+                return Err(Error::flow(format!("drag: WDA did not acknowledge the gesture ({reason})")));
+            }
             let value = crate::guard::success_value(response)
                 .map_err(|reason| Error::flow(format!("drag: WDA did not acknowledge the gesture ({reason})")))?;
             if value.get("error").is_some() || value.get("status").is_some_and(|status| status.as_i64() != Some(0)) {
@@ -75,14 +89,14 @@ impl<R: Reader> Flow<R> {
             Ok(())
         };
         if self.c.turbo != Some(false) {
-            let r = self.c.req_2xx("POST", "/wda/fastDrag", Some(&body), crate::wda::DEFAULT_TIMEOUT, None);
+            let r = post(&mut self.c, "/wda/fastDrag", &body);
             if !crate::wda::fast_mutation_route_missing(&r) {
                 return acknowledge(&r);
             }
         }
         let p = self.c.spath("/wda/dragfromtoforduration");
         let stock = j!({"fromX": x0, "fromY": y0, "toX": x1, "toY": y1, "duration": duration.max(0.2)});
-        let r = self.c.req_2xx("POST", &p, Some(&stock), crate::wda::DEFAULT_TIMEOUT, None);
+        let r = post(&mut self.c, &p, &stock);
         acknowledge(&r)
     }
 
@@ -120,12 +134,9 @@ impl<R: Reader> Flow<R> {
         if clock::now() >= deadline {
             return Ok("overlay-unverified".into());
         }
-        if self.c.live_foreground_app(Some(deadline)).as_deref() != Ok(shell) || clock::now() >= deadline {
-            return Ok("overlay-unverified".into());
-        }
         let x = ((line.x0 + line.x1) / 2.0) as i64;
         let y = ((line.y0 + line.y1) / 2.0) as i64;
-        self.drag(x, y, x, 4, 0.12, 0.02)?;
+        self.send_drag((x, y), (x, 4), 0.12, 0.02, Some((shell, deadline)))?;
 
         self.c.stop_check().map_err(Error::flow)?;
         if clock::now() >= deadline {
