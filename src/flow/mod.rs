@@ -18,9 +18,6 @@ use crate::wda::{check_wda_ok, WdaClient};
 use serde_json::{json as j, Value};
 
 pub mod act;
-mod appinstall;
-#[cfg(test)]
-mod appinstall_tests;
 pub mod fields;
 pub mod sense;
 pub mod tap;
@@ -113,10 +110,6 @@ pub(crate) fn short_repr(s: &str) -> String {
 pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   unlock                enter the passcode if the phone is locked (no-op otherwise)
   home                  press the Home button
-  appinstall:NAME|BUNDLE[|open]
-                        install a free App Store product whose listing exposes its bundle ID
-                        and wait for its Open control. Set --timeout 180 for slower downloads
-                        (the flow default is 8 s and includes App Store search).
   open:APP              activate an app by display name or bundle ID (open:Spotify,
                         open:com.apple.Preferences); names come from a per-device
                         devicectl cache (~1 ms; refreshed once on an unknown name)
@@ -174,7 +167,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         point; returns the label; no control there is refused with the
                         nearest labels. tapat:X,Y=LABEL presses only the one enabled control
                         labelled exactly LABEL there, read fresh; anything else is refused
-                        with nothing pressed; reports if the accepted tap had no visible reaction
+                        with nothing pressed; reports an unconfirmed result if no reaction is observed
   type:TEXT|env:V|cmd:C type into the focused field via /wda/keys (env:/cmd: keep secrets out of argv)
   key:NAME              press a named key (return|enter|backspace|delete|tab|space|escape) via /wda/keys;
                         these are hardware-keyboard key events to whatever has focus
@@ -998,7 +991,6 @@ impl<R: Reader> Flow<R> {
                 }
                 return some(bid);
             }
-            "appinstall" => return some(self.appinstall(arg)?),
             "url" => return some(self.open_url(arg)?),
             "wait" | "expect" => return some(self.wait(arg, None, false, None, true)?.text),
             "waitany" => return some(self.wait_any(arg, None)?.text),
@@ -1649,7 +1641,7 @@ impl<R: Reader> Flow<R> {
                         .read(&mut self.c, ReadOpts::full())
                         .map(|ls| ls.into_iter().take(40).map(|l| l.text).collect())
                         .unwrap_or_default();
-                    let ui: Vec<Control> = match self.controls(false, None, None, false, false) {
+                    let ui: Vec<Control> = match self.controls(false, None, None, false, true) {
                         Ok(ctl) => {
                             let mut v: Vec<Control> =
                                 ctl.into_iter().filter(|c| ui::INTERACTIVE_TYPES.contains(&c.kind.as_str())).collect();
@@ -1668,6 +1660,9 @@ impl<R: Reader> Flow<R> {
                         "ui": ui::controls_to_value(&ui),
                         "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
                     });
+                    if let Some(entry) = res.as_object_mut() {
+                        self.add_alert_meta(entry);
+                    }
                     // Earlier credential steps may still be visible on screen.
                     self.scrub_value(&mut res);
                     return Ok((false, res));

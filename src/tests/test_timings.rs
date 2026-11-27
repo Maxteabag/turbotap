@@ -71,6 +71,7 @@ fn test_tapat_logs_the_label_it_resolved_to() {
     let ui = json!([{"type": "Button", "label": "Settings", "x": 380, "y": 60}]);
     let mock = MockWda::start(MockState::default().with_fast_ui(fast_ui(ui, "Example", "com.example.app")));
     let mut flow = Flow::new(mock.client(), FakeReader::new(vec![]), 1.0, Some(DENY_DEFAULT), false).unwrap();
+    flow.changed_since_hook = Some(true);
     let (ok, _) = flow.run_outcome(&["tapat:372,66".to_string()]).unwrap();
     assert!(ok);
     flow.close();

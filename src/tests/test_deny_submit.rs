@@ -34,6 +34,7 @@ fn test_deny_also_refuses_a_label_in_the_callers_locale_and_the_default_does_not
     // Default only: no built-in word matches this label, so it is tapped (no new block).
     let m = MockWda::start(MockState::default().with_fast_ui(screen("return")));
     let mut f = flow_with(&m, Some(DENY_DEFAULT), &[]);
+    f.changed_since_hook = Some(true);
     f.step("tapat:200,300").unwrap();
     assert_eq!(m.tapped_points().len(), 1);
     f.close();
@@ -47,6 +48,7 @@ fn test_deny_also_refuses_a_label_in_the_callers_locale_and_the_default_does_not
     // With --no-deny the whole filter is off, additions included.
     let m = MockWda::start(MockState::default().with_fast_ui(screen("return")));
     let mut f = flow_with(&m, None, &["kaufen"]);
+    f.changed_since_hook = Some(true);
     f.step("tapat:200,300").unwrap();
     assert_eq!(m.tapped_points().len(), 1);
     f.close();

@@ -1197,11 +1197,16 @@ impl<R: Reader> Flow<R> {
             None => None,
         };
         match reaction {
-            Some(true) => {}
-            Some(false) => crate::errln!("turbotap: tapat: tap sent, no visible reaction"),
-            None => crate::errln!("turbotap: tapat: tap sent, reaction could not be checked"),
+            Some(true) => Ok(()),
+            Some(false) => Err(Error::flow(format!(
+                "tapat sent the tap on {} but observed no visible reaction; inspect the screen before retrying",
+                json::py_repr_str(&control.label)
+            ))),
+            None => Err(Error::flow(format!(
+                "tapat sent the tap on {} but could not verify the reaction; inspect the screen before retrying",
+                json::py_repr_str(&control.label)
+            ))),
         }
-        Ok(())
     }
 
     pub fn tap_el(&mut self, label: &str, timeout: Option<f64>) -> Result<(i64, i64)> {

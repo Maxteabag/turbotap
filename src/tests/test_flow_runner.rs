@@ -2859,9 +2859,9 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
     // A control within 24 pt: tapped at its own centre (never the raw point).
     let (mock, r) = mk();
     let mut flow = mk_flow(&mock, &r, 1.0);
-    let cap = crate::testutil::capture::Capture::start();
-    assert_eq!(step_s(&mut flow, "tapat:372,66"), "Settings");
-    assert!(cap.stderr().contains("tap sent, no visible reaction"));
+    let (ok, result) = flow.run_outcome(&["tapat:372,66".into()]).unwrap();
+    assert!(!ok);
+    assert!(result["error"].as_str().unwrap().contains("observed no visible reaction"));
     assert_eq!(pts(&mock), vec![(380, 60)]);
     // OCR text is never a target, even under the point.
     match flow.step("tapat:40,105") {
@@ -2889,6 +2889,7 @@ fn test_tapat_with_a_label_presses_only_that_exact_enabled_control() {
         let mock = MockWda::start(with_fast_ui(fui(ui)));
         let r = FakeReader::new(vec![fr(&img, &[]), fr(&copy_img(&img), &[])]);
         let mut flow = mk_flow(&mock, &r, 1.0);
+        flow.changed_since_hook = Some(true);
         let res = flow.step(step);
         flow.close();
         let pts: Vec<(i64, i64)> = mock.tapped_points().iter().map(|p| (p.0, p.1)).collect();

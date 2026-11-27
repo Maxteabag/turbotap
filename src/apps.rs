@@ -232,7 +232,7 @@ pub fn load_apps(refresh: bool, udid: &str, base_url: &str, cache_dir: &Path) ->
 }
 
 /// `[A-Za-z0-9-]+(\.[A-Za-z0-9-]+){2,}` (full match): a bundle ID passes through.
-pub(crate) fn looks_like_bundle_id(arg: &str) -> bool {
+fn looks_like_bundle_id(arg: &str) -> bool {
     let mut parts = 0usize;
     for part in arg.split('.') {
         if part.is_empty() || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
