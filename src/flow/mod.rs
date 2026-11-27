@@ -1061,17 +1061,19 @@ impl<R: Reader> Flow<R> {
                         }
                     };
                 }
-                let usage = || Error::flow("alert expects alert:text, alert:accept:LABEL, or alert:dismiss:LABEL");
-                let (action, label) = arg.split_once(':').ok_or_else(usage)?;
-                let suffix = match action.trim().to_ascii_lowercase().as_str() {
-                    "accept" => "/alert/accept",
-                    "dismiss" => "/alert/dismiss",
+                let usage = || Error::flow("alert expects alert:text, alert:accept[:LABEL], or alert:dismiss[:LABEL]");
+                let (action, label) = arg.split_once(':').map_or((arg, None), |(action, label)| (action, Some(label)));
+                let (suffix, receipt) = match action.trim().to_ascii_lowercase().as_str() {
+                    "accept" => ("/alert/accept", "accept-sent"),
+                    "dismiss" => ("/alert/dismiss", "dismiss-sent"),
                     _ => return Err(usage()),
                 };
-                if label.trim().is_empty() {
-                    return Err(usage());
-                }
-                return some(self.act_on_named_alert(label, suffix, "alert")?.unwrap_or_else(|| "no-alert".into()));
+                let result = match label {
+                    Some(label) if label.trim().is_empty() => return Err(usage()),
+                    Some(label) => self.act_on_named_alert(label, suffix, "alert")?,
+                    None => self.act_on_native_alert(suffix, receipt)?,
+                };
+                return some(result.unwrap_or_else(|| "no-alert".into()));
             }
             "scroll" => {
                 let dir = if arg.is_empty() { "down" } else { arg };

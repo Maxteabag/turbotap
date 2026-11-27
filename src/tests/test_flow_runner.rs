@@ -1138,9 +1138,10 @@ fn test_alert_action_requires_an_exact_live_allowed_button() {
     let accept = flow.c.spath("/alert/accept");
     let dismiss = flow.c.spath("/alert/dismiss");
 
-    for step in ["alert", "alert:", "alert:accept", "alert:dismiss", "alert:accept: ", "alert:invalid:Delete"] {
+    for step in ["alert", "alert:", "alert:accept: ", "alert:dismiss:", "alert:invalid:Delete"] {
         assert!(flow_err(flow.step(step)).contains("LABEL"), "{step}");
     }
+    assert!(flow_err(flow.step("alert:accept")).contains("native alert choice against caller deny rules"));
     assert!(flow_err(flow.step("alert:accept:Allow")).contains("no unique exact match"));
     assert!(flow_err(flow.step("alert:dismiss:Delete")).contains("matches --deny"));
     assert!(mock.calls_to(&accept).is_empty());
@@ -1165,20 +1166,61 @@ fn test_alert_action_requires_an_exact_live_allowed_button() {
 }
 
 #[test]
-fn test_tap_named_alert_rechecks_foreground_before_input() {
+fn test_native_alert_actions_use_wda_choice_and_report_absence_or_failure() {
+    let _cache = isolated_cache();
+    let mut st = MockState::default();
+    // WDA can observe an alert that has no text and offers no button metadata.
+    st.alert_text = Some(Dyn::one(json!("")));
+    st.alert_buttons = Some(Dyn::one(json!({"error": 404, "body": "unknown command"})));
+    let mock = MockWda::start(st);
+    let reader = FakeReader::new(vec![]);
+    let mut flow = mk_flow(&mock, &reader, 1.0);
+    let accept = flow.c.spath("/alert/accept");
+    let dismiss = flow.c.spath("/alert/dismiss");
+
+    assert_eq!(step_s(&mut flow, "alert:accept"), "accept-sent");
+    assert_eq!(step_s(&mut flow, "alert:dismiss"), "dismiss-sent");
+    assert_eq!(mock.calls_to(&accept), vec![("POST".into(), accept.clone(), json!({}))]);
+    assert_eq!(mock.calls_to(&dismiss), vec![("POST".into(), dismiss.clone(), json!({}))]);
+
+    let mut client = mock.client();
+    client.deny_also = vec!["^Something Else$".into()];
+    let mut guarded = Flow::new(client, reader, 1.0, None, false).unwrap();
+    assert!(flow_err(guarded.step("alert:dismiss")).contains("use alert:accept:LABEL or alert:dismiss:LABEL"));
+
+    mock.state().alert_text = None;
+    assert_eq!(step_s(&mut flow, "alert:accept"), "no-alert");
+    assert_eq!(step_s(&mut guarded, "alert:dismiss"), "no-alert");
+    mock.state().alert_text = Some(Dyn::one(json!({"error": 404, "body": "unknown command"})));
+    assert!(flow_err(flow.step("alert:dismiss")).contains("could not verify active iOS alert"));
+    assert_eq!(mock.calls_to(&accept).len(), 1);
+    assert_eq!(mock.calls_to(&dismiss).len(), 1);
+
+    mock.state().alert_text = Some(Dyn::one(json!("Choose what to do")));
+    mock.set_custom_handler(fail_on_suffix("/alert/dismiss", 500, "alert action failed"));
+    assert!(flow_err(flow.step("alert:dismiss")).contains("alert active iOS alert failed"));
+    assert_eq!(mock.calls_to(&dismiss).len(), 2);
+    assert!(mock.calls_to(&flow.c.spath("/wda/alert/buttons")).is_empty());
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
+fn test_alert_actions_recheck_foreground_before_input() {
     let _cache = isolated_cache();
     let r = FakeReader::new(vec![fr(&solid_img(240, (430, 932)), &[])]);
-    let mut st = MockState::default();
-    st.active_app = Seq::of(vec![json!("com.apple.springboard"), json!("com.example.other")]);
-    st.alert_text = Some(Dyn::one(json!("Allow tracking?")));
-    st.alert_buttons = Some(Dyn::one(json!(["Don't Allow"])));
-    let mock = MockWda::start(st);
-    let mut flow = mk_flow(&mock, &r, 1.0);
-    flow.c.set_allowed_apps(vec!["com.apple.springboard".into()]);
+    for (step, suffix) in [("tap:Don't Allow", "/alert/accept"), ("alert:dismiss", "/alert/dismiss")] {
+        let mut st = MockState::default();
+        st.active_app = Seq::of(vec![json!("com.apple.springboard"), json!("com.example.other")]);
+        st.alert_text = Some(Dyn::one(json!("Allow tracking?")));
+        st.alert_buttons = Some(Dyn::one(json!(["Don't Allow"])));
+        let mock = MockWda::start(st);
+        let mut flow = mk_flow(&mock, &r, 1.0);
+        flow.c.set_allowed_apps(vec!["com.apple.springboard".into()]);
 
-    assert!(matches!(flow.step("tap:Don't Allow"), Err(Error::AppGuard(message)) if message.contains("com.example.other")));
-    assert!(!mock.paths().iter().any(|path| path.ends_with("/alert/accept")));
-    assert!(mock.tapped_points().is_empty());
+        assert!(matches!(flow.step(step), Err(Error::AppGuard(message)) if message.contains("com.example.other")));
+        assert!(!mock.paths().iter().any(|path| path.ends_with(suffix)));
+        assert!(mock.tapped_points().is_empty());
+    }
 }
 
 #[test]

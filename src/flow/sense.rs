@@ -217,14 +217,8 @@ fn query_alert_text_on(c: &mut WdaClient, deadline: Option<f64>) -> (AlertStatus
     let val = json::get(&r, "value");
     if !json::has_err(&r) {
         return match crate::guard::success_value(&r) {
-            Ok(Value::String(s)) => {
-                let cleaned = clean_text(s);
-                if cleaned.is_empty() {
-                    (AlertStatus::Absent, None)
-                } else {
-                    (AlertStatus::Present, Some(cleaned))
-                }
-            }
+            // WDA can return an empty string for a present alert with no text.
+            Ok(Value::String(s)) => (AlertStatus::Present, Some(clean_text(s))),
             Ok(Value::Null) => (AlertStatus::Absent, None),
             Ok(other) => (AlertStatus::Error, Some(format!("unexpected alert value: {}", json::py_repr(other)))),
             Err(reason) => (AlertStatus::Error, Some(reason)),
@@ -268,13 +262,19 @@ fn alert_buttons_on(c: &mut WdaClient, deadline: Option<f64>) -> Vec<String> {
     Vec::new()
 }
 
+fn verified_alert_text_on(c: &mut WdaClient, deadline: Option<f64>) -> Result<Option<String>> {
+    match query_alert_text_on(c, deadline) {
+        (AlertStatus::Absent, _) => Ok(None),
+        (AlertStatus::Present, Some(title)) => Ok(Some(title)),
+        (_, detail) => Err(Error::flow(format!("could not verify active iOS alert ({})", detail.unwrap_or_default()))),
+    }
+}
+
 /// Read the live alert and its raw button labels. The named WDA action takes the
 /// original label, so OCR, UI trees and normalized display labels are unsuitable.
 fn named_alert_on(c: &mut WdaClient, deadline: Option<f64>) -> Result<Option<(String, Vec<String>)>> {
-    let title = match query_alert_text_on(c, deadline) {
-        (AlertStatus::Absent, _) => return Ok(None),
-        (AlertStatus::Present, Some(title)) => title,
-        (_, detail) => return Err(Error::flow(format!("could not verify active iOS alert ({})", detail.unwrap_or_default()))),
+    let Some(title) = verified_alert_text_on(c, deadline)? else {
+        return Ok(None);
     };
     let path = c.spath("/wda/alert/buttons");
     let buttons = alert_get(c, &path, deadline)
@@ -612,14 +612,33 @@ impl<R: Reader> Flow<R> {
         };
         let button = exact_alert_button(&buttons, label.trim()).ok_or_else(|| alert_match_error(&title, &buttons))?;
         self.guard(button, verb)?;
+        self.post_alert_action(suffix, verb, serde_json::json!({"name": button}))?;
+        Ok(Some(button.to_owned()))
+    }
+
+    pub(super) fn act_on_native_alert(&mut self, suffix: &str, receipt: &str) -> Result<Option<String>> {
+        if verified_alert_text_on(&mut self.c, None)?.is_none() {
+            return Ok(None);
+        }
+        // WDA can use a configured selector or an order that differs from
+        // /wda/alert/buttons. The native action does not expose its chosen label.
+        if self.has_deny_patterns() {
+            return Err(Error::flow(
+                "cannot verify WDA's native alert choice against caller deny rules; use alert:accept:LABEL or alert:dismiss:LABEL",
+            ));
+        }
+        self.post_alert_action(suffix, "alert", serde_json::json!({}))?;
+        Ok(Some(receipt.into()))
+    }
+
+    fn post_alert_action(&mut self, suffix: &str, verb: &str, body: Value) -> Result<()> {
         self.mark_action(false, false);
         let path = self.c.spath(suffix);
-        // WDA interprets a missing "name" as permission to choose its default.
-        let response = self.c.req_2xx("POST", &path, Some(&serde_json::json!({"name": button})), 4.0, None);
+        let response = self.c.req_2xx("POST", &path, Some(&body), 4.0, None);
         let action = format!("{verb} active iOS alert");
         let response = self.c.guard_result(crate::wda::check_wda_ok(response, &action, false))?;
         match crate::guard::success_value(&response) {
-            Ok(Value::Null) => Ok(Some(button.to_owned())),
+            Ok(Value::Null) => Ok(()),
             _ => Err(Error::flow(format!("{action} failed: invalid WDA acknowledgment"))),
         }
     }
