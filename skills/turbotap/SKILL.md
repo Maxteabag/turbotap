@@ -50,8 +50,8 @@ Each turn costs seconds of thinking, so do each phase in ONE `flow` call and rea
 ```sh
 turbotap flow "open:$APP" "search:$QUERY" "tap:$OBSERVED_RESULT_LABEL"
 
-# App Store example after observing the controls and confirming the intended free install.
-turbotap flow --timeout "$TIMEOUT" open:com.apple.AppStore "tap:$SEARCH_LABEL" "search:$QUERY" "tap:$INSTALL_LABEL" "waitcontrol:$READY_LABEL"
+# Example on an English App Store screen. Use the labels you see for the app you intend to install.
+turbotap flow --timeout 90 open:com.apple.AppStore tap:Search 'search:Angry Birds' 'tap:Angry Birds 2' tap:Get waitcontrol:Open
 turbotap flow "open:$APP" "tap:$OBSERVED_CONTROL_LABEL" ui
 turbotap flow "open:$APP" ui
 turbotap flow "tap:$LABEL" ui

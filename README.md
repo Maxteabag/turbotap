@@ -31,8 +31,8 @@ turbotap flow open:Weather read
 # Search through the native accessibility role and tap an observed result.
 turbotap flow "open:$APP" "search:$QUERY" "tap:$OBSERVED_RESULT_LABEL"
 
-# App Store example after observing the controls and confirming the intended free install.
-turbotap flow --timeout "$TIMEOUT" open:com.apple.AppStore "tap:$SEARCH_LABEL" "search:$QUERY" "tap:$INSTALL_LABEL" "waitcontrol:$READY_LABEL"
+# Example on an English App Store screen. Use the labels you see for the app you intend to install.
+turbotap flow --timeout 90 open:com.apple.AppStore tap:Search 'search:Angry Birds' 'tap:Angry Birds 2' tap:Get waitcontrol:Open
 
 # Select a particular input when you need to override the role-based search.
 turbotap flow "search:$OBSERVED_FIELD=$QUERY"
