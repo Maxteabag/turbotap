@@ -119,6 +119,10 @@ fn exact_field_read_uses_full_tree_editor_before_ocr() {
     assert!(f.step(&assert_step).is_err());
     mock.state().source_tree = Dyn::one(nested(json!([editor,editor])));
     assert!(f.step(&assert_step).is_err());
+    let mut taller_editor = editor.clone();
+    taller_editor["rect"]["height"] = json!(118);
+    mock.state().source_tree = Dyn::one(nested(json!([taller_editor])));
+    assert!(f.step(&assert_step).is_err());
 
     // A matching snapshot after a foreground switch is stale for this lookup.
     mock.state().source_tree = Dyn::one(nested(json!([editor])));

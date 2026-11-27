@@ -503,6 +503,17 @@ fn fill_by_identifier_recovers_when_the_probe_changes_the_inset_editor() {
     assert_eq!(f.step("readfield:form.title").unwrap(), Some(json!(title)));
     assert_eq!(mock.paths().iter().filter(|p| p.ends_with("/element/t1/value")).count(), 1);
     assert!(keys_typed(&mock).iter().all(|(text, _)| text == "x" || text == "\u{8}"));
+
+    // Invert the shape: the visible editor extends below the wrapper.
+    // Even explicit ancestry does not make this a verified inset.
+    {
+        let mut st = mock.state();
+        st.element_rects.get_mut("t1").unwrap()["height"] = json!(118);
+        st.source_tree = title_twin_source(&st);
+    }
+    mock.clear_calls();
+    assert!(f.step(&format!("fill:form.title={title}")).is_err());
+    assert!(!mock.paths().iter().any(|p| p.ends_with("/element/t1/value")));
 }
 
 #[test]

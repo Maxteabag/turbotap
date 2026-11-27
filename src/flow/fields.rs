@@ -110,6 +110,11 @@ fn field_frames_match(a: FieldRect, b: FieldRect, allow_vertical_inset: bool) ->
     axis(x, w, ox, ow, false) && axis(y, h, oy, oh, allow_vertical_inset)
 }
 
+fn wrapper_contains_editor(wrapper: FieldRect, editor: FieldRect) -> bool {
+    let ((x, y, w, h), (ex, ey, ew, eh)) = (wrapper, editor);
+    x <= ex && y <= ey && ex + ew <= x + w && ey + eh <= y + h
+}
+
 fn source_text<'a>(node: &'a Value, key: &str) -> &'a str {
     node.get(key).and_then(Value::as_str).unwrap_or("")
 }
@@ -169,6 +174,13 @@ fn source_descendant_editor<'a>(anchor: &'a Value, kind: &str, rect: FieldRect) 
         fields_near_source(child, kind, rect, &mut descendants);
     }
     let [editor] = descendants.as_slice() else { return None };
+    let wrapper_rect = source_rect(anchor)?;
+    let editor_rect = source_rect(editor)?;
+    if !field_frames_match(wrapper_rect, editor_rect, false)
+        && !wrapper_contains_editor(wrapper_rect, editor_rect)
+    {
+        return None;
+    }
     let label = source_text(editor, "label");
     let name = source_text(editor, "name");
     let anchor_name = source_text(anchor, "name");
@@ -414,10 +426,15 @@ impl<R: Reader> Flow<R> {
         if !node.near(other, false) || alias.trim() != identifier.trim() {
             // Geometry alone cannot link different identifiers. Verify the
             // editor is explicitly nested under the wrapper in the same tree.
-            let root = self.field_source(app?)?;
-            let kind = id_only.kind.strip_prefix("XCUIElementType")?;
             let wrapper_rect = if id_only.id == node.id { node.rect? } else { other.rect? };
             let editor_rect = if visible_alias.id == node.id { node.rect? } else { other.rect? };
+            if !field_frames_match(wrapper_rect, editor_rect, false)
+                && !wrapper_contains_editor(wrapper_rect, editor_rect)
+            {
+                return None;
+            }
+            let root = self.field_source(app?)?;
+            let kind = id_only.kind.strip_prefix("XCUIElementType")?;
             let anchor = source_field_anchor(&root, kind, wrapper_rect, &identifier, "")?;
             let editor = source_descendant_editor(anchor, kind, wrapper_rect)?;
             if source_text(editor, "label") != visible_label
