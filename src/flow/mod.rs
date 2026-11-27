@@ -18,7 +18,6 @@ use crate::wda::{check_wda_ok, WdaClient};
 use serde_json::{json as j, Value};
 
 pub mod act;
-mod appinstall;
 pub mod fields;
 pub mod sense;
 pub mod tap;
@@ -922,9 +921,7 @@ impl<R: Reader> Flow<R> {
     fn guarded_step(&mut self, spec: &str, label: &str) -> Result<Option<Value>> {
         let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
         let verb = verb.trim().to_lowercase();
-        // appinstall observes the live alert before the input guard, which
-        // still runs at dispatch with the step's shared deadline.
-        if verb != "appinstall" && crate::guard::step_is_input(&verb, arg) {
+        if crate::guard::step_is_input(&verb, arg) {
             self.c.ensure_allowed_app(label, None)?;
         } else if verb == "url" {
             self.c.ensure_url_allowed(label, Some(arg.trim()))?;
@@ -1037,7 +1034,6 @@ impl<R: Reader> Flow<R> {
                 }
                 return some(self.tap_at(parse_coord(parts[0])?, parse_coord(parts[1])?, expect)?);
             }
-            "appinstall" => return Ok(Some(self.appinstall(arg)?)),
             "longpress" => return some(self.long_press_text(arg, 0.65)?.text),
             "longpressxy" => {
                 let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
@@ -1647,27 +1643,20 @@ impl<R: Reader> Flow<R> {
                     return Ok((false, res));
                 }
                 Err(e) if e.is_flow() => {
-                    // appinstall is accessibility-only and already has a bounded receipt.
-                    let (verb, _) = spec.split_once(':').unwrap_or((spec, ""));
-                    let (visible, ui) = if verb.trim().eq_ignore_ascii_case("appinstall") {
-                        (vec![], vec![])
-                    } else {
-                        let visible: Vec<String> = self
-                            .r
-                            .read(&mut self.c, ReadOpts::full())
-                            .map(|ls| ls.into_iter().take(40).map(|l| l.text).collect())
-                            .unwrap_or_default();
-                        let ui: Vec<Control> = match self.controls(false, None, None, false, true) {
-                            Ok(ctl) => {
-                                let mut v: Vec<Control> =
-                                    ctl.into_iter().filter(|c| ui::INTERACTIVE_TYPES.contains(&c.kind.as_str())).collect();
-                                v.sort_by_key(|c| (c.y, c.x));
-                                v.truncate(30);
-                                v
-                            }
-                            Err(_) => vec![],
-                        };
-                        (visible, ui)
+                    let visible: Vec<String> = self
+                        .r
+                        .read(&mut self.c, ReadOpts::full())
+                        .map(|ls| ls.into_iter().take(40).map(|l| l.text).collect())
+                        .unwrap_or_default();
+                    let ui: Vec<Control> = match self.controls(false, None, None, false, true) {
+                        Ok(ctl) => {
+                            let mut v: Vec<Control> =
+                                ctl.into_iter().filter(|c| ui::INTERACTIVE_TYPES.contains(&c.kind.as_str())).collect();
+                            v.sort_by_key(|c| (c.y, c.x));
+                            v.truncate(30);
+                            v
+                        }
+                        Err(_) => vec![],
                     };
                     let mut res = j!({
                         "ok": false,
