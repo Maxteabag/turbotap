@@ -425,3 +425,130 @@ fn secret_field_failures_keep_the_trusted_reason_and_hide_runner_text() {
     assert!(result["error"].as_str().unwrap().contains("length mismatch"));
     assert!(!result.to_string().contains("printf"));
 }
+
+fn composer_with_title_twin() -> MockState {
+    let mut st = typing_composer();
+    st.elements_map.insert(
+        ekey(&["predicate string", INPUT_TYPES_PRED]),
+        vec![json!({"ELEMENT": "b1"}), json!({"ELEMENT": "t1"}), json!({"ELEMENT": "title-id"})],
+    );
+    st.elements_map.insert(ekey(&["predicate string", &exact("form.title")]), vec![json!({"ELEMENT": "title-id"})]);
+    st.element_types.insert("title-id".into(), json!("XCUIElementTypeTextView"));
+    st.element_names.insert("title-id".into(), json!("form.title"));
+    st.element_names.insert("t1".into(), json!("Title"));
+    st.element_rects.insert("t1".into(), json!({"x": 16, "y": 150, "width": 398, "height": 90}));
+    st.element_rects.insert("title-id".into(), json!({"x": 18, "y": 149, "width": 398, "height": 90}));
+    st.set_element_value("title-id", Dyn::one(json!("")));
+    st.set_element_value("b1", Dyn::one(json!("Body text")));
+    st
+}
+
+fn twin_visible(path: &str) -> Option<serde_json::Value> {
+    (path.ends_with("/element/title-id/attribute/visible") || path.ends_with("/element/t1/attribute/visible"))
+        .then(|| json!({"value": true}))
+}
+
+#[test]
+fn ordinal_and_named_fill_treat_a_visible_title_pair_as_one_input() {
+    let mock = MockWda::start(composer_with_title_twin());
+    mock.set_custom_handler(|_, _, path, _| {
+        // The identifier representation cannot take focus, though WDA accepts
+        // the click. The real title is still focused and receives the probe.
+        twin_visible(path).or_else(|| path.ends_with("/element/title-id/click").then(|| json!({"value": null})))
+    });
+    let mut f = flow(&mock);
+    assert_eq!(f.step("readfield:#2").unwrap(), Some(json!("Body text")));
+    assert!(f.step("readfield:#3").is_err());
+
+    let _env = set_env(&[("TT_TWIN_CODE", Some("simulated-code"))]);
+    assert_eq!(f.step("fill:form.title=env:TT_TWIN_CODE").unwrap(), Some(json!("form.title: len=14")));
+    assert_eq!(f.step("readfield:#2").unwrap(), Some(json!("Body text")));
+
+    let writes: Vec<_> = mock.calls().into_iter()
+        .filter(|(method, path, _)| method == "POST" && path.contains("/element/") && path.ends_with("/value"))
+        .collect();
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].1.ends_with("/element/t1/value"));
+    assert_eq!(writes[0].2["text"], json!("simulated-code"));
+    assert!(keys_typed(&mock).iter().all(|(text, _)| text == "x" || text == "\u{8}"));
+}
+
+#[test]
+fn fill_prefers_a_changed_direct_twin_value_and_never_replays_the_write() {
+    let mock = MockWda::start(composer_with_title_twin());
+    mock.set_custom_handler(|_, _, path, _| twin_visible(path));
+    mock.set_on_action(|st, action, data| {
+        if action == "value" && data[0] == json!("t1") {
+            // This snapshot's label representation loses its direct value
+            // after the write. The identifier representation exposes it.
+            let value = st.element_values.get_mut("t1").unwrap().next(&serde_json::Value::Null);
+            st.set_element_value("title-id", Dyn::one(value));
+            st.set_element_value("t1", Dyn::one(json!("")));
+        }
+    });
+    let mut f = flow(&mock);
+    assert_eq!(f.step("fill:Title=Sample title").unwrap(), Some(json!("Title: len=12")));
+    assert_eq!(f.step("assertfield:Title=Sample title").unwrap(), Some(json!("Title: len=12")));
+    assert_eq!(mock.paths().iter().filter(|p| p.ends_with("/element/t1/value")).count(), 1);
+    assert!(keys_typed(&mock).iter().all(|(text, _)| text == "x" || text == "\u{8}"));
+
+    // A write can report success while neither node gets the payload. The
+    // old value on the alternate must not turn this into direct verification.
+    mock.set_custom_handler(|_, method, path, _| {
+        twin_visible(path).or_else(|| {
+            (method == "POST" && path.ends_with("/element/t1/value")).then(|| json!({"value": null}))
+        })
+    });
+    let result = f.step("fill:Title=Sample title").unwrap().unwrap();
+    assert!(result.as_str().unwrap().contains("unverified"), "{result}");
+    assert_eq!(mock.paths().iter().filter(|p| p.ends_with("/element/t1/value")).count(), 2);
+}
+
+#[test]
+fn near_origins_and_ambiguous_neighbors_keep_fields_separate() {
+    for third_candidate in [false, true] {
+        let mut st = composer_with_title_twin();
+        // Both representations match the same predicate, either through the
+        // identifier or through the visible node's name.
+        st.element_names.insert("t1".into(), json!("form.title"));
+        st.elements_map.insert(
+            ekey(&["predicate string", &exact("form.title")]),
+            vec![json!({"ELEMENT": "t1"}), json!({"ELEMENT": "title-id"})],
+        );
+        if third_candidate {
+            st.element_rects.insert("b1".into(), json!({"x": 16, "y": 150, "width": 398, "height": 90}));
+        } else {
+            st.element_rects.insert("t1".into(), json!({"x": 16, "y": 150, "width": 2, "height": 90}));
+            st.element_rects.insert("title-id".into(), json!({"x": 18, "y": 150, "width": 2, "height": 90}));
+        }
+        let mock = MockWda::start(st);
+        mock.set_custom_handler(|_, _, path, _| twin_visible(path));
+        let mut f = flow(&mock);
+        let e = f.step("fill:form.title=Sample title").unwrap_err().to_string();
+        assert!(e.contains("2 inputs match"), "{e}");
+        assert!(f.step("readfield:#3").is_ok());
+        assert!(keys_typed(&mock).is_empty());
+        assert!(!mock.paths().iter().any(|p| p.ends_with("/click") || p.ends_with("/clear") || p.ends_with("/element/t1/value")));
+    }
+}
+
+#[test]
+fn a_pair_that_separates_during_focus_cannot_receive_the_payload() {
+    let mock = MockWda::start(composer_with_title_twin());
+    mock.set_custom_handler(|st, _, path, _| {
+        twin_visible(path).or_else(|| {
+            path.ends_with("/element/title-id/click").then(|| {
+                // Focus affected the layout between lookups. One representation
+                // now belongs to a different location even though its ID remains.
+                st.element_rects.insert("t1".into(), json!({"x": 16, "y": 250, "width": 398, "height": 90}));
+                json!({"value": null})
+            })
+        })
+    });
+    let mut f = flow(&mock);
+    let text = "A synthetic title long enough to require a focus probe.";
+    let error = f.step(&format!("fill:form.title={text}")).unwrap_err().to_string();
+    assert!(error.contains("target changed after focusing"), "{error}");
+    assert!(keys_typed(&mock).iter().all(|(text, _)| text == "x" || text == "\u{8}"));
+    assert!(!mock.paths().iter().any(|p| p.ends_with("/element/title-id/value") || p.ends_with("/element/t1/value")));
+}

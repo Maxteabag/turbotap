@@ -78,6 +78,64 @@ impl Field {
     }
 }
 
+type FieldRect = (f64, f64, f64, f64);
+
+struct FieldNode {
+    id: String,
+    rect: Option<FieldRect>,
+    visible: String,
+}
+
+impl FieldNode {
+    fn reading_order(&self) -> (i64, i64, &str) {
+        let (x, y, _, _) = self.rect.unwrap_or_default();
+        (y as i64, x as i64, &self.id)
+    }
+
+    fn near(&self, other: &Self) -> bool {
+        let (Some((x, y, w, h)), Some((ox, oy, ow, oh))) = (self.rect, other.rect) else {
+            return false;
+        };
+        // Check both edges on each axis and require substantial overlap even
+        // for very small controls (e.g. adjacent single-character inputs).
+        let axis = |start: f64, size: f64, other_start: f64, other_size: f64| {
+            let end = start + size;
+            let other_end = other_start + other_size;
+            (start - other_start).abs() <= 2.0
+                && (end - other_end).abs() <= 2.0
+                && end.min(other_end) - start.max(other_start) >= 0.9 * size.max(other_size)
+        };
+        axis(x, w, ox, ow) && axis(y, h, oy, oh) && w.min(ow) > 0.0 && h.min(oh) > 0.0
+    }
+}
+
+struct FieldTarget {
+    field: Field,
+    twin: Option<Field>,
+}
+
+impl FieldTarget {
+    fn prefer(&mut self, id: &str) {
+        if let Some(twin) = self.twin.as_mut().filter(|twin| twin.id == id) {
+            std::mem::swap(&mut self.field, twin);
+        }
+    }
+
+    fn orient_pair(&mut self, primary: &str, alternate: &str) -> bool {
+        self.prefer(primary);
+        self.field.id == primary && self.twin.as_ref().is_some_and(|twin| twin.id == alternate)
+    }
+
+    fn for_read(self) -> Field {
+        if !self.field.secure() && self.field.content().is_empty() {
+            if let Some(twin) = self.twin.filter(|twin| !twin.content().is_empty()) {
+                return twin;
+            }
+        }
+        self.field
+    }
+}
+
 /// The expected value: text, `file:PATH` (exact; one trailing newline dropped) or
 /// `env:VAR` / `cmd:CMD` (secret). Returns (text, is_secret).
 fn expected_value(verb: &str, spec: &str) -> Result<(String, bool)> {
@@ -125,15 +183,20 @@ impl<R: Reader> Flow<R> {
         element_ids(&r)
     }
 
-    fn field_attr(&mut self, id: &str, name: &str) -> String {
-        let p = self.c.spath(&format!("/element/{id}/attribute/{name}"));
+    fn field_attribute(&mut self, id: &str, attr: &str) -> Option<String> {
+        let p = self.c.spath(&format!("/element/{id}/attribute/{attr}"));
         let r = self.c.get(&p);
-        let v = json::get(&r, "value");
-        if json::has_err(&r) || v.is_null() {
-            String::new()
-        } else {
-            json::py_str(v)
+        if json::has_err(&r) {
+            return None;
         }
+        Some(match r.get("value")? {
+            Value::Null => String::new(),
+            v => json::py_str(v),
+        })
+    }
+
+    fn field_attr(&mut self, id: &str, attr: &str) -> String {
+        self.field_attribute(id, attr).unwrap_or_default()
     }
 
     fn field_type(&mut self, id: &str) -> String {
@@ -156,9 +219,12 @@ impl<R: Reader> Flow<R> {
     }
 
     /// An element's frame (x, y, width, height) in points.
-    fn field_rect(&mut self, id: &str) -> Option<(f64, f64, f64, f64)> {
+    fn field_rect(&mut self, id: &str) -> Option<FieldRect> {
         let p = self.c.spath(&format!("/element/{id}/rect"));
         let r = self.c.get(&p);
+        if json::has_err(&r) {
+            return None;
+        }
         let v = json::get(&r, "value");
         let g = |k: &str| json::get(v, k).as_f64();
         Some((g("x")?, g("y")?, g("width")?, g("height")?))
@@ -206,37 +272,104 @@ impl<R: Reader> Flow<R> {
         (!text.is_empty()).then_some(text)
     }
 
-    /// The one input named `field` by its label, accessibility identifier or
-    /// placeholder (exact, case-insensitive, beats substring). None or several
-    /// matches fail and list the inputs on screen, never a guess.
-    pub(crate) fn find_field(&mut self, verb: &str, field: &str) -> Result<Field> {
+    fn load_field(&mut self, id: &str, name: &str) -> Field {
+        Field {
+            id: id.to_string(),
+            kind: self.field_type(id),
+            name: name.to_string(),
+            placeholder: self.field_attr(id, "placeholderValue"),
+            value: self.field_attr(id, "value"),
+        }
+    }
+
+    /// Candidates come from one enumeration. Keep unknown visibility for
+    /// legacy ordinal lookups, but require positive visibility to pair nodes.
+    fn field_snapshot(&mut self) -> Vec<FieldNode> {
+        let mut ids = self.field_ids(INPUT_TYPES_PRED);
+        ids.sort();
+        ids.dedup();
+        ids.into_iter().filter_map(|id| {
+            let visible = self.field_attr(&id, "visible");
+            (!visible.trim().eq_ignore_ascii_case("false")).then(|| FieldNode {
+                rect: self.field_rect(&id),
+                id,
+                visible,
+            })
+        }).collect()
+    }
+
+    /// Require a unique mutual neighbor before examining names. A third nearby
+    /// representation leaves all of them separate, even if its metadata is sparse.
+    fn field_twin(&mut self, nodes: &[FieldNode], index: usize, name: &str) -> Option<(usize, FieldTarget)> {
+        let node = &nodes[index];
+        let mut nearby = nodes.iter().enumerate().filter(|(i, other)| *i != index && node.near(other));
+        let (other_index, other) = nearby.next()?;
+        if nearby.next().is_some()
+            || nodes.iter().enumerate().any(|(i, n)| i != index && i != other_index && other.near(n))
+            || ![node, other].iter().all(|n| n.visible.trim().eq_ignore_ascii_case("true"))
+        {
+            return None;
+        }
+        let mut field = self.load_field(&node.id, name);
+        let mut twin = self.load_field(&other.id, name);
+        if field.kind != twin.kind
+            || !crate::ui::INPUT_TYPES.contains(&field.kind.strip_prefix("XCUIElementType")?)
+            || (!field.content().is_empty() && !twin.content().is_empty() && field.content() != twin.content())
+        {
+            return None;
+        }
+
+        let label = self.field_attribute(&node.id, "label")?;
+        let other_label = self.field_attribute(&other.id, "label")?;
+        let (id_only, visible_alias, visible_label) = match (label.trim(), other_label.trim()) {
+            ("", label) if !label.is_empty() => (&field, &twin, label),
+            (label, "") if !label.is_empty() => (&twin, &field, label),
+            _ => return None,
+        };
+        let identifier = self.field_attribute(&id_only.id, "name")?;
+        let alias = self.field_attribute(&visible_alias.id, "name")?;
+        if !id_only.placeholder.trim().is_empty()
+            || identifier.trim().is_empty()
+            || identifier.trim().eq_ignore_ascii_case(visible_label)
+            || !(alias.trim().is_empty() || alias.trim() == visible_label || alias.trim() == identifier.trim())
+        {
+            return None;
+        }
+
+        // Use the visible label for an ordinal or a name matched by both nodes.
+        if label.trim().is_empty() {
+            std::mem::swap(&mut field, &mut twin);
+        }
+        Some((other_index, FieldTarget { field, twin: Some(twin) }))
+    }
+
+    /// The one input named by label, identifier or placeholder. Exact matches
+    /// beat substrings. A verified pair counts as one input in this lookup.
+    fn find_field(&mut self, verb: &str, field: &str) -> Result<FieldTarget> {
         let f = field.trim();
         if f.is_empty() {
             return Err(Error::flow(format!("{verb}: empty field name")));
         }
-        // `#N`: the Nth text input on screen in reading order (top to bottom, then left
-        // to right), for an input with no label, identifier or placeholder left (some
-        // apps drop the placeholder once text is in).
+        // An ordinal counts inputs in reading order, once per verified pair.
         if let Some(n) = f.strip_prefix('#').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n >= 1) {
-            let mut ids: Vec<(i64, i64, String)> = self
-                .field_ids(INPUT_TYPES_PRED)
-                .into_iter()
-                .map(|id| {
-                    let (x, y, _, _) = self.field_rect(&id).unwrap_or((0.0, 0.0, 0.0, 0.0));
-                    (y as i64, x as i64, id)
-                })
-                .collect();
-            ids.sort();
-            let Some((_, _, id)) = ids.into_iter().nth(n - 1) else {
-                return Err(Error::flow(format!("{verb}: no text input #{n} on screen")));
-            };
-            return Ok(Field {
-                id: id.clone(),
-                kind: self.field_type(&id),
-                name: f.to_string(),
-                placeholder: self.field_attr(&id, "placeholderValue"),
-                value: self.field_attr(&id, "value"),
-            });
+            let mut nodes = self.field_snapshot();
+            nodes.sort_by(|a, b| a.reading_order().cmp(&b.reading_order()));
+            let mut skipped = vec![false; nodes.len()];
+            let mut ordinal = 0;
+            for (index, node) in nodes.iter().enumerate() {
+                if skipped[index] {
+                    continue;
+                }
+                let paired = self.field_twin(&nodes, index, f).map(|(twin, target)| {
+                    skipped[twin] = true;
+                    target
+                });
+                ordinal += 1;
+                if ordinal == n {
+                    return Ok(paired.unwrap_or_else(|| FieldTarget { field: self.load_field(&node.id, f), twin: None }));
+                }
+            }
+            return Err(Error::flow(format!("{verb}: no text input #{n} on screen")));
         }
         let lit = pred_lit(f);
         let exact = format!("{INPUT_TYPES_PRED} AND (label ==[c] {lit} OR name ==[c] {lit} OR placeholderValue ==[c] {lit})");
@@ -256,17 +389,21 @@ impl<R: Reader> Flow<R> {
                 ids = vis;
             }
         }
-        match ids.len() {
-            1 => {
-                let id = ids.remove(0);
-                Ok(Field {
-                    id: id.clone(),
-                    kind: self.field_type(&id),
-                    name: f.to_string(),
-                    placeholder: self.field_attr(&id, "placeholderValue"),
-                    value: self.field_attr(&id, "value"),
-                })
+        if matches!(ids.len(), 1 | 2) {
+            let nodes = self.field_snapshot();
+            if let Some(index) = nodes.iter().position(|node| node.id == ids[0]) {
+                if let Some((twin_index, mut target)) = self.field_twin(&nodes, index, f) {
+                    if ids.len() == 1 || ids[1] == nodes[twin_index].id {
+                        if ids.len() == 1 {
+                            target.prefer(&ids[0]);
+                        }
+                        return Ok(target);
+                    }
+                }
             }
+        }
+        match ids.len() {
+            1 => Ok(FieldTarget { field: self.load_field(&ids[0], f), twin: None }),
             0 => {
                 let all = self.field_ids(INPUT_TYPES_PRED);
                 let names: Vec<String> = all.iter().take(8).map(|id| self.describe_id(id)).collect();
@@ -288,15 +425,7 @@ impl<R: Reader> Flow<R> {
     }
 
     fn field_value_len(&mut self, f: &Field) -> Option<usize> {
-        let p = self.c.spath(&format!("/element/{}/attribute/value", f.id));
-        let r = self.c.get(&p);
-        if json::has_err(&r) {
-            return None;
-        }
-        let value = match r.get("value")? {
-            Value::Null => String::new(),
-            v => json::py_str(v),
-        };
+        let value = self.field_attribute(&f.id, "value")?;
         Some(Field { value, ..f.clone() }.content().chars().count())
     }
 
@@ -412,11 +541,12 @@ impl<R: Reader> Flow<R> {
     /// is text, `file:PATH` (exact multi-line text; one trailing newline dropped) or
     /// `env:VAR` / `cmd:CMD` (secret). The field is cleared, focused (element click,
     /// then a tap in its own frame if no keyboard came up) and, for secrets, secure
-    /// fields and text of 40+ characters, checked with a probe. A missed focus gets
-    /// one fresh field lookup and attempt before sending the payload. Secrets use an
-    /// element-bound write and a post-write focus check. Secure fields are checked
-    /// by length. A field missing while the keyboard is up is looked for again
-    /// after a short downward drag closes it.
+    /// fields, verified pairs and text of 40+ characters, checked with a probe.
+    /// A missed focus gets one fresh lookup and attempt before the payload.
+    /// Verified pairs and secrets use an element-bound write. Secrets get a
+    /// post-write focus check. Secure fields are checked by length. A field
+    /// missing while the keyboard is up is looked for again after a short
+    /// downward drag closes it.
     pub fn fill(&mut self, arg: &str) -> Result<String> {
         let Some((field, spec)) = arg.split_once('=') else {
             return Err(Error::flow("fill expects FIELD=VALUE (VALUE: text, file:PATH, env:VAR or cmd:CMD)"));
@@ -432,7 +562,7 @@ impl<R: Reader> Flow<R> {
                 e
             }
         };
-        let mut f = match self.find_field("fill", field) {
+        let FieldTarget { field: mut f, mut twin } = match self.find_field("fill", field) {
             Ok(f) => f,
             Err(e) if e.to_string().contains("no text input named") && self.keyboard_up() => {
                 // The keyboard can keep a list cell out of the accessibility tree.
@@ -450,19 +580,30 @@ impl<R: Reader> Flow<R> {
         }
         self.mark_action(false, true);
         let want = text.chars().count();
-        let probe = secret || want >= PROBE_MIN_LEN;
+        let probe = secret || want >= PROBE_MIN_LEN || twin.is_some();
         let mut focus = self.prepare_fill(&f, probe, secret)?;
         if matches!(focus, Focus::Missed(_) | Focus::Unverified) {
             self.step_retries += 1;
-            let next = self.find_field("fill", field).map_err(|_| {
+            let mut next = self.find_field("fill", field).map_err(|_| {
                 Error::SecretField("fill: could not find the field again after focusing; check its label and visibility")
             })?;
-            // An ordinal can refer to a different input after a layout change.
-            if next.kind != f.kind || (f.name.starts_with('#') && next.id != f.id) {
-                return Err(Error::SecretField("fill: the target changed after focusing; use a unique field label"));
+            let changed = Error::SecretField("fill: the target changed after focusing; use a unique field label");
+            if let Some(alternate) = &twin {
+                // Confirm the same two IDs still pair in the fresh lookup before
+                // trying the alternate. A moved ordinal must never redirect a fill.
+                if !next.orient_pair(&f.id, &alternate.id) {
+                    return Err(changed);
+                }
+                next.prefer(&alternate.id);
+            } else if f.name.starts_with('#') && next.field.id != f.id {
+                return Err(changed);
             }
-            f = next;
-            focus = self.prepare_fill(&f, probe, secret)?;
+            if next.field.kind != f.kind {
+                return Err(changed);
+            }
+            f = next.field;
+            twin = next.twin;
+            focus = self.prepare_fill(&f, probe || twin.is_some(), secret)?;
         }
         let checkable = match focus {
             Focus::Proven => true,
@@ -472,15 +613,16 @@ impl<R: Reader> Flow<R> {
             }
             Focus::Missed(reason) => return Err(Error::SecretField(reason)),
         };
-        if secret {
-            // Through the element itself (as type:/cleartype: since #26): a focus
-            // change after the probe (an autofill or password sheet) cannot redirect
-            // it; then make sure no other field got any of it.
+        let twin_before = twin.as_ref().filter(|_| !secret).and_then(|t| self.field_attribute(&t.id, "value"));
+        if secret || twin.is_some() {
+            // Bind the payload to the representation that was prepared.
             let r = self.bound_write(&f.id, &text);
-            // Check for a misplaced write even if WDA reported a failure.
-            self.check_focus_after_secret("fill", &f.id, &text).map_err(|_| {
-                Error::SecretField("fill: detected secret text in another field and requested a clear; check the form with ui")
-            })?;
+            if secret {
+                // Check for a misplaced write even if WDA reported a failure.
+                self.check_focus_after_secret("fill", &f.id, &text).map_err(|_| {
+                    Error::SecretField("fill: detected secret text in another field and requested a clear; check the form with ui")
+                })?;
+            }
             if json::has_err(&r) {
                 return Err(Error::SecretField("fill: bound field write failed; check the form with ui before trying again"));
             }
@@ -489,7 +631,22 @@ impl<R: Reader> Flow<R> {
         }
         clock::sleep(0.25);
         let v = self.field_attr(&f.id, "value");
-        let got = Field { value: v, ..f.clone() };
+        let mut got = Field { value: v, ..f.clone() };
+        let alternate = twin.filter(|_| got.content().is_empty()).zip(twin_before);
+        if let Some((twin, before)) = alternate {
+            // Recheck the pair on the current screen. A stale value that
+            // already matched the payload is insufficient for verification.
+            let readback = self.find_field("fill", field).ok().and_then(|mut current| {
+                if current.orient_pair(&f.id, &twin.id) && current.field.kind == f.kind {
+                    current.twin
+                } else {
+                    None
+                }
+            });
+            if let Some(readback) = readback.filter(|t| !t.content().is_empty() && (want == 0 || t.value != before)) {
+                got = readback;
+            }
+        }
         let got = got.content();
         let n_got = got.chars().count();
         if n_got == 0 && want > 0 && !f.secure() && !secret {
@@ -532,7 +689,7 @@ impl<R: Reader> Flow<R> {
     /// as empty). Also added to the flow's `reads` as `{"field", "value", "len"}`. A
     /// secure field gives only `len=N`.
     pub fn read_field(&mut self, arg: &str) -> Result<String> {
-        let f = self.find_field("readfield", arg)?;
+        let f = self.find_field("readfield", arg)?.for_read();
         let n = f.content().chars().count();
         if f.secure() {
             self.reads.push(j!({"field": f.name, "secure": true, "len": n}));
@@ -569,6 +726,7 @@ impl<R: Reader> Flow<R> {
                 e
             }
         })?;
+        let f = if secret { f.field } else { f.for_read() };
         let n = want.chars().count();
         if secret || f.secure() {
             if !secret {
