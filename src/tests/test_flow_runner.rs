@@ -16,7 +16,7 @@ use crate::text::{find_text, Line, DEFAULT_FUZZY};
 use crate::ui::{Control, CTL_CACHE_TTL};
 use crate::wda::WdaClient;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
