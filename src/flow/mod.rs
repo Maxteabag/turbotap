@@ -175,13 +175,13 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         a warning (marks only, nothing is refused)
   cleartype:TEXT|env:V|cmd:C clear first TextField/SecureTextField/SearchField/TextView, type, verify read-back
   fill:FIELD=VALUE      type into the input named FIELD (label, identifier or placeholder) only: clear,
-                        focus (tap fallback), probe focus for secrets/long text, type at 200 chars/s,
-                        verify (exact; secrets and secure fields by length). VALUE: text, file:PATH,
-                        env:V or cmd:C; never printed unless env:/file:
+                        focus (tap fallback), probe secrets/long text, retry a focus miss once,
+                        type and verify (secure fields by length). VALUE: text, file:PATH, env:V or cmd:C
   readfield:FIELD       the exact value of the input named FIELD (label, identifier or placeholder),
                         blank lines included; read-only; a secure field gives only len=N
   assertfield:FIELD=VALUE  the named input holds exactly VALUE (text, file:PATH, env:V, cmd:C); read-only;
-                        a secure field is checked by length only (iOS shows only bullets)
+                        secure fields are checked by length. If a non-secret field reports no value,
+                        compare visible text via WDA Vision OCR (host OCR on older runners)
   typedigits:VAL|env:V  paced 0.08 s/digit /wda/keys input + exact digit read-back
   pintap:VAL|env:V|cmd:C tap digits on FLAG_SECURE PIN keyboards via /source key rects (uses /wda/fastTapBatch)
   picker:[INDEX:]VALUE  set a PickerWheel (default wheel 0, or 0-based INDEX) via WDA element value
@@ -291,9 +291,12 @@ pub fn safe_step(spec: &str) -> String {
     };
     let trimmed = verb.trim();
     if trimmed.eq_ignore_ascii_case("assertfield") || trimmed.eq_ignore_ascii_case("fill") {
-        // FIELD=VALUE: the field name is shown; the value only as env:NAME or file:PATH.
+        if is_secret_step(spec) {
+            return format!("{}:<redacted>", trimmed.to_ascii_lowercase());
+        }
+        // For non-secret FIELD=VALUE, retain the field name and any file path.
         return match arg.split_once('=') {
-            Some((_, value)) if value.starts_with("env:") || value.starts_with("file:") => spec.to_string(),
+            Some((_, value)) if value.starts_with("file:") => spec.to_string(),
             Some((field, _)) => format!("{verb}:{field}=<redacted>"),
             None => spec.to_string(),
         };
@@ -1551,6 +1554,7 @@ impl<R: Reader> Flow<R> {
         let f = |m: String| self.scrub(&m);
         match e {
             Error::Flow(m) => Error::Flow(f(m)),
+            Error::SecretField(_) => e,
             Error::DeadlineExceeded(m) => Error::DeadlineExceeded(f(m)),
             Error::StaleApp(m) => Error::StaleApp(f(m)),
             Error::Runtime(m) => Error::Runtime(f(m)),
@@ -1580,8 +1584,10 @@ impl<R: Reader> Flow<R> {
         for spec in steps {
             let s0 = clock::real_now();
             let secret_step = is_secret_step(spec);
-            if let Some((_, arg)) = spec.split_once(':').filter(|_| secret_step) {
-                if !arg.starts_with("env:") && !arg.starts_with("cmd:") {
+            if let Some((verb, arg)) = spec.split_once(':').filter(|_| secret_step) {
+                if CREDENTIAL_VERBS.iter().any(|v| verb.trim().eq_ignore_ascii_case(v))
+                    && !arg.starts_with("env:") && !arg.starts_with("cmd:")
+                {
                     self.note_secret(arg);
                 }
             }
@@ -1609,7 +1615,7 @@ impl<R: Reader> Flow<R> {
                     }
                     done.push(item);
                 }
-                Err(e) if e.is_flow() && secret_step => {
+                Err(e) if e.is_flow() && (secret_step || matches!(&e, Error::SecretField(_))) => {
                     // A credential step failed: the screen may show what was being
                     // entered, so no screen diagnostics at all.
                     let mut res = j!({
@@ -1622,6 +1628,11 @@ impl<R: Reader> Flow<R> {
                         "total_ms": ((clock::real_now() - t0) * 1000.0).round() as i64,
                     });
                     self.scrub_value(&mut res);
+                    if let Error::SecretField(reason) = e {
+                        res["error"] = j!(reason);
+                        let verb = spec.split_once(':').map_or(spec.as_str(), |(v, _)| v);
+                        res["failed_step"] = j!(format!("{}:<redacted>", verb.trim().to_ascii_lowercase()));
+                    }
                     return Ok((false, res));
                 }
                 Err(e) if e.is_flow() => {
@@ -1699,7 +1710,12 @@ impl<R: Reader> Flow<R> {
             target,
             req_kinds: Some(&self.c.req_kinds),
         };
-        crate::timings::append(&rec.to_value(|t| self.scrub(t)));
+        let mut receipt = rec.to_value(|t| self.scrub(t));
+        if let Some(Error::SecretField(reason)) = err {
+            receipt["error"] = j!(reason);
+            receipt["arg"] = Value::Null;
+        }
+        crate::timings::append(&receipt);
     }
 }
 

@@ -51,8 +51,33 @@ fn assertfield_compares_ocr_text_without_caring_about_line_breaks() {
     let m = MockWda::start(composer());
     let mut f = flow(&m);
     let ok = f.step(&format!("assertfield:#1={TITLE}")).unwrap().unwrap();
-    assert!(ok.as_str().unwrap().contains("read by OCR"), "{ok}");
+    assert!(ok.as_str().unwrap().contains("read by OCR (host)"), "{ok}");
     let e = f.step("assertfield:#1=A different title").unwrap_err().to_string();
-    assert!(e.contains("read by OCR") && e.contains("first difference"), "{e}");
+    assert!(e.contains("read by OCR (host)") && e.contains("first difference"), "{e}");
     f.close();
+}
+
+#[test]
+fn assertfield_prefers_vision_and_rejects_a_single_glyph_mismatch() {
+    let _c = isolated_cache();
+    let mock = MockWda::start(composer());
+    mock.set_custom_handler(|_, method, path, _| {
+        (method == "POST" && path == "/wda/fastOCR").then(|| json!({"value": {
+            "mode": "accurate",
+            "image": {"capture": "cgimage", "scale": 0.5, "sourcePixels": [860, 1800], "inputPixels": [430, 900]},
+            "lines": [
+                {"text": "AI title", "x": 0.1, "y": 0.18, "width": 0.3, "height": 0.02, "confidence": 1.0},
+                {"text": "Outside the field", "x": 0.1, "y": 0.05, "width": 0.3, "height": 0.02, "confidence": 1.0}
+            ]
+        }}))
+    });
+    // Give the host OCR a conflicting answer. A Vision mismatch must not
+    // fall through to a successful match on the host.
+    let host = vec![make_line("Al title", 20.0, 160.0, 200.0, 180.0)];
+    let reader = FakeReader::with(vec![(solid_img(255, (120, 240)), host)], (430, 900), 2.0);
+    let mut f = Flow::new(mock.client(), reader, 0.5, None, false).unwrap();
+    let ok = f.step("assertfield:#1=AI title").unwrap().unwrap();
+    assert!(ok.as_str().unwrap().contains("OCR (WDA Vision)"), "{ok}");
+    let error = f.step("assertfield:#1=Al title").unwrap_err().to_string();
+    assert!(error.contains("OCR (WDA Vision)") && error.contains("first difference at char 1"), "{error}");
 }

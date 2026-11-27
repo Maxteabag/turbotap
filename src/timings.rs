@@ -69,6 +69,9 @@ pub fn step_kind_arg(spec: &str) -> (String, Option<String>) {
     };
     // `assertfield:FIELD=VALUE` / `fill:FIELD=VALUE`: the field name only.
     if verb == "assertfield" || verb == "fill" {
+        if crate::flow::is_secret_step(spec) {
+            return (verb, None);
+        }
         let field = arg.and_then(|a| a.split_once('=').map(|(f, _)| f.chars().take(60).collect::<String>()));
         return (verb, field);
     }

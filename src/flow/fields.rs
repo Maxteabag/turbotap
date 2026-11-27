@@ -92,12 +92,30 @@ fn expected_value(verb: &str, spec: &str) -> Result<(String, bool)> {
         return Ok((s, false));
     }
     let secret = spec.starts_with("env:") || spec.starts_with("cmd:");
-    Ok((super::secret_arg(verb, spec)?, secret))
+    let value = super::secret_arg(verb, spec).map_err(|_| {
+        Error::SecretField(match verb {
+            "fill" => "fill: could not resolve the secret; check the environment variable or credential command",
+            _ => "assertfield: could not resolve the secret; check the environment variable or credential command",
+        })
+    })?;
+    if secret && value.is_empty() {
+        return Err(Error::SecretField(match verb {
+            "fill" => "fill: the credential command returned an empty secret",
+            _ => "assertfield: the credential command returned an empty secret",
+        }));
+    }
+    Ok((value, secret))
 }
 
 /// First index where two strings differ (in chars).
 fn first_diff(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+enum Focus {
+    Proven,
+    Unverified,
+    Missed(&'static str),
 }
 
 impl<R: Reader> Flow<R> {
@@ -155,6 +173,27 @@ impl<R: Reader> Flow<R> {
             return None;
         }
         let lines = self.r.read(&mut self.c, crate::ocr::ReadOpts::full()).ok()?;
+        Self::text_in_rect(lines, (x, y, w, h))
+    }
+
+    fn assertion_ocr(&mut self, id: &str) -> Result<Option<(String, &'static str)>> {
+        let Some(rect) = self.field_rect(id).filter(|(_, _, w, h)| *w > 0.0 && *h > 0.0) else {
+            return Ok(None);
+        };
+        let pt = self.r.pt_size(&mut self.c, false, None)
+            .map_err(|_| Error::flow("assertfield: could not get the screen size for WDA Vision OCR"))?;
+        match crate::vision::vision_lines(&mut self.c, pt, "accurate", crate::vision::VISION_DEFAULT_SCALE, None) {
+            Ok(lines) => Ok(Some((Self::text_in_rect(lines, rect).unwrap_or_default(), "WDA Vision"))),
+            Err(Error::VisionUnsupported(_)) => {
+                let lines = self.r.read(&mut self.c, crate::ocr::ReadOpts::full())
+                    .map_err(|_| Error::flow("assertfield: host OCR failed; WDA Vision OCR is unavailable"))?;
+                Ok(Some((Self::text_in_rect(lines, rect).unwrap_or_default(), "host")))
+            }
+            Err(_) => Err(Error::flow("assertfield: WDA Vision OCR failed; check the runner and try again")),
+        }
+    }
+
+    fn text_in_rect(lines: Vec<crate::text::Line>, (x, y, w, h): (f64, f64, f64, f64)) -> Option<String> {
         let mut inside: Vec<_> = lines
             .into_iter()
             .filter(|l| {
@@ -248,9 +287,17 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    fn field_value_len(&mut self, f: &Field) -> usize {
-        let v = self.field_attr(&f.id, "value");
-        Field { value: v, ..f.clone() }.content().chars().count()
+    fn field_value_len(&mut self, f: &Field) -> Option<usize> {
+        let p = self.c.spath(&format!("/element/{}/attribute/value", f.id));
+        let r = self.c.get(&p);
+        if json::has_err(&r) {
+            return None;
+        }
+        let value = match r.get("value")? {
+            Value::Null => String::new(),
+            v => json::py_str(v),
+        };
+        Some(Field { value, ..f.clone() }.content().chars().count())
     }
 
     /// Total value length of every text input on screen except `f`.
@@ -266,26 +313,29 @@ impl<R: Reader> Flow<R> {
     /// Focus `f` and confirm a keyboard is up. Some custom text views ignore WDA's
     /// element click: then tap inside the element's own frame (near its top, where
     /// a tall text view's first line is) and check again.
-    fn focus_field(&mut self, f: &Field) -> Result<()> {
+    fn focus_field(&mut self, f: &Field) -> Result<bool> {
         let p = self.c.spath(&format!("/element/{}/click", f.id));
         let r = self.c.post(&p, &j!({}));
-        check_wda_ok(r, &format!("fill: focusing {}", f.describe()), true)?;
+        if json::err_is(&r, 404) {
+            return Ok(false);
+        }
+        if json::has_err(&r) {
+            return Err(Error::SecretField("fill: field click failed; check that the field is visible"));
+        }
         clock::sleep(0.3);
         if self.keyboard_up() {
-            return Ok(());
+            return Ok(true);
         }
         let p = self.c.spath(&format!("/element/{}/rect", f.id));
         let rect = json::get(&self.c.get(&p), "value").clone();
         let n = |k: &str| json::get(&rect, k).as_f64().unwrap_or(0.0);
         let (x, y, w, h) = (n("x"), n("y"), n("width"), n("height"));
         if w > 0.0 && h > 0.0 {
-            self.tap_point((x + w / 2.0) as i64, (y + (h / 2.0).min(20.0)) as i64, "", None)?;
+            self.tap_point((x + w / 2.0) as i64, (y + (h / 2.0).min(20.0)) as i64, "", None)
+                .map_err(|_| Error::SecretField("fill: could not tap the field; check that it is visible and unobstructed"))?;
             clock::sleep(0.35);
         }
-        if !self.keyboard_up() {
-            return Err(Error::flow(format!("fill: no keyboard after focusing {}; nothing was typed", f.describe())));
-        }
-        Ok(())
+        Ok(self.keyboard_up())
     }
 
     fn fill_keys(&mut self, text: &str, what: &str, redact: bool) -> Result<()> {
@@ -298,98 +348,142 @@ impl<R: Reader> Flow<R> {
         Ok(())
     }
 
-    /// Prove keyboard focus is in `f`: one probe character must grow `f` by exactly
-    /// one (key events go to the one first responder, so then it went nowhere
-    /// else); it is deleted again either way. Fails with nothing typed.
-    /// Ok(false): plain text into a field that reports no value at all, so the probe
-    /// cannot be checked (some web views and custom editors); the caller goes on,
-    /// marked unverified. For a secret that still fails, with nothing typed.
-    fn probe_focus(&mut self, f: &Field, secret: bool) -> Result<bool> {
-        let before = self.field_value_len(f);
-        let others_before = if before == 0 { Some(self.other_inputs_len(f)) } else { None };
-        self.fill_keys("x", "fill: focus probe", false)?;
+    /// Probe outcomes are separate from request and cleanup errors so only a
+    /// verified, pre-payload focus miss can trigger another attempt.
+    fn probe_focus(&mut self, f: &Field, secret: bool) -> Result<Focus> {
+        let before = self.field_value_len(f).ok_or(Error::SecretField(
+            "fill: could not read the field before the focus probe; check that it is still visible",
+        ))?;
+        let others_before = (before == 0).then(|| self.other_inputs_len(f));
+        self.fill_keys("x", "fill: focus probe", false)
+            .map_err(|_| Error::SecretField("fill: could not send the focus probe; check the field before trying again"))?;
         clock::sleep(0.2);
         let after = self.field_value_len(f);
-        // The target reports nothing: did the probe land in another input instead? Any
-        // change counts: an empty field echoing its placeholder ("Title") shrinks to "x".
-        let landed_elsewhere = after == 0 && others_before.is_some_and(|b| self.other_inputs_len(f) != b);
-        self.fill_keys(BACKSPACE, "fill: removing focus probe", false)?;
+        let landed_elsewhere = after == Some(0) && others_before.is_some_and(|b| self.other_inputs_len(f) != b);
+        self.fill_keys(BACKSPACE, "fill: removing focus probe", false)
+            .map_err(|_| Error::SecretField("fill: could not remove the focus probe; check the field before trying again"))?;
         clock::sleep(0.15);
-        if before == 0 && after == 0 && !secret && !landed_elsewhere {
-            crate::errln!("turbotap: warning: fill: {} reports no value; the focus probe cannot be checked, typing on unverified", f.describe());
-            return Ok(false);
+        if self.field_value_len(f) != Some(before) || (landed_elsewhere && others_before != Some(self.other_inputs_len(f))) {
+            return Err(Error::SecretField("fill: could not verify removal of the focus probe; check the field before trying again"));
         }
-        if after != before + 1 {
-            return Err(Error::flow(format!(
-                "fill: keyboard focus is not in {} (a probe character did not land there and was deleted again); nothing was typed",
-                f.describe()
-            )));
+        if landed_elsewhere {
+            return Ok(Focus::Missed("fill: keyboard focus is not in the requested field; dismiss any overlay and tap the field"));
         }
-        if self.field_value_len(f) != before {
-            return Err(Error::flow(format!("fill: could not remove the focus probe from {}; nothing was typed", f.describe())));
+        let after = after.ok_or(Error::SecretField(
+            "fill: could not read the focus probe result; check that the field is still visible",
+        ))?;
+        if after == before + 1 {
+            Ok(Focus::Proven)
+        } else if before == 0 && after == 0 && !secret {
+            Ok(Focus::Unverified)
+        } else {
+            Ok(Focus::Missed("fill: keyboard focus is not in the requested field; tap the field and check that the keyboard is up"))
         }
-        Ok(true)
+    }
+
+    fn clear_fill_field(&mut self, f: &Field) -> bool {
+        let p = self.c.spath(&format!("/element/{}/clear", f.id));
+        !json::has_err(&self.c.post(&p, &j!({})))
+    }
+
+    fn prepare_fill(&mut self, f: &Field, probe: bool, secret: bool) -> Result<Focus> {
+        if !f.content().is_empty() && !self.clear_fill_field(f) {
+            return Err(Error::SecretField("fill: could not clear the field; check that it is editable"));
+        }
+        if !self.focus_field(f)? {
+            return Ok(Focus::Missed("fill: no keyboard after focusing the field; tap it to bring up the keyboard"));
+        }
+        if self.field_value_len(f).is_some_and(|n| n > 0) {
+            if !self.clear_fill_field(f) {
+                return Err(Error::SecretField("fill: could not clear the focused field; check that it is editable"));
+            }
+            if !self.focus_field(f)? {
+                return Ok(Focus::Missed("fill: no keyboard after clearing the field; tap it to bring up the keyboard"));
+            }
+        }
+        if probe {
+            self.probe_focus(f, secret)
+        } else {
+            Ok(Focus::Proven)
+        }
     }
 
     /// `fill:FIELD=VALUE`: type into the input named FIELD only, and verify. VALUE
     /// is text, `file:PATH` (exact multi-line text; one trailing newline dropped) or
     /// `env:VAR` / `cmd:CMD` (secret). The field is cleared, focused (element click,
     /// then a tap in its own frame if no keyboard came up) and, for secrets, secure
-    /// fields and text of 40+ characters, proven focused with one probe character.
-    /// Text is typed at 200 characters per second; a secret is written through the
-    /// element and followed by the focus check of `type:`/`cleartype:`. Secrets and
-    /// secure fields are checked by length (a mismatch clears the field), everything
-    /// else is read back exactly. A field missing while the keyboard is up is looked
-    /// for again after a short downward drag closes it.
+    /// fields and text of 40+ characters, checked with a probe. A missed focus gets
+    /// one fresh field lookup and attempt before sending the payload. Secrets use an
+    /// element-bound write and a post-write focus check. Secure fields are checked
+    /// by length. A field missing while the keyboard is up is looked for again
+    /// after a short downward drag closes it.
     pub fn fill(&mut self, arg: &str) -> Result<String> {
         let Some((field, spec)) = arg.split_once('=') else {
             return Err(Error::flow("fill expects FIELD=VALUE (VALUE: text, file:PATH, env:VAR or cmd:CMD)"));
         };
         let (text, secret_src) = expected_value("fill", spec)?;
-        let f = match self.find_field("fill", field) {
+        if secret_src {
+            self.note_secret(&text);
+        }
+        let lookup_error = |e| {
+            if secret_src {
+                Error::SecretField("fill: could not identify one field; check its label and close the keyboard if it is hidden")
+            } else {
+                e
+            }
+        };
+        let mut f = match self.find_field("fill", field) {
             Ok(f) => f,
             Err(e) if e.to_string().contains("no text input named") && self.keyboard_up() => {
-                // Lists keep only visible cells: a field under the keyboard can drop
-                // out of the tree. Close the keyboard with a short downward drag (80
-                // pt, mid-screen; interactive keyboard dismissal), look again.
-                let (w, h) = self.r.pt_size(&mut self.c, false, None)?;
+                // The keyboard can keep a list cell out of the accessibility tree.
+                let (w, h) = self.r.pt_size(&mut self.c, false, None).map_err(lookup_error)?;
                 let y0 = h * 2 / 5;
-                self.drag(w / 2, y0, w / 2, y0 + 80, 0.15, 0.0)?;
+                self.drag(w / 2, y0, w / 2, y0 + 80, 0.15, 0.0).map_err(lookup_error)?;
                 clock::sleep(0.3);
-                self.find_field("fill", field)?
+                self.find_field("fill", field).map_err(lookup_error)?
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(lookup_error(e)),
         };
         let secret = secret_src || f.secure();
-        if secret {
+        if f.secure() && !secret_src {
             self.note_secret(&text);
         }
         self.mark_action(false, true);
-        if !f.content().is_empty() {
-            let p = self.c.spath(&format!("/element/{}/clear", f.id));
-            let r = self.c.post(&p, &j!({}));
-            check_wda_ok(r, &format!("fill: clearing {}", f.describe()), true)?;
-        }
-        self.focus_field(&f)?;
-        if self.field_value_len(&f) > 0 {
-            // Some fields only clear once focused.
-            let p = self.c.spath(&format!("/element/{}/clear", f.id));
-            let r = self.c.post(&p, &j!({}));
-            check_wda_ok(r, &format!("fill: clearing {}", f.describe()), true)?;
-            self.focus_field(&f)?;
-        }
         let want = text.chars().count();
-        let mut checkable = true;
-        if secret || want >= PROBE_MIN_LEN {
-            checkable = self.probe_focus(&f, secret)?;
+        let probe = secret || want >= PROBE_MIN_LEN;
+        let mut focus = self.prepare_fill(&f, probe, secret)?;
+        if matches!(focus, Focus::Missed(_) | Focus::Unverified) {
+            self.step_retries += 1;
+            let next = self.find_field("fill", field).map_err(|_| {
+                Error::SecretField("fill: could not find the field again after focusing; check its label and visibility")
+            })?;
+            // An ordinal can refer to a different input after a layout change.
+            if next.kind != f.kind || (f.name.starts_with('#') && next.id != f.id) {
+                return Err(Error::SecretField("fill: the target changed after focusing; use a unique field label"));
+            }
+            f = next;
+            focus = self.prepare_fill(&f, probe, secret)?;
         }
+        let checkable = match focus {
+            Focus::Proven => true,
+            Focus::Unverified => {
+                crate::errln!("turbotap: warning: fill: {} reports no value; the focus probe cannot be checked, typing on unverified", f.describe());
+                false
+            }
+            Focus::Missed(reason) => return Err(Error::SecretField(reason)),
+        };
         if secret {
             // Through the element itself (as type:/cleartype: since #26): a focus
             // change after the probe (an autofill or password sheet) cannot redirect
             // it; then make sure no other field got any of it.
             let r = self.bound_write(&f.id, &text);
-            check_wda_ok(r, &format!("fill {}", f.describe()), true)?;
-            self.check_focus_after_secret("fill", &f.id, &text)?;
+            // Check for a misplaced write even if WDA reported a failure.
+            self.check_focus_after_secret("fill", &f.id, &text).map_err(|_| {
+                Error::SecretField("fill: detected secret text in another field and requested a clear; check the form with ui")
+            })?;
+            if json::has_err(&r) {
+                return Err(Error::SecretField("fill: bound field write failed; check the form with ui before trying again"));
+            }
         } else {
             self.fill_keys(&text, &format!("fill {}", f.describe()), false)?;
         }
@@ -413,13 +507,12 @@ impl<R: Reader> Flow<R> {
         }
         let secret_wrong = if f.secure() { n_got != want } else { secret && got != text };
         if secret_wrong {
-            // Never leave a wrong or partial secret in the field.
-            let p = self.c.spath(&format!("/element/{}/clear", f.id));
-            self.c.post(&p, &j!({}));
-            return Err(Error::flow(format!(
-                "fill: {} read-back mismatch (len {n_got} vs {want}); the field was cleared",
-                f.describe()
-            )));
+            let reason = if self.clear_fill_field(&f) {
+                "fill: read-back mismatch; the field was cleared. Check that the field accepts the credential"
+            } else {
+                "fill: read-back mismatch and clear failed; check the field with ui"
+            };
+            return Err(Error::SecretField(reason));
         }
         if !secret && got != text {
             let i = first_diff(got, &text);
@@ -466,15 +559,30 @@ impl<R: Reader> Flow<R> {
             return Err(Error::flow("assertfield expects FIELD=VALUE (VALUE: text, file:PATH, env:VAR or cmd:CMD)"));
         };
         let (want, secret) = expected_value("assertfield", spec)?;
-        let f = self.find_field("assertfield", field)?;
+        if secret {
+            self.note_secret(&want);
+        }
+        let f = self.find_field("assertfield", field).map_err(|e| {
+            if secret {
+                Error::SecretField("assertfield: could not identify one field; check its label and visibility")
+            } else {
+                e
+            }
+        })?;
         let n = want.chars().count();
         if secret || f.secure() {
-            self.note_secret(&want);
+            if !secret {
+                self.note_secret(&want);
+            }
             let got = f.content();
             // iOS shows a secure field's value as one bullet per character.
             let ok = if f.secure() { got.chars().count() == n } else { got == want };
             if !ok {
-                return Err(Error::flow(format!("assertfield: {} does not hold the expected value", f.describe())));
+                return Err(Error::SecretField(if f.secure() {
+                    "assertfield: the secure field does not hold the expected value (length mismatch); check the field and credential"
+                } else {
+                    "assertfield: the field does not hold the expected value; check the field and credential"
+                }));
             }
             return Ok(format!("{}: len={n}", f.name));
         }
@@ -482,16 +590,16 @@ impl<R: Reader> Flow<R> {
         if got.is_empty() && !want.is_empty() {
             // WDA reports no value although the field may show text: compare what OCR
             // reads in the field's frame, whitespace-insensitive (OCR has no blank lines).
-            if let Some(o) = self.ocr_in_field(&f.id) {
+            if let Some((o, engine)) = self.assertion_ocr(&f.id)? {
                 let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
                 let (a, b) = (norm(&o), norm(&want));
                 if a == b {
-                    return Ok(format!("{}: len={n} (read by OCR: the field reports no value)", f.name));
+                    return Ok(format!("{}: len={n} (read by OCR ({engine}): the field reports no value)", f.name));
                 }
                 let i = first_diff(&a, &b);
                 let ctx = |s: &str| -> String { s.chars().skip(i.saturating_sub(10)).take(30).collect() };
                 return Err(Error::flow(format!(
-                    "assertfield: {} differs (read by OCR, the field reports no value; only visible lines): first difference at char {i}: got {} want {}",
+                    "assertfield: {} differs (read by OCR ({engine}), the field reports no value; only visible lines): first difference at char {i}: got {} want {}",
                     f.describe(),
                     json::py_repr_str(&ctx(&a)),
                     json::py_repr_str(&ctx(&b)),

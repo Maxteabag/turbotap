@@ -133,7 +133,7 @@ fn unknown_or_ambiguous_names_fail_with_the_inputs_listed() {
 fn assertfield_values_stay_out_of_step_logs() {
     assert_eq!(safe_step("assertfield:Password=hunter2"), "assertfield:Password=<redacted>");
     assert_eq!(safe_step("assertfield:Body=file:/tmp/b.txt"), "assertfield:Body=file:/tmp/b.txt");
-    assert_eq!(safe_step("assertfield:Password=env:PW"), "assertfield:Password=env:PW");
+    assert_eq!(safe_step("assertfield:Password=env:PW"), "assertfield:<redacted>");
     assert!(crate::flow::is_secret_step("assertfield:Password=cmd:pass show x"));
     assert!(!crate::flow::is_secret_step("readfield:Body"));
     let (verb, arg) = crate::timings::step_kind_arg("assertfield:Password=hunter2");
@@ -372,4 +372,56 @@ fn fill_clears_and_fails_a_secret_whose_element_write_did_not_land_in_a_plain_fi
     assert!(e.contains("read-back mismatch") && e.contains("cleared") && !e.contains("123456"), "{e}");
     assert!(mock.calls().iter().any(|c| c.1.ends_with("/element/t1/clear")), "the field was cleared");
     f.close();
+}
+
+#[test]
+fn fill_reacquires_the_named_field_after_a_missed_focus_probe() {
+    let mock = MockWda::start(typing_composer());
+    mock.set_custom_handler(|st, method, path, _| {
+        if method == "POST" && path.ends_with("/element/b1/click") {
+            st.keys_lost = true;
+            st.elements_map.insert(ekey(&["predicate string", &exact("Body")]), vec![json!({"ELEMENT": "b2"})]);
+            st.element_types.insert("b2".into(), json!("XCUIElementTypeTextView"));
+            st.set_element_value("b2", Dyn::one(json!("")));
+        }
+        if method == "POST" && path.ends_with("/element/b2/click") {
+            st.keys_lost = false;
+        }
+        // Let the mock apply its ordinary focus and typing semantics.
+        None
+    });
+    let mut f = flow(&mock);
+    let result = f.step(&format!("fill:Body={BODY}")).unwrap();
+    assert_eq!(result, Some(json!(format!("Body: len={}", BODY.chars().count()))));
+    let mut st = mock.state();
+    assert_eq!(st.element_values.get_mut("b1").unwrap().next(&serde_json::Value::Null), json!(""));
+    assert_eq!(st.element_values.get_mut("b2").unwrap().next(&serde_json::Value::Null), json!(BODY));
+    assert_eq!(st.typed_history.iter().filter(|(_, text, _)| text == BODY).count(), 1);
+}
+
+#[test]
+fn secret_field_failures_keep_the_trusted_reason_and_hide_runner_text() {
+    let mock = MockWda::start(typing_composer());
+    mock.set_custom_handler(|_, method, path, _| {
+        // A write can have taken effect even when its reply fails. Also make both
+        // the response and the supplied value collide with the diagnostic text.
+        if method == "POST" && path.ends_with("/element/t1/value") {
+            return Some(json!({"error":"field write","message":"bound XYZfragment"}));
+        }
+        None
+    });
+    let _env = set_env(&[("TT_FILL_BOUND", Some("bound field write XYZfragment"))]);
+    let mut f = flow(&mock);
+    let result = f.run(&["fill:Title=env:TT_FILL_BOUND".into()]).unwrap();
+    assert_eq!(result["failed_step"], json!("fill:<redacted>"));
+    assert_eq!(result["error"], json!("fill: bound field write failed; check the form with ui before trying again"));
+    assert_eq!(result["visible"], json!([]));
+    assert!(!result.to_string().contains("XYZfragment"));
+    assert_eq!(mock.paths().iter().filter(|p| p.ends_with("/element/t1/value")).count(), 1);
+    assert!(keys_typed(&mock).iter().all(|(text, _)| text == "x" || text == "\u{8}"));
+
+    let result = f.run(&["assertfield:Password=cmd:printf expected".into()]).unwrap();
+    assert_eq!(result["failed_step"], json!("assertfield:<redacted>"));
+    assert!(result["error"].as_str().unwrap().contains("length mismatch"));
+    assert!(!result.to_string().contains("printf"));
 }
