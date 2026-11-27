@@ -28,9 +28,11 @@ turbotap flow open:Spotify tap:"Your Library" tap:"Liked Songs@y>150" wait:songs
 # Open Weather and read the forecast (~0.6-1.1s)
 turbotap flow open:Weather read
 
-# Read the interface and fill the input you selected.
-turbotap flow ui
-turbotap flow "search:OBSERVED_FIELD=QUERY"
+# Search through the native accessibility role and tap an observed result.
+turbotap flow "open:$APP" "search:$QUERY" "tap:$OBSERVED_RESULT_LABEL"
+
+# Select a particular input when you need to override the role-based search.
+turbotap flow "search:$OBSERVED_FIELD=$QUERY"
 ```
 
 Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`/`tapbatch:fixed:`, `read:vision`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `assert:`, `assertnot:`, `alert:text`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
@@ -193,7 +195,7 @@ Turbotap acts on controls the caller selects from the live interface. The caller
 
 A matching `--deny-also` pattern on a keyboard key blocks Return or newline input. A matching `--deny` pattern there produces a warning. `--no-deny` and an explicitly empty `--deny` disable the label filters, including configured additions. `--allow-label` is accepted for compatibility and has no effect.
 
-`alert:text` shows the current iOS alert. An alert action needs an exact button label observed on that alert. Use `tap:LABEL`, `alert:accept:LABEL`, or `alert:dismiss:LABEL`. Caller deny rules apply to the selected label.
+`alert:text` shows the current iOS alert. Use `alert:accept` or `alert:dismiss` to request the native action after reading the alert. To select a particular observed button use `tap:LABEL`, `alert:accept:LABEL`, or `alert:dismiss:LABEL`. Caller deny rules still apply.
 
 **App guard.** List the apps `turbotap` may control in `allowed_apps` (per device under `devices.<name>`, or top-level for all devices; a device's own list wins). With a list in place, every input (`tap:`, `tapxy:`, `tapat:`, `tapel:`, `tapif:`, `tapbatch:`, `toggle:`, `slider:`, `picker:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `scroll:`, `scrollto:`, `back`, `type:`, `cleartype:`, `typedigits:`, `pintap:`, `key:`, `search:`, `dismisskb`, `setclip:`, named alert button taps, `tap-ocr`, `otp-type`) first asks WDA which app is in front (`/wda/activeAppInfo`, live, never cached) and is refused unless that app is on the list. The check runs again right before every request that would touch the screen, so an app switch in the middle of a step is caught too. If WDA can't say which app is in front, or answers with an error (an HTTP error, an `error` field, or a nonzero `status`), the action is refused. Only an HTTP 2xx answer counts. If `config.json` exists but can't be read or parsed (including a symlink whose target is missing), every input is refused until it is valid again (read-only commands still work); only a missing file means no list. `turbotap` resolves one device per run: with `--url`/`WDA_URL` or `--udid`/`WDA_UDID` it is the configured device at that endpoint (compared the way turbotap connects: host and port as parsed, and resolved addresses, so `localhost`, `127.1`, the IPv4-mapped `[::ffff:127.0.0.1]` or a zero-padded port all count as the same endpoint; turbotap then connects only to the addresses it checked) or with that UDID, and its URL, UDID, `allowed_apps` and `stop_file` are all used together (a UDID-only override connects to that device's URL). A `--device`/`WDA_DEVICE` that names a different device, several matching devices, two devices configured at the same endpoint, a `--udid` that contradicts the device at that URL or belongs to another configured device, a host name that resolves to a device plus other addresses, a configured host name on the same port that cannot be looked up right now, or a default device used with an endpoint no device in `config.json` has, makes `flow`, `unlock`, `deploy`, `tap-ocr` and `otp-type` stop with exit 6 before any request. A fixed `tapbatch:fixed:` or `pintap:` sends one touch at a time while the guard is on, so the check runs before each touch. A refusal stops the run with exit 1 and nothing is sent:
 
