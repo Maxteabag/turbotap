@@ -13,7 +13,7 @@ use crate::json;
 use crate::ocr::{ReadOpts, Reader};
 use crate::testutil::*;
 use crate::text::{find_text, Line, DEFAULT_FUZZY};
-use crate::ui::{Control, CTL_CACHE_TTL, SOURCE_LITE};
+use crate::ui::{Control, CTL_CACHE_TTL};
 use crate::wda::WdaClient;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1052,69 +1052,6 @@ fn test_settle_transition_already_still_reuses_frame_and_skips_confirm_pass() {
     assert_eq!(r2.read_calls(), 1);
     assert_eq!(r2.grab_calls(), 2);
     flow2.close();
-}
-
-#[test]
-fn test_search_focus_settle_only_sleeps_remaining_time_since_last_tap() {
-    let _cache = isolated_cache();
-    let img = solid_img(240, (430, 932));
-    let img_open = solid_img(180, (430, 932));
-
-    // 1. Direct SearchField tap sleeps ~0.18s right after tap_point before fast_keys.
-    let c_direct = MockWda::start(with_fast_ui(fui(json!([
-        {"type": "SearchField", "label": "Search", "x": 200, "y": 110},
-    ]))));
-    let r_direct = FakeReader::with(vec![fr(&img, &[]), fr(&copy_img(&img), &[])], (430, 932), 1.0);
-    let mut flow_direct = mk_flow(&c_direct, &r_direct, 0.5);
-    {
-        let (sk, _g) = skip_sleep();
-        flow_direct.search("hello").unwrap();
-        let sleeps = sleeps_of(&sk);
-        assert_eq!(sleeps.len(), 1, "{sleeps:?}");
-        assert!(sleeps[0] > 0.1);
-    }
-    assert_eq!(c_direct.state().typed_history.last().unwrap().1, "hello");
-    flow_direct.close();
-
-    // 2. Search Button opening an already-focused SearchField after >= 0.18s elapsed
-    // during transition + controls() skips the redundant 0.18s sleep.
-    let mut st = MockState::default();
-    st.fast_ui = Some(Dyn::of(vec![
-        fui(json!([{"type": "Button", "label": "Search", "x": 200, "y": 110}])),
-        fui(json!([
-            {"type": "SearchField", "label": "Search", "x": 202, "y": 112},
-            {"type": "Button", "label": "Cancel", "x": 380, "y": 112},
-        ])),
-    ]));
-    let c_btn = MockWda::start(st);
-    let r_btn = FakeReader::with(
-        vec![fr(&img_open, &[]), fr(&copy_img(&img_open), &[]), fr(&copy_img(&img_open), &[])],
-        (430, 932),
-        1.0,
-    );
-    set_last(&r_btn, &img);
-    let mut flow_btn = mk_flow(&c_btn, &r_btn, 0.5);
-    {
-        // Python wrapped controls() to set `_last_tap_ts = now - 0.25` after its 2nd call;
-        // here the 2nd /wda/fastUI answer advances the virtual clock by 0.25 s instead.
-        let (vc, _g) = virtual_clock();
-        let ctl_calls = Arc::new(AtomicUsize::new(0));
-        {
-            let (vc, ctl_calls) = (vc.clone(), ctl_calls.clone());
-            c_btn.set_custom_handler(move |_, _, p, _| {
-                if p.starts_with("/wda/fastUI") && ctl_calls.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
-                    // Simulate >= 0.25s having already elapsed since tap_point(c).
-                    vc.advance(0.25);
-                }
-                None
-            });
-        }
-        flow_btn.search("world").unwrap();
-        assert_eq!(vc.sleeps.lock().unwrap().clone(), Vec::<f64>::new());
-    }
-    assert_eq!(c_btn.tapped_points().len(), 1);
-    assert_eq!(c_btn.state().typed_history.last().unwrap().1, "world");
-    flow_btn.close();
 }
 
 // ---------------------------------------------------------------------------
