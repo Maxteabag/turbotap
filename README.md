@@ -28,8 +28,9 @@ turbotap flow open:Spotify tap:"Your Library" tap:"Liked Songs@y>150" wait:songs
 # Open Weather and read the forecast (~0.6-1.1s)
 turbotap flow open:Weather read
 
-# Search the App Store for Angry Birds and install it
-turbotap flow open:com.apple.AppStore search:"Angry Birds" tap:"Angry Birds 2" tap:Get
+# Read the interface and fill the input you selected.
+turbotap flow ui
+turbotap flow "search:OBSERVED_FIELD=QUERY"
 ```
 
 Run `turbotap flow --help` to see all available verbs (including `url:`, `toggle:`, `slider:`, `tapbatch:`/`tapbatch:fixed:`, `read:vision`, `scrollto:up:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `picker:`, `tapif:`, `waitany:`, `gone:`, `assert:`, `assertnot:`, `alert:text`, `key:`, `clipboard`/`setclip`, `re:` regexes, and `read:Y0-Y1` band OCR).
