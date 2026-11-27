@@ -976,11 +976,16 @@ impl<R: Reader> Flow<R> {
             .map(|c| (*c).clone()))
     }
 
-    /// Read a selected element's label or name from a successful WDA response.
-    fn element_attr(&mut self, eid: &str, attr: &str) -> Option<String> {
-        let p = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
-        let value = self.c.strict_get_value(&p).ok()?;
-        value.as_str().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+    /// Check the selected element against caller patterns using live attributes.
+    fn deny_checked_attribute(&mut self, eid: &str, attr: &str) -> Result<()> {
+        let path = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
+        match self.c.strict_get_value(&path) {
+            Ok(Value::Null) => Ok(()),
+            Ok(Value::String(text)) => self.guard(text.trim(), "tap"),
+            _ => Err(Error::flow(format!(
+                "could not verify the selected control's {attr} against caller deny patterns; nothing pressed"
+            ))),
+        }
     }
 
     /// Tap one exact, enabled accessibility control from a fresh tree.
@@ -1131,9 +1136,7 @@ impl<R: Reader> Flow<R> {
                             // The query can match a substring or an alias. Check both attributes
                             // of the selected element before sending the tap.
                             for attr in ["label", "name"] {
-                                if let Some(text) = self.element_attr(&eid, attr).filter(|text| text.as_str() != label) {
-                                    self.guard(&text, "tap")?;
-                                }
+                                self.deny_checked_attribute(&eid, attr)?;
                             }
                         }
                         self.tap_point_after_label_check(x, y, None)?;

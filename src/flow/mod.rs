@@ -53,7 +53,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         OCR cannot see falls back to the control with that label.
                         A Button labelled exactly TEXT beats a longer OCR line that
                         only contains it; a switch row's label taps the toggle;
-                        Next/Previous prefer the form button over the keyboard bar.
+                        If several targets match, use an exact label and location.
                         With an active iOS alert, waitany: can match an exact button
                         label and tap: presses it by name. The app guard still applies.
   tapif:TEXT            optional tap (~1 s max): tap TEXT (OCR + exact UI control
@@ -109,7 +109,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   slider:[LABEL=]PCT    set an XCUIElementTypeSlider to 0%-100% or 0.0-1.0 (first slider or
                         matched by label/name; rejects disabled sliders; respects --deny)
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
-  setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS 16+ may prompt Allow Paste)
+  setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS may ask permission to paste)
   dismisskb:LABEL       tap the unique enabled control with this exact accessibility label
   dismisskb:tapat:X,Y=LABEL  tap the exact labelled control at the caller's location hint
                         reports dismissed, kb-visible, no-kb or dismissal-unverified

@@ -1570,6 +1570,10 @@ fn test_tapel_checks_the_selected_elements_name_when_selected_by_label() {
     let err = flow.step("tapel:Continue").unwrap_err().to_string();
     assert!(err.contains("'blocked-action': matches --deny"), "{err}");
     assert!(mock.tapped_points().is_empty());
+    mock.set_custom_handler(|_, _, path, _| path.ends_with("/attribute/name").then(|| json!({"error": 404})));
+    let err = flow.step("tapel:Continue").unwrap_err().to_string();
+    assert!(err.contains("could not verify the selected control's name"), "{err}");
+    assert!(mock.tapped_points().is_empty());
     flow.close();
 }
 

@@ -32,11 +32,6 @@ fn value_list(r: &Value) -> Vec<Value> {
     }
 }
 
-/// A numeric rect field (`rc.get(key, 0)`); missing or non-numeric counts as 0.
-fn num(v: &Value, key: &str) -> f64 {
-    json::get(v, key).as_f64().unwrap_or(0.0)
-}
-
 fn on_off(b: bool) -> &'static str {
     if b {
         "on"
