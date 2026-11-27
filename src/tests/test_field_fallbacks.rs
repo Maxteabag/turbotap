@@ -49,6 +49,10 @@ fn hash_n_picks_inputs_in_reading_order_and_ocr_reads_an_empty_value() {
 fn assertfield_compares_ocr_text_without_caring_about_line_breaks() {
     let _c = isolated_cache();
     let m = MockWda::start(composer());
+    m.set_custom_handler(|_, method, path, _| {
+        (method == "POST" && path == "/wda/fastOCR")
+            .then(|| json!({"error": 404, "body": "unknown command"}))
+    });
     let mut f = flow(&m);
     let ok = f.step(&format!("assertfield:#1={TITLE}")).unwrap().unwrap();
     assert!(ok.as_str().unwrap().contains("read by OCR (host)"), "{ok}");

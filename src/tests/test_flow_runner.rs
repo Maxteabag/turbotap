@@ -453,7 +453,7 @@ fn test_springboard_system_alert_awareness_in_controls_and_read_full() {
     flow_src_alert.close();
 
     // 2. CRITICAL SAFETY INVARIANT: Ordinary outgoing SpringBoard Home Screen
-    // (bundleId="com.apple.springboard" + alert_text=None/empty/404) right after
+    // (bundleId="com.apple.springboard" and an explicit absent alert) right after
     // home -> open:App STILL retries _STALE_UI_BACKOFF and raises _StaleAppError in
     // controls() / returns ui_res=None in read_full(), never caching or exposing Home Screen icons.
     let sb_home_ui = fast_ui(
@@ -461,11 +461,11 @@ fn test_springboard_system_alert_awareness_in_controls_and_read_full() {
         "SpringBoard",
         "com.apple.springboard",
     );
-    for no_alert_val in [None, Some("   ")] {
+    for no_alert in [None, Some(json!({"value": null}))] {
         let mut st = MockState::default();
         st.active_app = Seq::one(json!("com.example.target"));
         st.fast_ui = Some(Dyn::one(sb_home_ui.clone()));
-        st.alert_text = no_alert_val.map(|v| Dyn::one(json!(v)));
+        st.alert_text = no_alert.map(Dyn::one);
         let c_home = MockWda::start(st);
         let r_home = FakeReader::with(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)], (430, 932), 1.0);
         let mut flow_home = mk_flow(&c_home, &r_home, 1.0);
@@ -1065,7 +1065,7 @@ fn test_tapif_hits_ocr_ui_respects_deny_and_skips_cleanly() {
     let lines = vec![ml("Not Now", 100, 400, 180, 420), ml("Delete", 100, 500, 180, 520)];
     let c = MockWda::start(with_fast_ui(fui(json!([{"type": "Button", "label": "Dismiss", "x": 380, "y": 90}]))));
     let r = FakeReader::new(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)]);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     assert_eq!(step_s(&mut flow, "tapif:Not Now"), "Not Now");
     assert_eq!(step_s(&mut flow, "tapif:Dismiss"), "[Button:Dismiss]");
     assert_eq!(step_s(&mut flow, "tapif:MissingBanner"), "skipped");
@@ -1245,7 +1245,7 @@ fn test_longpress_and_longpressxy_with_deny_guard() {
     let lines = vec![ml("Draft Note", 50, 240, 170, 260), ml("Delete", 50, 340, 130, 360)];
     let c = MockWda::start(MockState::default());
     let r = FakeReader::new(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)]);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     assert_eq!(step_s(&mut flow, "longpress:Draft Note"), "Draft Note");
     assert_eq!(*c.tapped_points().last().unwrap(), (110, 250, Some(0.65)));
 
@@ -1738,7 +1738,7 @@ fn test_tapbatch_regions_errors_fallback_and_upfront_deny_zero_taps() {
     ]);
     let c = MockWda::start(with_fast_ui(fui(key_ui.clone())));
     let r = FakeReader::with(vec![fr(&img, &lines), fr(&solid_img(100, (430, 932)), &lines)], (430, 932), 1.0);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     // @y> filter needs zero OCR calls on fixed-layout batch.
     assert_eq!(step_s(&mut flow, "tapbatch:fixed:1@y>200,2@y<600"), "2 taps");
     assert_eq!(r.read_calls(), 0);
@@ -1999,7 +1999,7 @@ fn test_toggle_idempotent_states_region_verification_and_guards() {
     };
     let c = MockWda::start(with_fast_ui(fui(base_ui.clone())));
     let r = FakeReader::with(vec![fr(&img_before, &lines), fr(&img_after, &lines)], (430, 932), 1.0);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     let before_after = || vec![fr(&img_before, &lines), fr(&img_after, &lines)];
 
     // 1. Idempotent zero-tap skip when already in desired state (all accepted spellings).
@@ -2168,7 +2168,7 @@ fn test_slider_parsing_matching_guards_disabled_and_errors() {
     }
     let c = MockWda::start(st);
     let r = FakeReader::new(vec![fr(&img, &[])]);
-    let mut flow = mk_flow(&c, &r, 0.5);
+    let mut flow = mk_flow_deny(&c, &r, 0.5, Some("^Delete"));
     // 1. Unlabelled slider selects first slider and normalizes %, 0-1, and >1-100.
     flow.store_ctl_cache(&ctls(&json!([{"type": "Button", "label": "Ok", "x": 50, "y": 50}])), Some(img.clone()));
     assert_eq!(step_s(&mut flow, "slider:50%"), "50%");
@@ -2878,7 +2878,7 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
     let pts = |m: &MockWda| m.tapped_points().iter().map(|p| (p.0, p.1)).collect::<Vec<_>>();
     // A control within 24 pt: tapped at its own centre (never the raw point).
     let (mock, r) = mk();
-    let mut flow = mk_flow(&mock, &r, 1.0);
+    let mut flow = mk_flow_deny(&mock, &r, 1.0, Some("^Delete"));
     let (ok, result) = flow.run_outcome(&["tapat:372,66".into()]).unwrap();
     assert!(!ok);
     assert!(result["error"].as_str().unwrap().contains("observed no visible reaction"));
@@ -2889,7 +2889,7 @@ fn test_tapat_guards_the_label_at_the_point_and_taps_that_point() {
         other => panic!("expected refusal, got {other:?}"),
     }
     // The label at the point goes through --deny; a disabled control is refused.
-    flow_err(flow.step("tapat:385,795"));
+    assert!(flow_err(flow.step("tapat:385,795")).contains("--deny"));
     flow_err(flow.step("tapat:300,800"));
     // Nothing labelled there: refused, naming the nearest labels.
     match flow.step("tapat:60,600") {
