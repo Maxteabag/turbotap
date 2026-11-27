@@ -667,9 +667,8 @@ impl<R: Reader> Flow<R> {
     /// fields, verified pairs and text of 40+ characters, checked with a probe.
     /// A missed focus gets one fresh lookup and attempt before the payload.
     /// Verified pairs and secrets use an element-bound write. Secrets get a
-    /// post-write focus check. Secure fields are checked by length. A field
-    /// missing while the keyboard is up is looked for again after a short
-    /// downward drag closes it.
+    /// post-write focus check. Secure fields are checked by length. If the
+    /// keyboard hides the target, the caller can make it visible and retry.
     pub fn fill(&mut self, arg: &str) -> Result<String> {
         let Some((field, spec)) = arg.split_once('=') else {
             return Err(Error::flow("fill expects FIELD=VALUE (VALUE: text, file:PATH, env:VAR or cmd:CMD)"));
@@ -686,18 +685,8 @@ impl<R: Reader> Flow<R> {
             }
         };
         let app = self.c.live_foreground_app(None).ok();
-        let FieldTarget { field: mut f, mut twin } = match self.find_field("fill", field, app.as_deref()) {
-            Ok(f) => f,
-            Err(e) if e.to_string().contains("no text input named") && self.keyboard_up() => {
-                // The keyboard can keep a list cell out of the accessibility tree.
-                let (w, h) = self.r.pt_size(&mut self.c, false, None).map_err(lookup_error)?;
-                let y0 = h * 2 / 5;
-                self.drag(w / 2, y0, w / 2, y0 + 80, 0.15, 0.0).map_err(lookup_error)?;
-                clock::sleep(0.3);
-                self.find_field("fill", field, app.as_deref()).map_err(lookup_error)?
-            }
-            Err(e) => return Err(lookup_error(e)),
-        };
+        let FieldTarget { field: mut f, mut twin } =
+            self.find_field("fill", field, app.as_deref()).map_err(lookup_error)?;
         let secret = secret_src || f.secure();
         if f.secure() && !secret_src {
             self.note_secret(&text);

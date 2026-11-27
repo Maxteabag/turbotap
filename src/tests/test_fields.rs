@@ -310,27 +310,20 @@ fn fill_clears_a_secure_field_whose_length_is_wrong() {
 }
 
 #[test]
-fn fill_looks_again_after_closing_the_keyboard() {
+fn fill_reports_a_hidden_target_without_dismissing_the_keyboard() {
     let mut st = typing_composer();
     st.elements_map.remove(&ekey(&["predicate string", &exact("Body")]));
+    st.elements_map.insert(ekey(&["predicate string", INPUT_TYPES_PRED]), vec![json!({"ELEMENT": "t1"})]);
     let mock = MockWda::start(st);
-    let dragged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let d2 = dragged.clone();
-    let body_pred = exact("Body");
-    mock.set_custom_handler(move |_st, _m, path, data| {
-        if path.contains("ragfromto") || path.ends_with("/wda/fastDrag") {
-            d2.store(true, std::sync::atomic::Ordering::SeqCst);
-            return None;
-        }
-        if path.ends_with("/elements") && data["value"] == json!(body_pred) {
-            let seen = d2.load(std::sync::atomic::Ordering::SeqCst);
-            return Some(json!({"value": if seen { vec![json!({"ELEMENT": "b1"})] } else { vec![] }}));
-        }
-        None
-    });
     let mut f = flow(&mock);
-    f.step("fill:Body=Short body").unwrap();
-    assert!(dragged.load(std::sync::atomic::Ordering::SeqCst));
+    let error = f.step("fill:Body=Short body").unwrap_err().to_string();
+    assert!(error.contains("no text input named") && error.contains("close the keyboard first"), "{error}");
+    assert!(mock.state().drags.is_empty());
+    assert!(mock.tapped_points().is_empty());
+    assert!(keys_typed(&mock).is_empty());
+    assert!(!mock.calls_to("/session/").iter().any(|(method, path, _)| {
+        method == "POST" && ["/click", "/clear", "/value"].iter().any(|suffix| path.ends_with(*suffix))
+    }));
     f.close();
 }
 

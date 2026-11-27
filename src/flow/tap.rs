@@ -3,7 +3,7 @@
 use super::{scope_controls, Flow};
 use crate::clock;
 use crate::error::{Error, Result};
-use crate::image::{box_diff, content_pixel_still, thumb_diff, Frame, GrayImage};
+use crate::image::{box_diff, content_pixel_still, thumb_diff, Frame};
 use crate::json;
 use crate::ocr::{ReadOpts, Reader};
 use crate::text::{casefold, clean_text, find_text, norm, split_where, Line, Match, DEFAULT_FUZZY};
@@ -25,8 +25,20 @@ fn ext_types() -> &'static [&'static str] {
     })
 }
 
-fn img(f: &Option<Frame>) -> Option<&GrayImage> {
-    f.as_deref()
+#[derive(Debug)]
+pub struct TapOutcome {
+    pub target: Match,
+    pub reaction_observed: bool,
+}
+
+impl TapOutcome {
+    pub(super) fn into_step_text(self) -> String {
+        if self.reaction_observed {
+            self.target.text
+        } else {
+            format!("{} (tap acknowledged, reaction unconfirmed)", self.target.text)
+        }
+    }
 }
 
 /// Python truthiness of an optional `where` string.
@@ -127,6 +139,17 @@ fn unique_part_control<'a>(controls: &'a [Control], text: &str) -> Option<&'a Co
         }
     }
     found
+}
+
+/// Resolve a caller label that OCR matched only as part of a longer line.
+fn matched_ocr_control<'a>(base: &str, controls: &'a [Control]) -> Option<&'a Control> {
+    exact_control(controls, base, TAP_FORM_TYPES, false).or_else(|| {
+        if base.starts_with("re:") {
+            None
+        } else {
+            unique_part_control(controls, base)
+        }
+    })
 }
 
 impl<R: Reader> Flow<R> {
@@ -268,7 +291,7 @@ impl<R: Reader> Flow<R> {
     /// (e.g. Calculator). If a recent control cache matches `base` and the screen has
     /// only changed locally, tap once and use the pixel diff solely to keep or
     /// invalidate the cache (never replays an acknowledged tap).
-    pub fn try_cached_tap(&mut self, base: &str) -> Result<Option<Match>> {
+    pub fn try_cached_tap(&mut self, base: &str) -> Result<Option<TapOutcome>> {
         if base.starts_with("re:") {
             return Ok(None);
         }
@@ -306,9 +329,9 @@ impl<R: Reader> Flow<R> {
             return Ok(None);
         }
         self.last_tap_small_delta = true;
-        let before = cur_img;
-        let m = self.tap_control(&c, None)?;
-        if self.changed_since(Some(before), 0.45, Some(c.x), Some(c.y))? {
+        let target = self.tap_control(&c, None)?;
+        let outcome = self.observe_tap(target, Some(cur_img));
+        if outcome.reaction_observed {
             if let Some(last) = self.r.last() {
                 if thumb_diff(Some(&cache_img), Some(&last)) >= 5.0 {
                     self.invalidate_ctl_cache();
@@ -317,16 +340,29 @@ impl<R: Reader> Flow<R> {
                     cache.img = last;
                 }
             }
-        } else {
-            // Pixels stayed still after an acknowledged tap: drop cached coordinates
-            // for future steps, but NEVER replay the tap.
+        }
+        Ok(Some(outcome))
+    }
+
+    fn observe_tap(&mut self, target: Match, before: Option<Frame>) -> TapOutcome {
+        // WDA has acknowledged the tap. A missing baseline, still pixels or a
+        // failed read cannot establish a screen reaction.
+        let reaction_observed = before.is_some()
+            && matches!(self.changed_since(before, 0.45, Some(target.x), Some(target.y)), Ok(true));
+        if !reaction_observed {
             self.invalidate_ctl_cache();
         }
-        Ok(Some(m))
+        TapOutcome { target, reaction_observed }
+    }
+
+    fn tap_observed_control(&mut self, control: &Control) -> Result<TapOutcome> {
+        let before = self.r.last();
+        let target = self.tap_control(control, None)?;
+        Ok(self.observe_tap(target, before))
     }
 
     /// L3231.
-    pub fn tap_text(&mut self, label: &str) -> Result<Match> {
+    pub fn tap_text(&mut self, label: &str) -> Result<TapOutcome> {
         let app_confirmed = self.wait_active_app(1.5, 0.03, None);
         let (base, where_) = split_where(label);
         let where_ = where_set(where_.as_deref()).map(str::to_string);
@@ -410,7 +446,7 @@ impl<R: Reader> Flow<R> {
             let scoped = scope(&ctl, fl, wh);
             let ext = ext_types();
             if let Some(c) = exact_control(&scoped, &base, ext, false) {
-                return self.tap_control(c, None);
+                return self.tap_observed_control(c);
             }
             if exact_control(&scoped, &base, ext, true).is_some() {
                 return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
@@ -440,11 +476,12 @@ impl<R: Reader> Flow<R> {
                     let ctl_fb = scope(&raw_ctl_fb, &cur_lines, wh);
                     if base.starts_with("re:") {
                         if let Some(cm) = find_control_match(&ctl_fb, &base, Some(WAIT_UI_TYPES), false) {
+                            let before = self.r.last();
                             self.tap_point(cm.x, cm.y, &cm.text, None)?;
-                            return Ok(cm);
+                            return Ok(self.observe_tap(cm, before));
                         }
                     } else if let Some(c) = find_control(&ctl_fb, &base, None, false).cloned() {
-                        return self.tap_control(&c, None);
+                        return self.tap_observed_control(&c);
                     }
                     let last = self.r.last();
                     if let Some(slines) = self.read_sauvola(last)?.filter(|s| !s.is_empty()) {
@@ -452,8 +489,9 @@ impl<R: Reader> Flow<R> {
                             if self.is_disabled_ocr_match(&sm, &base, &slines, wh, Some(&raw_ctl_fb)) {
                                 return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
                             }
+                            let before = self.r.last();
                             self.tap_point(sm.x, sm.y, &sm.text, None)?;
-                            return Ok(sm);
+                            return Ok(self.observe_tap(sm, before));
                         }
                     }
                     if base.starts_with("re:") {
@@ -466,35 +504,24 @@ impl<R: Reader> Flow<R> {
                     if wh.is_some() || base.starts_with("re:") {
                         return Err(e);
                     }
+                    let before = self.r.last();
                     let (x, y) = self.tap_el(&base, Some(2.0f64.max(self.timeout - 2.2)))?;
-                    return Ok(Match::new(x, y, format!("[el:{label}]"), None, 0));
+                    let target = Match::new(x, y, format!("[el:{label}]"), None, 0);
+                    return Ok(self.observe_tap(target, before));
                 }
                 Err(e) => return Err(e),
             },
         };
-        let (_, h) = self.tap_pt()?;
-        let near_bottom_tab = m.line.is_some() && m.y > h - 55;
-        let is_form_label = base.trim_end().ends_with(':');
         let mut resolved_ctl: Option<Vec<Control>> = None;
-        if m.line.is_some() && (m.rank != 0 || near_bottom_tab || is_form_label) {
-            // 1. m.rank > 0: OCR only found TEXT inside a longer line ('Sign in with
-            //    another account' for tap:"Sign In", or '1 2 3' for tap:2): a control
-            //    labelled exactly TEXT wins over the substring.
-            // 2. near_bottom_tab: OCR matched a tab label near the bottom edge
-            //    (y > h - 55, close to the home indicator): prefer the Tab/Button centre.
-            // 3. is_form_label: classic form label ('To:', 'Subject:', 'Til:', 'Emne:')
-            //    where OCR matches the left-aligned label text, but the focusable input
-            //    (TextField/TextView/SearchField) spans the row and should be tapped at
-            //    its centre.
+        if m.line.is_some() && m.rank != 0 {
             let cur_lines = if is_header_where(wh) { self.tap_current_lines()? } else { Vec::new() };
             let rc = self.tap_ctl(None)?;
             let ctl = scope(&rc, &cur_lines, wh);
-            let c = self.resolve_ocr_control(&m, &base, &ctl, near_bottom_tab, is_form_label)?;
+            if let Some(c) = matched_ocr_control(&base, &ctl) {
+                return self.tap_observed_control(c);
+            }
             drop(ctl);
             resolved_ctl = Some(rc);
-            if let Some(c) = c {
-                return self.tap_control(&c, None);
-            }
         }
         if m.line.is_some() && (resolved_ctl.is_some() || self.ctl_cache.is_some()) {
             let cur_lines = if is_header_where(wh) { self.r.last_lines().unwrap_or_default() } else { Vec::new() };
@@ -502,82 +529,21 @@ impl<R: Reader> Flow<R> {
                 return Err(Error::flow(format!("{} is disabled", json::py_repr_str(&base))));
             }
         }
-        // Take a fresh pre-tap baseline when m came from wait()'s UI fallback so
-        // changed_since() measures the tap cleanly (used for switch/input companion
-        // resolution and cache invalidation; never replays an acknowledged tap).
-        let before: Option<Frame> = if m.line.is_none() { Some(self.tap_grab()?) } else { self.r.last() };
+        // UI fallback may leave an older OCR frame, so refresh its baseline.
+        let before = if m.line.is_none() { Some(self.tap_grab()?) } else { self.r.last() };
         self.tap_point(m.x, m.y, &m.text, None)?;
-        if !self.changed_since(before.clone(), 0.45, Some(m.x), Some(m.y))? {
-            self.invalidate_ctl_cache();
-            // Tapping a switch row's label does nothing: tap the distinct toggle control
-            // on that row, unless the toggle itself already flipped.
-            let ctl = match resolved_ctl {
-                Some(rc) => rc,
-                None => self.tap_ctl(None)?,
-            };
-            if let Some(sw) = self.switch_near(&base, &m, Some(&ctl))? {
-                if (sw.x - m.x).abs() > 12 || (sw.y - m.y).abs() > 12 {
-                    let now_img = self.tap_grab()?;
-                    if box_diff(img(&before), Some(&now_img), sw.x as f64, sw.y as f64, self.r.scale(), 30.0, 18.0, 0) < 4.0 {
-                        return self.tap_control(&sw, None);
-                    }
-                    return Ok(m);
-                }
-            }
-            // Tapping a form field's static label may not focus its input: tap a
-            // distinct row-aligned TextField/TextView/SearchField/SecureTextField.
-            if let Some(inp) = self.input_near(&base, &m, Some(&ctl))? {
-                if (inp.x - m.x).abs() > 12 || (inp.y - m.y).abs() > 12 {
-                    return self.tap_control(&inp, None);
-                }
-            }
-        } else if let (Some(cache), Some(last)) = (self.ctl_cache.as_ref(), self.r.last()) {
+        let outcome = self.observe_tap(m, before);
+        if let (Some(cache), Some(last)) = (self.ctl_cache.as_ref(), self.r.last()) {
             if thumb_diff(Some(&cache.img), Some(&last)) >= CTL_CACHE_MAX_DIFF {
                 self.invalidate_ctl_cache();
             }
         }
-        Ok(m)
-    }
-
-    /// Shared by `tap_text` and `_tap_if_ocr_match`: the control that should win over
-    /// an OCR substring / bottom-tab / form-label hit.
-    fn resolve_ocr_control(
-        &mut self,
-        m: &Match,
-        base: &str,
-        ctl: &[Control],
-        near_bottom_tab: bool,
-        is_form_label: bool,
-    ) -> Result<Option<Control>> {
-        let mut c = if m.rank != 0 || is_form_label { exact_control(ctl, base, TAP_FORM_TYPES, false).cloned() } else { None };
-        // A list row labelled "Title, subtitle, status": the one row whose label has a
-        // part exactly equal to TEXT beats an OCR line that only contains TEXT.
-        if c.is_none() && m.rank != 0 && !base.starts_with("re:") {
-            c = unique_part_control(ctl, base).cloned();
-        }
-        if c.is_none() && is_form_label {
-            c = self.input_near(base, m, Some(ctl))?;
-        }
-        if c.is_none() && near_bottom_tab {
-            c = exact_control(ctl, base, &["Tab", "Button"], false).cloned();
-            if c.is_none() {
-                let near: Vec<Control> = ctl
-                    .iter()
-                    .filter(|x| {
-                        (x.kind == "Tab" || x.kind == "Button") && (x.y - m.y).abs() <= 35 && (x.x - m.x).abs() <= 60
-                    })
-                    .cloned()
-                    .collect();
-                c = find_control(&near, base, Some(&["Tab", "Button"]), false).cloned();
-            }
-        }
-        Ok(c)
+        Ok(outcome)
     }
 
     /// L3446 `_tap_if_ocr_match`: tap an OCR match found by tap_if, preferring an
-    /// exact control on substring/bottom-tab/form-label hits, skipping explicitly
-    /// disabled controls, enforcing the tap_if deadline right before dispatch, and
-    /// respecting --deny.
+    /// matched control on substring hits, skipping explicitly disabled controls,
+    /// enforcing the tap_if deadline right before dispatch, and respecting --deny.
     pub fn tap_if_ocr_match(
         &mut self,
         m: &Match,
@@ -591,15 +557,8 @@ impl<R: Reader> Flow<R> {
         if past(deadline) {
             return Ok("skipped".into());
         }
-        let h = match self.r.pt_size(&mut self.c, false, deadline) {
-            Ok((_, h)) => h,
-            Err(Error::Timeout(_)) => return Ok("skipped".into()),
-            Err(e) => return Err(e),
-        };
-        let near_bottom_tab = m.line.is_some() && m.y > h - 55;
-        let is_form_label = base.trim_end().ends_with(':');
         let mut resolved_ctl = controls;
-        if m.line.is_some() && (m.rank != 0 || near_bottom_tab || is_form_label) {
+        if m.line.is_some() && m.rank != 0 {
             if resolved_ctl.is_none() {
                 if let Some(d) = deadline {
                     if d - clock::now() <= 0.0 {
@@ -617,11 +576,11 @@ impl<R: Reader> Flow<R> {
                 return Ok("skipped".into());
             }
             let ctl = scope(resolved_ctl.as_deref().unwrap_or(&[]), lines, where_);
-            if let Some(c) = self.resolve_ocr_control(m, base, &ctl, near_bottom_tab, is_form_label)? {
+            if let Some(c) = matched_ocr_control(base, &ctl) {
                 if past(deadline) {
                     return Ok("skipped".into());
                 }
-                return Ok(self.tap_control(&c, deadline)?.text);
+                return Ok(self.tap_control(c, deadline)?.text);
             }
         }
         if self.is_disabled_ocr_match(m, base, lines, where_, resolved_ctl.as_deref()) {
@@ -906,74 +865,6 @@ impl<R: Reader> Flow<R> {
             self.invalidate_ctl_cache();
         }
         Ok(Match::new(c.x, c.y, format!("[{}:{}]", c.kind, c.label), None, 0))
-    }
-
-    /// L3713. The Switch on the matched text's row whose label contains `label`.
-    pub fn switch_near(&mut self, label: &str, m: &Match, controls: Option<&[Control]>) -> Result<Option<Control>> {
-        let owned;
-        let ctl: &[Control] = match controls {
-            Some(c) => c,
-            None => {
-                owned = self.tap_ctl(None)?;
-                &owned
-            }
-        };
-        let want = casefold(&clean_text(label));
-        let norm_m = norm(&m.text);
-        Ok(ctl
-            .iter()
-            .filter(|c| {
-                if c.kind != "Switch" || (c.y - m.y).abs() > 30 {
-                    return false;
-                }
-                let lab = casefold(&c.label);
-                lab.contains(&want) || norm_m.contains(&lab)
-            })
-            .min_by_key(|c| (c.y - m.y).abs())
-            .cloned())
-    }
-
-    /// L3721. Exact or row-aligned TextField/SearchField/SecureTextField/TextView for a
-    /// form label.
-    pub fn input_near(&mut self, label: &str, m: &Match, controls: Option<&[Control]>) -> Result<Option<Control>> {
-        let owned;
-        let ctl: &[Control] = match controls {
-            Some(c) => c,
-            None => {
-                owned = self.tap_ctl(None)?;
-                &owned
-            }
-        };
-        let inputs: Vec<&Control> = ctl.iter().filter(|c| INPUT_TYPES.contains(&c.kind.as_str())).collect();
-        if inputs.is_empty() {
-            return Ok(None);
-        }
-        let want = casefold(clean_text(label).trim_end_matches(':'));
-        let dy = |c: &Control| (c.y - m.y).abs();
-        if let Some(c) = inputs
-            .iter()
-            .filter(|c| dy(c) <= 35 && casefold(c.label.trim_end_matches(':')) == want)
-            .min_by_key(|c| dy(c))
-        {
-            return Ok(Some((*c).clone()));
-        }
-        let norm_m = norm(&m.text);
-        let norm_m = norm_m.trim_end_matches(':');
-        if let Some(c) = inputs
-            .iter()
-            .filter(|c| {
-                dy(c) <= 35
-                    && (casefold(&c.label).contains(&want) || norm_m.contains(&casefold(c.label.trim_end_matches(':'))))
-            })
-            .min_by_key(|c| dy(c))
-        {
-            return Ok(Some((*c).clone()));
-        }
-        Ok(inputs
-            .iter()
-            .filter(|c| dy(c) <= 25 && c.x >= m.x - 20)
-            .min_by_key(|c| (dy(c), (c.x - m.x).abs()))
-            .map(|c| (*c).clone()))
     }
 
     /// Check the selected element against caller patterns using live attributes.

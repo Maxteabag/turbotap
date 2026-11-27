@@ -762,7 +762,7 @@ fn test_tap_text_drains_transition_before_ocr() {
     let mut flow = mk_flow(&c, &r, 1.0);
     flow.last_action_ts = clock::now();
     flow.last_reaction_diff = 12.0;
-    let m = flow.tap_text("About").unwrap();
+    let m = flow.tap_text("About").unwrap().target;
     assert_eq!(m.text, "About");
     // Mid-transition frame f_mid was drained with grab(), never OCR'd.
     assert_eq!(r.read_calls(), 1);
@@ -805,13 +805,14 @@ fn test_keypad_control_cache_hit_and_invalidation_safety_net() {
     let ui_calls_before = count_prefix(&c, "/wda/fastUI");
 
     // Cached tap on "7" hits directly with 0 OCR and 0 extra /wda/fastUI calls.
-    let m7 = flow.tap_text("7").unwrap();
-    assert_eq!((m7.x, m7.y), (60, 380));
+    let tap7 = flow.tap_text("7").unwrap();
+    assert!(tap7.reaction_observed);
+    assert_eq!((tap7.target.x, tap7.target.y), (60, 380));
     assert_eq!(r.read_calls(), 0);
     assert_eq!(count_prefix(&c, "/wda/fastUI"), ui_calls_before);
 
     // Second cached tap on "8" also succeeds from cache.
-    let m8 = flow.tap_text("8").unwrap();
+    let m8 = flow.tap_text("8").unwrap().target;
     assert_eq!((m8.x, m8.y), (140, 380));
     assert_eq!(r.read_calls(), 0);
 
@@ -834,7 +835,7 @@ fn test_keypad_control_cache_hit_and_invalidation_safety_net() {
     assert!(flow.ctl_cache.is_none());
 
     // Safety net: non-reaction after an acknowledged cached tap invalidates
-    // cache for future steps, returns the Match, and NEVER replays the tap.
+    // cache for future steps and reports the acknowledged tap as unconfirmed.
     let still = solid_img(30, (240, 480));
     r.set_frames(vec![fr(&still, &[])]);
     set_last(&r, &still);
@@ -845,47 +846,59 @@ fn test_keypad_control_cache_hit_and_invalidation_safety_net() {
     let m_still = flow.try_cached_tap("7").unwrap();
     flow.changed_since_hook = None;
     let m_still = m_still.expect("cached tap match");
-    assert_eq!(m_still.text, "[Key:7]");
+    assert_eq!(m_still.target.text, "[Key:7]");
+    assert!(!m_still.reaction_observed);
     assert_eq!(count_eq(&c, "/wda/fastTap") - taps_before, 1);
     assert!(flow.ctl_cache.is_none());
     flow.close();
 }
 
 #[test]
-fn test_form_label_input_near_and_switch_near() {
+fn test_tap_unchanged_frame_reports_one_tap_on_the_selected_label() {
     let _cache = isolated_cache();
     let img = solid_img(240, (430, 932));
-    let img_changed = solid_img(100, (430, 932));
-    let lines = vec![ml("Subject:", 20, 200, 90, 220), ml("Wi-Fi", 20, 300, 80, 320)];
-    let ui = json!([
-        {"type": "TextField", "label": "Subject", "x": 230, "y": 210},
-        {"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 310, "value": "0"},
-    ]);
-    let c = MockWda::start(with_fast_ui(fui(ui)));
-    let r = FakeReader::with(vec![fr(&img, &lines), fr(&copy_img(&img), &lines)], (430, 932), 1.0);
-    let mut flow = mk_flow(&c, &r, 1.0);
-    // Tapping form label "Subject:" redirects to row-aligned TextField center (230, 210).
-    let m_sub = flow.tap_text("Subject:").unwrap();
-    assert_eq!((m_sub.x, m_sub.y), (230, 210));
+    let cases = [
+        (
+            "Subject:",
+            ml("Subject:", 20, 200, 90, 220),
+            (55, 210),
+            json!({"type": "TextField", "label": "Subject", "x": 230, "y": 210}),
+        ),
+        (
+            "Wi-Fi",
+            ml("Wi-Fi", 20, 300, 80, 320),
+            (50, 310),
+            json!({"type": "Switch", "label": "Wi-Fi", "x": 380, "y": 310, "value": "0"}),
+        ),
+        (
+            "Recipient",
+            ml("Recipient", 20, 400, 100, 420),
+            (60, 410),
+            json!({"type": "TextField", "label": "Address", "x": 230, "y": 410}),
+        ),
+        (
+            "Stopwatch",
+            ml("Stopwatch", 200, 888, 280, 904),
+            (240, 896),
+            json!({"type": "Tab", "label": "Stopwatch", "x": 240, "y": 882}),
+        ),
+    ];
 
-    // Tapping switch label "Wi-Fi" with no frame reaction falls back to Switch toggle (380, 310).
-    c.state().tapped_points.clear();
-    r.set_frames(vec![fr(&img, &lines), fr(&copy_img(&img), &lines), fr(&copy_img(&img), &lines)]);
-    flow.changed_since_hook = Some(false);
-    let m_sw = flow.tap_text("Wi-Fi").unwrap();
-    flow.changed_since_hook = None;
-    assert_eq!((m_sw.x, m_sw.y), (380, 310));
-    assert_eq!(last_tap_xy(&c), (380, 310));
+    for (label, line, point, control) in cases {
+        let c = MockWda::start(with_fast_ui(fui(json!([control]))));
+        let r = FakeReader::with(vec![fr(&img, &[line.clone()]), fr(&copy_img(&img), &[line.clone()])], (430, 932), 1.0);
+        let mut flow = mk_flow(&c, &r, 1.0);
+        let result = step_s(&mut flow, &format!("tap:{label}"));
+        assert_eq!(result, format!("{label} (tap acknowledged, reaction unconfirmed)"));
+        assert_eq!(tapped_xy(&c), vec![point], "{label}");
+        assert!(drags(&c).is_empty(), "{label}");
 
-    // If toggle pixels already changed (_box_diff >= 4), do NOT double-toggle.
-    c.state().tapped_points.clear();
-    r.set_frames(vec![fr(&img, &lines), fr(&copy_img(&img), &lines), fr(&img_changed, &lines)]);
-    flow.changed_since_hook = Some(false);
-    flow.tap_text("Wi-Fi").unwrap();
-    flow.changed_since_hook = None;
-    // Only the initial label tap occurred; no second toggle tap.
-    assert_eq!(c.tapped_points().len(), 1);
-    flow.close();
+        c.state().tapped_points.clear();
+        r.set_frames(vec![fr(&img, &[line])]);
+        assert_eq!(step_s(&mut flow, &format!("tapif:{label}")), label);
+        assert_eq!(tapped_xy(&c), vec![point], "{label}");
+        flow.close();
+    }
 }
 
 #[test]
@@ -923,13 +936,13 @@ fn test_tap_text_region_icon_control_shortcut_and_disabled_rejection() {
     let r = FakeReader::with(vec![fr(&img, &[])], (430, 932), 1.0);
     let mut flow = mk_flow(&c, &r, 0.4);
     // 1. Instant exact_control shortcut respects @y<150 and @y>700 (1 OCR read, 0 wait polls).
-    let m_top = flow.tap_text("Close@y<150").unwrap();
+    let m_top = flow.tap_text("Close@y<150").unwrap().target;
     assert_eq!((m_top.x, m_top.y), (380, 90));
     assert_eq!(r.read_calls(), 1);
 
     r.lock().read_calls = 0;
     flow.last_action_ts = 0.0;
-    let m_bot = flow.tap_text("Close@y>700").unwrap();
+    let m_bot = flow.tap_text("Close@y>700").unwrap().target;
     assert_eq!((m_bot.x, m_bot.y), (380, 780));
     assert_eq!(r.read_calls(), 1);
 
@@ -963,7 +976,7 @@ fn test_tap_text_region_icon_control_shortcut_and_disabled_rejection() {
     c.state().tapped_points.clear();
     flow.last_action_ts = 0.0;
     flow.timeout = 0.05;
-    let m_part = flow.tap_text("Add Item@y>700").unwrap();
+    let m_part = flow.tap_text("Add Item@y>700").unwrap().target;
     assert_eq!((m_part.x, m_part.y), (360, 820));
 
     c.state().tapped_points.clear();
@@ -1015,7 +1028,7 @@ fn test_settle_transition_already_still_reuses_frame_and_skips_confirm_pass() {
     let mut flow = mk_flow(&c, &r, 1.0);
     flow.last_action_ts = clock::now();
     flow.last_reaction_diff = 12.0;
-    let m = flow.tap_text("About").unwrap();
+    let m = flow.tap_text("About").unwrap().target;
     assert_eq!(m.text, "About");
     assert_eq!(r.read_calls(), 1);
     // 1 grab inside _settle_transition (reused for OCR) + 1 grab inside changed_since().
@@ -1034,7 +1047,7 @@ fn test_settle_transition_already_still_reuses_frame_and_skips_confirm_pass() {
     let mut flow2 = mk_flow(&c2, &r2, 1.0);
     flow2.last_action_ts = clock::now();
     flow2.last_reaction_diff = 12.0;
-    let m2 = flow2.tap_text("About").unwrap();
+    let m2 = flow2.tap_text("About").unwrap().target;
     assert_eq!(m2.text, "About");
     assert_eq!(r2.read_calls(), 1);
     assert_eq!(r2.grab_calls(), 2);
@@ -1276,37 +1289,18 @@ fn test_swipe_directional_and_row_swipes() {
 }
 
 #[test]
-fn test_bottom_tab_cold_cache_disabled_guard_and_center_refinement() {
+fn test_tapif_cold_cache_does_not_press_a_disabled_tab() {
     let _cache = isolated_cache();
-    let img1 = solid_img(240, (402, 874));
-    let img2 = solid_img(180, (402, 874));
-    let tab_lines = vec![ml("Stopwatch", 200, 828, 280, 844)]; // y = 836 (> 874 - 55 = 819)
-
-    // 1. Cold cache + disabled accessibility tab at (240, 822) under exact OCR at (240, 836):
-    // MUST fetch controls, report disabled, and dispatch ZERO tap POSTs.
-    let c_dis = MockWda::start(with_fast_ui(fui(json!([
+    let img = solid_img(240, (402, 874));
+    let lines = vec![ml("Stopwatch", 200, 828, 280, 844)];
+    let c = MockWda::start(with_fast_ui(fui(json!([
         {"type": "Tab", "label": "Stopwatch", "x": 240, "y": 822, "enabled": false}
     ]))));
-    let r_dis = FakeReader::with(vec![fr(&img1, &tab_lines), fr(&copy_img(&img1), &tab_lines)], (402, 874), 1.0);
-    let mut flow_dis = mk_flow(&c_dis, &r_dis, 0.5);
-    let msg = flow_err(flow_dis.tap_text("Stopwatch"));
-    assert!(msg.to_lowercase().contains("disabled"), "{msg}");
-    assert_eq!(c_dis.tapped_points(), vec![]);
-    flow_dis.close();
-
-    // 2. Enabled accessibility tab in the bottom band refines to the Tab centre (240, 822).
-    let c_en = MockWda::start(with_fast_ui(fui(json!([
-        {"type": "Tab", "label": "Stopwatch", "x": 240, "y": 822, "enabled": true}
-    ]))));
-    let r_en = FakeReader::with(
-        vec![fr(&img1, &tab_lines), fr(&copy_img(&img1), &tab_lines), fr(&img2, &tab_lines)],
-        (402, 874),
-        1.0,
-    );
-    let mut flow_en = mk_flow(&c_en, &r_en, 0.5);
-    flow_en.tap_text("Stopwatch").unwrap();
-    assert_eq!(tapped_xy(&c_en), vec![(240, 822)]);
-    flow_en.close();
+    let r = FakeReader::with(vec![fr(&img, &lines)], (402, 874), 1.0);
+    let mut flow = mk_flow(&c, &r, 0.5);
+    assert_eq!(step_s(&mut flow, "tapif:Stopwatch"), "skipped");
+    assert!(c.tapped_points().is_empty());
+    flow.close();
 }
 
 #[test]

@@ -81,32 +81,6 @@ impl<R: Reader> Flow<R> {
         Ok(())
     }
 
-    /// `banner:dismiss`: a notification banner over the app makes SpringBoard the front
-    /// app for a moment and covers the top of the screen. When SpringBoard is in front
-    /// of the flow's app and the phone is not locked, swipe the banner up (top band) and
-    /// wait up to 1 s for the app to be back. Otherwise nothing is sent ("none"). One
-    /// foreground read, so it fits before a final check without slowing every read.
-    pub fn dismiss_banner(&mut self) -> Result<String> {
-        let Ok(front) = self.c.live_foreground_app(None) else { return Ok("none".into()) };
-        if front != crate::wda::SPRINGBOARD {
-            return Ok("none".into());
-        }
-        let locked = self.c.get("/wda/locked");
-        if json::get(&locked, "value").as_bool() == Some(true) {
-            return Ok("none (locked)".into());
-        }
-        let (w, _) = self.act_pt_size()?;
-        self.drag(w / 2, 60, w / 2, 4, 0.12, 0.02)?;
-        let end = clock::now() + 1.0;
-        while clock::now() < end {
-            if self.c.live_foreground_app(None).is_ok_and(|f| f != crate::wda::SPRINGBOARD) {
-                return Ok("dismissed".into());
-            }
-            clock::sleep(0.1);
-        }
-        Ok("swiped (SpringBoard still in front)".into())
-    }
-
     /// L3935. Scroll 54% of the screen without momentum (wda-turbo fastDrag crawls
     /// 1 pt during the 80 ms hold, so the release velocity is ~0 while keeping 46%
     /// viewport overlap so no row is skipped).

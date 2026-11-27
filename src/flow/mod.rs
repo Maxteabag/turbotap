@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::image::Frame;
 use crate::json;
 use crate::ocr::{ReadOpts, Reader, ScreenReader};
-use crate::text::{split_where, Line, Match};
+use crate::text::{split_where, Line};
 use crate::ui::{self, Control};
 use crate::wda::{check_wda_ok, WdaClient};
 use serde_json::{json as j, Value};
@@ -109,8 +109,6 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
   dismisskb:LABEL       tap the unique enabled control with this exact accessibility label
   dismisskb:tapat:X,Y=LABEL  tap the exact labelled control at the caller's location hint
                         reports dismissed, kb-visible, no-kb or dismissal-unverified
-  banner:dismiss        swipe away a notification banner over the app (only when SpringBoard
-                        is in front and the phone is unlocked; otherwise nothing is sent)
   alert:accept|dismiss|text accept, dismiss, or read an active iOS system alert
   scroll:down|up        one screen-height-ish swipe, then wait for it to settle
   scrollto:TEXT         scroll down (max 8x) until TEXT is visible; at the end of the list
@@ -843,7 +841,7 @@ impl<R: Reader> Flow<R> {
                 if let Some(button) = self.tap_named_alert(arg)? {
                     return some(button);
                 }
-                return some(self.tap_text(arg)?.text);
+                return some(self.tap_text(arg)?.into_step_text());
             }
             "tapif" => return some(self.tap_if(arg, 1.0)?),
             "tapbatch" => return some(self.tap_batch(arg)?),
@@ -985,8 +983,6 @@ impl<R: Reader> Flow<R> {
             "assertfield" => return some(self.assert_field(arg)?),
             "fill" => return some(self.fill(arg)?),
             "dismisskb" => return some(self.tap_navigation_target(&verb, arg)?),
-            "banner" if arg.trim() == "dismiss" => return some(self.dismiss_banner()?),
-            "banner" => return Err(Error::flow("banner: use banner:dismiss")),
             "typedigits" => return some(self.type_digits(arg)?),
             "pintap" => return some(self.pin_tap(arg)?),
             "alert" => {
@@ -1635,11 +1631,12 @@ pub fn cmd_tap_ocr(client: WdaClient, text: &str) -> Result<()> {
     flow.c.guard_action = Some("tap-ocr".into());
     flow.c.ensure_allowed_app("tap-ocr", None)?;
     let t0 = clock::real_now();
-    let m = flow.tap_text(text);
-    let m: Match = flow.c.guard_result(m)?;
+    let outcome = flow.tap_text(text);
+    let outcome = flow.c.guard_result(outcome)?;
+    let m = outcome.target;
     crate::outln!(
         "{}",
-        json::dumps(&j!({"ok": true, "matched": m.text, "x": m.x, "y": m.y, "ms": ((clock::real_now() - t0) * 1000.0).round() as i64}))
+        json::dumps(&j!({"ok": true, "matched": m.text, "x": m.x, "y": m.y, "reaction_observed": outcome.reaction_observed, "ms": ((clock::real_now() - t0) * 1000.0).round() as i64}))
     );
     flow.close();
     Ok(())
