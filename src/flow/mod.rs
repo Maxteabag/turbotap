@@ -110,6 +110,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         matched by label/name; rejects disabled sliders; respects --deny)
   clipboard             read device clipboard plaintext via /wda/getPasteboard (alias: copy)
   setclip:TEXT|env:V|cmd:C set device clipboard plaintext via /wda/setPasteboard (iOS may ask permission to paste)
+  dismisskb             gesture to dismiss an observed docked keyboard
   dismisskb:LABEL       tap the unique enabled control with this exact accessibility label
   dismisskb:tapat:X,Y=LABEL  tap the exact labelled control at the caller's location hint
                         reports dismissed, kb-visible, no-kb or dismissal-unverified
@@ -122,6 +123,7 @@ pub const FLOW_HELP: &str = r"steps (one argument each, run in order):
                         it turns and searches back up (scrollto:up:TEXT / scrollto:down:TEXT
                         scroll one way only)
   swipe:left|right|up|down fast mid-screen directional swipe (carousels, tabs, pull-to-refresh)
+  swipe:points:X0,Y0:X1,Y1  swipe between two caller-selected screen points
   swipe:left|right:TEXT horizontal row swipe on TEXT's row (damped 80%->30% / 20%->70% to reveal
                         row actions without triggering full-width destructive delete)
   back                  send the iOS edge-swipe gesture
@@ -1051,6 +1053,7 @@ impl<R: Reader> Flow<R> {
             "readfield" => return some(self.read_field(arg)?),
             "assertfield" => return some(self.assert_field(arg)?),
             "fill" => return some(self.fill(arg)?),
+            "dismisskb" if !spec.contains(':') => return some(self.dismiss_keyboard()?),
             "dismisskb" => return some(self.tap_navigation_target(&verb, arg)?),
             "typedigits" => return some(self.type_digits(arg)?),
             "pintap" => return some(self.pin_tap(arg)?),
@@ -1737,7 +1740,7 @@ pub fn flow_needs_ocr(steps: &[String]) -> bool {
             return !engine.eq_ignore_ascii_case("vision");
         }
         if v.eq_ignore_ascii_case("swipe") {
-            return arg.split_once(':').is_some_and(|(_, target)| !target.trim().is_empty());
+            return arg.split_once(':').is_some_and(|(kind, target)| !kind.trim().eq_ignore_ascii_case("points") && !target.trim().is_empty());
         }
         IMAGE_STEP_VERBS.iter().any(|iv| iv.eq_ignore_ascii_case(v))
     })

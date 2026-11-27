@@ -1463,6 +1463,23 @@ fn kb_ui(items: Value, has_kb: bool) -> Value {
 }
 
 #[test]
+fn test_swipe_points_sends_one_gesture_to_the_requested_coordinates() {
+    let _cache = isolated_cache();
+    let img = solid_img(240, (430, 932));
+    let mock = MockWda::start(MockState::default());
+    let mut flow = mk_flow(&mock, &FakeReader::new(vec![fr(&img, &[])]), 0.5);
+
+    assert_eq!(step_s(&mut flow, "swipe:points:215,80:215,12"), "gesture-sent");
+    assert!(flow.step("swipe:points:215,80:215,-12").is_err());
+    let sent = drags(&mock);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["fromY"], 80);
+    assert_eq!(sent[0]["toY"], 12);
+    assert!(mock.tapped_points().is_empty());
+    flow.close();
+}
+
+#[test]
 fn test_back_only_sends_the_requested_gesture_or_exact_tap() {
     let _cache = isolated_cache();
     let (_s, _g) = skip_sleep();
@@ -1516,7 +1533,7 @@ fn test_tap_and_tapif_do_not_treat_a_back_label_as_an_alias() {
 }
 
 #[test]
-fn test_dismisskb_requires_a_target_and_observes_keyboard_after_tapping() {
+fn test_dismisskb_checks_exact_targets_and_observes_keyboard_after_tapping() {
     let _cache = isolated_cache();
     let (_s, _g) = skip_sleep();
     let img = solid_img(240, (430, 932));
@@ -1529,7 +1546,7 @@ fn test_dismisskb_requires_a_target_and_observes_keyboard_after_tapping() {
     let mock = MockWda::start(with_fast_ui(kb_ui(controls.clone(), true)));
     let mut flow = mk_flow_deny(&mock, &reader, 0.5, Some("^Done$"));
 
-    assert!(flow_err(flow.step("dismisskb")).contains("use dismisskb:LABEL"));
+    assert_eq!(step_s(&mut flow, "dismisskb"), "kb-visible");
     assert!(flow_err(flow.step("dismisskb:Fold")).contains("no control labelled exactly"));
     assert!(flow_err(flow.step("dismisskb:Compact input")).contains("is disabled"));
     assert!(flow_err(flow.step("dismisskb:Done")).contains("refus"));
@@ -1551,6 +1568,34 @@ fn test_dismisskb_requires_a_target_and_observes_keyboard_after_tapping() {
     assert_eq!(step_s(&mut flow, "dismisskb:Fold input"), "no-kb");
     assert_eq!(mock.tapped_points().len(), 2);
     assert!(drags(&mock).is_empty());
+    flow.close();
+}
+
+#[test]
+fn test_bare_dismisskb_gestures_only_for_a_docked_keyboard() {
+    let _cache = isolated_cache();
+    let (_s, _g) = skip_sleep();
+    let img = solid_img(240, (430, 932));
+    let reader = FakeReader::new(vec![fr(&img, &[])]);
+    let mut keyboard = kb_ui(json!([]), true);
+    keyboard["keyboardRect"] = json!({"x": 100, "y": 600, "width": 230, "height": 250});
+    let mock = MockWda::start(with_fast_ui(keyboard.clone()));
+    let mut flow = mk_flow(&mock, &reader, 0.5);
+
+    assert_eq!(step_s(&mut flow, "dismisskb"), "kb-visible");
+    assert!(drags(&mock).is_empty());
+    keyboard["keyboardRect"] = json!({"x": 0, "y": 600, "width": 430, "height": 332});
+    set_fast_ui(&mock, keyboard);
+    mock.set_on_action(|st, action, _| {
+        if action == "drag" {
+            st.fast_ui = Some(Dyn::one(kb_ui(json!([]), false)));
+        }
+    });
+    assert_eq!(step_s(&mut flow, "dismisskb"), "dismissed");
+    assert_eq!(drags(&mock).len(), 1);
+    assert_eq!(step_s(&mut flow, "dismisskb"), "no-kb");
+    assert_eq!(drags(&mock).len(), 1);
+    assert!(mock.tapped_points().is_empty());
     flow.close();
 }
 

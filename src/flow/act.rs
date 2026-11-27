@@ -103,6 +103,21 @@ impl<R: Reader> Flow<R> {
         let (direction, target) = spec.split_once(':').unwrap_or((spec, ""));
         let direction = direction.trim().to_lowercase();
         let target = target.trim();
+        if direction == "points" {
+            let usage = || Error::flow("swipe:points expects X0,Y0:X1,Y1");
+            let (from, to) = target.split_once(':').ok_or_else(usage)?;
+            let (x0, y0, label0) = super::parse_tap_at(from).map_err(|_| usage())?;
+            let (x1, y1, label1) = super::parse_tap_at(to).map_err(|_| usage())?;
+            if label0.is_some() || label1.is_some() || (x0, y0) == (x1, y1) {
+                return Err(usage());
+            }
+            let (w, h) = self.act_pt_size()?;
+            if [(x0, y0), (x1, y1)].iter().any(|&(x, y)| !(0..w).contains(&x) || !(0..h).contains(&y)) {
+                return Err(Error::flow("swipe:points requires two points inside the current screen"));
+            }
+            self.drag(x0, y0, x1, y1, 0.18, 0.02)?;
+            return Ok("gesture-sent".into());
+        }
         if !matches!(direction.as_str(), "left" | "right" | "up" | "down") {
             return Err(Error::flow(format!(
                 "swipe:{}? use swipe:left|right|up|down or swipe:left|right:TEXT",
@@ -631,10 +646,14 @@ impl<R: Reader> Flow<R> {
 
     /// Report only keyboard state observed in this read, including on stock WDA.
     pub(super) fn keyboard_visible(&mut self) -> Result<Option<bool>> {
+        Ok(self.keyboard_observation()?.map(|(visible, _)| visible))
+    }
+
+    fn keyboard_observation(&mut self) -> Result<Option<(bool, Option<Value>)>> {
         self.c.last_fast_ui_kb = None;
         if self.controls_opt(false, None, None, true, false)?.is_some() {
-            if let Some((Some(visible), _)) = &self.c.last_fast_ui_kb {
-                return Ok(Some(*visible));
+            if let Some((Some(visible), rect)) = &self.c.last_fast_ui_kb {
+                return Ok(Some((*visible, rect.clone())));
             }
         }
         let path = self.c.spath("/elements");
@@ -644,12 +663,13 @@ impl<R: Reader> Flow<R> {
             return Ok(None);
         };
         if elements.is_empty() {
-            return Ok(Some(false));
+            return Ok(Some((false, None)));
         }
 
         let (_, screen_height) = self.act_pt_size()?;
+        let mut observed = None;
         for element in elements {
-            let Some(id) = element_id(element) else { continue };
+            let Some(id) = super::wda_element_ref(element) else { continue };
             let path = self.c.spath(&format!("/element/{id}/rect"));
             let Ok(rect) = self.c.strict_get_value(&path) else { continue };
             if let (Some(y), Some(width), Some(height)) = (
@@ -658,11 +678,45 @@ impl<R: Reader> Flow<R> {
                 rect["height"].as_f64(),
             ) {
                 if width > 0.0 && height > 0.0 && y < screen_height as f64 && y + height > 0.0 {
-                    return Ok(Some(true));
+                    if observed.is_some() {
+                        return Ok(Some((true, None)));
+                    }
+                    observed = Some(rect);
                 }
             }
         }
-        Ok(None)
+        Ok(observed.map(|rect| (true, (elements.len() == 1).then_some(rect))))
+    }
+
+    /// Send one dismissal gesture when a native keyboard occupies the bottom edge.
+    pub(super) fn dismiss_keyboard(&mut self) -> Result<String> {
+        let rect = match self.keyboard_observation()? {
+            Some((false, _)) => return Ok("no-kb".into()),
+            Some((true, Some(rect))) => rect,
+            Some((true, None)) => return Ok("kb-visible".into()),
+            None => return Ok("dismissal-unverified".into()),
+        };
+        let (w, h) = self.act_pt_size()?;
+        let (Some(x), Some(y), Some(width), Some(height)) = (
+            rect["x"].as_f64(), rect["y"].as_f64(),
+            rect["width"].as_f64(), rect["height"].as_f64(),
+        ) else {
+            return Ok("kb-visible".into());
+        };
+        if x.abs() > 8.0 || width < w as f64 - 16.0 || height <= 0.0
+            || (y + height - h as f64).abs() > 50.0 || y < 140.0 || y + 60.0 >= h as f64
+        {
+            return Ok("kb-visible".into());
+        }
+        self.drag(w / 2, y as i64 - 48, w / 2, y as i64 + 60, 0.2, 0.0)?;
+        self.invalidate_ctl_cache();
+        clock::sleep(0.3);
+        match self.keyboard_visible() {
+            Ok(Some(false)) => Ok("dismissed".into()),
+            Ok(Some(true)) => Ok("kb-visible".into()),
+            Ok(None) => Ok("dismissal-unverified".into()),
+            Err(e) => Err(Error::flow(format!("dismisskb sent the gesture but could not verify keyboard state: {e}"))),
+        }
     }
 }
 
