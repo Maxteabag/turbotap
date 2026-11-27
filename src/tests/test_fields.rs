@@ -426,6 +426,15 @@ fn secret_field_failures_keep_the_trusted_reason_and_hide_runner_text() {
     assert!(!result.to_string().contains("printf"));
 }
 
+fn title_twin_source(st: &MockState) -> Dyn {
+    Dyn::one(json!({"type":"Application", "children":[
+        {"type":"TextView", "name":"form.title", "isVisible":"1", "isAccessible":"0",
+            "rect":st.element_rects["title-id"],
+            "children":[{"type":"TextView", "name":"Title", "label":"Title", "isVisible":"1",
+                "isAccessible":"1", "rect":st.element_rects["t1"]}]}
+    ]}))
+}
+
 fn composer_with_title_twin() -> MockState {
     let mut st = typing_composer();
     st.elements_map.insert(
@@ -438,6 +447,7 @@ fn composer_with_title_twin() -> MockState {
     st.element_names.insert("t1".into(), json!("Title"));
     st.element_rects.insert("t1".into(), json!({"x": 16, "y": 150, "width": 398, "height": 90}));
     st.element_rects.insert("title-id".into(), json!({"x": 18, "y": 149, "width": 398, "height": 90}));
+    st.source_tree = title_twin_source(&st);
     st.set_element_value("title-id", Dyn::one(json!("")));
     st.set_element_value("b1", Dyn::one(json!("Body text")));
     st
@@ -478,6 +488,7 @@ fn fill_by_identifier_recovers_when_the_probe_changes_the_inset_editor() {
     let mut st = composer_with_title_twin();
     st.element_rects.insert("title-id".into(), json!({"x": 16, "y": 150, "width": 398, "height": 114}));
     st.element_rects.insert("t1".into(), json!({"x": 16, "y": 150, "width": 398, "height": 110}));
+    st.source_tree = title_twin_source(&st);
     let mock = MockWda::start(st);
     mock.set_custom_handler(|_, _, path, _| {
         twin_visible(path)

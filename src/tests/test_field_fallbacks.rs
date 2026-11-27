@@ -98,7 +98,12 @@ fn exact_field_read_uses_full_tree_editor_before_ocr() {
     let editor = json!({"type":"TextView", "name":"Heading", "label":"Heading", "isVisible":"1",
         "isAccessible":"1", "value":VALUE, "rect":{"x":16,"y":150,"width":398,"height":110}});
     st.element_rects.insert("t1".into(), wrapper["rect"].clone());
-    st.source_tree = Dyn::one(json!({"type":"Application","children":[wrapper,editor]}));
+    let nested = |children| {
+        let mut anchor = wrapper.clone();
+        anchor["children"] = children;
+        json!({"type":"Application","children":[anchor]})
+    };
+    st.source_tree = Dyn::one(nested(json!([{"type":"Other","children":[editor]}])));
     let mock = MockWda::start(st);
     let mut f = flow(&mock);
 
@@ -109,7 +114,19 @@ fn exact_field_read_uses_full_tree_editor_before_ocr() {
     assert!(mock.paths().iter().any(|p| p.ends_with("/source?format=json")));
     assert!(!mock.paths().iter().any(|p| p.contains("fastOCR")));
 
-    // Two equally plausible editors must not prove an exact value.
-    mock.state().source_tree = Dyn::one(json!({"type":"Application","children":[wrapper,editor,editor]}));
+    // A nearby sibling and two nested candidates are both insufficient.
+    mock.state().source_tree = Dyn::one(json!({"type":"Application","children":[wrapper,editor]}));
+    assert!(f.step(&assert_step).is_err());
+    mock.state().source_tree = Dyn::one(nested(json!([editor,editor])));
+    assert!(f.step(&assert_step).is_err());
+
+    // A matching snapshot after a foreground switch is stale for this lookup.
+    mock.state().source_tree = Dyn::one(nested(json!([editor])));
+    mock.set_custom_handler(|st, method, path, _| {
+        if method == "POST" && path.ends_with("/elements") {
+            st.active_app = Seq::one(json!("com.example.other"));
+        }
+        None
+    });
     assert!(f.step(&assert_step).is_err());
 }

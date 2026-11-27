@@ -145,6 +145,39 @@ fn fields_near_source<'a>(node: &'a Value, kind: &str, rect: FieldRect, fields: 
     }
 }
 
+fn source_field_anchor<'a>(root: &'a Value, kind: &str, rect: FieldRect, name: &str, label: &str) -> Option<&'a Value> {
+    let mut nearby = Vec::new();
+    fields_near_source(root, kind, rect, &mut nearby);
+    let mut matches = nearby.into_iter().filter(|node| {
+        let identity_matches = if name.is_empty() {
+            source_text(node, "label") == label
+        } else {
+            source_text(node, "name") == name
+        };
+        identity_matches && source_rect(node).is_some_and(|r| field_frames_match(rect, r, false))
+    });
+    let anchor = matches.next()?;
+    matches.next().is_none().then_some(anchor)
+}
+
+fn source_descendant_editor<'a>(anchor: &'a Value, kind: &str, rect: FieldRect) -> Option<&'a Value> {
+    if !source_flag(anchor, "isAccessible", "accessible", false) || !source_text(anchor, "label").is_empty() {
+        return None;
+    }
+    let mut descendants = Vec::new();
+    for child in anchor.get("children")?.as_array()? {
+        fields_near_source(child, kind, rect, &mut descendants);
+    }
+    let [editor] = descendants.as_slice() else { return None };
+    let label = source_text(editor, "label");
+    let name = source_text(editor, "name");
+    let anchor_name = source_text(anchor, "name");
+    (source_flag(editor, "isAccessible", "accessible", true)
+        && !label.is_empty() && label != anchor_name
+        && (name.is_empty() || name == anchor_name || name == label))
+        .then_some(*editor)
+}
+
 fn source_field_content(node: &Value, placeholder: &str) -> Option<String> {
     let value = source_text(node, "value");
     let source_placeholder = source_text(node, "placeholderValue");
@@ -342,7 +375,7 @@ impl<R: Reader> Flow<R> {
 
     /// Require a unique mutual neighbor before examining names. A third nearby
     /// representation leaves all of them separate, even if its metadata is sparse.
-    fn field_twin(&mut self, nodes: &[FieldNode], index: usize, name: &str) -> Option<(usize, FieldTarget)> {
+    fn field_twin(&mut self, nodes: &[FieldNode], index: usize, name: &str, app: Option<&str>) -> Option<(usize, FieldTarget)> {
         let node = &nodes[index];
         let mut nearby = nodes.iter().enumerate().filter(|(i, other)| *i != index && node.near(other, true));
         let (other_index, other) = nearby.next()?;
@@ -378,13 +411,17 @@ impl<R: Reader> Flow<R> {
             return None;
         }
 
-        if !node.near(other, false) {
-            // Allow the extra height of a wrapper only with positive evidence
-            // that it is inaccessible and the named editor is accessible.
-            let wrapper_accessible = self.field_attr(&id_only.id, "accessible");
-            let editor_accessible = self.field_attr(&visible_alias.id, "accessible");
-            if !(wrapper_accessible == "0" || wrapper_accessible.eq_ignore_ascii_case("false"))
-                || !(editor_accessible == "1" || editor_accessible.eq_ignore_ascii_case("true"))
+        if !node.near(other, false) || alias.trim() != identifier.trim() {
+            // Geometry alone cannot link different identifiers. Verify the
+            // editor is explicitly nested under the wrapper in the same tree.
+            let root = self.field_source(app?)?;
+            let kind = id_only.kind.strip_prefix("XCUIElementType")?;
+            let wrapper_rect = if id_only.id == node.id { node.rect? } else { other.rect? };
+            let editor_rect = if visible_alias.id == node.id { node.rect? } else { other.rect? };
+            let anchor = source_field_anchor(&root, kind, wrapper_rect, &identifier, "")?;
+            let editor = source_descendant_editor(anchor, kind, wrapper_rect)?;
+            if source_text(editor, "label") != visible_label
+                || !source_rect(editor).is_some_and(|r| field_frames_match(editor_rect, r, false))
             {
                 return None;
             }
@@ -399,7 +436,7 @@ impl<R: Reader> Flow<R> {
 
     /// The one input named by label, identifier or placeholder. Exact matches
     /// beat substrings. A verified pair counts as one input in this lookup.
-    fn find_field(&mut self, verb: &str, field: &str) -> Result<FieldTarget> {
+    fn find_field(&mut self, verb: &str, field: &str, app: Option<&str>) -> Result<FieldTarget> {
         let f = field.trim();
         if f.is_empty() {
             return Err(Error::flow(format!("{verb}: empty field name")));
@@ -414,7 +451,7 @@ impl<R: Reader> Flow<R> {
                 if skipped[index] {
                     continue;
                 }
-                let paired = self.field_twin(&nodes, index, f).map(|(twin, target)| {
+                let paired = self.field_twin(&nodes, index, f, app).map(|(twin, target)| {
                     skipped[twin] = true;
                     target
                 });
@@ -446,7 +483,7 @@ impl<R: Reader> Flow<R> {
         if matches!(ids.len(), 1 | 2) {
             let nodes = self.field_snapshot();
             if let Some(index) = nodes.iter().position(|node| node.id == ids[0]) {
-                if let Some((twin_index, mut target)) = self.field_twin(&nodes, index, f) {
+                if let Some((twin_index, mut target)) = self.field_twin(&nodes, index, f, app) {
                     if ids.len() == 1 || ids[1] == nodes[twin_index].id {
                         if ids.len() == 1 {
                             target.prefer(&ids[0]);
@@ -616,7 +653,8 @@ impl<R: Reader> Flow<R> {
                 e
             }
         };
-        let FieldTarget { field: mut f, mut twin } = match self.find_field("fill", field) {
+        let app = self.c.live_foreground_app(None).ok();
+        let FieldTarget { field: mut f, mut twin } = match self.find_field("fill", field, app.as_deref()) {
             Ok(f) => f,
             Err(e) if e.to_string().contains("no text input named") && self.keyboard_up() => {
                 // The keyboard can keep a list cell out of the accessibility tree.
@@ -624,7 +662,7 @@ impl<R: Reader> Flow<R> {
                 let y0 = h * 2 / 5;
                 self.drag(w / 2, y0, w / 2, y0 + 80, 0.15, 0.0).map_err(lookup_error)?;
                 clock::sleep(0.3);
-                self.find_field("fill", field).map_err(lookup_error)?
+                self.find_field("fill", field, app.as_deref()).map_err(lookup_error)?
             }
             Err(e) => return Err(lookup_error(e)),
         };
@@ -638,7 +676,7 @@ impl<R: Reader> Flow<R> {
         let mut focus = self.prepare_fill(&f, probe, secret)?;
         if matches!(focus, Focus::Missed(_) | Focus::Unverified) {
             self.step_retries += 1;
-            let mut next = self.find_field("fill", field).map_err(|_| {
+            let mut next = self.find_field("fill", field, app.as_deref()).map_err(|_| {
                 Error::SecretField("fill: could not find the field again after focusing; check its label and visibility")
             })?;
             let changed = Error::SecretField("fill: the target changed after focusing; use a unique field label");
@@ -693,7 +731,7 @@ impl<R: Reader> Flow<R> {
         if let Some((twin, before)) = alternate {
             // Recheck the pair on the current screen. A stale value that
             // already matched the payload is insufficient for verification.
-            let readback = self.find_field("fill", field).ok().and_then(|mut current| {
+            let readback = self.find_field("fill", field, app.as_deref()).ok().and_then(|mut current| {
                 if current.orient_pair(&f.id, &twin.id) && current.field.kind == f.kind {
                     current.twin
                 } else {
@@ -742,10 +780,25 @@ impl<R: Reader> Flow<R> {
         Ok(format!("{}: len={want}", f.name))
     }
 
-    /// Recover an exact value omitted by a live element attribute. The raw JSON
-    /// source preserves whitespace and exposes wrapper/editor metadata omitted
-    /// by fastUI. A value is usable only with a unique same-frame identity.
-    fn full_source_field_value(&mut self, field: &Field) -> Option<String> {
+    fn field_source(&mut self, expected_app: &str) -> Option<Value> {
+        let path = self.c.spath("/source?format=json");
+        let mut response = self.c.get(&path);
+        crate::guard::success_value(&response).ok()?;
+        let root = response.as_object_mut()?.remove("value")?;
+        let bundle = source_text(&root, "bundleId");
+        if (!bundle.is_empty() && bundle != expected_app)
+            || self.c.live_foreground_app(None).ok()? != expected_app
+        {
+            return None;
+        }
+        Some(root)
+    }
+
+    /// Recover an exact value omitted by the live element attribute. The raw
+    /// JSON tree preserves whitespace. Accept a uniquely anchored field or
+    /// its explicitly nested editor in a snapshot of the same foreground app.
+    fn full_source_field_value(&mut self, field: &Field, app: Option<&str>) -> Option<String> {
+        let app = app?;
         let kind = field.kind.strip_prefix("XCUIElementType")?;
         if !matches!(kind, "TextField" | "SearchField" | "TextView") {
             return None;
@@ -757,57 +810,20 @@ impl<R: Reader> Flow<R> {
             return None;
         }
 
-        let before = self.c.live_foreground_app(None).ok()?;
-        let response = self.c.get(&self.c.spath("/source?format=json"));
-        let root = crate::guard::success_value(&response).ok()?;
-        let bundle = source_text(root, "bundleId");
-        if (!bundle.is_empty() && bundle != before) || self.c.live_foreground_app(None).ok()? != before {
-            return None;
-        }
-        let mut nearby = Vec::new();
-        fields_near_source(root, kind, rect, &mut nearby);
-
-        let mut matches = nearby.iter().copied().filter(|node| {
-            let identity_matches = if name.is_empty() {
-                source_text(node, "label") == label
-            } else {
-                source_text(node, "name") == name
-            };
-            identity_matches && source_rect(node).is_some_and(|r| field_frames_match(rect, r, false))
-        });
-        let anchor = matches.next()?;
-        if matches.next().is_some() {
-            return None;
-        }
-        if let Some(value) = source_field_content(anchor, &field.placeholder) {
-            return Some(value);
-        }
-
-        if !source_flag(anchor, "isAccessible", "accessible", false)
-            || !source_text(anchor, "label").is_empty()
-            || nearby.len() != 2
-        {
-            return None;
-        }
-        let editor = nearby.into_iter().find(|node| !std::ptr::eq(*node, anchor))?;
-        let editor_label = source_text(editor, "label");
-        let editor_name = source_text(editor, "name");
-        let anchor_name = source_text(anchor, "name");
-        if !source_flag(editor, "isAccessible", "accessible", true)
-            || editor_label.is_empty()
-            || editor_label == anchor_name
-            || !(editor_name == editor_label || editor_name == anchor_name || editor_name.is_empty())
-        {
-            return None;
-        }
-        source_field_content(editor, &field.placeholder)
+        let root = self.field_source(app)?;
+        let anchor = source_field_anchor(&root, kind, rect, &name, &label)?;
+        source_field_content(anchor, &field.placeholder).or_else(|| {
+            let editor = source_descendant_editor(anchor, kind, rect)?;
+            source_field_content(editor, &field.placeholder)
+        })
     }
 
     /// `readfield:FIELD`: the named input's exact value (an echoed placeholder reads
     /// as empty). Also added to the flow's `reads` as `{"field", "value", "len"}`. A
     /// secure field gives only `len=N`.
     pub fn read_field(&mut self, arg: &str) -> Result<String> {
-        let f = self.find_field("readfield", arg)?.for_read();
+        let app = self.c.live_foreground_app(None).ok();
+        let f = self.find_field("readfield", arg, app.as_deref())?.for_read();
         let n = f.content().chars().count();
         if f.secure() {
             self.reads.push(j!({"field": f.name, "secure": true, "len": n}));
@@ -815,7 +831,7 @@ impl<R: Reader> Flow<R> {
         }
         let v = f.content().to_string();
         if v.is_empty() {
-            if let Some(value) = self.full_source_field_value(&f) {
+            if let Some(value) = self.full_source_field_value(&f, app.as_deref()) {
                 self.reads.push(j!({"field": f.name, "value": value, "len": value.chars().count(), "source": "accessibility"}));
                 return Ok(value);
             }
@@ -841,7 +857,8 @@ impl<R: Reader> Flow<R> {
         if secret {
             self.note_secret(&want);
         }
-        let f = self.find_field("assertfield", field).map_err(|e| {
+        let app = self.c.live_foreground_app(None).ok();
+        let f = self.find_field("assertfield", field, app.as_deref()).map_err(|e| {
             if secret {
                 Error::SecretField("assertfield: could not identify one field; check its label and visibility")
             } else {
@@ -867,7 +884,7 @@ impl<R: Reader> Flow<R> {
             return Ok(format!("{}: len={n}", f.name));
         }
         let direct = f.content();
-        let from_source = if direct.is_empty() { self.full_source_field_value(&f) } else { None };
+        let from_source = if direct.is_empty() { self.full_source_field_value(&f, app.as_deref()) } else { None };
         let got = from_source.as_deref().unwrap_or(direct);
         if got.is_empty() && !want.is_empty() {
             // WDA reports no value although the field may show text: compare what OCR
