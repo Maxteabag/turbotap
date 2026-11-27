@@ -1145,18 +1145,20 @@ impl WdaClient {
         crate::stop::check(&self.stop_paths).inspect_err(|_| crate::stop::mark_stopped())
     }
 
-    fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
-        // The user's brake first, with or without an app guard: a stop file created
-        // while a command runs stops it before its next input, not only at its start.
-        if !crate::guard::is_safe_method(method) && !self.stop_paths.is_empty() {
-            let kind = crate::guard::classify(path, body);
-            if !matches!(kind, crate::guard::RequestKind::ReadOnly) {
-                if let Err(r) = self.stop_check() {
-                    let what = self.guard_action.clone().unwrap_or_else(|| format!("{method} {}", path.split('?').next().unwrap_or(path)));
-                    return Err(format!("{r}; stopped before {what}"));
-                }
-            }
+    fn check_request_stop(&self, method: &str, path: &str, body: Option<&[u8]>) -> std::result::Result<(), String> {
+        if self.stop_paths.is_empty() || crate::guard::is_safe_method(method)
+            || matches!(crate::guard::classify(path, body), crate::guard::RequestKind::ReadOnly)
+        {
+            return Ok(());
         }
+        self.stop_check().map_err(|reason| {
+            let what = self.guard_action.clone().unwrap_or_else(|| format!("{method} {}", path.split('?').next().unwrap_or(path)));
+            format!("{reason}; stopped before {what}")
+        })
+    }
+
+    fn guard_request(&mut self, method: &str, path: &str, body: Option<&[u8]>, deadline: Option<f64>) -> std::result::Result<bool, String> {
+        self.check_request_stop(method, path, body)?;
         if !self.app_guard_active() || crate::guard::is_safe_method(method) {
             return Ok(true);
         }
@@ -1176,7 +1178,13 @@ impl WdaClient {
             }
             // A caller deadline that ends before the foreground check answers means
             // "nothing sent, deadline exceeded" (e.g. tapif: skips cleanly).
-            _ => return self.check_foreground(&label, deadline).map_err(|e| e.to_string()),
+            _ => {
+                let checked = self.check_foreground(&label, deadline);
+                if !matches!(&checked, Ok(true)) {
+                    self.check_request_stop(method, path, body)?;
+                }
+                return checked.map_err(|e| e.to_string());
+            }
         };
         r.map(|_| true).map_err(|e| e.to_string())
     }
@@ -1408,14 +1416,18 @@ impl WdaClient {
             if let Some(d) = deadline {
                 let rem = d - clock::now();
                 if rem <= 0.0 {
+                    self.check_request_stop(method, path, body)?;
                     return Ok(None);
                 }
                 eff_timeout = timeout.min(rem).max(0.05);
             }
             let mut sent = false;
             let t_req = std::time::Instant::now();
+            let connection = self.ensure_conn(eff_timeout);
+            // The foreground lookup and connection setup can both finish after STOP.
+            self.check_request_stop(method, path, body)?;
             let res: std::io::Result<(u16, Option<T>, Option<String>)> = (|| {
-                self.ensure_conn(eff_timeout)?;
+                connection?;
                 #[cfg(test)]
                 if self.test_fail_post_presend > 0 && method.eq_ignore_ascii_case("POST") {
                     self.test_fail_post_presend -= 1;
@@ -1486,14 +1498,17 @@ impl WdaClient {
             if let Some(d) = deadline {
                 let rem = d - clock::now();
                 if rem <= 0.0 {
+                    self.check_request_stop(method, path, body)?;
                     return Ok(None);
                 }
                 eff_timeout = timeout.min(rem).max(0.05);
             }
             let mut sent = false;
             let t_req = std::time::Instant::now();
+            let connection = self.ensure_conn(eff_timeout);
+            self.check_request_stop(method, path, body)?;
             let res: std::io::Result<(HttpResponse, Option<T>)> = (|| {
-                self.ensure_conn(eff_timeout)?;
+                connection?;
                 #[cfg(test)]
                 if self.test_fail_post_presend > 0 && method.eq_ignore_ascii_case("POST") {
                     self.test_fail_post_presend -= 1;

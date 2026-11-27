@@ -599,21 +599,28 @@ impl<R: Reader> Flow<R> {
     /// Flow tap may act by name on the live alert. Once an alert is detected, any
     /// mismatch or WDA failure ends the step before ordinary tap resolution.
     pub(super) fn tap_named_alert(&mut self, label: &str) -> Result<Option<String>> {
+        let selected = self.act_on_named_alert(label, "/alert/accept", "tap")?;
+        if selected.is_none() && self.waitany_alert_button.as_deref() == Some(label.trim()) {
+            return Err(Error::flow("tap: the iOS alert matched by waitany is no longer active"));
+        }
+        Ok(selected)
+    }
+
+    pub(super) fn act_on_named_alert(&mut self, label: &str, suffix: &str, verb: &str) -> Result<Option<String>> {
         let Some((title, buttons)) = named_alert_on(&mut self.c, None)? else {
-            if self.waitany_alert_button.as_deref() == Some(label.trim()) {
-                return Err(Error::flow("tap: the iOS alert matched by waitany is no longer active"));
-            }
             return Ok(None);
         };
         let button = exact_alert_button(&buttons, label.trim()).ok_or_else(|| alert_match_error(&title, &buttons))?;
-        self.guard(button, "tap")?;
+        self.guard(button, verb)?;
         self.mark_action(false, false);
-        let path = self.c.spath("/alert/accept");
-        let response = self.c.req_2xx("POST", &path, Some(&serde_json::json!({"buttonLabel": button})), 4.0, None);
-        let response = self.c.guard_result(crate::wda::check_wda_ok(response, "tap active iOS alert", false))?;
+        let path = self.c.spath(suffix);
+        // WDA interprets a missing "name" as permission to choose its default.
+        let response = self.c.req_2xx("POST", &path, Some(&serde_json::json!({"name": button})), 4.0, None);
+        let action = format!("{verb} active iOS alert");
+        let response = self.c.guard_result(crate::wda::check_wda_ok(response, &action, false))?;
         match crate::guard::success_value(&response) {
             Ok(Value::Null) => Ok(Some(button.to_owned())),
-            _ => Err(Error::flow("tap active iOS alert failed: invalid WDA acknowledgment")),
+            _ => Err(Error::flow(format!("{action} failed: invalid WDA acknowledgment"))),
         }
     }
 

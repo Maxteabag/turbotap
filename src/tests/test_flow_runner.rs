@@ -1175,7 +1175,7 @@ fn test_waitany_and_tap_use_live_named_alert_instead_of_foreground_controls() {
 
     mock.state().alert_buttons = Some(Dyn::one(json!([LABEL, "Tillat", "Delete Account"])));
     assert_eq!(step_s(&mut flow, &format!("tap:{LABEL}")), LABEL);
-    assert_eq!(mock.calls_to(&path), vec![("POST".into(), path.clone(), json!({"buttonLabel": LABEL}))]);
+    assert_eq!(mock.calls_to(&path), vec![("POST".into(), path.clone(), json!({"name": LABEL}))]);
     assert!(mock.tapped_points().is_empty());
 
     // If the alert closes after waitany, a foreground control with the same label
@@ -1186,6 +1186,44 @@ fn test_waitany_and_tap_use_live_named_alert_instead_of_foreground_controls() {
     assert!(flow_err(flow.step(&format!("tap:{LABEL}"))).contains("no longer active"));
     assert_eq!(step_s(&mut flow, &format!("waitany:Settings|{LABEL}")), "Settings");
     assert_eq!(mock.calls_to(&path).len(), 1);
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
+fn test_alert_action_requires_an_exact_live_allowed_button() {
+    let _cache = isolated_cache();
+    let mut st = MockState::default();
+    st.alert_text = Some(Dyn::one(json!("Choose what to do")));
+    st.alert_buttons = Some(Dyn::one(json!(["Allow: Once", "Keep Draft", "Delete"])));
+    let mock = MockWda::start(st);
+    let reader = FakeReader::new(vec![]);
+    let mut flow = mk_flow_deny(&mock, &reader, 1.0, Some("^Delete$"));
+    let accept = flow.c.spath("/alert/accept");
+    let dismiss = flow.c.spath("/alert/dismiss");
+
+    for step in ["alert", "alert:", "alert:accept", "alert:dismiss", "alert:accept: ", "alert:invalid:Delete"] {
+        assert!(flow_err(flow.step(step)).contains("LABEL"), "{step}");
+    }
+    assert!(flow_err(flow.step("alert:accept:Allow")).contains("no unique exact match"));
+    assert!(flow_err(flow.step("alert:dismiss:Delete")).contains("matches --deny"));
+    assert!(mock.calls_to(&accept).is_empty());
+    assert!(mock.calls_to(&dismiss).is_empty());
+
+    assert_eq!(step_s(&mut flow, "alert:accept:Allow: Once"), "Allow: Once");
+    assert_eq!(step_s(&mut flow, "alert:dismiss:Keep Draft"), "Keep Draft");
+    assert_eq!(mock.calls_to(&accept), vec![("POST".into(), accept.clone(), json!({"name": "Allow: Once"}))]);
+    assert_eq!(mock.calls_to(&dismiss), vec![("POST".into(), dismiss.clone(), json!({"name": "Keep Draft"}))]);
+
+    mock.state().alert_text = None;
+    assert_eq!(step_s(&mut flow, "alert:accept:Allow: Once"), "no-alert");
+    mock.state().alert_text = Some(Dyn::one(json!({"error": 404, "body": "unknown command"})));
+    assert!(flow_err(flow.step("alert:accept:Allow: Once")).contains("could not verify active iOS alert"));
+    assert_eq!(mock.calls_to(&accept).len(), 1);
+
+    mock.state().alert_text = Some(Dyn::one(json!("Choose what to do")));
+    mock.set_custom_handler(fail_on_suffix("/alert/accept", 500, "alert action failed"));
+    assert!(flow_err(flow.step("alert:accept:Allow: Once")).contains("alert active iOS alert failed"));
+    assert_eq!(mock.calls_to(&accept).len(), 2);
     assert!(mock.tapped_points().is_empty());
 }
 
@@ -2193,16 +2231,31 @@ fn test_slider_parsing_matching_guards_disabled_and_errors() {
     assert_eq!(paths_suffix(&c_alias, "/value"), Vec::<String>::new());
     flow_alias.close();
 
-    // Label/name lookup error while --deny is active refuses with ZERO value POSTs.
-    let c_aerr = MockWda::start(slider_state(&["s1"]));
-    c_aerr.set_custom_handler(|_, _, p, _| p.contains("/attribute/name").then(|| json!({"error": 500, "body": "attr err"})));
-    let mut client = c_aerr.client();
-    client.deny_also = vec!["^Delete Threshold$".into()];
-    let mut flow_aerr = Flow::new(client, FakeReader::new(vec![fr(&img, &[])]), 8.0, None, false).unwrap();
-    let msg = flow_err(flow_aerr.step("slider:50%"));
-    assert!(msg.contains("--deny"), "{msg}");
-    assert_eq!(paths_suffix(&c_aerr, "/value"), Vec::<String>::new());
-    flow_aerr.close();
+    // An absent alias is valid only when WDA actually returned null or empty text.
+    for (response, valid) in [
+        (json!({"error": 500, "body": "attr err"}), false),
+        (json!({"__raw__": {"status": 302, "body": "{\"value\":null}"}}), false),
+        (json!({"status": 7, "value": null}), false),
+        (json!({}), false),
+        (json!({"error": null, "value": null}), false),
+        (json!({"value": 0}), false),
+        (json!({"value": null}), true),
+        (json!({"value": ""}), true),
+    ] {
+        let mock = MockWda::start(slider_state(&["s1"]));
+        mock.set_custom_handler(move |_, _, p, _| p.ends_with("/attribute/name").then(|| response.clone()));
+        let mut client = mock.client();
+        client.deny_also = vec!["^Delete Threshold$".into()];
+        let mut flow = Flow::new(client, FakeReader::new(vec![]), 8.0, None, false).unwrap();
+        if valid {
+            assert_eq!(step_s(&mut flow, "slider:50%"), "50%");
+        } else {
+            let msg = flow_err(flow.step("slider:50%"));
+            assert!(msg.contains("cannot verify slider label/name"), "{msg}");
+        }
+        assert_eq!(paths_suffix(&mock, "/value").len(), usize::from(valid));
+        flow.close();
+    }
 
     // Failed /enabled and /attribute/enabled on the selected element MUST refuse with
     // ZERO value POSTs even when fastUI has a matching older tree (no enabled field)
@@ -2585,7 +2638,7 @@ fn test_assert_assertnot_and_alert_text_verbs() {
     assert_eq!(flow.last_action_ts, 0.0);
 
     // 5. alert:text reads active alert text and appends {"alert": txt} to reads;
-    // returns "no-alert" when no alert is active; preserves alert:accept and alert:dismiss.
+    // returns "no-alert" when no alert is active.
     assert_eq!(step_s(&mut flow, "alert:text"), "Allow Notifications?");
     assert_eq!(*flow.reads.last().unwrap(), json!({"alert": "Allow Notifications?"}));
 
@@ -2600,18 +2653,11 @@ fn test_assert_assertnot_and_alert_text_verbs() {
     c.state().alert_text = Some(Dyn::one(json!({"error": 404, "body": "unknown command"})));
     flow_err(flow.step("alert:text"));
 
-    {
-        let (_sk, _g) = skip_sleep();
-        assert_eq!(step_s(&mut flow, "alert:accept"), "accept");
-        assert_eq!(step_s(&mut flow, "alert:dismiss"), "dismiss");
-    }
-    flow_err(flow.step("alert:invalid"));
     flow_err(flow.step("assert:re:"));
     flow_err(flow.step("assertnot:re:"));
 
     assert!(FLOW_HELP.contains("assert:TEXT"));
     assert!(FLOW_HELP.contains("assertnot:TEXT"));
-    assert!(FLOW_HELP.contains("alert:accept|dismiss|text"));
     assert!(IMAGE_STEP_VERBS.contains(&"assert"));
     assert!(IMAGE_STEP_VERBS.contains(&"assertnot"));
     assert!(!IMAGE_STEP_VERBS.contains(&"alert"));

@@ -986,9 +986,7 @@ impl<R: Reader> Flow<R> {
             "typedigits" => return some(self.type_digits(arg)?),
             "pintap" => return some(self.pin_tap(arg)?),
             "alert" => {
-                let action = arg.trim().to_lowercase();
-                let action = if action.is_empty() { "accept".to_string() } else { action };
-                if action == "text" {
+                if arg.trim().eq_ignore_ascii_case("text") {
                     let (status, txt) = Self::query_alert_text(&mut self.c, None);
                     return match status {
                         AlertStatus::Present => {
@@ -1002,17 +1000,17 @@ impl<R: Reader> Flow<R> {
                         }
                     };
                 }
-                if action != "accept" && action != "dismiss" {
-                    return Err(Error::flow("alert step must be alert:accept, alert:dismiss, or alert:text"));
+                let usage = || Error::flow("alert expects alert:text, alert:accept:LABEL, or alert:dismiss:LABEL");
+                let (action, label) = arg.split_once(':').ok_or_else(usage)?;
+                let suffix = match action.trim().to_ascii_lowercase().as_str() {
+                    "accept" => "/alert/accept",
+                    "dismiss" => "/alert/dismiss",
+                    _ => return Err(usage()),
+                };
+                if label.trim().is_empty() {
+                    return Err(usage());
                 }
-                self.mark_action(false, false);
-                let p = self.c.spath(&format!("/alert/{action}"));
-                let r = self.c.post(&p, &j!({}));
-                if json::has_err(&r) {
-                    return some("no-alert".into());
-                }
-                clock::sleep(0.5);
-                return some(action);
+                return some(self.act_on_named_alert(label, suffix, "alert")?.unwrap_or_else(|| "no-alert".into()));
             }
             "scroll" => {
                 let dir = if arg.is_empty() { "down" } else { arg };

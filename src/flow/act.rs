@@ -337,21 +337,17 @@ impl<R: Reader> Flow<R> {
 
     /// `_read_slider_aliases`: cleaned (label, name) and whether either lookup failed.
     fn read_slider_aliases(&mut self, eid: &str) -> (String, String, bool) {
-        let lp = self.c.spath(&format!("/element/{eid}/attribute/label"));
-        let lab_r = self.c.get(&lp);
-        let np = self.c.spath(&format!("/element/{eid}/attribute/name"));
-        let name_r = self.c.get(&np);
-        let lab_err = !lab_r.is_object() || json::has_err(&lab_r);
-        let name_err = !name_r.is_object() || json::has_err(&name_r);
-        let alias = |err: bool, r: &Value| {
-            let v = if err { &json::NULL } else { json::get(r, "value") };
-            if json::truthy(v) {
-                clean_text(&json::py_str(v))
-            } else {
-                String::new()
+        let mut alias = |attr| {
+            let path = self.c.spath(&format!("/element/{eid}/attribute/{attr}"));
+            match self.c.strict_get_value(&path) {
+                Ok(Value::String(s)) => Some(clean_text(&s)),
+                Ok(Value::Null) => Some(String::new()),
+                _ => None,
             }
         };
-        (alias(lab_err, &lab_r), alias(name_err, &name_r), lab_err || name_err)
+        let (label, name) = (alias("label"), alias("name"));
+        let failed = label.is_none() || name.is_none();
+        (label.unwrap_or_default(), name.unwrap_or_default(), failed)
     }
 
     /// L4116. Set an XCUIElementTypeSlider to a normalized fraction [0.0, 1.0]:

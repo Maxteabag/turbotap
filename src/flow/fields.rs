@@ -638,19 +638,26 @@ impl<R: Reader> Flow<R> {
         !json::has_err(&self.c.post(&p, &j!({})))
     }
 
-    fn prepare_fill(&mut self, f: &Field, probe: bool, secret: bool) -> Result<Focus> {
-        if !f.content().is_empty() && !self.clear_fill_field(f) {
+    fn prepare_fill(&mut self, f: &Field, probe: bool, secret: bool, guard_multiline: bool) -> Result<Focus> {
+        if !guard_multiline && !f.content().is_empty() && !self.clear_fill_field(f) {
             return Err(Error::SecretField("fill: could not clear the field; check that it is editable"));
         }
         if !self.focus_field(f)? {
             return Ok(Focus::Missed("fill: no keyboard after focusing the field; tap it to bring up the keyboard"));
         }
-        if self.field_value_len(f).is_some_and(|n| n > 0) {
+        if guard_multiline {
+            self.guard_submit("multi-line fill:")?;
+        }
+        let has_content = self.field_value_len(f).map_or(guard_multiline && !f.content().is_empty(), |n| n > 0);
+        if has_content {
             if !self.clear_fill_field(f) {
                 return Err(Error::SecretField("fill: could not clear the focused field; check that it is editable"));
             }
             if !self.focus_field(f)? {
                 return Ok(Focus::Missed("fill: no keyboard after clearing the field; tap it to bring up the keyboard"));
+            }
+            if guard_multiline {
+                self.guard_submit("multi-line fill:")?;
             }
         }
         if probe {
@@ -694,7 +701,8 @@ impl<R: Reader> Flow<R> {
         self.mark_action(false, true);
         let want = text.chars().count();
         let probe = secret || want >= PROBE_MIN_LEN || twin.is_some();
-        let mut focus = self.prepare_fill(&f, probe, secret)?;
+        let guard_multiline = !secret && self.has_deny_patterns() && text.contains(['\n', '\r']);
+        let mut focus = self.prepare_fill(&f, probe, secret, guard_multiline)?;
         if matches!(focus, Focus::Missed(_) | Focus::Unverified) {
             self.step_retries += 1;
             let mut next = self.find_field("fill", field, app.as_deref()).map_err(|_| {
@@ -716,7 +724,7 @@ impl<R: Reader> Flow<R> {
             }
             f = next.field;
             twin = next.twin;
-            focus = self.prepare_fill(&f, probe || twin.is_some(), secret)?;
+            focus = self.prepare_fill(&f, probe || twin.is_some(), secret, guard_multiline)?;
         }
         let checkable = match focus {
             Focus::Proven => true,

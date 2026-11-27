@@ -46,6 +46,43 @@ fn flow(mock: &MockWda) -> Flow<FakeReader> {
 }
 
 #[test]
+fn multiline_fill_and_search_check_the_focused_keyboard_before_clearing() {
+    let _cache = isolated_cache();
+    let (_sleep, _guard) = skip_sleep();
+    for step in ["fill:Body=one\ntwo", "search:Body=one\ntwo"] {
+        let mut st = composer(BODY);
+        st.focused_eid = None;
+        st.elements_map.insert(
+            ekey(&["predicate string", "type == 'XCUIElementTypeKeyboard'"]),
+            vec![json!({"ELEMENT": "kb"})],
+        );
+        let mock = MockWda::start(st);
+        mock.set_custom_handler(|st, _, path, _| {
+            path.starts_with("/wda/fastUI").then(|| {
+                let keys = if st.focused_eid.as_deref() == Some("b1") {
+                    json!([{"type": "Button", "label": "Send", "x": 380, "y": 880, "inKeyboard": true}])
+                } else {
+                    json!([])
+                };
+                fast_ui(keys, "Example", "com.example.app")
+            })
+        });
+        let mut client = mock.client();
+        client.deny_also = vec!["^Send$".into()];
+        let mut flow = Flow::new(client, FakeReader::new(vec![]), 1.0, None, false).unwrap();
+
+        let error = flow.step(step).unwrap_err().to_string();
+        assert!(error.contains("matches --deny-also") && error.contains("may submit"), "{step}: {error}");
+        assert_eq!(flow.step("readfield:Body").unwrap(), Some(json!(BODY)));
+        let calls = mock.calls();
+        assert!(calls.iter().any(|(_, path, _)| path.ends_with("/element/b1/click")), "{calls:?}");
+        assert!(calls.iter().all(|(method, path, _)| {
+            method == "GET" || path.ends_with("/elements") || path.ends_with("/element/b1/click")
+        }), "{calls:?}");
+    }
+}
+
+#[test]
 fn readfield_returns_the_exact_multi_paragraph_value() {
     let mock = MockWda::start(composer(BODY));
     let mut f = flow(&mock);

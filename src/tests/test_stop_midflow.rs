@@ -8,6 +8,8 @@ use crate::testutil::*;
 use serde_json::json;
 use std::path::PathBuf;
 
+const ALLOWED: &str = "com.example.app";
+
 fn run_flow(mock: &MockWda, stop: &PathBuf, steps: &[&str]) -> (i32, String) {
     let home = TempDir::new("tt-stop-mid-");
     let (h, st, sf) = (home.path().to_str().unwrap().to_string(), home.path().join("state").to_str().unwrap().to_string(), stop.to_str().unwrap().to_string());
@@ -45,6 +47,88 @@ fn test_stop_file_created_after_the_first_tap_stops_the_rest() {
     assert!(out.contains("stopped before"), "{out}");
     assert_eq!(mock.tapped_points().len(), 1, "input after the stop file appeared");
     assert!(!mock.paths().iter().any(|p| p.ends_with("/wda/fastKeys") || p.ends_with("/wda/keys")));
+}
+
+#[test]
+fn stop_during_the_mutation_foreground_check_exits_six_without_input() {
+    let _cache = isolated_cache();
+    let dir = TempDir::new("tt-stop-live-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(MockState::default());
+    let stop_in_handler = stop.clone();
+    let mut reads = 0;
+    mock.set_custom_handler(move |_, method, path, _| {
+        (method == "GET" && path == "/wda/activeAppInfo").then(|| {
+            reads += 1;
+            // The first is flow admission. The second is checking the actual POST.
+            if reads == 2 {
+                std::fs::write(&stop_in_handler, "").unwrap();
+            }
+            json!({"value": {"bundleId": ALLOWED}})
+        })
+    });
+
+    let (code, out) = run_flow(&mock, &stop, &["--allow-app", ALLOWED, "tapxy:10,10"]);
+    assert_eq!(code, crate::stop::STOP_EXIT, "{out}");
+    assert!(out.contains("stopped before"), "{out}");
+    assert_eq!(mock.calls_to("/wda/activeAppInfo").len(), 2);
+    assert!(mock.calls_to("/wda/fastTap").is_empty());
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
+fn stop_during_foreground_lookup_blocks_raw_and_typed_sends_and_presend_retries() {
+    let _cache = isolated_cache();
+    for (entry, retry) in [("json", true), ("raw", false), ("bytes", false), ("typed", false)] {
+        let dir = TempDir::new("tt-stop-dispatch-");
+        let stop = dir.path().join("phone.STOP");
+        let mock = MockWda::start(MockState::default());
+        let stop_in_handler = stop.clone();
+        let stop_on_read = if retry { 2 } else { 1 };
+        let mut reads = 0;
+        mock.set_custom_handler(move |_, method, path, _| {
+            (method == "GET" && path == "/wda/activeAppInfo").then(|| {
+                reads += 1;
+                if reads == stop_on_read {
+                    std::fs::write(&stop_in_handler, "").unwrap();
+                }
+                json!({"value": {"bundleId": ALLOWED}})
+            })
+        });
+        let mut client = mock.client();
+        client.set_allowed_apps(vec![ALLOWED.into()]);
+        client.stop_paths.push(stop);
+        client.test_fail_post_presend = u32::from(retry);
+        let path = "/wda/fastTap";
+        let data = json!({"x": 10, "y": 10});
+
+        let reason = match entry {
+            "json" => client.post(path, &data)["error"].as_str().unwrap_or_default().to_owned(),
+            "raw" => {
+                let (status, _, body) = client.req_raw("POST", path, Some(&data), 1.0, None, None);
+                assert_eq!(status, 0);
+                String::from_utf8(body).unwrap()
+            }
+            "bytes" => {
+                let (status, body) = client.req_post_bytes(path, br#"{"x":10,"y":10}"#, 1.0, None);
+                assert_eq!(status, 0);
+                String::from_utf8(body).unwrap()
+            }
+            "typed" => {
+                match client.req_typed_with_deadline("POST", path, 1.0, None, |body| {
+                    serde_json::from_slice::<serde_json::Value>(body)
+                }) {
+                    crate::wda::TypedHttpResult::TransportError(reason) => reason,
+                    _ => panic!("typed call did not report STOP"),
+                }
+            }
+            _ => unreachable!(),
+        };
+        assert!(reason.contains("stopped before"), "{entry}: {reason}");
+        assert!(crate::stop::take_stopped(), "{entry}");
+        assert_eq!(mock.calls_to("/wda/activeAppInfo").len(), stop_on_read, "{entry}");
+        assert!(mock.calls_to(path).is_empty(), "{entry}");
+    }
 }
 
 #[test]

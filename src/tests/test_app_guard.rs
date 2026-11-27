@@ -611,8 +611,8 @@ fn test_every_input_step_checks_the_foreground_app_before_firing() {
         "picker:Value",
         "slider:50",
         "setclip:hello",
-        "alert:accept",
-        "alert:dismiss",
+        "alert:accept:Allow",
+        "alert:dismiss:Cancel",
         "alert",
     ];
     let ui = json!([
