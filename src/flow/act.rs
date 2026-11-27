@@ -38,24 +38,6 @@ fn num(v: &Value, key: &str) -> f64 {
     json::get(v, key).as_f64().unwrap_or(0.0)
 }
 
-/// Python `_parse_wda_bool` (set_slider): bool, 0/1 numbers, and yes/no strings.
-fn parse_wda_bool(val: &Value) -> Option<bool> {
-    match val {
-        Value::Bool(b) => Some(*b),
-        Value::Number(n) => match n.as_f64() {
-            Some(f) if f == 0.0 => Some(false),
-            Some(f) if f == 1.0 => Some(true),
-            _ => None,
-        },
-        Value::String(s) => match casefold(s.trim()).as_str() {
-            "1" | "true" | "yes" => Some(true),
-            "0" | "false" | "no" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 fn on_off(b: bool) -> &'static str {
     if b {
         "on"
@@ -521,7 +503,7 @@ impl<R: Reader> Flow<R> {
             let ep = self.c.spath(&suffix);
             let en_resp = self.c.get(&ep);
             if en_resp.is_object() && !json::has_err(&en_resp) {
-                if let Some(parsed) = parse_wda_bool(json::get(&en_resp, "value")) {
+                if let Some(parsed) = ui::parse_wda_bool(json::get(&en_resp, "value")) {
                     en_state = Some(parsed);
                     break;
                 }

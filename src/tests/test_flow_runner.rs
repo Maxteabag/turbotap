@@ -2108,10 +2108,12 @@ fn test_toggle_idempotent_states_region_verification_and_guards() {
     // (b) Explicit requested state with unreadable initial value refuses with ZERO taps;
     // disappearing switch or unreadable post-tap state raises FlowError (never reports 'toggled'/'on').
     c.state().tapped_points.clear();
-    set_fast_ui(&c, sw("Sync", 210, None));
-    let msg = flow_err(flow.step("toggle:Sync=on"));
-    assert!(msg.contains("unreadable initial state"), "{msg}");
-    assert_eq!(c.tapped_points(), vec![]);
+    for value in [None, Some("on"), Some("yes"), Some("off"), Some("no")] {
+        set_fast_ui(&c, sw("Sync", 210, value));
+        let msg = flow_err(flow.step("toggle:Sync=on"));
+        assert!(msg.contains("unreadable initial state"), "{msg}");
+        assert_eq!(c.tapped_points(), vec![]);
+    }
 
     c.state().tapped_points.clear();
     set_fast_ui_seq(&c, vec![sw("Sync", 210, Some("0")), fui(json!([]))]);

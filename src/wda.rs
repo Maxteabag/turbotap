@@ -3500,7 +3500,7 @@ pub fn readiness(locked: &Value, app: &Value, w: &Value, capture: &str) -> (bool
     if app.as_str().is_some_and(|a| a.starts_with("local.pid.")) {
         not_ready.push(j!({
             "why": "WDA has no UI-testing access (XCTest error 41: front app reads as local.pid.0)",
-            "recover": "turbotap deploy --no-build once while the phone is unlocked and not in use (it restarts the runner and retries once); if it stays: on the phone, Settings > Developer > Enable UI Automation off and on"
+            "recover": "turbotap deploy --no-build once while the phone is unlocked and not in use (it restarts the runner and retries once); if it stays, verify UI testing authorization in the device developer settings"
         }));
     }
     if capture != "ok" && locked.as_bool() != Some(true) {

@@ -230,31 +230,37 @@ fn not_none_or_empty(v: &Value) -> bool {
     !(v.is_null() || v.as_str() == Some(""))
 }
 
-fn str_disabled_str(s: &str) -> Option<bool> {
-    let t = s.trim();
-    if t.is_ascii() {
-        if t.eq_ignore_ascii_case("0") || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("no") {
-            return Some(true);
-        }
-        if t.eq_ignore_ascii_case("1") || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes") {
-            return Some(false);
-        }
-        return None;
+fn protocol_bool_string(value: &str) -> Option<bool> {
+    let value = value.trim();
+    if value == "1" || value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value == "0" || value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
-    match crate::text::casefold(t).as_str() {
-        "0" | "false" | "no" => Some(true),
-        "1" | "true" | "yes" => Some(false),
+}
+
+/// A boolean flag reported by WDA as a bool, a 0/1 number or its string form.
+pub(crate) fn parse_wda_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => match n.as_f64() {
+            Some(1.0) => Some(true),
+            Some(0.0) => Some(false),
+            _ => None,
+        },
+        Value::String(s) => protocol_bool_string(s),
         _ => None,
     }
 }
 
-/// Python `isinstance(val, ...)`/str test shared by the enabled-value parsers:
-/// Some(disabled) when decisive.
-fn str_disabled(v: &Value) -> Option<bool> {
-    match v {
-        Value::String(s) => str_disabled_str(s),
-        _ => str_disabled_str(&json::py_str(v)),
-    }
+fn str_disabled_str(value: &str) -> Option<bool> {
+    protocol_bool_string(value).map(|enabled| !enabled)
+}
+
+fn str_disabled(value: &Value) -> Option<bool> {
+    parse_wda_bool(value).map(|enabled| !enabled)
 }
 
 /// True only when a WDA /source or /wda/fastUI node explicitly reports disabled.
@@ -2016,54 +2022,14 @@ pub fn walk_accessible(node: &Value, out: &mut Vec<String>, depth: usize) {
     }
 }
 
-/// iOS Switch accessibility value -> Some(true)/Some(false)/None.
-pub fn parse_switch_state(val: &Value) -> Option<bool> {
-    match val {
-        Value::Null => None,
-        Value::Bool(b) => Some(*b),
-        Value::Number(n) if !n.is_f64() => match n.as_i64() {
-            Some(1) => Some(true),
-            Some(0) => Some(false),
-            _ => None,
-        },
-        Value::String(s) if s.is_ascii() => {
-            let t = s.trim();
-            if t.eq_ignore_ascii_case("1")
-                || t.eq_ignore_ascii_case("true")
-                || t.eq_ignore_ascii_case("on")
-                || t.eq_ignore_ascii_case("yes")
-            {
-                Some(true)
-            } else if t.eq_ignore_ascii_case("0")
-                || t.eq_ignore_ascii_case("false")
-                || t.eq_ignore_ascii_case("off")
-                || t.eq_ignore_ascii_case("no")
-            {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        _ => match casefold(&clean_text(&json::py_str(val))).as_str() {
-            "1" | "true" | "on" | "yes" => Some(true),
-            "0" | "false" | "off" | "no" => Some(false),
-            _ => None,
-        },
-    }
+/// Decode a switch's state when WDA supplies a protocol value.
+pub fn parse_switch_state(value: &Value) -> Option<bool> {
+    parse_wda_bool(value)
 }
 
-/// True only when a WDA `/element/{eid}/enabled` value explicitly reports False/0.
-pub fn is_wda_disabled_value(val: &Value) -> bool {
-    match val {
-        Value::Null => false,
-        Value::Bool(b) => !b,
-        Value::Number(n) => n.as_f64() == Some(0.0),
-        Value::String(s) if s.is_ascii() => {
-            let t = s.trim();
-            t.eq_ignore_ascii_case("0") || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("no")
-        }
-        _ => matches!(casefold(json::py_str(val).trim()).as_str(), "0" | "false" | "no"),
-    }
+/// True only when a WDA element's enabled flag explicitly reports false.
+pub fn is_wda_disabled_value(value: &Value) -> bool {
+    parse_wda_bool(value) == Some(false)
 }
 
 #[cfg(test)]

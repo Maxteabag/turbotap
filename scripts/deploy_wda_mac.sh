@@ -255,7 +255,7 @@ if [[ "$why" == *"no UI-testing access"* && -z "${WDA_DEPLOY_RETRIED:-}" ]]; the
   WDA_DEPLOY_RETRIED=1 exec bash "$0" --no-build
 fi
 if [[ "$why" == *"no UI-testing access"* ]]; then
-  echo "WDA did not come up: still no UI-testing access after a fresh runner (XCTest error 41). On the phone: Settings > Developer > Enable UI Automation off and on, then turbotap deploy --no-build; see $MAC:$LOG" >&2
+  echo "WDA did not come up: still no UI-testing access after a fresh runner (XCTest error 41). Verify UI testing authorization in the device developer settings, then run turbotap deploy --no-build; see $MAC:$LOG" >&2
   exit 4
 fi
 echo "WDA did not come up after 60 s: $why; see $MAC:$LOG" >&2
