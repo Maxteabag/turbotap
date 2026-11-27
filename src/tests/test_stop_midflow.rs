@@ -329,6 +329,9 @@ fn waitchange_distinguishes_unusable_snapshots_from_disappearance_and_timeout() 
     let other = json!({"type": "Button", "label": "Sync", "x": 60, "y": 40});
     let snapshot = |controls| fast_ui(controls, "Example", ALLOWED);
     let baseline = snapshot(json!([control]));
+    // The clock advances polling sleeps, but loopback requests still use wall
+    // time. Leave enough room for both snapshots on a busy build host.
+    let timeout = "8";
     for (step, snapshots, error, evidence) in [
         ("waitchange:tapat:41,40=Sync", vec![baseline.clone()], "no initial exact match", json!(null)),
         ("waitchange:Sync", vec![snapshot(json!([control, other]))], "ambiguous snapshot", json!(null)),
@@ -341,12 +344,12 @@ fn waitchange_distinguishes_unusable_snapshots_from_disappearance_and_timeout() 
                 {"type": "Button", "label": "Sync", "x": 60, "y": 40, "enabled": false},
                 control
             ]))],
-            "timed out after 0.4 s",
+            "timed out after 8 s",
             control.clone(),
         ),
     ] {
         let mock = MockWda::start(MockState { fast_ui: Some(Dyn::of(snapshots)), ..Default::default() });
-        let (code, out) = run_flow(&mock, &stop, &["--timeout", "0.4", step]);
+        let (code, out) = run_flow(&mock, &stop, &["--timeout", timeout, step]);
         assert_eq!(code, 1, "{out}");
         let result: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(result["failed_step"], step);
