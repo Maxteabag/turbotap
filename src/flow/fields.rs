@@ -93,20 +93,62 @@ impl FieldNode {
     }
 
     fn near(&self, other: &Self) -> bool {
-        let (Some((x, y, w, h)), Some((ox, oy, ow, oh))) = (self.rect, other.rect) else {
-            return false;
-        };
-        // Check both edges on each axis and require substantial overlap even
-        // for very small controls (e.g. adjacent single-character inputs).
-        let axis = |start: f64, size: f64, other_start: f64, other_size: f64| {
-            let end = start + size;
-            let other_end = other_start + other_size;
-            (start - other_start).abs() <= 2.0
-                && (end - other_end).abs() <= 2.0
-                && end.min(other_end) - start.max(other_start) >= 0.9 * size.max(other_size)
-        };
-        axis(x, w, ox, ow) && axis(y, h, oy, oh) && w.min(ow) > 0.0 && h.min(oh) > 0.0
+        self.rect.zip(other.rect).is_some_and(|(a, b)| field_frames_match(a, b, false))
     }
+}
+
+fn field_frames_match(a: FieldRect, b: FieldRect, allow_vertical_inset: bool) -> bool {
+    let ((x, y, w, h), (ox, oy, ow, oh)) = (a, b);
+    let axis = |start: f64, size: f64, other_start: f64, other_size: f64, inset: bool| {
+        let end = start + size;
+        let other_end = other_start + other_size;
+        size > 0.0 && other_size > 0.0
+            && (start - other_start).abs() <= 2.0
+            && (inset || (end - other_end).abs() <= 2.0)
+            && end.min(other_end) - start.max(other_start) >= 0.9 * size.max(other_size)
+    };
+    axis(x, w, ox, ow, false) && axis(y, h, oy, oh, allow_vertical_inset)
+}
+
+fn source_text<'a>(node: &'a Value, key: &str) -> &'a str {
+    node.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn source_flag(node: &Value, native_key: &str, fallback_key: &str, expected: bool) -> bool {
+    node.get(native_key).or_else(|| node.get(fallback_key)).is_some_and(|v| {
+        v.as_bool() == Some(expected)
+            || v.as_str().is_some_and(|s| {
+                if expected { s == "1" || s.eq_ignore_ascii_case("true") }
+                else { s == "0" || s.eq_ignore_ascii_case("false") }
+            })
+    })
+}
+
+fn source_rect(node: &Value) -> Option<FieldRect> {
+    let r = node.get("rect")?;
+    let get = |k: &str| r.get(k).and_then(Value::as_f64);
+    Some((get("x")?, get("y")?, get("width")?, get("height")?))
+}
+
+fn fields_near_source<'a>(node: &'a Value, kind: &str, rect: FieldRect, fields: &mut Vec<&'a Value>) {
+    let t = source_text(node, "type");
+    if t.strip_prefix("XCUIElementType").unwrap_or(t) == kind
+        && source_flag(node, "isVisible", "visible", true)
+        && source_rect(node).is_some_and(|r| field_frames_match(rect, r, true))
+    {
+        fields.push(node);
+    }
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            fields_near_source(child, kind, rect, fields);
+        }
+    }
+}
+
+fn source_field_content(node: &Value, placeholder: &str) -> Option<String> {
+    let value = source_text(node, "value");
+    let source_placeholder = source_text(node, "placeholderValue");
+    (!value.is_empty() && value != placeholder && value != source_placeholder).then(|| value.to_owned())
 }
 
 struct FieldTarget {
@@ -688,6 +730,67 @@ impl<R: Reader> Flow<R> {
         Ok(format!("{}: len={want}", f.name))
     }
 
+    /// Recover an exact value omitted by a live element attribute. The raw JSON
+    /// source preserves whitespace and exposes wrapper/editor metadata omitted
+    /// by fastUI. A value is usable only with a unique same-frame identity.
+    fn full_source_field_value(&mut self, field: &Field) -> Option<String> {
+        let kind = field.kind.strip_prefix("XCUIElementType")?;
+        if !matches!(kind, "TextField" | "SearchField" | "TextView") {
+            return None;
+        }
+        let rect = self.field_rect(&field.id)?;
+        let name = self.field_attribute(&field.id, "name").unwrap_or_default();
+        let label = self.field_attribute(&field.id, "label").unwrap_or_default();
+        if name.is_empty() && label.is_empty() {
+            return None;
+        }
+
+        let before = self.c.live_foreground_app(None).ok()?;
+        let response = self.c.get(&self.c.spath("/source?format=json"));
+        let root = crate::guard::success_value(&response).ok()?;
+        let bundle = source_text(root, "bundleId");
+        if (!bundle.is_empty() && bundle != before) || self.c.live_foreground_app(None).ok()? != before {
+            return None;
+        }
+        let mut nearby = Vec::new();
+        fields_near_source(root, kind, rect, &mut nearby);
+
+        let mut matches = nearby.iter().copied().filter(|node| {
+            let identity_matches = if name.is_empty() {
+                source_text(node, "label") == label
+            } else {
+                source_text(node, "name") == name
+            };
+            identity_matches && source_rect(node).is_some_and(|r| field_frames_match(rect, r, false))
+        });
+        let anchor = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        if let Some(value) = source_field_content(anchor, &field.placeholder) {
+            return Some(value);
+        }
+
+        if !source_flag(anchor, "isAccessible", "accessible", false)
+            || !source_text(anchor, "label").is_empty()
+            || nearby.len() != 2
+        {
+            return None;
+        }
+        let editor = nearby.into_iter().find(|node| !std::ptr::eq(*node, anchor))?;
+        let editor_label = source_text(editor, "label");
+        let editor_name = source_text(editor, "name");
+        let anchor_name = source_text(anchor, "name");
+        if !source_flag(editor, "isAccessible", "accessible", true)
+            || editor_label.is_empty()
+            || editor_label == anchor_name
+            || !(editor_name == editor_label || editor_name == anchor_name || editor_name.is_empty())
+        {
+            return None;
+        }
+        source_field_content(editor, &field.placeholder)
+    }
+
     /// `readfield:FIELD`: the named input's exact value (an echoed placeholder reads
     /// as empty). Also added to the flow's `reads` as `{"field", "value", "len"}`. A
     /// secure field gives only `len=N`.
@@ -700,6 +803,10 @@ impl<R: Reader> Flow<R> {
         }
         let v = f.content().to_string();
         if v.is_empty() {
+            if let Some(value) = self.full_source_field_value(&f) {
+                self.reads.push(j!({"field": f.name, "value": value, "len": value.chars().count(), "source": "accessibility"}));
+                return Ok(value);
+            }
             if let Some(o) = self.ocr_in_field(&f.id) {
                 let n = o.chars().count();
                 self.reads.push(j!({"field": f.name, "value": o, "len": n, "source": "ocr"}));
@@ -747,7 +854,9 @@ impl<R: Reader> Flow<R> {
             }
             return Ok(format!("{}: len={n}", f.name));
         }
-        let got = f.content().to_string();
+        let direct = f.content();
+        let from_source = if direct.is_empty() { self.full_source_field_value(&f) } else { None };
+        let got = from_source.as_deref().unwrap_or(direct);
         if got.is_empty() && !want.is_empty() {
             // WDA reports no value although the field may show text: compare what OCR
             // reads in the field's frame, whitespace-insensitive (OCR has no blank lines).
@@ -783,7 +892,6 @@ impl<R: Reader> Flow<R> {
                 )));
             }
         }
-        let got = got.as_str();
         if got != want {
             let i = first_diff(got, &want);
             let ctx = |s: &str| -> String { s.chars().skip(i.saturating_sub(10)).take(30).collect() };

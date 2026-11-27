@@ -83,3 +83,33 @@ fn assertfield_prefers_vision_and_rejects_a_single_glyph_mismatch() {
     let mismatch = f.step("assertfield:#1=AC title").unwrap_err().to_string();
     assert!(mismatch.contains("OCR (WDA Vision)") && mismatch.contains("first difference at char 1"), "{mismatch}");
 }
+
+#[test]
+fn exact_field_read_uses_full_tree_editor_before_ocr() {
+    let _c = isolated_cache();
+    const NAME: &str = "example.editor.heading";
+    const VALUE: &str = "AI title\n\nwith blank lines";
+    let pred = format!("{INPUT_TYPES_PRED} AND (label ==[c] '{NAME}' OR name ==[c] '{NAME}' OR placeholderValue ==[c] '{NAME}')");
+    let mut st = composer();
+    st.elements_map.insert(ekey(&["predicate string", &pred]), vec![json!({"ELEMENT": "t1"})]);
+    st.element_names.insert("t1".into(), json!(NAME));
+    let wrapper = json!({"type":"TextView", "name":NAME, "isVisible":"1", "isAccessible":"0",
+        "rect":{"x":16,"y":150,"width":398,"height":114}});
+    let editor = json!({"type":"TextView", "name":"Heading", "label":"Heading", "isVisible":"1",
+        "isAccessible":"1", "value":VALUE, "rect":{"x":16,"y":150,"width":398,"height":110}});
+    st.element_rects.insert("t1".into(), wrapper["rect"].clone());
+    st.source_tree = Dyn::one(json!({"type":"Application","children":[wrapper,editor]}));
+    let mock = MockWda::start(st);
+    let mut f = flow(&mock);
+
+    let value = f.step(&format!("readfield:{NAME}")).unwrap().unwrap();
+    assert_eq!(value, json!(VALUE));
+    let assert_step = format!("assertfield:{NAME}={VALUE}");
+    assert!(f.step(&assert_step).is_ok());
+    assert!(mock.paths().iter().any(|p| p.ends_with("/source?format=json")));
+    assert!(!mock.paths().iter().any(|p| p.contains("fastOCR")));
+
+    // Two equally plausible editors must not prove an exact value.
+    mock.state().source_tree = Dyn::one(json!({"type":"Application","children":[wrapper,editor,editor]}));
+    assert!(f.step(&assert_step).is_err());
+}
