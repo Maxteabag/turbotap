@@ -2,7 +2,7 @@
 
 Measured on 28 Nov 2026 on a real **iPhone 17, iOS 26.6.2**, over home Wi-Fi from a Linux laptop, with the wda-turbo runner. The phone was in everyday use (Norwegian UI, real accounts), not a clean lab device. All scenarios use the Settings app, so every repetition sees the same screens. Times are wall clock in milliseconds: median, then fastest–slowest, then the number of runs. Step times come from each flow's own JSON output; failed steps are left out of step rows and counted in the success column of flow rows.
 
-Absolute numbers drift with the phone's state: a full-screen `read:ocr` of the Settings main page measured about 346 ms median at 05:45 and 420–510 ms at 06:15 the same morning. So compare numbers within one table, not across sessions.
+Absolute numbers drift with the phone's state: a full-screen `read:ocr` of the Settings main page measured about 346 ms median at 05:50 and 420–510 ms at 06:15 the same morning. So compare numbers within one table, not across sessions.
 
 ## v1.6.7 against older versions
 
@@ -48,7 +48,7 @@ Every failure, in every version, was the same: the second tap's label `Om` was n
 | `turbotap tree` (separate call) | 754 (608–1,158) | 771 (743–1,141) | 966 (810–1,160) | 756 (720–1,181) | same | same | faster (22%) |
 | `turbotap ocr` (separate call) | 302 (217–603) | 213 (194–262) | 216 (185–1,130) | 243 (187–415) | faster (20%) | **slower** (+14%) | **slower** (+12%) |
 
-Faster in v1.6.7: `back`, `tapel:` and `read`. The same: typing and the band read. The other labels go both ways depending on which older version you compare with.
+Faster than all three: `back` and `tapel:`; `read` is faster than two and the same as v1.6.0. The same: typing and the band read. Same or slower: `settle`, `read:ocr`, `read:vision`, `tapxy`. Same or faster: `ui`, `turbotap tree`. Mixed: `launch`, `turbotap ocr`.
 
 ## Warm daemon
 
@@ -67,7 +67,7 @@ The same Settings task, driven the way most phone agents work: each step takes a
 |---|---:|---:|---:|
 | whole task, wall clock | **22,008** | 16,057–26,847 | 6 |
 | same, minus `claude -p` start-up (screenshots, taps and model API time) | 14,597 | 10,091–17,358 | 6 |
-| model API time alone, per task | 5,999 | 4,316–7,397 | 6 |
+| model API time alone, per task | 5,998 | 4,316–7,397 | 6 |
 | one model call, wall clock / API time | 2,670 / 1,239 | 1,924–4,426 / 678–1,784 | 30 |
 | screenshots, total per task | 1,624 | 1,250–2,818 | 6 |
 | taps and scrolls incl. `settle`, total per task | 4,542 | 2,678–7,112 | 6 |
