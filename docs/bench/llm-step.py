@@ -12,9 +12,12 @@ msg = {"type": "user", "message": {"role": "user", "content": [
 sp = ("You control an iPhone one screenshot at a time. Reply with ONLY a JSON object, no prose: "
       '{"action":"tap","x":X,"y":Y} using pixel coordinates in the given image, {"action":"scroll","direction":"down"|"up"} to scroll the list, or {"action":"done","answer":"..."}. Controls hidden behind the bottom search bar are not tappable: scroll first.')
 t0 = time.time()
-p = subprocess.run(["claude", "-p", "--model", model, "--tools", "", "--system-prompt", sp,
+# isolated: no CLAUDE.md, settings, skills or MCP servers, so each call carries only this prompt and the image
+env = dict(os.environ, CLAUDE_CODE_DISABLE_CLAUDE_MDS="1")
+p = subprocess.run(["claude", "-p", "--model", model, "--tools", "", "--disable-slash-commands", "--setting-sources", "",
+                    "--strict-mcp-config", "--system-prompt", sp,
                     "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
-                   input=json.dumps(msg) + "\n", capture_output=True, text=True, cwd=os.getcwd())
+                   input=json.dumps(msg) + "\n", capture_output=True, text=True, env=env, cwd=os.getcwd())
 wall = int((time.time() - t0) * 1000)
 res = None
 for line in p.stdout.splitlines():
@@ -31,4 +34,4 @@ try:
 except Exception:
     pass
 print(json.dumps({"answer": ans, "raw": txt[:200], "wall_ms": wall, "api_ms": (res or {}).get("duration_api_ms"),
-                  "rc": p.returncode}))
+                  "rc": p.returncode, "ctx_tokens": sum(((res or {}).get("usage") or {}).get(k, 0) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))}))

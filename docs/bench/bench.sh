@@ -17,7 +17,9 @@ for rep in $(seq 1 $N); do
   run perstep launch:com.apple.Preferences wait:Flymodus settle read:ocr read ui read:vision "read:120-320" "tapxy:200,142"
   run type launch:com.apple.Preferences wait:Flymodus 'tapel:Søk' 'type:bluetooth wifi battery about'
   run fullflow launch:com.apple.Preferences wait:Flymodus settle 'scrollto:re:^Generelt$' 'tap:re:^Generelt$' 'tap:Om@y>380' 'wait:re:iOS-versjon' read:ocr
-  run back_nav 'back' 'wait:iPhone-lagring'
   cli cli_ocr turbotap --device 17 ocr
   cli cli_ui turbotap --device 17 tree
 done
+turbotap daemon start >/dev/null; sleep 2; turbotap --daemon --device 17 ocr >/dev/null 2>&1  # warm-up call, not counted
+for rep in $(seq 1 $N); do cli cli_ocr_daemon turbotap --daemon --device 17 ocr; done
+turbotap daemon stop >/dev/null

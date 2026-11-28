@@ -1,69 +1,78 @@
 # Benchmarks
 
-Measured on 28 Nov 2026 with **turbotap 1.6.7** (wda-turbo runner) on a real **iPhone 17, iOS 26.6.2**, over home Wi-Fi from a Linux laptop. The phone was in everyday use (Norwegian UI, real accounts), not a clean lab device. Each row was repeated 6 to 13 times. Times are wall clock in milliseconds; "range" is the fastest and slowest run. Per-step numbers come from turbotap's own timing log (`~/.local/state/turbotap/timings.jsonl`).
+Measured on 28 Nov 2026 on a real **iPhone 17, iOS 26.6.2**, over home Wi-Fi from a Linux laptop, with the wda-turbo runner. The phone was in everyday use (Norwegian UI, real accounts), not a clean lab device. All scenarios use the Settings app, so every repetition sees the same screens. Times are wall clock in milliseconds: median, then fastest–slowest, then the number of runs. Step times come from each flow's own JSON output; failed steps are left out of step rows and counted in the success column of flow rows.
 
-All runs use the Settings app, so the screens are the same on every repetition. Other apps, other screens and other networks will give other numbers.
+Absolute numbers drift with the phone's state: the same `read:ocr` step measured 146 ms median at 05:45 and around 450 ms at 06:15 the same morning. So compare numbers within one table, not across sessions.
 
-## Per step
+## v1.6.7 against older versions
 
-| Step | What it does | Median | Range | n |
-|---|---|---:|---:|---:|
-| `launch:APP` | terminate and cold-start Settings | 179 | 133–475 | 21 |
-| `tap:LABEL` | find a row by OCR, tap it, wait until the screen reacts (opens the next page) | 1,159 | 1,060–1,918 | 13 |
-| `tapxy:X,Y` | raw tap at a point, no lookup | 399 | 392–419 | 7 |
-| `tapel:LABEL` | tap an accessibility element by its exact label | 724 | 713–769 | 7 |
-| `type:TEXT` | type 28 characters into a focused search field | 903 | 879–922 | 7 |
-| `read:ocr` | screenshot + local OCR of the full screen | 146 | 115–495 | 13 |
-| `read:Y0-Y1` | OCR of a 200 pt band only | 49 | 44–56 | 7 |
-| `read` | OCR + on-screen controls in one step | 265 | 186–1,042 | 7 |
-| `ui` | on-screen controls from the accessibility tree | 130 | 117–149 | 7 |
-| `read:vision` | Apple Vision OCR on the phone | 350 | 344–369 | 7 |
-| `wait:TEXT` | poll until text is on screen | 352 | 125–508 | 29 |
-| `settle` | wait until the screen stops moving | 234 | 202–433 | 14 |
-| `scrollto:TEXT` | scroll until a label is visible | 783 | 176–928 | 7 |
-| `back` | edge-swipe back one page | 951 | 793–999 | 7 |
+Same phone, same scenarios, interleaved: each round ran every version once per scenario, with the version order rotated every round so no version always went first. Two sets: 6 rounds of every scenario, then 10 more rounds of the whole Settings flow only.
 
-`tap:` includes the time iOS takes to animate to the next page, because the step waits for the screen to react before it returns.
+"Same" means the medians are within 5% or 15 ms. With 6 runs and wide ranges, a difference of 10–20% between overlapping ranges is noise; the rows marked **regression** are the ones where the ranges hardly overlap.
 
-## Separate CLI calls
+### Label tap: slower in v1.6.7 (regression)
 
-| Command | Median | Range | n |
+| Step | v1.5.3 | v1.6.0 | v1.6.1 | v1.6.7 |
+|---|---:|---:|---:|---:|
+| `tap:LABEL` that opens the next page | 854 (614–3,577, 16) | 648 (598–11,100, 16) | 1,098 (624–2,190, 16) | **1,286** (1,084–3,922, 16) |
+| second `tap:LABEL` (`tap:Om@y>380`) | 1,088 (820–1,316, 12) | 1,071 (889–2,325, 13) | 1,136 (954–2,643, 11) | **1,299** (1,186–1,987, 13) |
+
+v1.6.7's fastest label tap is slower than the median of every older version. The timing log shows why: v1.6.7 sends one extra request per tap, `GET /session/:id/alert/text`, which took 409 ms median. Versions 1.5.3 to 1.6.1 never send it; their other requests per tap (`fastTap` ~258 ms, `activeAppInfo` ~238 ms, one screenshot, one `fastUI`) are unchanged.
+
+### Whole flow
+
+Open Settings, go to General, then About, and read the iOS version (`launch`, `wait`, `settle`, `scrollto`, two taps, `wait`, `read:ocr`):
+
+| | v1.5.3 | v1.6.0 | v1.6.1 | v1.6.7 |
+|---|---:|---:|---:|---:|
+| wall clock, successful runs | 5,061 (3,848–16,627) | 4,378 (3,898–25,577) | 7,819 (4,037–15,519) | 5,352 (4,834–10,442) |
+| succeeded | 12 of 16 | 13 of 16 | 11 of 16 | 13 of 16 |
+
+Every failure, in every version, was the same: the second tap's label `Om` was not found in time, and nothing else was tapped. v1.6.7 is the most consistent (fastest–median spread of 0.5 s), but its median is about 1 s slower than v1.6.0, mostly from the two label taps above.
+
+### Other steps (6 runs each)
+
+| Step | v1.5.3 | v1.6.0 | v1.6.1 | v1.6.7 | v1.6.7 is |
+|---|---:|---:|---:|---:|---|
+| `back` (edge swipe) | 1,846 (1,222–2,502) | 1,345 (1,269–2,433) | 2,180 (2,088–2,952) | **968** (797–1,145) | faster |
+| `tapel:LABEL` (accessibility element) | 994 (908–1,100) | 969 (915–1,017) | 1,058 (936–1,164) | **793** (723–898) | faster |
+| `settle` | 272 (159–372) | 247 (138–458) | 268 (143–366) | 214 (178–433) | faster or same |
+| `read` (OCR + controls) | 240 (152–806) | 185 (151–394) | 214 (165–421) | 180 (153–607) | same or faster |
+| `type:` 28 characters | 898 (891–932) | 916 (896–1,056) | 903 (890–938) | 902 (876–1,001) | same |
+| `read:Y0-Y1` (200 pt band) | 70 (46–201) | 62 (48–78) | 54 (44–167) | 66 (55–168) | same |
+| `ui` | 166 (134–1,908) | 152 (144–238) | 137 (114–196) | 142 (113–266) | same |
+| `read:vision` | 346 (338–1,088) | 372 (350–527) | 346 (338–359) | 372 (338–412) | same (within 7%) |
+| `read:ocr` | 442 (318–938) | 510 (273–646) | 419 (160–662) | 492 (297–591) | same (noisy) |
+| `tapxy:X,Y` (raw tap) | 424 (390–604) | 433 (409–473) | 434 (400–483) | 449 (400–543) | same (within 6%) |
+| `launch:APP` | 127 (80–180) | 194 (164–720) | 300 (131–471) | 175 (141–461) | noisy |
+| `turbotap tree` (separate call) | 754 (608–1,158) | 771 (743–1,141) | 966 (810–1,160) | 756 (720–1,181) | same |
+| `turbotap ocr` (separate call) | 302 (217–603) | 213 (194–262) | 216 (185–1,130) | 243 (187–415) | same (noisy) |
+
+## Warm daemon
+
+Separate `turbotap ocr` calls, v1.6.7, alternating with and without the daemon (10 each, after one warm-up call):
+
+| | Median | Range |
+|---|---:|---:|
+| `turbotap ocr` | 237 | 177–401 |
+| `turbotap --daemon ocr` | **148** | 122–295 |
+
+## One call vs one screenshot per step
+
+The same Settings task, driven the way most phone agents work: each step takes a full-resolution screenshot (downscaled to 603×1311 for the model), sends it to Claude Sonnet through `claude -p`, and the model answers with one tap (pixel coordinates), a scroll, or the answer. Each call is isolated (no tools, no CLAUDE.md, settings, skills or MCP servers; about 1,830 input tokens including the image). After every tap or scroll the script runs turbotap's `settle`, so the next screenshot is not taken mid-animation. turbotap only executes the tap or scroll the model chose. Measured in the same session as the version comparison.
+
+| | Median | Range | n |
 |---|---:|---:|---:|
-| `turbotap ocr` (new process, full-screen OCR) | 170 | 151–187 | 7 |
-| `turbotap --daemon ocr` (warm daemon) | 118 | 110–145 | 8 |
-| `turbotap tree` (full accessibility tree) | 749 | 699–1,077 | 7 |
+| whole task, wall clock | **22,008** | 16,057–26,847 | 6 |
+| same, counting only model API time (`claude -p` start-up removed) | 14,597 | 10,091–17,358 | 6 |
+| one model call, wall clock / API time | 2,670 / 1,239 | 1,924–4,426 / 678–1,784 | 30 |
+| screenshots, total per task | 1,624 | 1,250–2,818 | 6 |
+| taps and scrolls incl. `settle`, total per task | 4,542 | 2,678–7,112 | 6 |
 
-## A whole task: one call vs one screenshot per step
-
-Task: open Settings, go to General, then About, and read the iOS version.
-
-**turbotap, one call** (no model in the loop):
-
-```sh
-turbotap flow launch:com.apple.Preferences wait:Flymodus settle \
-  'scrollto:re:^Generelt$' 'tap:re:^Generelt$' 'tap:Om@y>380' 'wait:re:iOS-versjon' read:ocr
-```
-
-| | Median | Range | Success |
-|---|---:|---:|---:|
-| whole flow | **4,565** | 4,422–4,622 | 6 of 7 |
-
-One run failed: the second tap did not find its label in time (6.3 s, exit 1, nothing tapped by mistake).
-
-**One screenshot per step, a model picks each action**: the same task driven the way most phone agents work. Each step takes a full-resolution screenshot (downscaled to 603×1311 for the model), sends it to Claude Sonnet through `claude -p` with no tools, and the model answers with one tap (pixel coordinates), a scroll, or the answer. turbotap only executes the tap or scroll it is given.
-
-| | Median | Range | Success |
-|---|---:|---:|---:|
-| whole task, wall clock | **29,636** | 26,161–37,263 | 6 of 6 |
-| same, counting only model API time (CLI start-up removed) | 16,292 | 13,197–17,258 | |
-| model calls per task | 5 | 5–5 | |
-| screenshots, total per task | 1,727 | 1,582–2,251 | |
-| taps and scrolls, total per task | 4,571 | 4,430–5,312 | |
-
-The model-driven loop needed 5 round trips (tap, scroll, tap, tap, answer). Even with the `claude -p` start-up removed, it took about 3.6× as long as the single flow. With start-up counted it took about 6.5× as long. In practice an agent using turbotap still makes one model call to write the flow, so add one model turn (a few seconds) to the 4.6 s.
+All 6 runs found the right answer. Three runs took 6 model calls (one of them a wrong tap that had to be undone), three took 4. The same task as a single turbotap flow took 5,352 ms median in this session (table above), so the screenshot loop was about 4× slower in wall clock and 2.7× slower counting only model time. The comparison favours the flow in one way: it was written by someone who already knew the screens (`scrollto` before the tap, `@y>380` to pick the right `Om`). An agent using turbotap still spends one model turn writing the flow.
 
 ## How to reproduce
 
-The scripts used are in [`docs/bench/`](bench/): `bench.sh` (per-step, flow and CLI rows), `llm-loop.sh` with `llm-step.py` (the screenshot-per-step loop) and `stats.py` (median and range from the timing log). They expect a configured device named `17` and the Settings app in Norwegian; change the labels for your phone's language.
+The scripts are in [`docs/bench/`](bench/): `compare.sh` (the interleaved version comparison), `bench.sh` (per-step, flow and CLI rows for one version, plus the daemon rows), `llm-loop.sh` with `llm-step.py` (the screenshot-per-step loop) and `stats.py` / `cmp-stats.py` (medians and ranges). They expect a configured device named `17` and the Settings app in Norwegian; change the labels for your phone's language.
 
 Not re-measured here: the stock-WebDriverAgent comparison figures in earlier READMEs, and the offline host-side microbenchmarks.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-screenshot-per-step LLM control of the same Settings task as "fullflow": launch, then screenshot -> Claude -> one action, until it answers.
+# One-screenshot-per-step LLM control of the same Settings task as "fullflow": launch, then screenshot -> Claude -> tap, x3.
 set -u
 D=$(cd "$(dirname "$0")" && pwd); OUT=${OUT:-$PWD/bench-out}; mkdir -p $OUT; N=${N:-5}; MODEL=${MODEL:-sonnet}
 export TURBOTAP_TIMINGS=$OUT/timings-llm.jsonl
@@ -22,7 +22,7 @@ for rep in $(seq 1 $N); do
     if [ "$act" = scroll ]; then a=$(date +%s%N); $T "scroll:$(echo "$r" | jq -r .answer.direction)" >/dev/null 2>&1; b=$(date +%s%N); taps=$((taps+(b-a)/1000000)); steps=$((steps+1)); continue; fi
     [ "$act" = tap ] || break; steps=$((steps+1))
     x=$(echo "$r" | jq ".answer.x / $SCALE | floor"); y=$(echo "$r" | jq ".answer.y / $SCALE | floor")
-    a=$(date +%s%N); $T "tapxy:$x,$y" "sleep:400" >/dev/null 2>&1; b=$(date +%s%N); taps=$((taps+(b-a)/1000000))
+    a=$(date +%s%N); $T "tapxy:$x,$y" settle >/dev/null 2>&1; b=$(date +%s%N); taps=$((taps+(b-a)/1000000))
   done
   t1=$(date +%s%N)
   echo "{\"label\":\"llmloop\",\"rep\":$rep,\"model\":\"$MODEL\",\"ok\":$ok,\"answer\":$(jq -Rn --arg a "$ans" '$a'),\"wall_ms\":$(( (t1-t0)/1000000 )),\"shot_ms\":$shots,\"llm_ms\":$llm,\"llm_api_ms\":$api,\"tap_ms\":$taps,\"actions\":$steps}" | tee -a $OUT/runs.jsonl
