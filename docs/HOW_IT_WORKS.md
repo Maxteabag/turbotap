@@ -116,5 +116,14 @@ What stays warm is the transport and the engines: keep-alive connections (droppe
 | Scroll until settled | ~2,000 ms | 150-370 ms | **150-350 ms** (`dur=0.08, rel=0.08`) |
 | UI tree (`/wda/fastUI`) | ~2,600 ms | ~453 ms | **~158-198 ms** (single-RTT `waitBundle`; 297 ms v1 fallback) |
 | Multi-step flow (9-task suite) | 14.4-15.7 s | 66.1 s (5/9) | **25.4 s (9/9)** (-34.1% vs v0.5.0, **2.6× faster** vs v0.2.0) |
+| `preflight` (v6 `/wda/fastPreflight`) | ~245 ms | ~245 ms | **~230 ms** (one request; stock fallback) |
+| Polling an unchanged screen (20 frames) | 1.22 MB | 1.22 MB | **244 KB** (v6 `ETag` / `304 Not Modified`) |
+| Read + UI tree (`read`, parallel) | ~204 ms serial | ~204 ms serial | **~95 ms** (frame capture + `/wda/fastUI` in parallel) |
+| Repeated separate CLI calls (OCR) | ~555 ms | ~555 ms | **~288 ms** (warm daemon `--daemon`) |
+| Hard-to-read text (`read:vision`) | 12/72 words (host OCR) | 12/72 words | **72/72 words, ~235 ms** (v6 on-device Apple Vision OCR) |
+
+The last five rows were measured on an iPhone 17 in [PR #8](https://github.com/Maxteabag/turbotap/pull/8) on small workloads (Calculator, Settings, and a multilingual test page). Expect different numbers on other screens.
+
+**Host-side Rust vs Python `v0.10.0` overhead (offline mock-WDA microbenchmarks, separate from the iPhone 17 numbers above):** moving to the native Rust binary cut CLI startup from ~43 ms to **~1.3 ms**, `daemon start` from ~409 ms (Python) / ~326 ms (`v1.0.0`) to **~3.9 ms** (async OCR warm-up overlapping socket readiness), non-OCR flows (`ui`, `read:vision`, `shot`, `settle`) to **~2–6 ms** and **~12 MB RSS** (-97% vs ~414 MB), warm daemon request overhead to **~1.9–2.1 ms**, and warm daemon OCR to **~24–28 ms** (~2.2× faster than Python `v0.10.0`).
 
 `WDA_TURBO=0` forces the stock endpoints and `WDA_OCR=binary` forces a fork of the `tesseract` binary per call. Use them to reproduce the baseline on your own phone.
