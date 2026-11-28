@@ -16,7 +16,7 @@
   <sub>Click to watch the 39-second demo on a real iPhone over Wi-Fi (Settings, Spotify, Weather, and the App Store).</sub>
 </p>
 
-Driving an iPhone one screenshot per LLM turn is painfully slow: grab a frame, wait for the model to pick coordinates, and wait another second per tap on stock WebDriverAgent. `turbotap` runs an entire sequence of UI steps in one local Rust command against a patched WebDriverAgent on the phone and returns JSON with the text and interactive controls on screen.
+Driving an iPhone one screenshot per LLM turn is slow: grab a frame, wait for the model to pick coordinates, send one action, and repeat. `turbotap` runs an entire sequence of UI steps in one local Rust command against a patched WebDriverAgent on the phone and returns JSON with the text and interactive controls on screen.
 
 ## What it does
 
@@ -24,8 +24,8 @@ All numbers below were measured on 28 Nov 2026 on a real iPhone 17 (iOS 26.6.2) 
 
 - **One-command multi-step flows:** batches taps, scrolls, text entry, and reads in one local Rust process instead of taking a screenshot per LLM turn. On the Settings → General → About → read iOS version task, a single flow ran in **6.9 s median** (5.5–15.8 s; 5/8 succeeded on v1.6.8 candidate `7d2e6cd`), while a screenshot-per-step Claude Sonnet loop took **22.0 s median** wall clock (16.1–26.8 s, 6/6 succeeded, separate v1.6.7 session; an agent using `turbotap` still spends one model turn writing the flow).
 - **Patched WebDriverAgent (`wda-turbo`):** on v1.6.7 (n=6), cold app launch (`launch:APP`) measured **175 ms median** (141–461 ms), raw tap (`tapxy:`) **449 ms** (400–543 ms), exact element tap (`tapel:`) **793 ms** (723–898 ms), and typing 28 characters (`type:`) **902 ms** (876–1,001 ms). Reaction-verified label taps (`tap:LABEL`, including iOS transition wait) measured **1,141 ms cold** (1,067–1,269 ms) and **1,207 ms primed** (1,148–1,406 ms, n=8 each on v1.6.8 candidate `7d2e6cd`). Automatically falls back to stock WDA when unpatched.
-- **Dual screen reading (OCR + UI tree):** on v1.6.7 (n=6), combined `read` (OCR + interactive controls) measured **180 ms median** (153–607 ms), accessibility tree (`ui`) **142 ms** (113–266 ms), 200 pt band OCR (`read:Y0-Y1`) **66 ms** (55–168 ms), full-screen `read:ocr` **492 ms** (297–591 ms; 183 ms inside the candidate flow, n=5), and on-device Apple Vision OCR (`read:vision`) **372 ms** (338–412 ms).
-- **Single standalone binary for agents and scripts:** no Python runtime, bundled agent skills (`turbotap install-skill`), step-level timing receipts (`turbotap timings --receipt`), and an optional warm daemon (`--daemon`, cutting separate `turbotap ocr` calls from **237 ms** to **148 ms median**, 122–295 ms, v1.6.7, n=10 each).
+- **Dual screen reading (OCR + UI tree):** on v1.6.7 (n=6), combined `read` (OCR + interactive controls) measured **180 ms median** (153–607 ms), accessibility tree (`ui`) **142 ms** (113–266 ms), 200 pt band OCR (`read:Y0-Y1`) **66 ms** (55–168 ms), full-screen `read:ocr` **492 ms** (297–591 ms; 183 ms, 158–284 ms, inside the candidate flow, n=5), and on-device Apple Vision OCR (`read:vision`) **372 ms** (338–412 ms).
+- **Single standalone binary for agents and scripts:** no Python runtime, bundled agent skills (`turbotap install-skill`), step-level timing receipts (`turbotap timings --receipt`), and an optional warm daemon (`--daemon`, cutting separate `turbotap ocr` calls from **237 ms** (177–401 ms) to **148 ms median** (122–295 ms), v1.6.7, n=10 each).
 
 ## Examples
 
