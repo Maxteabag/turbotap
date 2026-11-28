@@ -34,7 +34,7 @@ fn input_posts(mock: &MockWda) -> Vec<(String, String, Value)> {
 }
 
 fn active_app_calls(mock: &MockWda) -> usize {
-    mock.paths().iter().filter(|p| p.as_str() == "/wda/activeAppInfo").count()
+    mock.paths().iter().filter(|p| p.split('?').next() == Some("/wda/activeAppInfo")).count()
 }
 
 fn state_with_app(app: Value) -> MockState {
