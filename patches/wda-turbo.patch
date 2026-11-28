@@ -1,16 +1,17 @@
 diff --git a/WebDriverAgentLib/Commands/FBCustomCommands.m b/WebDriverAgentLib/Commands/FBCustomCommands.m
-index 6dee73b..80d8c67 100644
+index 6dee73b..f1c1ae0 100644
 --- a/WebDriverAgentLib/Commands/FBCustomCommands.m
 +++ b/WebDriverAgentLib/Commands/FBCustomCommands.m
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,8 @@
  #import <XCTest/XCUIDevice.h>
  #import <CoreLocation/CoreLocation.h>
  
 +#import "FBElementCommands.h"
++#import "FBAlert.h"
  #import "FBConfiguration.h"
  #import "FBKeyboard.h"
  #import "FBNotificationsHelper.h"
-@@ -35,6 +36,67 @@
+@@ -35,6 +37,67 @@
  #import "XCUIElement+FBIsVisible.h"
  #import "XCUIElementQuery.h"
  #import "FBUnattachedAppLauncher.h"
@@ -78,7 +79,7 @@ index 6dee73b..80d8c67 100644
  
  @implementation FBCustomCommands
  
-@@ -50,6 +112,7 @@
+@@ -50,6 +113,7 @@
      [[FBRoute POST:@"/wda/lock"] respondWithTarget:self action:@selector(handleLock:)],
      [[FBRoute POST:@"/wda/unlock"].withoutSession respondWithTarget:self action:@selector(handleUnlock:)],
      [[FBRoute POST:@"/wda/unlock"] respondWithTarget:self action:@selector(handleUnlock:)],
@@ -86,7 +87,7 @@ index 6dee73b..80d8c67 100644
      [[FBRoute GET:@"/wda/locked"].withoutSession respondWithTarget:self action:@selector(handleIsLocked:)],
      [[FBRoute GET:@"/wda/locked"] respondWithTarget:self action:@selector(handleIsLocked:)],
      [[FBRoute GET:@"/wda/screen"] respondWithTarget:self action:@selector(handleGetScreen:)],
-@@ -75,6 +138,8 @@
+@@ -75,6 +139,8 @@
      [[FBRoute POST:@"/wda/expectNotification"] respondWithTarget:self action:@selector(handleExpectNotification:)],
      [[FBRoute POST:@"/wda/siri/activate"] respondWithTarget:self action:@selector(handleActivateSiri:)],
      [[FBRoute POST:@"/wda/apps/launchUnattached"].withoutSession respondWithTarget:self action:@selector(handleLaunchUnattachedApp:)],
@@ -95,7 +96,7 @@ index 6dee73b..80d8c67 100644
      [[FBRoute GET:@"/wda/device/hingeAngle"] respondWithTarget:self action:@selector(handleGetSimulatedHingeAngle:)],
      [[FBRoute GET:@"/wda/device/hingeAngle"].withoutSession respondWithTarget:self action:@selector(handleGetSimulatedHingeAngle:)],
      [[FBRoute POST:@"/wda/device/hingeAngle"] respondWithTarget:self action:@selector(handleSetSimulatedHingeAngle:)],
-@@ -207,8 +272,12 @@
+@@ -207,8 +273,12 @@
  
  + (id<FBResponsePayload>)handleIsLocked:(FBRouteRequest *)request
  {
@@ -110,12 +111,27 @@ index 6dee73b..80d8c67 100644
  }
  
  + (id<FBResponsePayload>)handleUnlock:(FBRouteRequest *)request
-@@ -222,16 +291,30 @@
+@@ -222,16 +292,45 @@
  
  + (id<FBResponsePayload>)handleActiveAppInfo:(FBRouteRequest *)request
  {
 -  XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
-+  return FBResponseWithObject([self activeAppInfoForSession:request.session]);
++  NSDictionary *info = [self activeAppInfoForSession:request.session];
++  NSString *sessionID = request.parameters[@"tapAlertSession"];
++  FBSession *alertSession = sessionID.length > 0 ? [FBSession sessionWithIdentifier:sessionID] : nil;
++  if (nil == alertSession) {
++    return FBResponseWithObject(info);
++  }
++
++  // Opt-in only. Observe the same session application as /alert/text so
++  // system and limited-access prompts use the existing WDA alert discovery.
++  XCUIApplication *alertApp = alertSession.activeApplication ?: XCUIApplication.fb_activeApplication;
++  if (nil == alertApp) {
++    return FBResponseWithObject(info);
++  }
++  NSMutableDictionary *result = [info mutableCopy];
++  result[@"tapAlertPresent"] = @([[FBAlert alertWithApplication:alertApp] isPresent]);
++  return FBResponseWithObject(result);
 +}
 +
 ++ (NSDictionary *)activeAppInfoForSession:(FBSession *)session
@@ -144,7 +160,7 @@ index 6dee73b..80d8c67 100644
  }
  
  /**
-@@ -386,6 +469,81 @@
+@@ -386,6 +485,81 @@
    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"LSApplicationWorkspace failed to launch app" traceback:nil]);
  }
  

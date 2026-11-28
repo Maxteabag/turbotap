@@ -361,6 +361,19 @@ impl<R: Reader> Flow<R> {
         Ok(self.observe_tap(target, before))
     }
 
+    pub(super) fn tap_step(&mut self, label: &str, alert_present: Option<bool>) -> Result<String> {
+        self.c.stop_check().map_err(Error::flow)?;
+        if alert_present != Some(false) || self.waitany_alert_button.is_some() {
+            if let Some(button) = self.tap_named_alert(label)? {
+                return Ok(button);
+            }
+            if alert_present == Some(true) {
+                return Err(Error::flow("tap: the observed iOS alert is no longer active"));
+            }
+        }
+        Ok(self.tap_text(label)?.into_step_text())
+    }
+
     /// L3231.
     pub fn tap_text(&mut self, label: &str) -> Result<TapOutcome> {
         let app_confirmed = self.wait_active_app(1.5, 0.03, None);
