@@ -20,12 +20,12 @@ Driving an iPhone one screenshot per LLM turn is painfully slow: grab a frame, w
 
 ## What it does
 
-- **One-command multi-step flows:** batches taps, scrolls, text entry, and screen reads in a single local process (~1.3 ms CLI startup, offline microbenchmark) — **1.0–6.0 s** vs 14.4–15.7 s on stock WDA (measured on an iPhone 17 over Wi-Fi).
-- **Patched WebDriverAgent (`wda-turbo`):** cuts taps from 740–1,200 ms to **~260 ms**, frame grabs from 123–244 ms to **~34 ms**, UI trees from ~2,600 ms to **158–198 ms**, and scrolls from ~2,000 ms to **150–350 ms** (iPhone 17 over Wi-Fi; falls back automatically to stock WDA).
-- **Dual screen reading (OCR + UI tree):** runs strip-parallel local Tesseract OCR (100–180 ms cold, ~50 ms cached) in parallel with `/wda/fastUI` (**~95 ms** combined vs ~204 ms serial, [PR #8](https://github.com/Maxteabag/turbotap/pull/8)), plus optional on-device Apple Vision OCR (`read:vision`, 72/72 words in ~235 ms on a multilingual test page vs 12/72 for host OCR).
-- **Single standalone binary for agents and scripts:** no Python runtime, bundled agent skills (`turbotap install-skill`), optional warm daemon (`--daemon`, keeps `libtesseract` and WDA connections warm; ~2 ms local dispatch and ~24–28 ms OCR in offline Rust benchmarks), and step-level timing receipts (`turbotap timings --receipt`).
+All numbers below were measured on 28 Nov 2026 on a real iPhone 17 (iOS 26.6.2) over home Wi-Fi; full methodology, ranges, version labels, and reproduction scripts are in [docs/benchmarks.md](docs/benchmarks.md).
 
-See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the full benchmark table and technical details.
+- **One-command multi-step flows:** batches taps, scrolls, text entry, and reads in one local Rust process instead of taking a screenshot per LLM turn. On the Settings → General → About → read iOS version task, a single flow ran in **6.9 s median** (5.5–15.8 s; 5/8 succeeded on v1.6.8 candidate `7d2e6cd`), while a screenshot-per-step Claude Sonnet loop took **22.0 s median** wall clock (16.1–26.8 s, 6/6 succeeded, separate v1.6.7 session; an agent using `turbotap` still spends one model turn writing the flow).
+- **Patched WebDriverAgent (`wda-turbo`):** on v1.6.7 (n=6), cold app launch (`launch:APP`) measured **175 ms median** (141–461 ms), raw tap (`tapxy:`) **449 ms** (400–543 ms), exact element tap (`tapel:`) **793 ms** (723–898 ms), and typing 28 characters (`type:`) **902 ms** (876–1,001 ms). Reaction-verified label taps (`tap:LABEL`, including iOS transition wait) measured **1,141 ms cold** (1,067–1,269 ms) and **1,207 ms primed** (1,148–1,406 ms, n=8 each on v1.6.8 candidate `7d2e6cd`). Automatically falls back to stock WDA when unpatched.
+- **Dual screen reading (OCR + UI tree):** on v1.6.7 (n=6), combined `read` (OCR + interactive controls) measured **180 ms median** (153–607 ms), accessibility tree (`ui`) **142 ms** (113–266 ms), 200 pt band OCR (`read:Y0-Y1`) **66 ms** (55–168 ms), full-screen `read:ocr` **492 ms** (297–591 ms; 183 ms inside the candidate flow, n=5), and on-device Apple Vision OCR (`read:vision`) **372 ms** (338–412 ms).
+- **Single standalone binary for agents and scripts:** no Python runtime, bundled agent skills (`turbotap install-skill`), step-level timing receipts (`turbotap timings --receipt`), and an optional warm daemon (`--daemon`, cutting separate `turbotap ocr` calls from **237 ms** to **148 ms median**, 122–295 ms, v1.6.7, n=10 each).
 
 ## Examples
 
@@ -132,7 +132,8 @@ See [docs/SAFETY.md](docs/SAFETY.md) for the full security model, device-pinning
 - [docs/SETUP.md](docs/SETUP.md) — Mac/Xcode signing, SSH keychain, multiple phones, troubleshooting
 - [docs/REFERENCE.md](docs/REFERENCE.md) — Complete CLI subcommands, flow steps, timing receipts, warm daemon, environment variables
 - [docs/SAFETY.md](docs/SAFETY.md) — Stop file, app guard, deny patterns, credential handling, cross-invocation redaction
-- [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) — Full benchmark table, `wda-turbo.patch` endpoints, strip-parallel OCR, zero-momentum scrolling
+- [docs/benchmarks.md](docs/benchmarks.md) — Fresh iPhone 17 benchmarks (medians, ranges, version comparisons, reproduction scripts)
+- [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) — Architecture, `wda-turbo.patch` endpoints, strip-parallel OCR, zero-momentum scrolling
 - [skills/turbotap/SKILL.md](skills/turbotap/SKILL.md) & [skills/turbotap-retro/SKILL.md](skills/turbotap-retro/SKILL.md) — Bundled skills for Claude Code, Codex, and OpenClaw
 
 ## License
