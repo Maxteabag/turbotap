@@ -180,6 +180,27 @@ fn test_stop_created_during_alert_lookup_blocks_alert_input() {
 }
 
 #[test]
+fn stop_during_bundled_tap_preflight_exits_without_input() {
+    let _cache = isolated_cache();
+    let dir = TempDir::new("tt-stop-bundled-alert-");
+    let stop = dir.path().join("phone.STOP");
+    let mock = MockWda::start(MockState::default());
+    let stop_in_handler = stop.clone();
+    mock.set_custom_handler(move |_, method, path, _| {
+        if method == "GET" && path.starts_with("/wda/activeAppInfo?tapAlertSession=") {
+            std::fs::write(&stop_in_handler, "").unwrap();
+            return Some(json!({"value": {"bundleId": ALLOWED, "tapAlertPresent": false}}));
+        }
+        None
+    });
+    let (code, out) = run_flow(&mock, &stop, &["--allow-app", ALLOWED, "tap:Continue"]);
+    assert_eq!(code, crate::stop::STOP_EXIT, "{out}");
+    assert!(mock.paths().iter().any(|p| p.starts_with("/wda/activeAppInfo?tapAlertSession=")));
+    assert!(mock.tapped_points().is_empty());
+    assert!(!mock.paths().iter().any(|p| p.ends_with("/alert/text") || p.ends_with("/alert/accept")));
+}
+
+#[test]
 fn test_stop_during_navigation_target_lookup_blocks_the_tap() {
     let _c = isolated_cache();
     let dir = TempDir::new("tt-stop-navigation-");

@@ -654,7 +654,7 @@ impl<R: Reader> Flow<R> {
     /// [`Error::AppGuard`].
     pub fn step(&mut self, spec: &str) -> Result<Option<Value>> {
         if !self.c.app_guard_active() {
-            return self.step_inner(spec);
+            return self.step_inner(spec, None);
         }
         let label = safe_step(spec);
         let prev = self.c.guard_action.replace(label.clone());
@@ -786,12 +786,16 @@ impl<R: Reader> Flow<R> {
     fn guarded_step(&mut self, spec: &str, label: &str) -> Result<Option<Value>> {
         let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
         let verb = verb.trim().to_lowercase();
+        if verb == "tap" {
+            let alert = self.c.ensure_tap_foreground(label)?;
+            return self.step_inner(spec, alert);
+        }
         if crate::guard::step_is_input(&verb, arg) {
             self.c.ensure_allowed_app(label, None)?;
         } else if verb == "url" {
             self.c.ensure_url_allowed(label, Some(arg.trim()))?;
         }
-        self.step_inner(spec)
+        self.step_inner(spec, None)
     }
 
     fn tap_navigation_target(&mut self, verb: &str, arg: &str) -> Result<String> {
@@ -832,7 +836,7 @@ impl<R: Reader> Flow<R> {
         }
     }
 
-    fn step_inner(&mut self, spec: &str) -> Result<Option<Value>> {
+    fn step_inner(&mut self, spec: &str, tap_alert: Option<bool>) -> Result<Option<Value>> {
         let (verb, arg) = spec.split_once(':').unwrap_or((spec, ""));
         let verb_trimmed = verb.trim();
         let verb: std::borrow::Cow<'_, str> =
@@ -904,12 +908,7 @@ impl<R: Reader> Flow<R> {
             "gone" => self.gone(arg, None)?,
             "assert" => return some(self.assert_text(arg)?),
             "assertnot" => return some(self.assert_not_text(arg)?),
-            "tap" => {
-                if let Some(button) = self.tap_named_alert(arg)? {
-                    return some(button);
-                }
-                return some(self.tap_text(arg)?.into_step_text());
-            }
+            "tap" => return some(self.tap_step(arg, tap_alert)?),
             "tapif" => return some(self.tap_if(arg, 1.0)?),
             "tapbatch" => return some(self.tap_batch(arg)?),
             "toggle" => return some(self.toggle(arg)?),

@@ -1127,6 +1127,72 @@ fn test_waitany_and_tap_use_live_named_alert_instead_of_foreground_controls() {
 }
 
 #[test]
+fn test_guarded_tap_uses_bundled_alert_presence_and_preserves_legacy_fallback() {
+    let _cache = isolated_cache();
+    let (_clock, _hook) = skip_sleep();
+    let image = solid_img(240, (430, 932));
+    let lines = [ml("Continue", 40, 200, 120, 220)];
+    let reader = FakeReader::new(vec![fr(&image, &lines)]);
+    for (signal, alert_title, alerts, taps, expected_error) in [
+        (Some(json!(false)), None, 0, 1, None),
+        (None, None, 1, 1, None),
+        (Some(json!("false")), None, 1, 1, None),
+        (Some(json!(true)), Some("Choose a response"), 1, 0, Some("no unique exact match")),
+        (Some(json!(true)), None, 1, 0, Some("no longer active")),
+    ] {
+        let mut state = MockState::default();
+        state.alert_text = alert_title.map(|title| Dyn::one(json!(title)));
+        state.alert_buttons = Some(Dyn::one(json!(["Other choice"])));
+        let mock = MockWda::start(state);
+        mock.set_custom_handler(move |_, method, path, _| {
+            if method == "GET" && path.starts_with("/wda/activeAppInfo?tapAlertSession=") {
+                let mut reply = json!({"value": {"bundleId": "com.example.app"}});
+                if let Some(signal) = &signal {
+                    reply["value"]["tapAlertPresent"] = signal.clone();
+                }
+                Some(reply)
+            } else {
+                None
+            }
+        });
+        let mut flow = mk_flow(&mock, &reader, 2.0);
+        flow.c.set_allowed_apps(vec!["com.example.app".into()]);
+        let result = flow.step("tap:Continue");
+        if let Some(message) = expected_error {
+            assert!(flow_err(result).contains(message), "{message}");
+        } else {
+            assert!(result.unwrap().unwrap().as_str().unwrap().starts_with("Continue"));
+        }
+        let paths = mock.paths();
+        assert_eq!(paths.iter().filter(|p| p.starts_with("/wda/activeAppInfo?tapAlertSession=")).count(), 1);
+        assert_eq!(paths.iter().filter(|p| p.ends_with("/alert/text")).count(), alerts);
+        assert_eq!(mock.tapped_points().len(), taps);
+        if taps == 1 {
+            let index = paths.iter().position(|p| p == "/wda/fastTap" || p.ends_with("/wda/tap")).unwrap();
+            assert_eq!(paths[index - 1], "/wda/activeAppInfo");
+        }
+    }
+
+    let mut state = MockState::default();
+    state.alert_text = Some(Dyn::one(json!("Choose a response")));
+    state.alert_buttons = Some(Dyn::one(json!(["Continue"])));
+    let mock = MockWda::start(state);
+    mock.set_custom_handler(|_, _, path, _| {
+        path.starts_with("/wda/activeAppInfo?tapAlertSession=").then(|| {
+            json!({"value": {"bundleId": "com.example.app", "tapAlertPresent": false}})
+        })
+    });
+    let mut flow = mk_flow(&mock, &reader, 2.0);
+    flow.c.set_allowed_apps(vec!["com.example.app".into()]);
+    assert_eq!(step_s(&mut flow, "waitany:Continue"), "Continue");
+    mock.state().alert_text = None;
+    let before = mock.paths().iter().filter(|p| p.ends_with("/alert/text")).count();
+    assert!(flow_err(flow.step("tap:Continue")).contains("no longer active"));
+    assert_eq!(mock.paths().iter().filter(|p| p.ends_with("/alert/text")).count(), before + 1);
+    assert!(mock.tapped_points().is_empty());
+}
+
+#[test]
 fn test_alert_action_requires_an_exact_live_allowed_button() {
     let _cache = isolated_cache();
     let mut st = MockState::default();

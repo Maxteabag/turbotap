@@ -984,9 +984,13 @@ impl WdaClient {
     }
 
     pub fn live_foreground_app(&mut self, deadline: Option<f64>) -> std::result::Result<String, String> {
+        self.foreground_observation("/wda/activeAppInfo", deadline).map(|(bundle, _)| bundle)
+    }
+
+    fn foreground_observation(&mut self, path: &str, deadline: Option<f64>) -> std::result::Result<(String, Option<bool>), String> {
         // Raw status on purpose: the shared typed helper treats every status below 400
         // (redirects included) as success, but only an actual 2xx may authorize input.
-        match self.exchange_borrowed("GET", "/wda/activeAppInfo", None, &[], 5.0, deadline, false, |b| {
+        match self.exchange_borrowed("GET", path, None, &[], 5.0, deadline, false, |b| {
             serde_json::from_slice::<Value>(b).map(Some).map_err(|e| e.to_string())
         }) {
             Ok(Some((status, Some(v), _))) if (200..300).contains(&status) => {
@@ -994,7 +998,7 @@ impl WdaClient {
                 if let Ok(b) = &r {
                     self.last_foreground = Some(b.clone());
                 }
-                r
+                r.map(|bundle| (bundle, v.pointer("/value/tapAlertPresent").and_then(Value::as_bool)))
             }
             Ok(Some((status, _, _))) => Err(format!("activeAppInfo failed: HTTP {status}")),
             Ok(None) => Err("activeAppInfo failed: deadline exceeded".into()),
@@ -1049,15 +1053,42 @@ impl WdaClient {
         Err(self.guard_refuse(crate::guard::refuse_unknown(action, why, &self.allowed_apps)))
     }
 
+    /// Ask a prepared runner for alert presence in the foreground request the tap
+    /// already needs. Missing metadata leaves old and stock runners on the live
+    /// alert endpoint. The transport still runs its own foreground and STOP checks.
+    pub(crate) fn ensure_tap_foreground(&mut self, action: &str) -> Result<Option<bool>> {
+        let Some(sid) = self.sid.as_deref().filter(|sid| {
+            !sid.is_empty() && sid.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        }) else {
+            self.ensure_allowed_app(action, None)?;
+            return Ok(None);
+        };
+        let path = format!("/wda/activeAppInfo?tapAlertSession={sid}");
+        let mut alert_present = None;
+        self.check_foreground_with(action, None, |client| {
+            let (bundle, observed) = client.foreground_observation(&path, None)?;
+            alert_present = observed;
+            Ok(bundle)
+        })?;
+        Ok(alert_present)
+    }
+
     /// Live foreground check: Ok(true) allowed, Ok(false) `deadline` ran out first
     /// (nothing decided), Err refusal (sticky).
     fn check_foreground(&mut self, action: &str, deadline: Option<f64>) -> Result<bool> {
+        self.check_foreground_with(action, deadline, |client| client.live_foreground_app(deadline))
+    }
+
+    fn check_foreground_with(
+        &mut self, action: &str, deadline: Option<f64>,
+        mut read: impl FnMut(&mut Self) -> std::result::Result<String, String>,
+    ) -> Result<bool> {
         self.guard_precheck(action)?;
         let expired = |d: Option<f64>| d.is_some_and(|d| clock::now() >= d);
         if expired(deadline) {
             return Ok(false);
         }
-        let mut first = self.live_foreground_app(deadline);
+        let mut first = read(self);
         if let Some(expected) = self.required_input_foreground {
             return match first {
                 _ if expired(deadline) => Ok(false),
@@ -1078,7 +1109,7 @@ impl WdaClient {
             let end = deadline.map_or(t0 + BANNER_RECHECK, |d| d.min(t0 + BANNER_RECHECK));
             while clock::now() < end {
                 clock::sleep(0.2f64.min((end - clock::now()).max(0.0)));
-                first = self.live_foreground_app(deadline);
+                first = read(self);
                 if !matches!(&first, Ok(b) if b == SPRINGBOARD) {
                     break;
                 }
