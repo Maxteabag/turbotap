@@ -361,68 +361,8 @@ impl<R: Reader> Flow<R> {
         Ok(self.observe_tap(target, before))
     }
 
-    fn tap_needs_transition_settle(&self) -> bool {
-        self.last_action_ts != 0.0
-            && (clock::now() - self.last_action_ts) < 0.7
-            && self.wait_settled_ts < self.last_action_ts
-            && self.last_reaction_diff >= 2.0
-            && self.r.last_lines().is_none()
-            && self.r.last().is_some()
-    }
-
-    pub(super) fn tap_text_step(&mut self, label: &str) -> Result<String> {
-        // Leave the cheap cached paths and app-transition handling alone.
-        // An observed alert match must still be rechecked before any action.
-        if self.pending_bundle.is_some() || self.waitany_alert_button.is_some() || self.ctl_cache.is_some()
-            || self.tap_needs_transition_settle()
-            || (self.r.last().is_some() && clock::now() - self.r.last_ts() < 0.15)
-        {
-            if let Some(button) = self.tap_named_alert(label)? {
-                return Ok(button);
-            }
-            return Ok(self.tap_text(label)?.into_step_text());
-        }
-
-        self.c.stop_check().map_err(Error::flow)?;
-        let session = self.c.sid.clone();
-        let (worker, probes) = self.ui_worker();
-        let alert = worker.submit(probes, |side| {
-            let before = side.stats;
-            let previous_kinds = std::mem::take(&mut side.req_kinds);
-            let observation = super::sense::named_alert_on(side, None);
-            let kinds = std::mem::replace(&mut side.req_kinds, previous_kinds);
-            (observation, side.stats.since(&before), kinds)
-        });
-        let screen = self.lines(None, None);
-        let (observation, stats, kinds) = alert.recv()
-            .map_err(|_| Error::flow("could not verify active iOS alert (UI worker unavailable)"))?;
-        self.c.stats.add(&stats);
-        for (kind, (count, micros)) in kinds {
-            let total = self.c.req_kinds.entry(kind).or_default();
-            total.0 += count;
-            total.1 += micros;
-        }
-        self.c.stop_check().map_err(Error::flow)?;
-        if self.c.sid != session {
-            // A screenshot can recover a dead session. Discard that old session's
-            // alert observation and repeat the ordinary guarded path.
-            if let Some(button) = self.tap_named_alert(label)? {
-                return Ok(button);
-            }
-            return Ok(self.tap_text(label)?.into_step_text());
-        }
-        if let Some(button) = self.act_on_observed_alert(label, "/alert/accept", "tap", observation?)? {
-            return Ok(button);
-        }
-        Ok(self.tap_text_with_lines(label, Some(screen?))?.into_step_text())
-    }
-
     /// L3231.
     pub fn tap_text(&mut self, label: &str) -> Result<TapOutcome> {
-        self.tap_text_with_lines(label, None)
-    }
-
-    fn tap_text_with_lines(&mut self, label: &str, mut first_lines: Option<Vec<Line>>) -> Result<TapOutcome> {
         let app_confirmed = self.wait_active_app(1.5, 0.03, None);
         let (base, where_) = split_where(label);
         let where_ = where_set(where_.as_deref()).map(str::to_string);
@@ -435,9 +375,16 @@ impl<R: Reader> Flow<R> {
         // If the previous tap triggered a full-screen slide/push (last_reaction_diff
         // >= 2.0), drain the animation with cheap ~34 ms raw grabs before paying for
         // full OCR on blurry mid-transition frames.
-        let mut m0 = first_lines.as_ref().and_then(|lines| find_text(lines, &base, DEFAULT_FUZZY, wh));
+        let mut m0: Option<Match> = None;
         let mut m0_pixel_stable = false;
-        if first_lines.is_none() && self.tap_needs_transition_settle() {
+        let mut first_lines: Option<Vec<Line>> = None;
+        if self.last_action_ts != 0.0
+            && (clock::now() - self.last_action_ts) < 0.7
+            && self.wait_settled_ts < self.last_action_ts
+            && self.last_reaction_diff >= 2.0
+            && self.r.last_lines().is_none()
+            && self.r.last().is_some()
+        {
             let (settled_prev, settled_img) = self.settle_transition(0.5, 1.2)?;
             if let Some(si) = settled_img.clone() {
                 let fl = self.tap_read_img(si.clone())?;

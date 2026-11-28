@@ -278,7 +278,7 @@ fn verified_alert_text_on(c: &mut WdaClient, deadline: Option<f64>) -> Result<Op
 
 /// Read the live alert and its raw button labels. The named WDA action takes the
 /// original label, so OCR, UI trees and normalized display labels are unsuitable.
-pub(super) fn named_alert_on(c: &mut WdaClient, deadline: Option<f64>) -> Result<Option<(String, Vec<String>)>> {
+fn named_alert_on(c: &mut WdaClient, deadline: Option<f64>) -> Result<Option<(String, Vec<String>)>> {
     let Some(title) = verified_alert_text_on(c, deadline)? else {
         return Ok(None);
     };
@@ -613,14 +613,7 @@ impl<R: Reader> Flow<R> {
     }
 
     pub(super) fn act_on_named_alert(&mut self, label: &str, suffix: &str, verb: &str) -> Result<Option<String>> {
-        let alert = named_alert_on(&mut self.c, None)?;
-        self.act_on_observed_alert(label, suffix, verb, alert)
-    }
-
-    pub(super) fn act_on_observed_alert(
-        &mut self, label: &str, suffix: &str, verb: &str, alert: Option<(String, Vec<String>)>,
-    ) -> Result<Option<String>> {
-        let Some((title, buttons)) = alert else {
+        let Some((title, buttons)) = named_alert_on(&mut self.c, None)? else {
             return Ok(None);
         };
         let button = exact_alert_button(&buttons, label.trim()).ok_or_else(|| alert_match_error(&title, &buttons))?;

@@ -904,7 +904,12 @@ impl<R: Reader> Flow<R> {
             "gone" => self.gone(arg, None)?,
             "assert" => return some(self.assert_text(arg)?),
             "assertnot" => return some(self.assert_not_text(arg)?),
-            "tap" => return some(self.tap_text_step(arg)?),
+            "tap" => {
+                if let Some(button) = self.tap_named_alert(arg)? {
+                    return some(button);
+                }
+                return some(self.tap_text(arg)?.into_step_text());
+            }
             "tapif" => return some(self.tap_if(arg, 1.0)?),
             "tapbatch" => return some(self.tap_batch(arg)?),
             "toggle" => return some(self.toggle(arg)?),
