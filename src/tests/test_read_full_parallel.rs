@@ -37,6 +37,7 @@ struct OverlapReader {
     inner: FakeReader,
     ui_started: Event,
     overlapped: Arc<Mutex<Option<bool>>>,
+    read_started: Option<Event>,
     read_thread: Arc<Mutex<Option<ThreadId>>>,
 }
 
@@ -54,6 +55,9 @@ impl Reader for OverlapReader {
         let first = self.overlapped.lock().unwrap().is_none();
         if first {
             *self.read_thread.lock().unwrap() = Some(std::thread::current().id());
+            if let Some(started) = &self.read_started {
+                started.set();
+            }
             let ok = self.ui_started.wait(2.0);
             *self.overlapped.lock().unwrap() = Some(ok);
         }
@@ -105,6 +109,7 @@ fn run(ui_reply: Value, flow_setup: Option<fn(&mut Flow<OverlapReader>)>) -> Run
     let reader = OverlapReader {
         inner: FakeReader::new(vec![(img.clone(), lines.clone()), (copy_img(&img), lines)]),
         ui_started,
+        read_started: None,
         overlapped: overlapped.clone(),
         read_thread: read_thread.clone(),
     };
@@ -139,6 +144,41 @@ fn test_fast_ui_is_in_flight_while_the_first_frame_is_read() {
     assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["Inbox"]);
     let ui = ui.expect("ui");
     assert_eq!(ui.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), vec!["Compose"]);
+}
+
+#[test]
+fn tap_reads_screen_while_alert_check_is_in_flight_and_preserves_alert_priority() {
+    let _cache = isolated_cache();
+    let alert_started = Event::default();
+    let read_started = Event::default();
+    let read_during_alert = Arc::new(Mutex::new(false));
+    let mut state = MockState::default();
+    state.alert_buttons = Some(Dyn::one(json!(["Proceed"])));
+    let mock = MockWda::start(state);
+    let (alert_local, read_local, proof) = (alert_started.clone(), read_started.clone(), read_during_alert.clone());
+    mock.set_custom_handler(move |_, method, path, _| {
+        if method == "GET" && path.ends_with("/alert/text") {
+            alert_local.set();
+            *proof.lock().unwrap() = read_local.wait(2.0);
+            return Some(json!({"value": "Choose a response"}));
+        }
+        None
+    });
+    let image = solid_img(240, (120, 240));
+    let button = make_line("Proceed", 20.0, 100.0, 120.0, 120.0);
+    let reader = OverlapReader {
+        inner: FakeReader::new(vec![(image, vec![button])]),
+        ui_started: alert_started,
+        read_started: Some(read_started),
+        overlapped: Arc::default(),
+        read_thread: Arc::default(),
+    };
+    let mut flow = Flow::new(mock.client(), reader, 1.0, None, false).unwrap();
+    assert_eq!(flow.step("tap:Proceed").unwrap(), Some(json!("Proceed")));
+    assert!(*read_during_alert.lock().unwrap(), "the alert response completed before the screen read began");
+    assert!(mock.tapped_points().is_empty());
+    let route = flow.c.spath("/alert/accept");
+    assert_eq!(mock.calls_to(&route), vec![("POST".into(), route, json!({"name": "Proceed"}))]);
 }
 
 #[test]
