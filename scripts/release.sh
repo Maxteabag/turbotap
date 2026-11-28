@@ -53,7 +53,7 @@ for asset in "$linux" "$macos"; do
     fi
 done
 file "$scratch/$linux" | grep -q 'ELF 64-bit.*x86-64'
-file "$scratch/$macos" | grep -q 'Mach-O 64-bit executable arm64'
+file "$scratch/$macos" | grep -Eq 'Mach-O 64-bit (arm64 executable|executable arm64)([,[:space:]]|$)'
 # Publish additively. Existing manifests must match and are never replaced.
 for asset in "$linux" "$macos"; do
     manifest="$asset.SHA256SUMS"
