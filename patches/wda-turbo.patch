@@ -1,5 +1,63 @@
+diff --git a/WebDriverAgentLib/Categories/XCUIApplication+FBAlert.h b/WebDriverAgentLib/Categories/XCUIApplication+FBAlert.h
+index ec6ada7..7934c22 100644
+--- a/WebDriverAgentLib/Categories/XCUIApplication+FBAlert.h
++++ b/WebDriverAgentLib/Categories/XCUIApplication+FBAlert.h
+@@ -30,7 +30,8 @@ extern NSString *const FB_SAFARI_APP_NAME;
+  callers should seed it with nil beforehand. Pass NULL if not needed.
+  @return Alert element instance, or nil if no alert is present
+  */
+-- (nullable XCUIElement *)fb_alertElementWithSnapshot:(id<FBXCElementSnapshot> _Nullable * _Nullable)snapshotOut;
++- (nullable XCUIElement *)fb_alertElementWithSnapshot:(id<FBXCElementSnapshot> _Nullable * _Nullable)snapshotOut
++                                      observationFailed:(BOOL * _Nullable)observationFailed;
+
+ /**
+  Retrieve the application hosting the iOS 18+ limited access permission prompt,
+diff --git a/WebDriverAgentLib/Categories/XCUIApplication+FBAlert.m b/WebDriverAgentLib/Categories/XCUIApplication+FBAlert.m
+index d89afc3..785bce5 100644
+--- a/WebDriverAgentLib/Categories/XCUIApplication+FBAlert.m
++++ b/WebDriverAgentLib/Categories/XCUIApplication+FBAlert.m
+@@ -97,6 +97,7 @@ static NSString *const FB_LIMITED_ACCESS_PROMPT_BUNDLE_ID = @"com.apple.Contacts
+ // iPad popover check, the Safari web-alert walk) only run for candidates
+ // that actually matched, not for every possible type.
+ - (nullable XCUIElement *)fb_alertElementWithSnapshot:(id<FBXCElementSnapshot> _Nullable * _Nullable)snapshotOut
++                                      observationFailed:(BOOL * _Nullable)observationFailed
+ {
+   NSPredicate *predicate = [NSPredicate predicateWithFormat:@"elementType IN {%lu,%lu,%lu}",
+                             XCUIElementTypeAlert, XCUIElementTypeSheet, XCUIElementTypeScrollView];
+@@ -106,6 +107,9 @@ static NSString *const FB_LIMITED_ACCESS_PROMPT_BUNDLE_ID = @"com.apple.Contacts
+   // hop).
+   NSArray<XCUIElement *> *candidates = [[self descendantsMatchingType:XCUIElementTypeAny]
+                                         matchingPredicate:predicate].allElementsBoundByAccessibilityElement;
++  if (nil == candidates && NULL != observationFailed) {
++    *observationFailed = YES;
++  }
+   if (0 == candidates.count) {
+     return nil;
+   }
+@@ -137,6 +141,10 @@ static NSString *const FB_LIMITED_ACCESS_PROMPT_BUNDLE_ID = @"com.apple.Contacts
+     // In case of iPad we want to check if sheet isn't contained by popover.
+     // In that case we ignore it.
+     id<FBXCElementSnapshot> sheetSnapshot = sheet.fb_cachedSnapshot ?: [sheet fb_customSnapshot];
++    if (nil == sheetSnapshot && NULL != observationFailed) {
++      *observationFailed = YES;
++      continue;
++    }
+     BOOL isInsidePopover = NO;
+     id<FBXCElementSnapshot> ancestor = sheetSnapshot.parent;
+     while (nil != ancestor) {
+@@ -156,6 +164,10 @@ static NSString *const FB_LIMITED_ACCESS_PROMPT_BUNDLE_ID = @"com.apple.Contacts
+
+   for (XCUIElement *scrollView in scrollViews) {
+     id<FBXCElementSnapshot> scrollViewSnapshot = scrollView.fb_cachedSnapshot ?: [scrollView fb_customSnapshot];
++    if (nil == scrollViewSnapshot && NULL != observationFailed) {
++      *observationFailed = YES;
++      continue;
++    }
+     id<FBXCElementSnapshot> app = [[FBXCElementSnapshotWrapper ensureWrapped:scrollViewSnapshot] fb_parentMatchingType:XCUIElementTypeApplication];
+     if (nil == app || ![app.label isEqualToString:FB_SAFARI_APP_NAME]) {
+       continue;
 diff --git a/WebDriverAgentLib/Commands/FBCustomCommands.m b/WebDriverAgentLib/Commands/FBCustomCommands.m
-index 6dee73b..f1c1ae0 100644
+index 6dee73b..c8a59a2 100644
 --- a/WebDriverAgentLib/Commands/FBCustomCommands.m
 +++ b/WebDriverAgentLib/Commands/FBCustomCommands.m
 @@ -14,6 +14,8 @@
@@ -111,7 +169,7 @@ index 6dee73b..f1c1ae0 100644
  }
  
  + (id<FBResponsePayload>)handleUnlock:(FBRouteRequest *)request
-@@ -222,16 +292,45 @@
+@@ -222,16 +292,49 @@
  
  + (id<FBResponsePayload>)handleActiveAppInfo:(FBRouteRequest *)request
  {
@@ -129,8 +187,12 @@ index 6dee73b..f1c1ae0 100644
 +  if (nil == alertApp) {
 +    return FBResponseWithObject(info);
 +  }
++  NSNumber *presence = [FBAlert alertWithApplication:alertApp].observedPresence;
++  if (nil == presence) {
++    return FBResponseWithObject(info);
++  }
 +  NSMutableDictionary *result = [info mutableCopy];
-+  result[@"tapAlertPresent"] = @([[FBAlert alertWithApplication:alertApp] isPresent]);
++  result[@"tapAlertPresent"] = presence;
 +  return FBResponseWithObject(result);
 +}
 +
@@ -160,7 +222,7 @@ index 6dee73b..f1c1ae0 100644
  }
  
  /**
-@@ -386,6 +485,81 @@
+@@ -386,6 +489,81 @@
    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"LSApplicationWorkspace failed to launch app" traceback:nil]);
  }
  
@@ -1276,6 +1338,75 @@ index 9586a19..ba6d9d6 100644
 +}
 +
  @end
+diff --git a/WebDriverAgentLib/FBAlert.h b/WebDriverAgentLib/FBAlert.h
+index ddb013f..2887511 100644
+--- a/WebDriverAgentLib/FBAlert.h
++++ b/WebDriverAgentLib/FBAlert.h
+@@ -38,6 +38,9 @@ NS_ASSUME_NONNULL_BEGIN
+  */
+ - (BOOL)isPresent;
+
++/** Fresh presence observation. Returns nil if discovery did not complete. */
++- (nullable NSNumber *)observedPresence;
++
+ /**
+  Gets the labels of the buttons visible in the alert.
+  See isPresent for how presence is resolved.
+diff --git a/WebDriverAgentLib/FBAlert.m b/WebDriverAgentLib/FBAlert.m
+index 9324ea4..af300dd 100644
+--- a/WebDriverAgentLib/FBAlert.m
++++ b/WebDriverAgentLib/FBAlert.m
+@@ -49,7 +49,7 @@
+ {
+   if (!self.hasCachedAlertElement) {
+     id<FBXCElementSnapshot> snapshot = nil;
+-    self.cachedAlertElement = [self alertElementFromApplication:&snapshot];
++    self.cachedAlertElement = [self alertElementFromApplication:&snapshot observationFailed:NULL];
+     self.hasCachedAlertElement = YES;
+     if (nil != snapshot) {
+       self.cachedAlertSnapshot = snapshot;
+@@ -85,6 +85,16 @@
+   return nil != self.alertElement;
+ }
+
++- (nullable NSNumber *)observedPresence
++{
++  BOOL observationFailed = NO;
++  XCUIElement *element = [self alertElementFromApplication:NULL observationFailed:&observationFailed];
++  if (nil != element) {
++    return @YES;
++  }
++  return observationFailed ? nil : @NO;
++}
++
+ + (NSArray<id<FBXCElementSnapshot>> *)fb_buttonSnapshotsInSnapshot:(id<FBXCElementSnapshot>)snapshot
+ {
+   NSMutableArray<id<FBXCElementSnapshot>> *buttons = [NSMutableArray array];
+@@ -428,6 +438,7 @@
+ // getter above, which caches both the element and (if one comes back) the
+ // snapshot obtained as a side effect of resolving it.
+ - (nullable XCUIElement *)alertElementFromApplication:(id<FBXCElementSnapshot> _Nullable *)snapshotOut
++                                      observationFailed:(BOOL * _Nullable)observationFailed
+ {
+   @try {
+     XCUIApplication *systemApp = XCUIApplication.fb_systemApplication;
+@@ -440,12 +451,15 @@
+       [candidates addObject:promptApp];
+     }
+     for (XCUIApplication *candidate in candidates) {
+-      XCUIElement *element = [candidate fb_alertElementWithSnapshot:snapshotOut];
++      XCUIElement *element = [candidate fb_alertElementWithSnapshot:snapshotOut observationFailed:observationFailed];
+       if (nil != element) {
+         return element;
+       }
+     }
+   } @catch (NSException *) {
++    if (NULL != observationFailed) {
++      *observationFailed = YES;
++    }
+     return nil;
+   }
+   return nil;
 diff --git a/WebDriverAgentLib/Routing/FBResponsePayload.h b/WebDriverAgentLib/Routing/FBResponsePayload.h
 index b29b8f9..8ea549a 100644
 --- a/WebDriverAgentLib/Routing/FBResponsePayload.h
