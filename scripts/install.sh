@@ -30,7 +30,7 @@ main() {
     fi
 
     downloads="https://github.com/Maxteabag/turbotap/releases/download/$tag"
-    curl --proto '=https' --proto-redir '=https' -fsSL "$downloads/SHA256SUMS" -o "$scratch/SHA256SUMS"
+    curl --proto '=https' --proto-redir '=https' -fsSL "$downloads/$asset.SHA256SUMS" -o "$scratch/SHA256SUMS"
     curl --proto '=https' --proto-redir '=https' -fsSL "$downloads/$asset" -o "$scratch/turbotap"
     expected=$(awk -v asset="$asset" '
         $2 == asset && NF == 2 && length($1) == 64 && $1 !~ /[^0-9a-f]/ { hash = $1; count++ }
@@ -46,6 +46,11 @@ main() {
         exit 1
     fi
     chmod 0755 "$scratch/turbotap"
+    if ! reported_version=$("$scratch/turbotap" --version) ||
+        [ "$reported_version" != "turbotap ${tag#v}" ]; then
+        printf 'Cannot run Turbotap %s on this host. Check the release platform requirements or install from source with Cargo.\n' "$tag" >&2
+        exit 1
+    fi
     if [ -d "$dest/turbotap" ]; then
         printf 'Destination is a directory: %s/turbotap\n' "$dest" >&2
         exit 1

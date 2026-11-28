@@ -15,7 +15,7 @@ cd "$1/source"
 if [[ -x "$HOME/.cargo/bin/cargo" ]]; then
     export PATH="$HOME/.cargo/bin:$PATH"
 fi
-if ! command -v cargo >/dev/null; then
+if ! cargo -V >/dev/null 2>&1; then
     export CARGO_HOME="$1/cargo" RUSTUP_HOME="$1/rustup"
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$1/rustup-init.sh"
     sh "$1/rustup-init.sh" -y --profile minimal --no-modify-path >&2

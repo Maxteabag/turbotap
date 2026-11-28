@@ -11,7 +11,7 @@ gh release create vMAJOR.MINOR.PATCH --verify-tag --draft --notes-file release-n
 gh release edit vMAJOR.MINOR.PATCH --draft=false
 ```
 
-For a backfill, run just the release script against the existing release. It verifies and preserves any binary already attached, builds missing binaries from the exact published tag, and publishes a shared `SHA256SUMS` with one entry per platform. The script prints the release URL after checking GitHub’s asset digests.
+For a backfill, run just the release script against the existing release. It verifies and preserves any binary already attached, builds missing binaries from the exact published tag, and publishes a separate `<binary>.SHA256SUMS` for each platform. Existing manifests, including the legacy `SHA256SUMS` on v1.6.7, stay available. The script prints the release URL after checking GitHub’s asset digests.
 
 ## Install the latest published release
 
@@ -19,4 +19,4 @@ For a backfill, run just the release script against the existing release. It ver
 curl -fsSL https://raw.githubusercontent.com/Maxteabag/turbotap/main/scripts/install.sh | sh
 ```
 
-The installer uses the latest stable release tag for both the binary and its checksum. It installs to `~/.local/bin/turbotap` by default. Set `TURBOTAP_INSTALL_DIR` in the environment of `sh` to choose another directory. Other platforms can use the Cargo source install.
+The installer uses the latest stable release tag for both the binary and its checksum. It installs to `~/.local/bin/turbotap` by default. Set `TURBOTAP_INSTALL_DIR` in the environment of `sh` to choose another directory. The Linux v1.6.7 binary requires x86-64 with glibc 2.39 or later. The installer runs the staged binary to verify it starts and reports the requested version before replacing any installation. Older glibc, musl and other unsupported platforms can use the Cargo source install.

@@ -54,20 +54,25 @@ for asset in "$linux" "$macos"; do
 done
 file "$scratch/$linux" | grep -q 'ELF 64-bit.*x86-64'
 file "$scratch/$macos" | grep -q 'Mach-O 64-bit executable arm64'
-(cd "$scratch" && sha256sum "$linux" "$macos" > SHA256SUMS && sha256sum -c SHA256SUMS)
+# Publish additively. Existing manifests must match and are never replaced.
+for asset in "$linux" "$macos"; do
+    manifest="$asset.SHA256SUMS"
+    (cd "$scratch" && sha256sum "$asset" > "$manifest" && sha256sum -c "$manifest")
+    existing_digest=$(asset_digest "$manifest")
+    if [[ -z $existing_digest ]]; then
+        pending+=("$scratch/$manifest")
+    else
+        verify_digest "$manifest" "$existing_digest"
+    fi
+done
 
-# Preserve existing binaries. Publish the checksum last, after both assets exist.
 if (( ${#pending[@]} )); then
     gh release upload "$tag" "${pending[@]}" --repo "$repo"
 fi
 assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[] | [.name,.digest] | @tsv')
-verify_digest "$linux" "$(asset_digest "$linux")"
-verify_digest "$macos" "$(asset_digest "$macos")"
-manifest_digest=$(asset_digest SHA256SUMS)
-local_digest=$(sha256sum < "$scratch/SHA256SUMS")
-if [[ $manifest_digest != "sha256:${local_digest%% *}" ]]; then
-    gh release upload "$tag" "$scratch/SHA256SUMS" --clobber --repo "$repo"
-fi
-assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[] | [.name,.digest] | @tsv')
-verify_digest SHA256SUMS "$(asset_digest SHA256SUMS)"
+for asset in "$linux" "$macos"; do
+    verify_digest "$asset" "$(asset_digest "$asset")"
+    manifest="$asset.SHA256SUMS"
+    verify_digest "$manifest" "$(asset_digest "$manifest")"
+done
 gh release view "$tag" --repo "$repo" --json url --jq .url
