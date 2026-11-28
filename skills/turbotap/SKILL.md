@@ -9,7 +9,7 @@ Use `turbotap` to operate any app on a real iPhone over Wi-Fi without AirPlay sc
 
 ## 0. A Longer Task, Start to Finish (posting, installing, filling a form)
 
-1. **Ready, bounded, one recovery.** `turbotap --device N preflight --require-ready` checks the lock state, front app, screen size and one small capture, and exits 1 with `not_ready` reasons. Do the one recovery it names (`turbotap unlock` once under the vault rule, or `turbotap deploy` once for an empty capture or no answer), run preflight once more, and stop with its reason if it is still not ready. Never loop on empty screenshots.
+1. **Ready, bounded, one recovery.** `turbotap --device N preflight --require-ready` checks the lock state, front app, screen size and one small capture, and exits 1 with `not_ready` reasons. Do the one recovery it names (`turbotap unlock` once using your configured `passcode_cmd`, or `turbotap deploy` once for an empty capture or no answer), run preflight once more, and stop with its reason if it is still not ready. Never loop on empty screenshots.
 2. **Open the app, then inspect it.** Pair `open:BUNDLE` with `ui` in one flow. `ui` returns the labels, accessibility roles, coordinates and disabled state actually reported by iOS. Use `read` in its place when the visible text also matters. If an alert is active, read its title and offered buttons before choosing a response.
 3. **Media: what is already there first, then only the allowed path.** Check the app's picker or Photos for the exact item (name, duration or date) and use it if it is there. Transfer only when it is not, and only over a path the task allows; never invent a new channel.
 4. **Observe progress and choose the next control.** Use the live accessibility labels and roles to scope a wait to a control you have identified. When the next state is unknown, use a fresh `ui` or `read` to decide what to do.
@@ -47,19 +47,30 @@ Each turn costs seconds of thinking, so do each phase in ONE `flow` call and rea
 
 ## 3. Targeting & Navigation Patterns
 
-```sh
-turbotap flow "open:$APP" "search:$QUERY" "tap:$OBSERVED_RESULT_LABEL"
-
-# Example on an English App Store screen. Use the labels you see for the app you intend to install.
+```bash
+# Open the App Store, search "Angry Birds", tap Get, and wait until Open appears
 turbotap flow --timeout 90 open:com.apple.AppStore tap:Search 'search:Angry Birds' 'tap:Angry Birds 2' tap:Get waitcontrol:Open
-turbotap flow "open:$APP" "tap:$OBSERVED_CONTROL_LABEL" ui
-turbotap flow "open:$APP" ui
-turbotap flow "tap:$LABEL" ui
-turbotap flow "tap:$LABEL@below:$HEADER" read
-turbotap flow "fill:$FIELD=$VALUE" "assertfield:$FIELD=$VALUE"
+
+# Open Spotify -> Your Library -> Liked Songs, read the list, and swipe back
+turbotap flow open:Spotify 'tap:Your Library' 'tap:Liked Songs@y>150' wait:songs read:ocr back
+
+# Open Weather and read the forecast
+turbotap flow open:Weather read
+
+# Draft a Messenger reply to Alice while blocking Send and Call buttons
+turbotap flow --deny-also 'Send|Call' open:Messenger 'tap:Alice@y>300' 'fill:Message=On my way' read
+
+# Open Settings -> General -> About and read the iOS version
+turbotap flow launch:com.apple.Preferences scrollto:General tap:General tap:About 'wait:iOS Version' read
+
+# Read a 2FA code directly from Authenticator's accessibility tree
+turbotap flow open:Authenticator readel:GitHub
+
+# Fill and verify a form field in one flow
+turbotap flow 'fill:Title=Release notes' 'assertfield:Title=Release notes'
 ```
 
-Set the variables from the authorized app and its live interface. When matching controls repeat, add the observed location or a region that distinguishes the target.
+Adapt app names, labels, and regions (`@below:HEADER`, `@y>N`) to what the live interface actually shows. When matching controls repeat, add a region or exact position (`tapat:X,Y=LABEL`) that distinguishes the target.
 
 - **Choose the exact target.** Use the live label, role and location to identify the control. For duplicate labels, pass an exact label and position with `tapat:X,Y=LABEL`. Check the receipt and read the resulting interface before choosing another action.
 - **Failed steps show exact labels:** a failing `flow` returns `visible` (OCR lines) and `ui` (top 30 interactive controls with exact labels and `(x, y)`). Retry with those; don't spend a turn on `tree`.
@@ -105,8 +116,8 @@ Every flow step and standalone command appends one JSON line to `~/.local/state/
 
 ## 7. Setup & Reference
 
-- Install or upgrade: `cargo install --force --git https://github.com/Maxteabag/turbotap.git` then `turbotap install-skill` (installed skill copies refresh themselves after upgrades)
-- CLI & configuration: [README.md](../../README.md) | Full Mac + Xcode + iPhone setup: [docs/SETUP.md](../../docs/SETUP.md)
+- Install or upgrade: `curl -fsSL https://raw.githubusercontent.com/Maxteabag/turbotap/main/scripts/install.sh | sh` (Apple Silicon macOS / Linux x86-64) or `cargo install --force --git https://github.com/Maxteabag/turbotap.git`, then `turbotap install-skill` (installed skill copies refresh themselves after upgrades)
+- Overview: [README.md](../../README.md) | Setup: [docs/SETUP.md](../../docs/SETUP.md) | Full reference: [docs/REFERENCE.md](../../docs/REFERENCE.md) | Safety & redaction: [docs/SAFETY.md](../../docs/SAFETY.md)
 - Fast WDA routes (`/wda/fastLaunch`, `/wda/fastTap`, `/wda/fastDoubleTap`, `/wda/fastPinch`, `/wda/fastTapBatch`, `/wda/fastDrag`, `/wda/fastKeys`, `/wda/fastScreenshot` with ETag/304, `/wda/fastUI`, and v6 `/wda/fastPreflight`, `/wda/fastOCR`): [wda-turbo.patch](../../patches/wda-turbo.patch); deploy/restart with `turbotap deploy [--no-build]`. `turbotap preflight` uses the one-request v6 read automatically and falls back to the stock reads on older runners (`--stock` forces them).
 - Speed internals (session cache, strip-parallel OCR, zero-momentum drag, trimmed `/source`): [docs/HOW_IT_WORKS.md](../../docs/HOW_IT_WORKS.md)
 - After a non-trivial task, run [`turbotap-retro`](../turbotap-retro/SKILL.md): fix what slowed you down once, in `turbotap` itself, with generic primitives only.

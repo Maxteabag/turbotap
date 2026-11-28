@@ -7,7 +7,7 @@ This guide takes you from zero to driving a physical iPhone headlessly over Wi-F
 1. **An iPhone** running iOS 17+ on the same Wi-Fi network as your machine.
 2. **A Mac with Xcode** (used to sign and launch `WebDriverAgentRunner` onto the iPhone; can be the same machine or a Mac reachable over SSH).
 3. **An Apple ID** (free Apple ID works for personal development signing; a paid Apple Developer account gives longer provisioning lifetimes).
-4. **A Rust toolchain** (`cargo`) to build `turbotap`, and optionally **Tesseract** (`libtesseract`) on the machine running it. Tesseract is loaded at runtime, so it is not needed to build.
+4. **Prebuilt binaries** are published for Apple Silicon macOS and Linux x86-64 (glibc 2.39+); a **Rust toolchain** (`cargo`) is only needed to build from source on other platforms. **Tesseract** (`libtesseract`) is optional for local OCR and is loaded at runtime, so it is not needed to build.
 
 ---
 
@@ -102,14 +102,20 @@ curl -fsS http://192.168.1.50:8100/status
 
 ## Step 4: Install `turbotap` and Tesseract
 
-Install `turbotap` and its agent skills:
+Install a checksum-verified prebuilt binary for Apple Silicon macOS or Linux x86-64 (glibc 2.39+) from [GitHub Releases](https://github.com/Maxteabag/turbotap/releases/latest), or build from source with Cargo:
 
 ```bash
+# Prebuilt binary (verifies SHA-256, installs to ~/.local/bin/turbotap; set TURBOTAP_INSTALL_DIR to override)
+curl -fsSL https://raw.githubusercontent.com/Maxteabag/turbotap/main/scripts/install.sh | sh
+
+# Or build from source
 cargo install --git https://github.com/Maxteabag/turbotap.git
+
+# Install bundled agent skills
 turbotap install-skill
 ```
 
-`install-skill` copies the `turbotap` and `turbotap-retro` skills into `~/.agents/skills` and `~/.claude/skills` (whichever exist, else `~/.agents/skills`). Use `--claude`, `--codex`, `--agents` or `--dir DIR` to pick folders. After an upgrade (`cargo install --force --git https://github.com/Maxteabag/turbotap.git`), the next `turbotap` run refreshes those copies by itself.
+`install-skill` copies the `turbotap` and `turbotap-retro` skills into `~/.agents/skills` and `~/.claude/skills` (whichever exist, else `~/.agents/skills`). Use `--claude`, `--codex`, `--agents` or `--dir DIR` to pick folders. After an upgrade, the next `turbotap` run refreshes those copies by itself.
 
 Install `libtesseract` for 180–250 ms in-process parallel OCR:
 
