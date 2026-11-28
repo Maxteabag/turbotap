@@ -7,7 +7,7 @@ This guide takes you from zero to driving a physical iPhone headlessly over Wi-F
 1. **An iPhone** running iOS 17+ on the same Wi-Fi network as your machine.
 2. **A Mac with Xcode** (used to sign and launch `WebDriverAgentRunner` onto the iPhone; can be the same machine or a Mac reachable over SSH).
 3. **An Apple ID** (free Apple ID works for personal development signing; a paid Apple Developer account gives longer provisioning lifetimes).
-4. **A Rust toolchain** (`cargo`) to build `turbotap`, and optionally **Tesseract** (`libtesseract`) on the machine running it. Tesseract is loaded at runtime, so it is not needed to build.
+4. **Prebuilt binaries** are published for Apple Silicon macOS and Linux x86-64 (glibc 2.39+); a **Rust toolchain** (`cargo`) is only needed to build from source on other platforms. **Tesseract** (`libtesseract`) is optional for local OCR and is loaded at runtime, so it is not needed to build.
 
 ---
 

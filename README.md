@@ -23,7 +23,7 @@ Driving an iPhone one screenshot per LLM turn is painfully slow: grab a frame, w
 - **One-command multi-step flows:** batches taps, scrolls, text entry, and screen reads in a single local process (~1.3 ms CLI startup, offline microbenchmark) — **1.0–6.0 s** vs 14.4–15.7 s on stock WDA (measured on an iPhone 17 over Wi-Fi).
 - **Patched WebDriverAgent (`wda-turbo`):** cuts taps from 740–1,200 ms to **~260 ms**, frame grabs from 123–244 ms to **~34 ms**, UI trees from ~2,600 ms to **158–198 ms**, and scrolls from ~2,000 ms to **150–350 ms** (iPhone 17 over Wi-Fi; falls back automatically to stock WDA).
 - **Dual screen reading (OCR + UI tree):** runs strip-parallel local Tesseract OCR (100–180 ms cold, ~50 ms cached) in parallel with `/wda/fastUI` (**~95 ms** combined vs ~204 ms serial, [PR #8](https://github.com/Maxteabag/turbotap/pull/8)), plus optional on-device Apple Vision OCR (`read:vision`, 72/72 words in ~235 ms on a multilingual test page vs 12/72 for host OCR).
-- **Single standalone binary for agents and scripts:** no Python runtime, bundled agent skills (`turbotap install-skill`), optional warm daemon (`--daemon`, ~288 ms vs ~555 ms for repeated OCR calls on iPhone 17), and step-level timing receipts (`turbotap timings --receipt`).
+- **Single standalone binary for agents and scripts:** no Python runtime, bundled agent skills (`turbotap install-skill`), optional warm daemon (`--daemon`, keeps `libtesseract` and WDA connections warm; ~2 ms local dispatch and ~24–28 ms OCR in offline Rust benchmarks), and step-level timing receipts (`turbotap timings --receipt`).
 
 See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the full benchmark table and technical details.
 

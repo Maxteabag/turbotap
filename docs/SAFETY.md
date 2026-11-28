@@ -23,7 +23,7 @@ Details:
 
 List the bundle IDs `turbotap` may control under `allowed_apps` in `~/.config/turbotap/config.json` (per device under `devices.<name>`, or top-level; a device's own list wins).
 
-With an allowlist configured, every input step (`tap:`, `tapxy:`, `tapat:`, `tapel:`, `tapif:`, `tapbatch:`, `toggle:`, `slider:`, `picker:`, `longpress:`, `doubletap:`, `zoom:`, `swipe:`, `scroll:`, `scrollto:`, `back`, `type:`, `cleartype:`, `typedigits:`, `pintap:`, `key:`, `search:`, `searchfield:`, `dismisskb`, `banner:dismiss:`, `setclip:`, alert actions, `tap-ocr`, `otp-type`) queries WDA live (`GET /wda/activeAppInfo`, never cached) right before sending input. If the foreground bundle ID is not on the allowlist, or if WDA fails to return an unambiguous HTTP 2xx success with a `bundleId`, the run stops with exit 1 and sends nothing:
+With an allowlist configured, every input step (`tap:`, `tapxy:`, `tapat:`, `tapel:`, `tapif:`, `tapbatch:`, `toggle:`, `slider:`, `picker:`, `longpress:`, `longpressxy:`, `doubletap:`, `doubletapxy:`, `zoom:`, `swipe:`, `scroll:`, `scrollto:`, `back`, `fill:`, `type:`, `cleartype:`, `typedigits:`, `pintap:`, `key:`, `search:`, `searchfield:`, `dismisskb`, `banner:dismiss:`, `setclip:`, alert actions, `tap-ocr`, `otp-type`) queries WDA live (`GET /wda/activeAppInfo`, never cached) right before sending input. If the foreground bundle ID is not on the allowlist, or if WDA fails to return an unambiguous HTTP 2xx success with a `bundleId`, the run stops with exit 1 and sends nothing:
 
 ```text
 turbotap: app guard refused tap:Message: foreground app 'com.example.other' is not in allowlist [com.example.app] (use --allow-app <bundle_id> for this run)
@@ -31,7 +31,7 @@ turbotap: app guard refused tap:Message: foreground app 'com.example.other' is n
 
 Rules and exceptions:
 - **`open:APP` / `launch:APP`** check the target bundle ID instead of the current foreground app, so a flow can start from the Home Screen. If WDA reports the app failed to open (not installed, restricted, locked) or another non-SpringBoard app remains in front for over a second, the step fails.
-- **`url:`** is refused while the app guard is active because iOS chooses which app receives a URL (including universal `https://` links). To open an app's own custom scheme, pass `--allow-url-scheme SCHEME` together with `--allow-app BUNDLE_ID` for that run (system schemes such as `http`, `https`, `tel`, `sms`, `mailto`, `facetime`, `maps`, and `x-apple...` are always refused). After opening, `turbotap` watches the foreground app for 0.8 s and stops if another app comes forward; only the scheme is printed, never the URL.
+- **`url:`** is refused while the app guard is active because iOS chooses which app receives a URL (including universal `https://` links). To open an app's own custom scheme, pass `--allow-url-scheme SCHEME` together with `--allow-app BUNDLE_ID` for that run (system schemes such as `http`, `https`, `tel`, `sms`, `mailto`, `facetime`, `maps`, `apple*`, and `x-apple*` are always refused). A live check confirms an `--allow-app` app is already in front before opening, then `turbotap` watches the foreground app for 0.8 s afterward and stops if another app comes forward; only the scheme is printed, never the URL.
 - **`unlock`** (on the lock screen), **`home`**, and read-only steps (`read`, `ui`, `ocr`, `wait:`, `assert:`, `assertnot:`, `alert:text`, `clipboard`, `shot:`, `preflight`, `tree`, `screenshot`) work in any app.
 - **`tapbatch:fixed:`** and **`pintap:`** send one touch at a time while the guard is active so the live foreground check runs before every touch.
 - **Extending for one run:** `--allow-app BUNDLE_ID` (repeatable) adds an app for one invocation; `TURBOTAP_ALLOWED_APPS=a,b` adds apps in that environment. Neither can remove an app from the configured list, and without a config list they turn the guard on by themselves.
@@ -59,7 +59,7 @@ Example configuration to guard irreversible actions:
 ```
 
 Behavior:
-- Applies to `tap:`, `tapif:`, `tapel:`, `tapat:`, `tapbatch:`, `toggle:`, `slider:`, `longpress:`, `doubletap:`, `banner:dismiss:`, and labeled alert buttons.
+- Applies to `tap:`, `tapif:`, `tapel:`, `tapat:`, `tapbatch:`, `toggle:`, `slider:`, `longpress:`, `doubletap:`, `search:`, `banner:dismiss:`, labeled `back:LABEL` / `dismisskb:LABEL`, and labeled alert buttons.
 - Raw coordinate taps (`tapxy:`) have no label to match; use labelled targets (`tap:`, `tapel:`, `tapat:`) when filtering matters.
 - **Keyboard submit guard:** before `key:return`, `key:enter`, or multi-line text input, `turbotap` reads the live unfiltered keyboard keys. If any key matches `--deny-also` / `deny_also` — or if the live keyboard cannot be read — the input is refused. A match or unreadable keyboard under `--deny` prints a warning.
 - **`--no-deny`** or an empty `--deny ""` disables both `--deny` and `--deny-also` (including configured `deny_also`). Use only when explicitly authorized for that action.

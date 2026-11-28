@@ -4,7 +4,7 @@ Run `turbotap --help` or `turbotap flow --help` for the built-in summary from yo
 
 ## Global flags
 
-Place global flags before the subcommand (`--allow-app`, `--allow-url-scheme`, and `--deny*` also work on `flow`):
+Place global flags before the subcommand (`--allow-app` also works on `flow`, `tap-ocr`, and `otp-type`; `--allow-url-scheme` also works on `flow`; `--deny`, `--deny-also`, and `--no-deny` are `flow`-only options):
 
 | Flag | Env / Config | Purpose |
 |---|---|---|
@@ -29,8 +29,8 @@ Place global flags before the subcommand (`--allow-app`, `--allow-url-scheme`, a
 | `turbotap tap-ocr TEXT` | Find `TEXT` and tap it once |
 | `turbotap tree` | Dump the raw WDA accessible source tree |
 | `turbotap screenshot OUT.png` | Save a full-resolution PNG screenshot |
-| `turbotap otp-type [--code N] [--pattern '%code%'] [--after-rowid N] [--timeout 20]` | Poll macOS `Messages/chat.db` over SSH (read-only) and type a 6-digit OTP |
-| `turbotap timings [--since WHEN] [--by step\|app\|step+app] [--top 10] [--receipt --until WHEN]` | Summarize per-step timings or generate a wall-clock run receipt |
+| `turbotap otp-type [--code N] [--pattern '%code%'] [--after-rowid N] [--timeout 20] [--mac-host HOST] [--allow-app BUNDLE]` | Poll macOS `Messages/chat.db` over SSH (read-only) and type a 6-digit OTP |
+| `turbotap timings [--since WHEN] [--by step\|app\|step+app] [--file PATH] [--top 10] [--receipt --until WHEN]` | Summarize per-step timings or generate a wall-clock run receipt |
 | `turbotap daemon start\|stop\|status [--idle 900] [--foreground]` | Manage the opt-in warm local daemon |
 | `turbotap install-skill [--agents\|--claude\|--codex\|--dir DIR] [--force]` | Install the bundled `turbotap` and `turbotap-retro` agent skills |
 
